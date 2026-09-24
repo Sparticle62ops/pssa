@@ -114,6 +114,13 @@ for i in $(seq 1 "$TOTAL"); do
 done
 if [ -n "$PREV" ]; then
   echo "resuming from $PREV, next is ck$(printf '%02d' "$START")"
+  if [ "$START" -gt "$TOTAL" ]; then
+    echo
+    echo "the chain is already complete through ck$(printf '%02d' "$TOTAL") (TOTAL=$TOTAL),"
+    echo "so there is nothing to train. to keep going, rerun with a bigger cap, e.g.:"
+    echo "  TOTAL=$((TOTAL + 32)) bash kaggle/kaggle_continue.sh"
+    exit 0
+  fi
 else
   echo "no existing checkpoints, starting fresh"
 fi
