@@ -9,4 +9,5 @@ pub mod inference;
 pub mod linalg;
 pub mod memory;
 pub mod pssa;
+pub mod tui;
 pub mod ui;

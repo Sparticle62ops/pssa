@@ -353,6 +353,24 @@ impl CLIHandler {
                 options.warmup_steps
             ));
         }
+        // Chained resumes must continue the ORIGINAL cosine/warmup schedule instead of
+        // restarting it per link: the lr step counts from the resumed model's prior
+        // optimizer steps, so the next link picks up the decay curve where the last
+        // one left off rather than jumping back to full learning rate.
+        let prior_steps = options
+            .resume
+            .as_deref()
+            .map(|_| model.step_counter)
+            .unwrap_or(0);
+        let schedule_total = (prior_steps + total_updates)
+            .checked_sub(1)
+            .ok_or("training update count overflow")? + 1;
+        let schedule_warmup = if prior_steps > 0 { 0 } else { options.warmup_steps };
+        if prior_steps > 0 {
+            println!(
+                "lr_schedule=continued from_step={prior_steps} to_step={schedule_total} (no restart, no re-warmup)"
+            );
+        }
         ui::banner("train", "plastic state-space architecture");
         ui::field(
             "corpus",
@@ -425,9 +443,9 @@ impl CLIHandler {
                 update += 1;
                 model.apply_adamw(learning_rate_for_update(
                     options.lr,
-                    update,
-                    total_updates,
-                    options.warmup_steps,
+                    prior_steps + update,
+                    schedule_total,
+                    schedule_warmup,
                 )?);
                 if !Self::finite(&model) {
                     return Err("non-finite parameters; training aborted without checkpoint".into());
@@ -732,6 +750,7 @@ impl CLIHandler {
             ("status", "checkpoints and corpora in this directory"),
             ("download", "pull a Hugging Face dataset to a local file"),
             ("benchmark", "end-to-end smoke test on the built-in corpus"),
+            ("tui", "live dashboard for a piped training run (train ... | oxide tui)"),
             (
                 "gpu-probe",
                 "check whether a WebGPU compute device is usable",
@@ -889,6 +908,7 @@ impl CLIHandler {
             ("chat", "interactive prompt loop against a checkpoint"),
             ("download", "pull a Hugging Face dataset to a local file"),
             ("benchmark", "end-to-end smoke test on the built-in corpus"),
+            ("tui", "live dashboard for a piped training run (train ... | oxide tui)"),
             (
                 "gpu-probe",
                 "check whether a WebGPU compute device is usable",
@@ -1136,6 +1156,7 @@ impl CLIHandler {
                 }
                 Self::run_benchmark()
             }
+            "tui" => crate::tui::run(&args[2..]),
             _ => Err(format!("unknown command '{}'; run oxide help", args[1])),
         }
     }
