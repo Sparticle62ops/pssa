@@ -1,0 +1,10 @@
+
+# Rust build artifacts
+target/
+
+# Test dataset (wikimedia/wikipedia)
+data/downloaded.txt
+
+/.venv
+
+for.txt

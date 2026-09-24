@@ -1,0 +1,27 @@
+[package]
+name = "oxide_ai_pssa"
+version = "0.4.0"
+edition = "2024"
+authors = ["Sparticle62ops"]
+description = "Plastic State-Space Architecture (PSSA) V2 with CPU SIMD & WebGPU Compute Backends"
+
+[dependencies]
+# HTTP/HTTPS streaming for corpus downloads
+ureq = { version = "2.9", features = ["tls"] }
+
+# WebGPU compute runtime & buffer casting
+wgpu = { version = "0.19", features = ["wgsl"] }
+pollster = "0.3"
+bytemuck = { version = "1.16", features = ["derive"] }
+
+# Multi-threaded CPU fallback acceleration
+rayon = "1.10"
+tokenizers = { version = "0.22.1", default-features = false, features = ["fancy-regex"] }
+# Explicit direct use validates persisted tokenizer policy before model allocation.
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
