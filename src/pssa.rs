@@ -422,6 +422,13 @@ pub struct PSSALayerV2 {
     pub buf_g_c_proj: Vec<f32>,
     pub buf_g_h_prev: Vec<f32>,
 
+    // Batched backward per-token adjoint storage (stage/twin dispatch path)
+    pub bwd_g_zfinal: Vec<f32>,
+    pub bwd_g_zraw: Vec<f32>,
+    pub bwd_g_ad_down: Vec<f32>,
+    pub bwd_g_xnorm: Vec<f32>,
+    pub bwd_g_ysm: Vec<f32>,
+
     // Inference Scratch Buffers
     pub inf_x_norm: Vec<f32>,
     pub inf_delta: Vec<f32>,
@@ -551,6 +558,11 @@ impl PSSALayerV2 {
             buf_g_b_proj: vec![0.0; d_s],
             buf_g_c_proj: vec![0.0; d_s],
             buf_g_h_prev: vec![0.0; d_m * d_s],
+            bwd_g_zfinal: vec![0.0; chunk_len * d_m],
+            bwd_g_zraw: vec![0.0; chunk_len * d_m],
+            bwd_g_ad_down: vec![0.0; chunk_len * rank],
+            bwd_g_xnorm: vec![0.0; chunk_len * d_m],
+            bwd_g_ysm: vec![0.0; chunk_len * d_m],
             inf_x_norm: vec![0.0; d_m],
             inf_delta: vec![0.0; d_m],
             inf_b: vec![0.0; d_s],
