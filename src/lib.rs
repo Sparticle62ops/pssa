@@ -7,6 +7,7 @@ pub mod defense;
 pub mod diagnostics;
 pub mod inference;
 pub mod linalg;
+pub mod gpu_batch;
 pub mod memory;
 pub mod pssa;
 pub mod tui;
