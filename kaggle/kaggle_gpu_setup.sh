@@ -43,7 +43,7 @@ cd "$WORK"
 rm -rf oxide-ai
 git clone --quiet --branch "$BRANCH" "$REPO"
 cd oxide-ai
-cargo build --release
+cargo build --release --features cuda
 
 echo
 echo "### 4. GPU probe"

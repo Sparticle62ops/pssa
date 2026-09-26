@@ -81,7 +81,7 @@ echo "data=$DATA bytes=$(wc -c < "$DATA")"
 
 echo
 echo "### 2. Build"
-cargo build --release
+cargo build --release --features cuda
 HELP_TEXT="$(./target/release/oxide_ai_pssa help 2>&1 || true)"
 case "$HELP_TEXT" in
   *--resume*) echo "--resume present" ;;
