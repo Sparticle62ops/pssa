@@ -8,3 +8,4 @@ data/downloaded.txt
 /.venv
 
 for.txt/.cargo/
+/.cargo/
