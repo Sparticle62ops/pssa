@@ -1249,6 +1249,11 @@ impl PSSALayerV2 {
         self.mlp_w1.step_adamw(lr, beta1, beta2, wd, eps, step);
         self.mlp_w2.step_adamw(lr, beta1, beta2, wd, eps, step);
         self.unembed_w.step_adamw(lr, beta1, beta2, wd, eps, step);
+
+        // Host weights just moved, so any copies resident on the GPU are stale.
+        if let crate::backend::Device::Gpu(ctx) = &self.device {
+            ctx.invalidate_weights();
+        }
     }
 
     pub fn backward_and_step_chunk(&mut self, seq_len: usize) {
