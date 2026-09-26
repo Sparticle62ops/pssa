@@ -461,17 +461,90 @@ pub fn gemm_cpu_reference(
 pub enum Device {
     Cpu,
     Gpu(WgpuContext),
+    #[cfg(feature = "cuda")]
+    Cuda(crate::cuda::CudaContext),
+}
+
+/// A GPU context cloned out of a [`Device`], so the batched stage functions can
+/// dispatch without caring which backend is underneath. Both variants honour
+/// the same row-major layout contract and are checked against
+/// [`gemm_cpu_reference`].
+#[derive(Clone)]
+pub enum GpuDispatch {
+    Wgpu(WgpuContext),
+    #[cfg(feature = "cuda")]
+    Cuda(crate::cuda::CudaContext),
+}
+
+impl GpuDispatch {
+    /// Y[b] = X[b] * W^T, X [batch,M,K], W [N,K], Y [batch,M,N].
+    pub fn dispatch_gemm(
+        &self,
+        x: &[f32],
+        w: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        batch: usize,
+    ) -> Vec<f32> {
+        match self {
+            GpuDispatch::Wgpu(ctx) => ctx.dispatch_gemm(x, w, m, n, k, batch),
+            #[cfg(feature = "cuda")]
+            GpuDispatch::Cuda(ctx) => ctx.dispatch_gemm(x, w, m, n, k, batch),
+        }
+    }
+
+    /// Drop device-resident weight copies after an optimizer step.
+    pub fn invalidate_weights(&self) {
+        match self {
+            GpuDispatch::Wgpu(ctx) => ctx.invalidate_weights(),
+            #[cfg(feature = "cuda")]
+            GpuDispatch::Cuda(ctx) => ctx.invalidate_weights(),
+        }
+    }
+
+    pub fn backend_label(&self) -> String {
+        match self {
+            GpuDispatch::Wgpu(_) => "webgpu".to_string(),
+            #[cfg(feature = "cuda")]
+            GpuDispatch::Cuda(ctx) => format!("cuda ({})", ctx.adapter_name()),
+        }
+    }
 }
 
 impl Device {
     pub fn is_gpu(&self) -> bool {
-        matches!(self, Device::Gpu(_))
+        self.gpu().is_some()
     }
 
-    /// Try to bring up a real WebGPU compute device. Returns Err with the
-    /// adapter-level reason when no GPU is usable on this machine.
+    /// The dispatch handle for this device, or `None` on CPU.
+    pub fn gpu(&self) -> Option<GpuDispatch> {
+        match self {
+            Device::Cpu => None,
+            Device::Gpu(ctx) => Some(GpuDispatch::Wgpu(ctx.clone())),
+            #[cfg(feature = "cuda")]
+            Device::Cuda(ctx) => Some(GpuDispatch::Cuda(ctx.clone())),
+        }
+    }
+
+    /// Try to bring up a real GPU compute device. Native CUDA is preferred when
+    /// the build has it and a driver is present, because cuBLAS beats the WGSL
+    /// kernel; WebGPU is the portable fallback. Returns Err with the reason each
+    /// backend gave when neither is usable.
     pub fn try_gpu() -> Result<Device, String> {
-        WgpuContext::init_blocking().map(Device::Gpu)
+        #[cfg(feature = "cuda")]
+        let cuda_err = match crate::cuda::CudaContext::init() {
+            Ok(ctx) => return Ok(Device::Cuda(ctx)),
+            Err(e) => e,
+        };
+
+        match WgpuContext::init_blocking() {
+            Ok(ctx) => Ok(Device::Gpu(ctx)),
+            #[cfg(feature = "cuda")]
+            Err(e) => Err(format!("{cuda_err}; {e}")),
+            #[cfg(not(feature = "cuda"))]
+            Err(e) => Err(e),
+        }
     }
 }
 

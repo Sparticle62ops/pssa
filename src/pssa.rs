@@ -1251,7 +1251,7 @@ impl PSSALayerV2 {
         self.unembed_w.step_adamw(lr, beta1, beta2, wd, eps, step);
 
         // Host weights just moved, so any copies resident on the GPU are stale.
-        if let crate::backend::Device::Gpu(ctx) = &self.device {
+        if let Some(ctx) = self.device.gpu() {
             ctx.invalidate_weights();
         }
     }

@@ -334,8 +334,12 @@ impl CLIHandler {
         // available; the stage math is cpu-twin verified and falls back to CPU.
         match Device::try_gpu() {
             Ok(gpu_device) => {
+                let label = gpu_device
+                    .gpu()
+                    .map(|g| g.backend_label())
+                    .unwrap_or_else(|| "cpu".to_string());
                 model.device = gpu_device;
-                println!("backend=webgpu");
+                println!("backend={label}");
             }
             Err(e) => println!("backend=cpu ({e})"),
         }
@@ -1182,7 +1186,7 @@ pub fn run_gpu_probe() {
     println!("=== oxide gpu-probe ===");
     let device = match Device::try_gpu() {
         Ok(d) => {
-            println!("adapter: WebGPU compute device acquired");
+            println!("adapter: GPU compute device acquired");
             d
         }
         Err(e) => {
@@ -1192,9 +1196,12 @@ pub fn run_gpu_probe() {
         }
     };
 
-    let ctx = match &device {
-        Device::Gpu(ctx) => ctx.clone(),
-        Device::Cpu => {
+    let ctx = match device.gpu() {
+        Some(ctx) => {
+            println!("backend: {}", ctx.backend_label());
+            ctx
+        }
+        None => {
             println!("result: CPU device returned; nothing to probe");
             return;
         }

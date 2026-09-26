@@ -38,18 +38,15 @@ fn batched_matvec(w: &[f32], rows: usize, cols: usize, x: &[f32], l: usize, out:
 /// Clone the layer's GPU context out, so stage functions can keep borrowing
 /// tape fields while the dispatch runs. `None` on the CPU path.
 #[inline]
-fn gpu_ctx(m: &PSSALayerV2) -> Option<crate::backend::WgpuContext> {
-    match &m.device {
-        crate::backend::Device::Gpu(ctx) => Some(ctx.clone()),
-        crate::backend::Device::Cpu => None,
-    }
+fn gpu_ctx(m: &PSSALayerV2) -> Option<crate::backend::GpuDispatch> {
+    m.device.gpu()
 }
 
 /// Device-aware batched matvec: on a GPU device this is one `dispatch_gemm`
 /// call (X [L,1,K], W [rows,K], Y [L,1,rows]); on CPU it is the scalar twin
 /// used by the numerical verification.
 #[inline]
-fn batched_matvec_dev(gpu: Option<&crate::backend::WgpuContext>, w: &[f32], rows: usize, cols: usize, x: &[f32], l: usize, out: &mut [f32]) {
+fn batched_matvec_dev(gpu: Option<&crate::backend::GpuDispatch>, w: &[f32], rows: usize, cols: usize, x: &[f32], l: usize, out: &mut [f32]) {
     if let Some(ctx) = gpu {
         let y = ctx.dispatch_gemm(&x[..l * cols], w, 1, rows, cols, l);
         out[..l * rows].copy_from_slice(&y);

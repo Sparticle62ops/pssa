@@ -2,6 +2,8 @@ pub mod adapter;
 pub mod backend;
 pub mod checkpoint;
 pub mod cli;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod dataset;
 pub mod defense;
 pub mod diagnostics;

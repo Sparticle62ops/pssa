@@ -20,6 +20,19 @@ tokenizers = { version = "0.22.1", default-features = false, features = ["fancy-
 # Explicit direct use validates persisted tokenizer policy before model allocation.
 serde_json = "1.0"
 
+# Optional native CUDA backend (cuBLAS). Enabled with --features cuda.
+# dynamic-loading means the binary still builds and runs on machines with no
+# CUDA driver present; the backend simply reports itself unavailable there.
+[dependencies.cudarc]
+version = "0.19"
+optional = true
+default-features = false
+features = ["cuda-12060", "driver", "cublas", "dynamic-loading"]
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"
