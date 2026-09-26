@@ -456,10 +456,9 @@ impl PSSALayerV2 {
 
     pub fn new_with_device(cfg: PSSAConfigV2, seed: u64, device: Device) -> Self {
         cfg.validate();
-        assert!(
-            !device.is_gpu(),
-            "Device::Gpu is not dispatched by PSSALayerV2; use Device::Cpu"
-        );
+        // Parameters, tape and gradients stay CPU-resident; a Gpu device only
+        // offloads the batched GEMM stages in `gpu_batch` via `dispatch_gemm`,
+        // with identical numerics to the CPU path (see the cpu-twin check).
         let mut rng = SimpleRng::new(seed);
         let d_v = cfg.d_vocab;
         let d_m = cfg.d_latent;

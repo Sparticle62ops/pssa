@@ -35,6 +35,29 @@ fn batched_matvec(w: &[f32], rows: usize, cols: usize, x: &[f32], l: usize, out:
     }
 }
 
+/// Clone the layer's GPU context out, so stage functions can keep borrowing
+/// tape fields while the dispatch runs. `None` on the CPU path.
+#[inline]
+fn gpu_ctx(m: &PSSALayerV2) -> Option<crate::backend::WgpuContext> {
+    match &m.device {
+        crate::backend::Device::Gpu(ctx) => Some(ctx.clone()),
+        crate::backend::Device::Cpu => None,
+    }
+}
+
+/// Device-aware batched matvec: on a GPU device this is one `dispatch_gemm`
+/// call (X [L,1,K], W [rows,K], Y [L,1,rows]); on CPU it is the scalar twin
+/// used by the numerical verification.
+#[inline]
+fn batched_matvec_dev(gpu: Option<&crate::backend::WgpuContext>, w: &[f32], rows: usize, cols: usize, x: &[f32], l: usize, out: &mut [f32]) {
+    if let Some(ctx) = gpu {
+        let y = ctx.dispatch_gemm(&x[..l * cols], w, 1, rows, cols, l);
+        out[..l * rows].copy_from_slice(&y);
+    } else {
+        batched_matvec(w, rows, cols, x, l, out);
+    }
+}
+
 // =============================================================================
 // FORWARD STAGES
 // =============================================================================
@@ -66,7 +89,7 @@ pub fn stage_projections(m: &mut PSSALayerV2, seq_len: usize) {
     let l = seq_len;
     let xn = &m.tape.x_norm[..l * d_m];
 
-    batched_matvec(&m.w_delta.data, d_m, d_m, xn, l, &mut m.tape.delta_raw[..l * d_m]);
+    batched_matvec_dev(gpu_ctx(m).as_ref(), &m.w_delta.data, d_m, d_m, xn, l, &mut m.tape.delta_raw[..l * d_m]);
     // Reference keeps the raw projection in `delta_raw` and the softplus in
     // `delta`; the backward pass takes sigmoid(delta_raw), so both are needed.
     for i in 0..l * d_m {
@@ -150,11 +173,11 @@ pub fn stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
     }
 
     // Gate, memory projection and injection as batched GEMMs over the chunk.
-    batched_matvec(&m.w_gate.data, d_m, d_m, &m.tape.x_norm[..seq_len * d_m], seq_len, &mut m.tape.g_mem[..seq_len * d_m]);
+    batched_matvec_dev(gpu_ctx(m).as_ref(), &m.w_gate.data, d_m, d_m, &m.tape.x_norm[..seq_len * d_m], seq_len, &mut m.tape.g_mem[..seq_len * d_m]);
     for v in &mut m.tape.g_mem[..seq_len * d_m] {
         *v = sigmoid(*v);
     }
-    batched_matvec(&m.w_proj.data, d_m, d_m, &m.tape.m_val[..seq_len * d_m], seq_len, &mut m.tape.m_proj[..seq_len * d_m]);
+    batched_matvec_dev(gpu_ctx(m).as_ref(), &m.w_proj.data, d_m, d_m, &m.tape.m_val[..seq_len * d_m], seq_len, &mut m.tape.m_proj[..seq_len * d_m]);
     for t in 0..seq_len {
         let m_off = t * d_m;
         for i in 0..d_m {
@@ -225,12 +248,12 @@ pub fn stage_mlp(m: &mut PSSALayerV2, seq_len: usize) {
         }
     }
 
-    batched_matvec(&m.mlp_w1.data, d_mlp, d_m, &m.tape.z_raw[..seq_len * d_m], seq_len, &mut m.tape.mlp_hidden[..seq_len * d_mlp]);
+    batched_matvec_dev(gpu_ctx(m).as_ref(), &m.mlp_w1.data, d_mlp, d_m, &m.tape.z_raw[..seq_len * d_m], seq_len, &mut m.tape.mlp_hidden[..seq_len * d_mlp]);
     for t_i in 0..seq_len * d_mlp {
         let h = m.tape.mlp_hidden[t_i];
         m.tape.mlp_act[t_i] = h * sigmoid(h);
     }
-    batched_matvec(&m.mlp_w2.data, d_m, d_mlp, &m.tape.mlp_act[..seq_len * d_mlp], seq_len, &mut m.tape.z_final[..seq_len * d_m]);
+    batched_matvec_dev(gpu_ctx(m).as_ref(), &m.mlp_w2.data, d_m, d_mlp, &m.tape.mlp_act[..seq_len * d_mlp], seq_len, &mut m.tape.z_final[..seq_len * d_m]);
     for t in 0..seq_len {
         let z_off = t * d_m;
         for i in 0..d_m {
@@ -247,7 +270,8 @@ pub fn stage_logits_loss(m: &mut PSSALayerV2, seq_len: usize) -> f32 {
     let d_v = m.cfg.d_vocab;
     let logit_scale = 1.0 / (d_m as f32).sqrt();
 
-    batched_matvec(
+    batched_matvec_dev(
+        gpu_ctx(m).as_ref(),
         &m.unembed_w.data,
         d_v,
         d_m,

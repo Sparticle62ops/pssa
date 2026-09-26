@@ -330,6 +330,15 @@ impl CLIHandler {
                 (model, tokenizer)
             }
         };
+        // Attach the GPU dispatch path when a WebGPU compute adapter is
+        // available; the stage math is cpu-twin verified and falls back to CPU.
+        match Device::try_gpu() {
+            Ok(gpu_device) => {
+                model.device = gpu_device;
+                println!("backend=webgpu");
+            }
+            Err(_) => println!("backend=cpu"),
+        }
         let docs = Self::documents(raw, &tokenizer, options.max_tokens, options.skip_tokens)?;
         let mut plan = Vec::<(usize, usize, usize)>::new();
         for (doc_id, doc) in docs.iter().enumerate() {
@@ -422,11 +431,11 @@ impl CLIHandler {
                     }
                     let input = &docs[doc_id][start..start + len];
                     let target = &docs[doc_id][start + 1..start + 1 + len];
-                    let loss = model.forward_train_chunk(input, target);
+                    let loss = crate::gpu_batch::forward_train_chunk_batched(&mut model, input, target);
                     if !loss.is_finite() {
                         return Err("non-finite loss; training aborted without checkpoint".into());
                     }
-                    model.backward_chunk(len, len as f32 / total_tokens as f32);
+                    crate::gpu_batch::backward_chunk_batched(&mut model, len, len as f32 / total_tokens as f32);
                     if loss > 3.5 {
                         let last = len - 1;
                         let q = &model.tape.q_poincare
