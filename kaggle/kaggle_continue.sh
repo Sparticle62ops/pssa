@@ -7,14 +7,14 @@ set -euo pipefail
 REPO="${REPO:-https://github.com/Sparticle62ops/oxide-ai.git}"
 WORK="${WORK:-/kaggle/working}"
 BRANCH="${BRANCH:-main}"
-TOTAL="${TOTAL:-32}"
+TOTAL="${TOTAL:-64}"
 # Each link reads a different WINDOW-sized slice instead of the same prefix, so the
 # chain walks the whole corpus. The offset wraps around at the end of the file.
 WINDOW="${WINDOW:-200000}"
 # The checked-in corpus is only ~3 MB, so a 16-link chain wraps and sees the same
 # text three times over, which is what drift looks like. Pull a much larger corpus
 # once into the working directory so every link reads text the model has not seen.
-CORPUS_MB="${CORPUS_MB:-48}"
+CORPUS_MB="${CORPUS_MB:-64}"
 CORPUS_URL="${CORPUS_URL:-https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-103-raw-v1/train-00000-of-00002.parquet}"
 BIG="${BIG:-$WORK/corpus/big.txt}"
 
