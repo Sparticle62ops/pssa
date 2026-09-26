@@ -153,3 +153,97 @@ impl CudaContext {
             .map_err(|e| format!("readback failed ({e:?})"))
     }
 }
+
+impl CudaContext {
+    /// C(M,N) = A(M,K) * B(K,N), all row-major. Used by the backward pass,
+    /// where the second operand is not transposed.
+    pub fn gemm_nn(&self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        self.try_gemm_nn(a, b, m, k, n)
+            .unwrap_or_else(|_| crate::backend::gemm_nn_cpu(a, b, m, k, n))
+    }
+
+    /// C(K,N) = A(M,K)^T * B(M,N), all row-major. This is the weight-gradient
+    /// shape: contract over the token axis.
+    pub fn gemm_tn(&self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        self.try_gemm_tn(a, b, m, k, n)
+            .unwrap_or_else(|_| crate::backend::gemm_tn_cpu(a, b, m, k, n))
+    }
+
+    fn try_gemm_nn(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>, String> {
+        // Column-major identity: C^c(N,M) = B^c(N,K) * A^c(K,M), no transposes.
+        let a_dev = self
+            .stream
+            .clone_htod(a)
+            .map_err(|e| format!("gemm_nn lhs upload failed ({e:?})"))?;
+        let b_dev = self.weight_buffer(b)?;
+        let mut c_dev = self
+            .stream
+            .alloc_zeros::<f32>(m * n)
+            .map_err(|e| format!("gemm_nn output alloc failed ({e:?})"))?;
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: 1.0f32,
+            beta: 0.0f32,
+            lda: n as i32,
+            ldb: k as i32,
+            ldc: n as i32,
+        };
+        unsafe { self.blas.gemm(cfg, b_dev.as_ref(), &a_dev, &mut c_dev) }
+            .map_err(|e| format!("cuBLAS gemm_nn failed ({e:?})"))?;
+        self.stream
+            .clone_dtoh(&c_dev)
+            .map_err(|e| format!("gemm_nn readback failed ({e:?})"))
+    }
+
+    fn try_gemm_tn(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>, String> {
+        // Column-major identity: C^c(N,K) = B^c(N,M) * (A^c)^T(M,K).
+        // Both operands are activations here, so neither is weight-cached.
+        let a_dev = self
+            .stream
+            .clone_htod(a)
+            .map_err(|e| format!("gemm_tn lhs upload failed ({e:?})"))?;
+        let b_dev = self
+            .stream
+            .clone_htod(b)
+            .map_err(|e| format!("gemm_tn rhs upload failed ({e:?})"))?;
+        let mut c_dev = self
+            .stream
+            .alloc_zeros::<f32>(k * n)
+            .map_err(|e| format!("gemm_tn output alloc failed ({e:?})"))?;
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_T,
+            m: n as i32,
+            n: k as i32,
+            k: m as i32,
+            alpha: 1.0f32,
+            beta: 0.0f32,
+            lda: n as i32,
+            ldb: k as i32,
+            ldc: n as i32,
+        };
+        unsafe { self.blas.gemm(cfg, &b_dev, &a_dev, &mut c_dev) }
+            .map_err(|e| format!("cuBLAS gemm_tn failed ({e:?})"))?;
+        self.stream
+            .clone_dtoh(&c_dev)
+            .map_err(|e| format!("gemm_tn readback failed ({e:?})"))
+    }
+}

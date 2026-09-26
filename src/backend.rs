@@ -453,6 +453,44 @@ pub fn gemm_cpu_reference(
     y
 }
 
+/// Row-major C(M,N) = A(M,K) * B(K,N). CPU twin for the backward-pass GEMMs.
+pub fn gemm_nn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    for i in 0..m {
+        for kk in 0..k {
+            let av = a[i * k + kk];
+            if av == 0.0 {
+                continue;
+            }
+            let b_row = &b[kk * n..kk * n + n];
+            let c_row = &mut c[i * n..i * n + n];
+            for j in 0..n {
+                c_row[j] += av * b_row[j];
+            }
+        }
+    }
+    c
+}
+
+/// Row-major C(K,N) = A(M,K)^T * B(M,N). CPU twin for the weight-gradient GEMMs.
+pub fn gemm_tn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; k * n];
+    for t in 0..m {
+        for kk in 0..k {
+            let av = a[t * k + kk];
+            if av == 0.0 {
+                continue;
+            }
+            let b_row = &b[t * n..t * n + n];
+            let c_row = &mut c[kk * n..kk * n + n];
+            for j in 0..n {
+                c_row[j] += av * b_row[j];
+            }
+        }
+    }
+    c
+}
+
 // =============================================================================
 // HARDWARE-AGNOSTIC DEVICE & TENSOR PRIMITIVES
 // =============================================================================
@@ -500,6 +538,36 @@ impl GpuDispatch {
             GpuDispatch::Wgpu(ctx) => ctx.invalidate_weights(),
             #[cfg(feature = "cuda")]
             GpuDispatch::Cuda(ctx) => ctx.invalidate_weights(),
+        }
+    }
+
+    /// Row-major C(M,N) = A(M,K) * B(K,N).
+    pub fn gemm_nn(&self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        match self {
+            GpuDispatch::Wgpu(_) => gemm_nn_cpu(a, b, m, k, n),
+            #[cfg(feature = "cuda")]
+            GpuDispatch::Cuda(ctx) => ctx.gemm_nn(a, b, m, k, n),
+        }
+    }
+
+    /// Row-major C(K,N) = A(M,K)^T * B(M,N).
+    pub fn gemm_tn(&self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        match self {
+            GpuDispatch::Wgpu(_) => gemm_tn_cpu(a, b, m, k, n),
+            #[cfg(feature = "cuda")]
+            GpuDispatch::Cuda(ctx) => ctx.gemm_tn(a, b, m, k, n),
+        }
+    }
+
+    /// Whether this backend actually accelerates the backward-pass GEMM shapes.
+    /// The WGSL kernel only implements the forward X * W^T layout, so on WebGPU
+    /// the backward pass stays on its fused CPU loops instead of paying to
+    /// materialize intermediates for a CPU twin.
+    pub fn accelerates_backward(&self) -> bool {
+        match self {
+            GpuDispatch::Wgpu(_) => false,
+            #[cfg(feature = "cuda")]
+            GpuDispatch::Cuda(_) => true,
         }
     }
 
