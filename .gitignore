@@ -7,4 +7,4 @@ data/downloaded.txt
 
 /.venv
 
-for.txt
+for.txt/.cargo/
