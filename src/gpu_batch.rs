@@ -55,6 +55,38 @@ fn batched_matvec_dev(gpu: Option<&crate::backend::GpuDispatch>, w: &[f32], rows
     }
 }
 
+/// Device-aware row-major C(M,N) = A(M,K) * B(K,N).
+#[inline]
+fn gemm_nn_dev(
+    gpu: Option<&crate::backend::GpuDispatch>,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Vec<f32> {
+    match gpu {
+        Some(ctx) => ctx.gemm_nn(a, b, m, k, n),
+        None => crate::backend::gemm_nn_cpu(a, b, m, k, n),
+    }
+}
+
+/// Device-aware row-major C(K,N) = A(M,K)^T * B(M,N).
+#[inline]
+fn gemm_tn_dev(
+    gpu: Option<&crate::backend::GpuDispatch>,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Vec<f32> {
+    match gpu {
+        Some(ctx) => ctx.gemm_tn(a, b, m, k, n),
+        None => crate::backend::gemm_tn_cpu(a, b, m, k, n),
+    }
+}
+
 // =============================================================================
 // FORWARD STAGES
 // =============================================================================
@@ -355,6 +387,58 @@ pub fn forward_train_chunk_batched(m: &mut PSSALayerV2, token_ids: &[usize], tar
 /// batched over all L tokens.
 #[inline]
 pub fn bwd_stage_logits(m: &mut PSSALayerV2, seq_len: usize, scale_loss: f32) {
+    if let Some(gpu) = gpu_ctx(m).filter(|g| g.accelerates_backward()) {
+        bwd_stage_logits_blocked(m, seq_len, scale_loss, Some(&gpu));
+        return;
+    }
+    bwd_stage_logits_scalar(m, seq_len, scale_loss);
+}
+
+/// Blocked form of the logits backward pass: build the per-token logit adjoints
+/// once, then take both the input gradient and the unembedding weight gradient
+/// as single GEMMs. Passing `gpu = None` runs the CPU twins, which is how the
+/// restructure is verified against [`bwd_stage_logits_scalar`].
+pub fn bwd_stage_logits_blocked(
+    m: &mut PSSALayerV2,
+    seq_len: usize,
+    scale_loss: f32,
+    gpu: Option<&crate::backend::GpuDispatch>,
+) {
+    let d_m = m.cfg.d_latent;
+    let d_v = m.cfg.d_vocab;
+    let logit_scale = 1.0 / (d_m as f32).sqrt();
+
+    // G [L, d_v]: dLoss/dlogit for every token.
+    let mut g_logit = vec![0.0f32; seq_len * d_v];
+    for t in 0..seq_len {
+        let log_off = t * d_v;
+        let tgt_id = m.tape.target_ids[t];
+        for i in 0..d_v {
+            let indicator = if i == tgt_id { 1.0 } else { 0.0 };
+            g_logit[log_off + i] = (m.tape.probs[log_off + i] - indicator) * scale_loss * logit_scale;
+        }
+    }
+
+    // grad_z_final [L, d_m] = G [L, d_v] * W [d_v, d_m]
+    let g_zfinal = gemm_nn_dev(gpu, &g_logit, &m.unembed_w.data, seq_len, d_v, d_m);
+    m.bwd_g_zfinal[..seq_len * d_m].copy_from_slice(&g_zfinal);
+
+    // unembed grad [d_v, d_m] += G^T [d_v, L] * Z [L, d_m]
+    let g_w = gemm_tn_dev(
+        gpu,
+        &g_logit,
+        &m.tape.z_final[..seq_len * d_m],
+        seq_len,
+        d_v,
+        d_m,
+    );
+    for (dst, src) in m.unembed_w.grad.iter_mut().zip(g_w.iter()) {
+        *dst += *src;
+    }
+}
+
+/// Fused per-token reference form, kept as the CPU path and the twin.
+pub fn bwd_stage_logits_scalar(m: &mut PSSALayerV2, seq_len: usize, scale_loss: f32) {
     let d_m = m.cfg.d_latent;
     let d_v = m.cfg.d_vocab;
     let logit_scale = 1.0 / (d_m as f32).sqrt();
@@ -383,6 +467,60 @@ pub fn bwd_stage_logits(m: &mut PSSALayerV2, seq_len: usize, scale_loss: f32) {
 /// Backward Stage 6: SiLU MLP adjoint, batched over all L tokens.
 #[inline]
 pub fn bwd_stage_mlp(m: &mut PSSALayerV2, seq_len: usize) {
+    if let Some(gpu) = gpu_ctx(m).filter(|g| g.accelerates_backward()) {
+        bwd_stage_mlp_blocked(m, seq_len, Some(&gpu));
+        return;
+    }
+    bwd_stage_mlp_scalar(m, seq_len);
+}
+
+/// Blocked form of the MLP backward pass: four GEMMs over the whole chunk
+/// instead of four matvecs per token. `gpu = None` runs the CPU twins, which is
+/// how this is verified against [`bwd_stage_mlp_scalar`].
+pub fn bwd_stage_mlp_blocked(
+    m: &mut PSSALayerV2,
+    seq_len: usize,
+    gpu: Option<&crate::backend::GpuDispatch>,
+) {
+    let d_m = m.cfg.d_latent;
+    let d_mlp = d_m * 2;
+    let l = seq_len;
+
+    let gz = m.bwd_g_zfinal[..l * d_m].to_vec();
+
+    // g_mlp_act [L, d_mlp] = gz [L, d_m] * mlp_w2 [d_m, d_mlp]
+    let g_mlp_act = gemm_nn_dev(gpu, &gz, &m.mlp_w2.data, l, d_m, d_mlp);
+
+    // mlp_w2 grad [d_m, d_mlp] += gz^T * mlp_act [L, d_mlp]
+    let gw2 = gemm_tn_dev(gpu, &gz, &m.tape.mlp_act[..l * d_mlp], l, d_m, d_mlp);
+    for (dst, src) in m.mlp_w2.grad.iter_mut().zip(gw2.iter()) {
+        *dst += *src;
+    }
+
+    // SiLU derivative, elementwise over the chunk.
+    let mut g_hidden = vec![0.0f32; l * d_mlp];
+    for i in 0..l * d_mlp {
+        let h = m.tape.mlp_hidden[i];
+        let sig_h = sigmoid(h);
+        g_hidden[i] = g_mlp_act[i] * (sig_h * (1.0 + h * (1.0 - sig_h)));
+    }
+
+    // g_zraw_mlp [L, d_m] = g_hidden [L, d_mlp] * mlp_w1 [d_mlp, d_m]
+    let g_zraw_mlp = gemm_nn_dev(gpu, &g_hidden, &m.mlp_w1.data, l, d_mlp, d_m);
+
+    // mlp_w1 grad [d_mlp, d_m] += g_hidden^T * z_raw [L, d_m]
+    let gw1 = gemm_tn_dev(gpu, &g_hidden, &m.tape.z_raw[..l * d_m], l, d_mlp, d_m);
+    for (dst, src) in m.mlp_w1.grad.iter_mut().zip(gw1.iter()) {
+        *dst += *src;
+    }
+
+    for i in 0..l * d_m {
+        m.bwd_g_zraw[i] = m.bwd_g_zfinal[i] + g_zraw_mlp[i];
+    }
+}
+
+/// Fused per-token reference form, kept as the CPU path and the twin.
+pub fn bwd_stage_mlp_scalar(m: &mut PSSALayerV2, seq_len: usize) {
     let d_m = m.cfg.d_latent;
     let d_mlp = d_m * 2;
     let l = seq_len;
