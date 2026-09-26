@@ -337,7 +337,7 @@ impl CLIHandler {
                 model.device = gpu_device;
                 println!("backend=webgpu");
             }
-            Err(_) => println!("backend=cpu"),
+            Err(e) => println!("backend=cpu ({e})"),
         }
         let docs = Self::documents(raw, &tokenizer, options.max_tokens, options.skip_tokens)?;
         let mut plan = Vec::<(usize, usize, usize)>::new();

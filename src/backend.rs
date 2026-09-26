@@ -187,6 +187,18 @@ pub struct WgpuContext {
 
 impl WgpuContext {
     pub fn init_blocking() -> Result<Self, String> {
+        // Headless boxes (Kaggle included) often run without XDG_RUNTIME_DIR,
+        // in which case the Vulkan loader refuses to start and wgpu silently
+        // downgrades to the GL backend on llvmpipe: a software rasterizer
+        // running on the CPU. Point the loader at a writable scratch dir so
+        // real GPU drivers get a chance to come up.
+        if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+            let dir = std::env::temp_dir().join("oxide-xdg-runtime");
+            let _ = std::fs::create_dir_all(&dir);
+            // SAFETY: single-threaded bring-up; no other thread reads the env.
+            unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+        }
+
         let instance = wgpu::Instance::default();
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -195,6 +207,22 @@ impl WgpuContext {
             force_fallback_adapter: false,
         }))
         .ok_or_else(|| "No compatible WebGPU compute adapter found.".to_string())?;
+
+        let info = adapter.get_info();
+        // A software rasterizer (llvmpipe / lavapipe) reports device_type Cpu.
+        // It is slower than our scalar CPU path end to end (buffer upload +
+        // dispatch + blocking readback per stage), so refuse it and let the
+        // caller fall back to CPU rather than train 12x slower.
+        if info.device_type == wgpu::DeviceType::Cpu {
+            return Err(format!(
+                "software GPU adapter refused ({} / {:?}): slower than cpu",
+                info.name, info.backend
+            ));
+        }
+        println!(
+            "gpu adapter: {} (backend={:?}, type={:?}, driver={})",
+            info.name, info.backend, info.device_type, info.driver
+        );
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
