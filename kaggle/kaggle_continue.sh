@@ -103,7 +103,18 @@ if ! ls "$WORK/chain"/ck*.pssa >/dev/null 2>&1; then
   else
     echo "no checkpoints found under /kaggle/input. what is mounted:"
     ls -R /kaggle/input 2>/dev/null | head -40
-    echo "starting a fresh chain"
+    if [ "${FRESH:-0}" != "1" ]; then
+      echo
+      echo "ERROR: /kaggle/working/chain is empty and nothing under /kaggle/input"
+      echo "holds a ck*.pssa, so continuing here would silently retrain from ck01"
+      echo "and throw away the existing chain."
+      echo
+      echo "attach the previous run's output as a notebook input (Add Input ->"
+      echo "Notebook Output), then rerun this script. to genuinely start over:"
+      echo "  FRESH=1 bash kaggle/kaggle_continue.sh"
+      exit 1
+    fi
+    echo "FRESH=1 set, starting a fresh chain"
   fi
 fi
 PREV=""
@@ -122,6 +133,10 @@ if [ -n "$PREV" ]; then
     exit 0
   fi
 else
+  if [ "${FRESH:-0}" != "1" ]; then
+    echo "ERROR: no existing checkpoints. rerun with FRESH=1 to start a new chain."
+    exit 1
+  fi
   echo "no existing checkpoints, starting fresh"
 fi
 
