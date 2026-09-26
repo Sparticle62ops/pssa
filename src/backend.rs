@@ -1,5 +1,6 @@
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
 
 // =============================================================================
@@ -183,6 +184,11 @@ pub struct WgpuContext {
     pub norm_pipeline: Arc<wgpu::ComputePipeline>,
     pub silu_pipeline: Arc<wgpu::ComputePipeline>,
     pub adamw_pipeline: Arc<wgpu::ComputePipeline>,
+    /// Weight matrices resident on the device, keyed by (host pointer, len).
+    /// Weights only change when the optimizer steps, so every GEMM between two
+    /// steps reuses the uploaded copy instead of re-sending it. Cleared by
+    /// `invalidate_weights` right after each AdamW step.
+    weight_cache: Arc<Mutex<HashMap<(usize, usize), Arc<wgpu::Buffer>>>>,
 }
 
 impl WgpuContext {
@@ -274,7 +280,29 @@ impl WgpuContext {
             norm_pipeline: Arc::new(norm_pipeline),
             silu_pipeline: Arc::new(silu_pipeline),
             adamw_pipeline: Arc::new(adamw_pipeline),
+            weight_cache: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Upload a weight matrix once and keep it on the device until the next
+    /// optimizer step. Without this every GEMM re-sends the full matrix over
+    /// PCIe, which for small per-stage batches costs more than the arithmetic.
+    pub fn weight_buffer(&self, w: &[f32]) -> Arc<wgpu::Buffer> {
+        let key = (w.as_ptr() as usize, w.len());
+        let mut cache = self.weight_cache.lock().unwrap();
+        if let Some(buf) = cache.get(&key) {
+            return buf.clone();
+        }
+        let buf = Arc::new(self.create_buffer_init("gemm_w_resident", w, true));
+        cache.insert(key, buf.clone());
+        buf
+    }
+
+    /// Drop every resident weight copy. Must be called whenever host-side
+    /// weights change (i.e. straight after an AdamW step), or the GPU would
+    /// keep multiplying by stale parameters.
+    pub fn invalidate_weights(&self) {
+        self.weight_cache.lock().unwrap().clear();
     }
 
     pub fn create_buffer_init(&self, label: &str, data: &[f32], read_only: bool) -> wgpu::Buffer {
@@ -352,7 +380,7 @@ impl WgpuContext {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
         let x_buf = self.create_buffer_init("gemm_x", x, true);
-        let w_buf = self.create_buffer_init("gemm_w", w, true);
+        let w_buf = self.weight_buffer(w);
         let y_buf = self.create_buffer_init("gemm_y", &vec![0.0f32; out_len], false);
 
         let layout = self.gemm_pipeline.get_bind_group_layout(0);
