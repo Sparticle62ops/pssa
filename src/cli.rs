@@ -8,6 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::time::Instant;
 
+/// Keep command-line generation requests bounded before inference preallocates
+/// its token and byte buffers.
+const MAX_GENERATION_TOKENS: usize = 100_000;
+
 #[derive(Clone, Debug)]
 pub struct TrainingOptions {
     pub epochs: usize,
@@ -92,10 +96,14 @@ impl Parsed {
                 if !allowed.contains(arg.as_str()) {
                     return Err(format!("unknown option '{arg}'"));
                 }
-                if i + 1 >= args.len() || args[i + 1].starts_with('-') {
+                if i + 1 >= args.len()
+                    || (args[i + 1].starts_with('-') && allowed.contains(args[i + 1].as_str()))
+                {
                     return Err(format!("option '{arg}' requires a value"));
                 }
-                flags.insert(arg.clone(), args[i + 1].clone());
+                if flags.insert(arg.clone(), args[i + 1].clone()).is_some() {
+                    return Err(format!("option '{arg}' was specified more than once"));
+                }
                 i += 2;
             } else {
                 positional.push(arg.clone());
@@ -109,6 +117,19 @@ impl Parsed {
             .get(long)
             .or_else(|| self.flags.get(short))
             .map(String::as_str)
+    }
+    fn first(&self, names: &[&str]) -> Option<&str> {
+        names
+            .iter()
+            .find_map(|name| self.flags.get(*name).map(String::as_str))
+    }
+    fn reject_duplicate_aliases(&self, names: &[&str], label: &str) -> Result<(), String> {
+        let count = names.iter().filter(|name| self.flags.contains_key(**name)).count();
+        if count > 1 {
+            Err(format!("{label} was specified more than once (use one spelling)"))
+        } else {
+            Ok(())
+        }
     }
     fn required_usize(&self, long: &str, short: &str, default: usize) -> Result<usize, String> {
         self.string(long, short).map_or(Ok(default), |x| {
@@ -125,13 +146,16 @@ impl Parsed {
         }
     }
     fn f32(&self, long: &str, short: &str, default: f32) -> Result<f32, String> {
-        let n = self.string(long, short).map_or(Ok(default), |x| {
-            x.parse().map_err(|_| format!("{long} must be a number"))
+        self.f32_first(&[long, short], long, default)
+    }
+    fn f32_first(&self, names: &[&str], label: &str, default: f32) -> Result<f32, String> {
+        let n = self.first(names).map_or(Ok(default), |x| {
+            x.parse().map_err(|_| format!("{label} must be a number"))
         })?;
         if n.is_finite() {
             Ok(n)
         } else {
-            Err(format!("{long} must be finite"))
+            Err(format!("{label} must be finite"))
         }
     }
 }
@@ -161,7 +185,7 @@ impl CLIHandler {
             "word" => TokenizerKind::Word,
             x => return Err(format!("--tokenizer must be bpe or word, got '{x}'")),
         };
-        let x = TrainingOptions {
+        let mut x = TrainingOptions {
             epochs: parsed.usize_nonzero("--epochs", "-e", 4)?,
             latent: parsed.usize_nonzero("--latent", "", 256)?,
             state: parsed.usize_nonzero("--state", "", 16)?,
@@ -196,6 +220,43 @@ impl CLIHandler {
         if x.tokenizer == TokenizerKind::Bpe && x.vocab_size < 257 {
             return Err("--vocab-size must be at least 257 for byte-level BPE".into());
         }
+        for (name, value, maximum) in [
+            ("--epochs", x.epochs, 1_000_000usize),
+            ("--latent", x.latent, 4_096),
+            ("--state", x.state, 4_096),
+            ("--key", x.key, 4_096),
+            ("--memory", x.memory, 1_000_000),
+            ("--chunk", x.chunk, 65_536),
+            ("--accumulate", x.accumulate, 1_000_000),
+        ] {
+            if value > maximum {
+                return Err(format!("{name} must be at most {maximum}"));
+            }
+        }
+        if let Some(resume) = x.resume.as_deref() {
+            let loaded = checkpoint::load_checkpoint(resume)
+                .map_err(|e| format!("cannot inspect resume checkpoint '{resume}': {e}"))?;
+            let checks = [
+                ("--latent", "--latent", x.latent, loaded.model.cfg.d_latent),
+                ("--state", "--state", x.state, loaded.model.cfg.d_state),
+                ("--key", "--key", x.key, loaded.model.cfg.d_mem_key),
+                ("--memory", "--memory", x.memory, loaded.model.cfg.mem_capacity),
+                ("--chunk", "--chunk", x.chunk, loaded.model.cfg.chunk_len),
+            ];
+            for (label, flag, requested, actual) in checks {
+                if parsed.flags.contains_key(flag) && requested != actual {
+                    return Err(format!(
+                        "{label}={requested} does not match resume checkpoint value {actual}"
+                    ));
+                }
+            }
+            // A resume keeps the checkpoint's optimizer schedule unless the
+            // caller explicitly supplies a new learning rate.  Previously the
+            // parser's 1e-3 default silently replaced a custom checkpoint LR.
+            if !parsed.flags.contains_key("--lr") {
+                x.lr = loaded.model.cfg.lr;
+            }
+        }
         Ok(x)
     }
 
@@ -205,81 +266,129 @@ impl CLIHandler {
         limit: Option<usize>,
         skip: usize,
     ) -> Result<Vec<Vec<usize>>, String> {
-        let mut docs = Vec::new();
-        let mut remaining = limit.unwrap_or(usize::MAX);
-        // Wrap the offset so a chained walk can run past the end of the corpus and
-        // come back around to the front instead of failing.
-        let mut to_skip = skip;
-        if to_skip > 0 {
-            let mut total = 0usize;
-            for line in raw.lines() {
-                total += tokenizer.try_encode(line, true)?.len();
-            }
-            if total == 0 {
-                return Err("dataset has no token transitions".into());
-            }
-            to_skip %= total;
+        // Tokenize once, then walk the nonempty documents cyclically.  A
+        // chained Kaggle window may cross EOF; returning a second segment from
+        // the beginning is preferable to silently training on fewer tokens.
+        let encoded: Vec<Vec<usize>> = raw
+            .lines()
+            .map(|line| tokenizer.try_encode(line, true))
+            .collect::<Result<_, _>>()?;
+        let nonempty: Vec<&[usize]> = encoded
+            .iter()
+            .map(Vec::as_slice)
+            .filter(|ids| !ids.is_empty())
+            .collect();
+        let total = nonempty.iter().try_fold(0usize, |sum, ids| {
+            sum.checked_add(ids.len())
+                .ok_or_else(|| "dataset token count overflow".to_string())
+        })?;
+        if total < 2 {
+            return Err("dataset has no token transitions".into());
         }
-        for line in raw.lines() {
-            if remaining == 0 {
+
+        let mut remaining = limit.unwrap_or(total.saturating_sub(skip % total));
+        if remaining == 0 {
+            return Err("dataset has no token transitions in the selected window".into());
+        }
+        let mut offset = skip % total;
+        let mut doc_index = 0;
+        while offset >= nonempty[doc_index].len() {
+            offset -= nonempty[doc_index].len();
+            doc_index = (doc_index + 1) % nonempty.len();
+        }
+
+        let mut docs = Vec::new();
+        while remaining > 0 {
+            let ids = nonempty[doc_index];
+            let take = (ids.len() - offset).min(remaining);
+            if take >= 2 {
+                docs.push(ids[offset..offset + take].to_vec());
+            }
+            remaining -= take;
+            doc_index = (doc_index + 1) % nonempty.len();
+            offset = 0;
+            if limit.is_none() && doc_index == 0 {
                 break;
             }
-            let mut ids = tokenizer.try_encode(line, true)?;
-            if ids.is_empty() {
-                continue;
-            }
-            if to_skip > 0 {
-                if to_skip >= ids.len() {
-                    to_skip -= ids.len();
-                    continue;
-                }
-                ids.drain(0..to_skip);
-                to_skip = 0;
-            }
-            let clipped = ids.len() > remaining;
-            ids.truncate(remaining);
-            remaining -= ids.len();
-            if ids.len() < 2 {
-                if clipped || skip > 0 {
-                    continue;
-                }
-                return Err(
-                    "each nonempty training document must contain at least two tokens".into(),
-                );
-            }
-            docs.push(ids);
         }
         if docs.is_empty() {
-            Err("dataset has no token transitions".into())
+            Err("dataset has no token transitions in the selected window".into())
         } else {
             Ok(docs)
         }
     }
     fn finite(model: &PSSALayerV2) -> bool {
+        fn matrix_finite(p: &crate::pssa::ParamMatrix) -> bool {
+            p.data
+                .iter()
+                .chain(&p.grad)
+                .chain(&p.m)
+                .chain(&p.v)
+                .all(|v| v.is_finite())
+        }
+        fn vector_finite(p: &crate::pssa::ParamVector) -> bool {
+            p.data
+                .iter()
+                .chain(&p.grad)
+                .chain(&p.m)
+                .chain(&p.v)
+                .all(|v| v.is_finite())
+        }
         [
-            &model.embed_w.data,
-            &model.a_mat.data,
-            &model.w_delta.data,
-            &model.w_b.data,
-            &model.w_c.data,
-            &model.w_qx.data,
-            &model.w_qh.data,
-            &model.w_gate.data,
-            &model.w_proj.data,
-            &model.mlp_w1.data,
-            &model.mlp_w2.data,
-            &model.unembed_w.data,
-            &model.norm_gamma.data,
-            &model.norm_beta.data,
+            &model.embed_w,
+            &model.a_mat,
+            &model.w_delta,
+            &model.w_b,
+            &model.w_c,
+            &model.w_qx,
+            &model.w_qh,
+            &model.w_gate,
+            &model.w_proj,
+            &model.mlp_w1,
+            &model.mlp_w2,
+            &model.unembed_w,
         ]
         .iter()
-        .all(|x| x.iter().all(|v| v.is_finite()))
+        .all(|p| matrix_finite(p))
+            && vector_finite(&model.norm_gamma)
+            && vector_finite(&model.norm_beta)
+            && model
+                .adapters
+                .iter()
+                .all(|ad| matrix_finite(&ad.down_proj) && matrix_finite(&ad.up_proj))
+            && model.h_persistent.iter().all(|v| v.is_finite())
+            && model.memory.keys.iter().all(|v| v.is_finite())
+            && model.memory.values.iter().all(|v| v.is_finite())
+            && model.memory.norm_sq.iter().all(|v| v.is_finite())
+            && model.memory.confidence.iter().all(|v| v.is_finite())
+            && model.adapters.iter().all(|ad| {
+                ad.consolidated_up.iter().all(|v| v.is_finite())
+            })
     }
 
     pub fn train_corpus(
         raw: &str,
         options: &TrainingOptions,
     ) -> Result<(PSSALayerV2, Tokenizer), String> {
+        if options.epochs == 0
+            || options.latent == 0
+            || options.state == 0
+            || options.key == 0
+            || options.memory == 0
+            || options.chunk == 0
+            || options.accumulate == 0
+        {
+            return Err(
+                "epochs, latent, state, key, memory, chunk, and accumulate must be positive"
+                    .into(),
+            );
+        }
+        if !options.lr.is_finite() || options.lr <= 0.0 {
+            return Err("learning rate must be finite and positive".into());
+        }
+        if options.max_tokens == Some(0) {
+            return Err("max_tokens must be positive when supplied".into());
+        }
         let (mut model, tokenizer) = match options.resume.as_deref() {
             Some(path) => {
                 let loaded = checkpoint::load_checkpoint(path)
@@ -310,7 +419,7 @@ impl CLIHandler {
             }
             None => {
                 let tokenizer = match options.tokenizer {
-                    TokenizerKind::Word => Tokenizer::from_corpus(raw, true),
+                    TokenizerKind::Word => Tokenizer::from_corpus(raw, true)?,
                     TokenizerKind::Bpe => Tokenizer::from_corpus_bpe(raw, options.vocab_size)?,
                 };
                 let cfg = PSSAConfigV2 {
@@ -323,13 +432,16 @@ impl CLIHandler {
                     lr: options.lr,
                     ..Default::default()
                 };
-                cfg.validate();
+                checkpoint::validate_model_config(&cfg)?;
                 let mut model = PSSALayerV2::new(cfg, options.seed);
                 model.vocabulary = tokenizer.ordered_vocabulary()?;
                 model.tokenizer_json = tokenizer.serialized_metadata();
                 (model, tokenizer)
             }
         };
+        // Keep an explicit resume override in the checkpoint's persisted
+        // configuration so a later link does not silently revert to the old LR.
+        model.cfg.lr = options.lr;
         // Attach the GPU dispatch path when a WebGPU compute adapter is
         // available; the stage math is cpu-twin verified and falls back to CPU.
         match Device::try_gpu() {
@@ -344,11 +456,19 @@ impl CLIHandler {
             Err(e) => println!("backend=cpu ({e})"),
         }
         let docs = Self::documents(raw, &tokenizer, options.max_tokens, options.skip_tokens)?;
+        let chunk_len = if options.resume.is_some() {
+            // A checkpoint owns its tape capacity.  Using a fresh CLI default
+            // here could make the plan longer than that tape and panic in the
+            // batched backward pass.
+            model.cfg.chunk_len
+        } else {
+            options.chunk
+        };
         let mut plan = Vec::<(usize, usize, usize)>::new();
         for (doc_id, doc) in docs.iter().enumerate() {
             let mut start = 0;
             while start + 1 < doc.len() {
-                let len = options.chunk.min(doc.len() - 1 - start);
+                let len = chunk_len.min(doc.len() - 1 - start);
                 plan.push((doc_id, start, len));
                 start += len;
             }
@@ -360,12 +480,6 @@ impl CLIHandler {
         if total_updates == 0 {
             return Err("dataset has no training chunks".into());
         }
-        if options.warmup_steps >= total_updates && options.warmup_steps != 0 {
-            return Err(format!(
-                "--warmup-steps ({}) must be less than total optimizer updates ({total_updates})",
-                options.warmup_steps
-            ));
-        }
         // Chained resumes must continue the ORIGINAL cosine/warmup schedule instead of
         // restarting it per link: the lr step counts from the resumed model's prior
         // optimizer steps, so the next link picks up the decay curve where the last
@@ -375,9 +489,18 @@ impl CLIHandler {
             .as_deref()
             .map(|_| model.step_counter)
             .unwrap_or(0);
-        let schedule_total = (prior_steps + total_updates)
-            .checked_sub(1)
-            .ok_or("training update count overflow")? + 1;
+        if prior_steps == 0
+            && options.warmup_steps >= total_updates
+            && options.warmup_steps != 0
+        {
+            return Err(format!(
+                "--warmup-steps ({}) must be less than total optimizer updates ({total_updates})",
+                options.warmup_steps
+            ));
+        }
+        let schedule_total = prior_steps
+            .checked_add(total_updates)
+            .ok_or("training update count overflow")?;
         let schedule_warmup = if prior_steps > 0 { 0 } else { options.warmup_steps };
         if prior_steps > 0 {
             println!(
@@ -401,7 +524,7 @@ impl CLIHandler {
             "memory",
             &format!(
                 "{} slots, key width {}",
-                options.memory, model.cfg.d_mem_key
+                model.cfg.mem_capacity, model.cfg.d_mem_key
             ),
         );
         ui::field(
@@ -524,7 +647,7 @@ impl CLIHandler {
         let tokenizer = Tokenizer::from_vocabulary(&model.vocabulary)?;
         if let Some(source) = data {
             let raw = DatasetManager::try_load_dataset(Some(source))?;
-            let external = Tokenizer::from_corpus(&raw, true);
+            let external = Tokenizer::from_corpus(&raw, true)?;
             if external.ordered_vocabulary()? != model.vocabulary {
                 return Err(format!(
                     "--data tokenizer/order does not match {label} checkpoint"
@@ -569,7 +692,7 @@ impl CLIHandler {
                     "warning: legacy V5 checkpoint is inference-only; optimizer and tokenizer provenance are unavailable"
                 );
                 let raw = DatasetManager::try_load_dataset(Some(source))?;
-                let tokenizer = Tokenizer::from_corpus(&raw, true);
+                let tokenizer = Tokenizer::from_corpus(&raw, true)?;
                 if tokenizer.vocab_size != model.cfg.d_vocab {
                     return Err(format!(
                         "legacy corpus vocabulary size {} does not match checkpoint {}",
@@ -588,6 +711,11 @@ impl CLIHandler {
         temperature: f32,
         max_new: usize,
     ) -> Result<String, String> {
+        if max_new > MAX_GENERATION_TOKENS {
+            return Err(format!(
+                "max_new_tokens must be at most {MAX_GENERATION_TOKENS}"
+            ));
+        }
         let (mut model, tokenizer) = Self::load_for_inference(model_path, data)?;
         let cfg = InferenceConfig {
             temperature,
@@ -645,7 +773,14 @@ impl CLIHandler {
         Ok((loss / tokens.max(1) as f64, tokens, correct, oov))
     }
     fn run_evaluate(model_path: &str, data: &str) -> Result<(), String> {
-        let (mut model, tokenizer) = Self::load_for_inference(model_path, None)?;
+        // V5 checkpoints contain no tokenizer provenance, so the evaluation
+        // corpus also has to seed their legacy word tokenizer.  Newer formats
+        // restore their tokenizer independently of the held-out corpus.
+        let format = checkpoint::load_checkpoint(model_path)
+            .map_err(|e| format!("cannot inspect model '{model_path}': {e}"))?
+            .format;
+        let provenance = (format == CheckpointFormat::LegacyV5InferenceOnly).then_some(data);
+        let (mut model, tokenizer) = Self::load_for_inference(model_path, provenance)?;
         let raw = DatasetManager::try_load_dataset(Some(data))?;
         let (ce, tokens, correct, oov) = Self::evaluate_corpus(&mut model, &tokenizer, &raw)?;
         let encoded = docs_token_count(&raw, &tokenizer)?;
@@ -793,12 +928,17 @@ impl CLIHandler {
     fn workspace_panel() {
         let mut checkpoints: Vec<(String, u64)> = Vec::new();
         let mut corpora: Vec<(String, u64)> = Vec::new();
+        let mut seen = HashSet::new();
         for dir in [".", "data", "chain", "data/chain"] {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 continue;
             };
             for entry in entries.flatten() {
                 let path = entry.path();
+                let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if !seen.insert(identity) {
+                    continue;
+                }
                 let Some(name) = path.to_str() else { continue };
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 let label = name.trim_start_matches("./").to_string();
@@ -849,6 +989,7 @@ impl CLIHandler {
         println!();
         Self::workspace_panel();
         let mut described = 0usize;
+        let mut seen = HashSet::new();
         for dir in ["data", "chain", "data/chain", "."] {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 continue;
@@ -860,6 +1001,11 @@ impl CLIHandler {
                 .collect();
             paths.sort();
             for path in paths {
+                let identity = std::fs::canonicalize(&path)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(&path));
+                if !seen.insert(identity) {
+                    continue;
+                }
                 if described == 0 {
                     println!();
                     ui::panel_top("checkpoint detail");
@@ -901,11 +1047,11 @@ impl CLIHandler {
     }
 
     pub fn print_help() {
-        let bin = "oxide";
+        let bin = "oxide_ai_pssa";
         println!();
         println!(
             "  {}  {}",
-            ui::bold(&ui::cyan("oxide")),
+            ui::bold(&ui::cyan(bin)),
             ui::dim("plastic state-space architecture, v0.4.0")
         );
         println!("  {}", ui::dim(&"\u{2500}".repeat(62)));
@@ -991,7 +1137,7 @@ impl CLIHandler {
         println!();
         println!("  {}", ui::bold("GENERATE"));
         println!(
-            "    {bin} generate <prompt> [-m|--model path] [-t|--temp f] [--max-new-tokens n]"
+            "    {bin} generate <prompt> [-m|--model path] [-t|--temp|--temperature f] [--max-new-tokens n]"
         );
         println!();
         println!("  {}", ui::bold("EXAMPLES"));
@@ -1030,12 +1176,112 @@ impl CLIHandler {
         );
         println!();
     }
+    fn print_command_help(command: &str) -> Result<(), String> {
+        let bin = "oxide_ai_pssa";
+        match command {
+            "train" => {
+                println!("Usage: {bin} train [SOURCE] [OPTIONS]");
+                println!();
+                println!("Fit a checkpoint on a text corpus. SOURCE may be a local file, directory, URL, hf:REPO, or science.");
+                println!();
+                println!("Options:");
+                println!("  -d, --data <SOURCE>           dataset source (also accepted as SOURCE)");
+                println!("  -o, --out <PATH>              checkpoint output (default: data/model.pssa)");
+                println!("  -e, --epochs <N>              positive number of passes (default: 4)");
+                println!("      --tokenizer <bpe|word>    tokenizer family (default: bpe)");
+                println!("      --vocab-size <N>          BPE vocabulary ceiling (default: 2048)");
+                println!("      --latent <N>              latent width (default: 256)");
+                println!("      --state <N>               recurrent state width (default: 16)");
+                println!("      --key <N>                 memory key width (default: 32)");
+                println!("      --memory <N>              memory capacity (default: 512)");
+                println!("      --chunk <N>               training chunk length (default: 64)");
+                println!("      --accumulate <N>          chunks per optimizer update (default: 8)");
+                println!("      --lr <F>                  base learning rate (default: 0.001)");
+                println!("      --warmup-steps <N>        linear warm-up updates (default: 0)");
+                println!("      --seed <N>                initialization seed (default: 42)");
+                println!("      --max-tokens <N>          global token cap");
+                println!("      --skip-tokens <N>         offset into the corpus; wraps at EOF");
+                println!("      --resume <PATH>            continue optimizer/model state from a checkpoint");
+                println!();
+                println!("Examples:");
+                println!("  {bin} train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1");
+                println!("  {bin} train data/downloaded.txt -o data/ck02.pssa --resume data/ck01.pssa --skip-tokens 200000 --max-tokens 200000 -e 1");
+            }
+            "generate" => {
+                println!("Usage: {bin} generate [PROMPT] [OPTIONS]");
+                println!();
+                println!("Options:");
+                println!("  -p, --prompt <TEXT>           prompt (also accepted as PROMPT)");
+                println!("  -m, --model <PATH>            checkpoint (default: data/model.pssa)");
+                println!("  -t, --temp, --temperature <F> sampling temperature; 0 is greedy (default: 0.70)");
+                println!("      --max-new-tokens <N>      generation cap (default: 64, max: {MAX_GENERATION_TOKENS})");
+                println!();
+                println!("Examples:");
+                println!("  {bin} generate -m data/model.pssa -p \"The sun is\"");
+                println!("  {bin} generate \"quantum mechanics\" --temperature 0 --max-new-tokens 32");
+            }
+            "chat" | "repl" => {
+                println!("Usage: {bin} chat [DATA] [OPTIONS]");
+                println!();
+                println!("Start an interactive prompt loop. DATA is an optional legacy word-tokenizer provenance source.");
+                println!("Options:");
+                println!("  -m, --model <PATH>            checkpoint (default: data/model.pssa)");
+                println!("  -d, --data <SOURCE>           legacy tokenizer provenance source");
+                println!("  -t, --temp, --temperature <F> sampling temperature (default: 0.70)");
+                println!();
+                println!("Example: {bin} chat -m data/model.pssa --temperature 0.7");
+            }
+            "evaluate" => {
+                println!("Usage: {bin} evaluate [DATA] [-m|--model PATH] [-d|--data SOURCE]");
+                println!();
+                println!("Evaluate a checkpoint and print one JSON metrics object.");
+                println!("Example: {bin} evaluate data/heldout.txt --model data/model.pssa");
+            }
+            "download" => {
+                println!("Usage: {bin} download REPOSITORY [-o|--out PATH]");
+                println!();
+                println!("Download the train split from Hugging Face as plain text.");
+                println!("Example: {bin} download wikimedia/wikipedia --out data/downloaded.txt");
+            }
+            "status" | "benchmark" | "gpu-probe" => {
+                println!("Usage: {bin} {command}");
+                println!();
+                println!("This command takes no options.");
+            }
+            "tui" => {
+                println!("Usage: {bin} tui");
+                println!();
+                println!("Render a dashboard for a piped training run: train ... | {bin} tui");
+            }
+            _ => return Err(format!("unknown command '{command}'; run {bin} help")),
+        }
+        Ok(())
+    }
+
     pub fn parse_and_execute(args: Vec<String>) -> Result<(), String> {
         if args.len() < 2 {
             Self::print_home();
             return Ok(());
         }
-        match args[1].as_str() {
+        let command = args[1].as_str();
+        if command == "help" {
+            if args.len() == 2 {
+                Self::print_help();
+                return Ok(());
+            }
+            if args.len() == 3 {
+                return Self::print_command_help(&args[2]);
+            }
+            return Err("help accepts at most one command name".into());
+        }
+        if matches!(command, "--help" | "-h") {
+            Self::print_help();
+            return Ok(());
+        }
+        if args[2..].iter().any(|arg| matches!(arg.as_str(), "--help" | "-h")) {
+            return Self::print_command_help(command);
+        }
+        match command {
             "help" | "--help" | "-h" => {
                 Self::print_help();
                 Ok(())
@@ -1066,8 +1312,18 @@ impl CLIHandler {
                         "--skip-tokens",
                     ],
                 )?;
+                for (names, label) in [
+                    (&["--data", "-d"][..], "--data"),
+                    (&["--out", "-o"][..], "--out"),
+                    (&["--epochs", "-e"][..], "--epochs"),
+                ] {
+                    p.reject_duplicate_aliases(names, label)?;
+                }
                 if p.positional.len() > 1 {
                     return Err("train accepts at most one positional source".into());
+                }
+                if p.positional.len() == 1 && p.string("--data", "-d").is_some() {
+                    return Err("train source was specified both positionally and with --data".into());
                 }
                 let data = p
                     .string("--data", "-d")
@@ -1088,22 +1344,39 @@ impl CLIHandler {
                         "--data",
                         "-d",
                         "--temp",
+                        "--temperature",
                         "-t",
                         "--max-new-tokens",
                     ],
                 )?;
+                for (names, label) in [
+                    (&["--prompt", "-p"][..], "--prompt"),
+                    (&["--model", "-m"][..], "--model"),
+                    (&["--data", "-d"][..], "--data"),
+                    (&["--temp", "--temperature", "-t"][..], "--temperature"),
+                ] {
+                    p.reject_duplicate_aliases(names, label)?;
+                }
                 if p.positional.len() > 1 {
                     return Err("generate accepts one positional prompt".into());
+                }
+                if p.positional.len() == 1 && p.string("--prompt", "-p").is_some() {
+                    return Err("generate prompt was specified both positionally and with --prompt".into());
                 }
                 let prompt = p
                     .string("--prompt", "-p")
                     .or_else(|| p.positional.first().map(String::as_str))
                     .ok_or("generate requires a prompt")?;
-                let temp = p.f32("--temp", "-t", 0.70)?;
+                let temp = p.f32_first(&["--temp", "--temperature", "-t"], "--temperature", 0.70)?;
                 if temp < 0.0 {
                     return Err("--temp must be >= 0".into());
                 }
                 let max = p.usize_nonzero("--max-new-tokens", "", 64)?;
+                if max > MAX_GENERATION_TOKENS {
+                    return Err(format!(
+                        "--max-new-tokens must be at most {MAX_GENERATION_TOKENS}"
+                    ));
+                }
                 println!(
                     "{}",
                     Self::run_generate(
@@ -1118,31 +1391,54 @@ impl CLIHandler {
             }
             "evaluate" => {
                 let p = Parsed::parse(&args[2..], &["--model", "-m", "--data", "-d"])?;
-                if !p.positional.is_empty() {
-                    return Err("evaluate does not accept positional arguments".into());
+                p.reject_duplicate_aliases(&["--model", "-m"], "--model")?;
+                p.reject_duplicate_aliases(&["--data", "-d"], "--data")?;
+                if p.positional.len() > 1 {
+                    return Err("evaluate accepts one positional data source".into());
                 }
+                if p.positional.len() == 1 && p.string("--data", "-d").is_some() {
+                    return Err("evaluate data was specified both positionally and with --data".into());
+                }
+                let data = p
+                    .string("--data", "-d")
+                    .or_else(|| p.positional.first().map(String::as_str))
+                    .ok_or("evaluate requires a data source (use DATA or --data DATA)")?;
                 Self::run_evaluate(
                     p.string("--model", "-m").unwrap_or("data/model.pssa"),
-                    p.string("--data", "-d").ok_or("evaluate requires --data")?,
+                    data,
                 )
             }
             "chat" | "repl" => {
                 let p = Parsed::parse(
                     &args[2..],
-                    &["--model", "-m", "--data", "-d", "--temp", "-t"],
+                    &["--model", "-m", "--data", "-d", "--temp", "--temperature", "-t"],
                 )?;
-                let t = p.f32("--temp", "-t", 0.70)?;
+                p.reject_duplicate_aliases(&["--model", "-m"], "--model")?;
+                p.reject_duplicate_aliases(&["--data", "-d"], "--data")?;
+                p.reject_duplicate_aliases(
+                    &["--temp", "--temperature", "-t"],
+                    "--temperature",
+                )?;
+                if p.positional.len() > 1 {
+                    return Err("chat accepts one positional data source".into());
+                }
+                if p.positional.len() == 1 && p.string("--data", "-d").is_some() {
+                    return Err("chat data was specified both positionally and with --data".into());
+                }
+                let t = p.f32_first(&["--temp", "--temperature", "-t"], "--temperature", 0.70)?;
                 if t < 0.0 {
-                    return Err("--temp must be >= 0".into());
+                    return Err("--temperature must be >= 0".into());
                 }
                 Self::run_chat(
                     p.string("--model", "-m").unwrap_or("data/model.pssa"),
-                    p.string("--data", "-d"),
+                    p.string("--data", "-d")
+                        .or_else(|| p.positional.first().map(String::as_str)),
                     t,
                 )
             }
             "download" => {
                 let p = Parsed::parse(&args[2..], &["--out", "-o"])?;
+                p.reject_duplicate_aliases(&["--out", "-o"], "--out")?;
                 if p.positional.len() != 1 {
                     return Err("download requires one Hugging Face repository".into());
                 }
@@ -1160,8 +1456,10 @@ impl CLIHandler {
                 Self::run_status()
             }
             "gpu-probe" => {
-                run_gpu_probe();
-                Ok(())
+                if args.len() != 2 {
+                    return Err("gpu-probe takes no options".into());
+                }
+                run_gpu_probe()
             }
             "benchmark" => {
                 if args.len() != 2 {
@@ -1176,13 +1474,15 @@ impl CLIHandler {
 }
 fn docs_token_count(raw: &str, tokenizer: &Tokenizer) -> Result<usize, String> {
     raw.lines().try_fold(0usize, |n, line| {
-        tokenizer.try_encode(line, true).map(|ids| n + ids.len())
+        let ids = tokenizer.try_encode(line, true)?;
+        n.checked_add(ids.len())
+            .ok_or_else(|| "dataset token count overflow".to_string())
     })
 }
 
 /// Bring up the WebGPU compute device, run the embedded tiled GEMM kernel on it,
 /// and check the result against the CPU reference implementation.
-pub fn run_gpu_probe() {
+pub fn run_gpu_probe() -> Result<(), String> {
     println!("=== oxide gpu-probe ===");
     let device = match Device::try_gpu() {
         Ok(d) => {
@@ -1192,7 +1492,7 @@ pub fn run_gpu_probe() {
         Err(e) => {
             println!("adapter: unavailable ({})", e);
             println!("result: no GPU on this machine; training stays on CPU");
-            return;
+            return Ok(());
         }
     };
 
@@ -1203,7 +1503,7 @@ pub fn run_gpu_probe() {
         }
         None => {
             println!("result: CPU device returned; nothing to probe");
-            return;
+            return Ok(());
         }
     };
 
@@ -1242,6 +1542,8 @@ pub fn run_gpu_probe() {
         println!("result: PASS, GPU kernel matches CPU reference");
     } else {
         println!("result: FAIL, GPU kernel diverges from CPU reference");
+        return Err(format!("GPU GEMM differs from CPU reference by {max_abs:.3e}"));
     }
     println!("note: layer math is still CPU-dispatched; this proves the device path only");
+    Ok(())
 }

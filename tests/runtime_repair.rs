@@ -113,6 +113,37 @@ fn evaluate_uniform_logits_has_known_loss_and_oov_count() {
     assert_eq!(oov, 1);
 }
 #[test]
+fn word_tokenizer_reports_unusable_corpus_and_windows_wrap_at_eof() {
+    let bad = cli::TrainingOptions {
+        tokenizer: oxide_ai_pssa::dataset::TokenizerKind::Word,
+        epochs: 1,
+        latent: 4,
+        state: 2,
+        key: 2,
+        memory: 2,
+        chunk: 2,
+        accumulate: 1,
+        max_tokens: Some(4),
+        ..Default::default()
+    };
+    assert!(CLIHandler::train_corpus("😀😀\n", &bad).is_err());
+
+    let wrapped = cli::TrainingOptions {
+        tokenizer: oxide_ai_pssa::dataset::TokenizerKind::Word,
+        epochs: 1,
+        latent: 4,
+        state: 2,
+        key: 2,
+        memory: 2,
+        chunk: 2,
+        accumulate: 1,
+        max_tokens: Some(5),
+        skip_tokens: 4,
+        ..Default::default()
+    };
+    assert!(CLIHandler::train_corpus("a b c\nd e f\n", &wrapped).is_ok());
+}
+#[test]
 fn cli_errors_do_not_train_or_write_and_bad_numeric_exits_nonzero() {
     let exe = env!("CARGO_BIN_EXE_oxide_ai_pssa");
     let out = temp("should-not-exist");
@@ -137,6 +168,32 @@ fn cli_errors_do_not_train_or_write_and_bad_numeric_exits_nonzero() {
         .status()
         .unwrap();
     assert!(!prompt.success());
+    let temperature = Command::new(exe)
+        .args([
+            "generate",
+            "alpha",
+            "--temperature",
+            "0",
+            "--model",
+            "/definitely/not/here",
+        ])
+        .output()
+        .unwrap();
+    assert!(!temperature.status.success());
+    assert!(!String::from_utf8_lossy(&temperature.stderr).contains("unknown option"));
+    let excessive = Command::new(exe)
+        .args([
+            "generate",
+            "alpha",
+            "--model",
+            "/definitely/not/here",
+            "--max-new-tokens",
+            "100001",
+        ])
+        .output()
+        .unwrap();
+    assert!(!excessive.status.success());
+    assert!(String::from_utf8_lossy(&excessive.stderr).contains("at most"));
 }
 #[test]
 fn process_train_save_then_generate_without_corpus() {

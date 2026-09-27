@@ -178,7 +178,7 @@ impl Tokenizer {
         self.kind
     }
 
-    pub fn from_corpus(corpus: &str, lower: bool) -> Self {
+    pub fn from_corpus(corpus: &str, lower: bool) -> Result<Self, String> {
         let raw = Self::clean_and_tokenize(corpus, lower);
         let mut freq = HashMap::<String, usize>::new();
         for token in &raw {
@@ -199,7 +199,7 @@ impl Tokenizer {
             }
         }
         counts[0] = unknown.max(1);
-        Self::word_with_ordered_tokens(tokens, counts).expect("constructed vocabulary is valid")
+        Self::word_with_ordered_tokens(tokens, counts)
     }
 
     /// Trains a deterministic byte-level BPE from precisely the supplied
@@ -558,33 +558,108 @@ impl DatasetManager {
         }
         Ok(out)
     }
-    pub fn load_dataset(sources_arg: Option<&str>) -> String {
+    /// Fallible dataset loader.  Callers must not silently train on the
+    /// built-in corpus when an explicitly requested source fails.
+    pub fn load_dataset(sources_arg: Option<&str>) -> Result<String, String> {
+        Self::try_load_dataset(sources_arg)
+    }
+
+    /// Compatibility helper for callers that explicitly want the historical
+    /// built-in fallback.  New code should prefer [`Self::load_dataset`].
+    pub fn load_dataset_or_default(sources_arg: Option<&str>) -> String {
         Self::try_load_dataset(sources_arg)
             .unwrap_or_else(|_| Self::SCIENCE_REFERENCE_CORPUS.into())
     }
-    pub fn download_url_dataset(url: &str) -> Result<String, String> {
-        let body = ureq::get(url)
+    fn download_url_raw(url: &str) -> Result<String, String> {
+        ureq::get(url)
             .set("User-Agent", "oxide-ai/0.4.0")
             .timeout(std::time::Duration::from_secs(60))
             .call()
             .map_err(|e| format!("HTTP request failed: {e}"))?
             .into_string()
-            .map_err(|e| format!("failed to read response body: {e}"))?;
-        Ok(Self::extract_clean_text(&body))
+            .map_err(|e| format!("failed to read response body: {e}"))
+    }
+
+    pub fn download_url_dataset(url: &str) -> Result<String, String> {
+        let body = Self::download_url_raw(url)?;
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+            return Self::extract_json_text(&body).ok_or_else(|| {
+                let kind = value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|message| format!(": {message}"))
+                    .unwrap_or_default();
+                format!("URL response contains no supported text fields{kind}")
+            });
+        }
+        Ok(body.trim().to_string())
     }
     pub fn download_huggingface_dataset(repo: &str) -> Result<String, String> {
         let endpoint = format!(
             "https://datasets-server.huggingface.co/rows?dataset={repo}&split=train&offset=0&limit=1000"
         );
-        let text = Self::download_url_dataset(&endpoint)?;
+        let body = Self::download_url_raw(&endpoint)?;
+        let text = Self::extract_json_text(&body).ok_or_else(|| {
+            format!("dataset '{repo}' response contains no supported text fields")
+        })?;
         if text.trim().is_empty() {
             Err(format!("dataset '{repo}' is empty"))
         } else {
             Ok(text)
         }
     }
+
+    /// Extract text columns from structured API responses while leaving plain
+    /// text downloads unchanged.  The Hugging Face rows API nests records as
+    /// `rows[].row`, so extraction walks all objects and recognizes common
+    /// corpus fields at any depth.
+    fn extract_json_text(raw: &str) -> Option<String> {
+        const TEXT_FIELDS: &[&str] = &[
+            "text", "content", "article", "story", "instruction", "output", "sentence",
+            "summary",
+        ];
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let mut parts = Vec::new();
+        fn collect_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        collect_strings(value, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn collect_text(
+            value: &serde_json::Value,
+            fields: &[&str],
+            out: &mut Vec<String>,
+        ) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    for (key, value) in object {
+                        if fields.contains(&key.as_str()) {
+                            collect_strings(value, out);
+                        } else {
+                            collect_text(value, fields, out);
+                        }
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        collect_text(value, fields, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        collect_text(&value, TEXT_FIELDS, &mut parts);
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    }
+
     pub fn extract_clean_text(raw: &str) -> String {
-        raw.trim().to_string()
+        Self::extract_json_text(raw).unwrap_or_else(|| raw.trim().to_string())
     }
     pub fn contradiction_stream() -> String {
         "the secret access code is 9988 . system authentication protocol initiated . the secret access code is 1122 . the secret access code is 1122 .".into()

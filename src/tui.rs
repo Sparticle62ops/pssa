@@ -35,7 +35,6 @@ struct RunState {
     epoch_updates: Option<u64>,
     // summary card
     wall: Option<String>,
-    total_tokens: Option<u64>,
     throughput: Option<String>,
     training_seconds: Option<f64>,
     optimizer_updates: Option<u64>,

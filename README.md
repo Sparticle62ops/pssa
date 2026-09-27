@@ -59,10 +59,12 @@ Generate one completion, or start the REPL:
 
 ```bash
 cargo run --release -- generate "quantum mechanics" --model data/model.pssa
-cargo run --release -- chat data/downloaded.txt --model data/model.pssa --temp 0.70
+cargo run --release -- chat data/downloaded.txt --model data/model.pssa --temperature 0.70
 ```
 
-If `data/model.pssa` does not exist, `chat` and `generate` train a four-epoch model first. Training time depends heavily on corpus size and CPU speed.
+`generate` and `chat` load an existing checkpoint; they do not train implicitly. Run
+`train` first when `data/model.pssa` is missing. Training time depends heavily on
+corpus size and CPU speed.
 
 ## CLI Reference
 
@@ -95,8 +97,8 @@ Options:
 | `-o, --out <path>` | `data/model.pssa` | `train`, `download` | Output checkpoint or dataset path. |
 | `-p, --prompt <text>` | empty | `generate` | Prompt text. Required for generation. |
 | `-e, --epochs <n>` | `4` | `train` | Training epochs. |
-| `-t, --temp <float>` | `0.70` | `chat`, `generate` | Sampling temperature. |
-| `--max-new-tokens <n>` | `64` | `generate` | Generation length cap. |
+| `-t, --temp, --temperature <float>` | `0.70` | `chat`, `generate` | Sampling temperature. |
+| `--max-new-tokens <n>` | `64` (maximum 100,000) | `generate` | Generation length cap. |
 | `--latent <n>` | `256` | `train` | Latent dimension. |
 | `--state <n>` | `16` | `train` | Recurrent state dimension. |
 | `--key <n>` | `32` | `train` | Memory-key dimension. |
@@ -129,7 +131,7 @@ Inside the REPL:
 
 ## Training over a long corpus
 
-`--skip-tokens`, `--max-tokens` and `--resume` together let a long corpus be trained as a chain of short runs, so a single run never has to survive a session limit. Each link trains its own window and hands its optimizer state to the next:
+`--skip-tokens`, `--max-tokens` and `--resume` together let a long corpus be trained as a chain of short runs, so a single run never has to survive a session limit. If a window crosses EOF, selection wraps to the beginning of the corpus. Each link trains its own window and hands its optimizer state to the next:
 
 ```bash
 cargo run --release -- train data/downloaded.txt -e 1 \
@@ -153,7 +155,10 @@ cargo run --release -- train hf:owner/dataset              # Hugging Face reposi
 cargo run --release -- train science,data/downloaded.txt   # multiple sources
 ```
 
-The loader first tries local paths. A missing non-special source is treated as a Hugging Face repository name. Remote loading probes the datasets server and several conventional raw-file names. JSON-like responses are reduced using common fields such as `text`, `content`, `article`, `story`, `instruction`, `output`, `sentence`, and `summary`.
+Local files and directories are read directly; HTTP(S) URLs and explicit `hf:owner/dataset`
+sources are downloaded. Structured responses are reduced using common fields such as
+`text`, `content`, `article`, `story`, `instruction`, `output`, `sentence`, and `summary`;
+structured responses without a supported text field are rejected.
 
 Byte-level BPE keeps exact UTF-8 case, whitespace, punctuation, and line endings, and has a complete 256-byte fallback alphabet, so valid UTF-8 never collapses to `<unk>`. The previous lowercase word splitter, including its 10,000-word cap and `<unk>` behavior, is available only with `--tokenizer word`.
 
@@ -170,7 +175,7 @@ Network downloads are not validated or curated by Oxide AI. Review licensing, pr
 The `train` command performs two phases:
 
 1. **Continuous recurrent ingestion:** token transitions are processed through the PSSA layer. The model updates state, memory, adapters, and routing behavior with a cosine learning-rate schedule.
-2. **Ridge consolidation:** online transition statistics are accumulated and consolidated into the base matrix using closed-form ridge regression.
+2. **Adapter consolidation:** after each epoch, the plastic adapter's fast coefficients are folded into its consolidated coefficients with the configured EMA rate.
 
 Defaults are latent 256, recurrent state 16, memory-key 32, memory capacity 512, chunk length 64, learning rate 1e-3, 8 chunks per update, and seed 42. The resulting binary holds weights, configuration, memory, adapters, and optimizer state. It is not an interchange format for other ML frameworks and should be loaded through `PSSALayer::import_from_pssa_bytes`.
 
