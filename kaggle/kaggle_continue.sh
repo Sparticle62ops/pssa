@@ -172,7 +172,7 @@ for i in $(seq "$START" "$TOTAL"); do
   if [ -z "$PREV" ]; then
     ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --total-updates "$TOTAL_UPDATES"
   else
-    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --resume "$PREV"
+    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --resume "$PREV" --total-updates "$TOTAL_UPDATES"
   fi
   PREV="$OUT"
 done
