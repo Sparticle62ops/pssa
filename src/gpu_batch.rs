@@ -221,25 +221,30 @@ pub fn stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
 pub fn stage_adapter(m: &mut PSSALayerV2, seq_len: usize) {
     let d_m = m.cfg.d_latent;
     let rank = m.adapters[0].rank;
-    let down = m.adapters[0].down_proj.data.clone();
-
-    batched_matvec(
-        &down,
-        rank,
-        d_m,
-        &m.tape.x_norm[..seq_len * d_m],
-        seq_len,
-        &mut m.tape.adapter_hidden[..seq_len * rank],
-    );
+    let down = &m.adapters[0].down_proj.data;
+    for t in 0..seq_len {
+        let x_off = t * d_m;
+        let out_off = t * rank;
+        for r in 0..rank {
+            m.tape.adapter_hidden[out_off + r] = dot_slice(
+                &down[r * d_m..(r + 1) * d_m],
+                &m.tape.x_norm[x_off..x_off + d_m],
+            );
+        }
+    }
 }
 
 /// Adapter up-projection contribution for token t, written into `out`
 /// (`out[i] = sum_r (U_fast + U_slow)[i, r] * act[r]`).
 #[inline(always)]
-fn adapter_up_into(m: &PSSALayerV2, act: &[f32], out: &mut [f32]) {
-    let rank = m.adapters[0].rank;
-    let ad = &m.adapters[0];
-    for i in 0..m.cfg.d_latent {
+fn adapter_up_into(
+    ad: &crate::adapter::PlasticAdapterV2,
+    d_m: usize,
+    act: &[f32],
+    out: &mut [f32],
+) {
+    let rank = ad.rank;
+    for i in 0..d_m {
         let off = i * rank;
         let mut total = 0.0f32;
         for r in 0..rank {
@@ -256,9 +261,9 @@ pub fn stage_mlp(m: &mut PSSALayerV2, seq_len: usize) {
     let d_mlp = d_m * 2;
     let ssm_scale = 1.0 / (m.cfg.d_state as f32).sqrt();
 
-    let mut ad_out = [0.0f32; 256]; // d_latent <= 256 by config validation below.
-    debug_assert!(d_m <= ad_out.len());
-
+    // Use the model-owned scratch buffer rather than a fixed-size temporary.
+    // The CLI permits latent widths larger than 256, and the old stack array
+    // indexed past its end for those otherwise valid configurations.
     for t in 0..seq_len {
         let z_off = t * d_m;
         let m_off = t * d_m;
@@ -268,12 +273,18 @@ pub fn stage_mlp(m: &mut PSSALayerV2, seq_len: usize) {
             let h = m.tape.adapter_hidden[ad_off + r];
             m.tape.adapter_act[ad_off + r] = h * sigmoid(h);
         }
-        adapter_up_into(m, &m.tape.adapter_act[ad_off..ad_off + m.adapters[0].rank], &mut ad_out[..d_m]);
+        let act = &m.tape.adapter_act[ad_off..ad_off + m.adapters[0].rank];
+        adapter_up_into(
+            &m.adapters[0],
+            d_m,
+            act,
+            &mut m.buf_ad_out[..d_m],
+        );
 
         for i in 0..d_m {
             m.tape.z_raw[z_off + i] = (m.tape.y_ssm[y_off + i] * ssm_scale)
                 + m.tape.m_inj[m_off + i]
-                + ad_out[i];
+                + m.buf_ad_out[i];
         }
     }
 
@@ -350,7 +361,11 @@ pub fn stage_logits_loss(m: &mut PSSALayerV2, seq_len: usize) -> f32 {
 pub fn forward_train_chunk_batched(m: &mut PSSALayerV2, token_ids: &[usize], target_ids: &[usize]) -> f32 {
     assert!(!token_ids.is_empty(), "training chunk must be nonempty");
     assert_eq!(token_ids.len(), target_ids.len(), "token and target counts must match");
-    let seq_len = token_ids.len().min(m.cfg.chunk_len);
+    assert!(
+        token_ids.len() <= m.cfg.chunk_len,
+        "training chunk length exceeds configured tape capacity"
+    );
+    let seq_len = token_ids.len();
     assert!(seq_len > 0);
     assert!(
         token_ids[..seq_len].iter().all(|&id| id < m.cfg.d_vocab)
@@ -659,7 +674,6 @@ pub fn bwd_stage_adapter_down(m: &mut PSSALayerV2, seq_len: usize) {
 #[inline]
 pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
     let d_m = m.cfg.d_latent;
-    let d_s = m.cfg.d_state;
     let d_k = m.cfg.d_mem_key;
     let mem_cap = m.cfg.mem_capacity;
     let l = seq_len;
@@ -709,6 +723,17 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
         let q_sq = dot_slice(q, q) as f64;
 
         m.g_query_pnc.fill(0.0);
+        // Recompute the projection adjoint for this token.  It cannot be
+        // kept in `buf_g_m_val` from the first pass: that scratch buffer is
+        // overwritten once per token, so using it here would apply the last
+        // token's memory gradient to every query in the chunk.
+        for i in 0..d_m {
+            let gz_i = m.bwd_g_zraw[m_off + i];
+            m.buf_g_m_proj_out[i] = gz_i * m.tape.g_mem[m_off + i];
+        }
+        m.w_proj
+            .matvec_transpose(&m.buf_g_m_proj_out, &mut m.buf_g_m_val);
+
         for entry in 0..m.memory.count {
             let key_off = entry * d_k;
             let key = &m.memory.keys[key_off..key_off + d_k];
@@ -770,7 +795,6 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
         for j in 0..d_m {
             m.bwd_g_ysm[m_off + j] = m.g_y_ssm[j];
         }
-        let _ = d_s;
     }
 }
 

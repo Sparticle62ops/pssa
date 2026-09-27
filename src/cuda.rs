@@ -89,7 +89,10 @@ impl CudaContext {
     ) -> Vec<f32> {
         match self.try_dispatch_gemm(x, w, m, n, k, batch) {
             Ok(y) => y,
-            Err(_) => crate::backend::gemm_cpu_reference(x, w, m, n, k, batch),
+            Err(error) => {
+                eprintln!("warning: CUDA GEMM failed; using CPU fallback: {error}");
+                crate::backend::gemm_cpu_reference(x, w, m, n, k, batch)
+            }
         }
     }
 
@@ -102,9 +105,23 @@ impl CudaContext {
         k: usize,
         batch: usize,
     ) -> Result<Vec<f32>, String> {
-        let batch = batch.max(1);
-        debug_assert_eq!(x.len(), batch * m * k);
-        debug_assert_eq!(w.len(), n * k);
+        if m == 0 || n == 0 || k == 0 || batch == 0 {
+            return Err("CUDA GEMM dimensions must be positive".into());
+        }
+        let x_len = batch
+            .checked_mul(m)
+            .and_then(|v| v.checked_mul(k))
+            .ok_or_else(|| "CUDA GEMM input size overflow".to_string())?;
+        let w_len = n
+            .checked_mul(k)
+            .ok_or_else(|| "CUDA GEMM weight size overflow".to_string())?;
+        let out_len = batch
+            .checked_mul(m)
+            .and_then(|v| v.checked_mul(n))
+            .ok_or_else(|| "CUDA GEMM output size overflow".to_string())?;
+        if x.len() != x_len || w.len() != w_len {
+            return Err("CUDA GEMM buffer length mismatch".into());
+        }
 
         let w_dev = self.weight_buffer(w)?;
         let x_dev = self
@@ -113,7 +130,7 @@ impl CudaContext {
             .map_err(|e| format!("activation upload failed ({e:?})"))?;
         let mut y_dev = self
             .stream
-            .alloc_zeros::<f32>(batch * m * n)
+            .alloc_zeros::<f32>(out_len)
             .map_err(|e| format!("output alloc failed ({e:?})"))?;
 
         let gemm = GemmConfig {
@@ -158,15 +175,19 @@ impl CudaContext {
     /// C(M,N) = A(M,K) * B(K,N), all row-major. Used by the backward pass,
     /// where the second operand is not transposed.
     pub fn gemm_nn(&self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-        self.try_gemm_nn(a, b, m, k, n)
-            .unwrap_or_else(|_| crate::backend::gemm_nn_cpu(a, b, m, k, n))
+        self.try_gemm_nn(a, b, m, k, n).unwrap_or_else(|error| {
+            eprintln!("warning: CUDA backward GEMM (NN) failed; using CPU fallback: {error}");
+            crate::backend::gemm_nn_cpu(a, b, m, k, n)
+        })
     }
 
     /// C(K,N) = A(M,K)^T * B(M,N), all row-major. This is the weight-gradient
     /// shape: contract over the token axis.
     pub fn gemm_tn(&self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-        self.try_gemm_tn(a, b, m, k, n)
-            .unwrap_or_else(|_| crate::backend::gemm_tn_cpu(a, b, m, k, n))
+        self.try_gemm_tn(a, b, m, k, n).unwrap_or_else(|error| {
+            eprintln!("warning: CUDA backward GEMM (TN) failed; using CPU fallback: {error}");
+            crate::backend::gemm_tn_cpu(a, b, m, k, n)
+        })
     }
 
     fn try_gemm_nn(

@@ -130,9 +130,16 @@ fn validate_config(cfg: &PSSAConfigV2) -> Result<()> {
     allocation_bytes(cfg).map(|_| ())
 }
 
+/// Validate a fresh model configuration before its large activation and
+/// optimizer buffers are allocated.  Checkpoint loading uses the same guard.
+pub fn validate_model_config(cfg: &PSSAConfigV2) -> std::result::Result<(), String> {
+    validate_config(cfg).map_err(|e| e.to_string())
+}
+
 /// Reject a dimension declaration whose tape/scratch allocation is implausibly
 /// larger than the bytes available to populate even its persisted tensors. This
-/// prevents a valid-looking tiny header from causing a near-cap allocation.
+/// keeps a tiny malformed checkpoint from forcing a near-cap allocation before
+/// the reader can discover that its payload is truncated.
 fn ensure_backed_by_file(cfg: &PSSAConfigV2, available_bytes: usize) -> Result<()> {
     let allocated = allocation_bytes(cfg)?;
     let backed = available_bytes.saturating_mul(128);
@@ -788,6 +795,9 @@ fn load_payload(payload: &[u8], is_v7: bool) -> Result<LoadedCheckpoint> {
     let cfg = config_from_payload(&mut r)?;
     ensure_backed_by_file(&cfg, payload.len())?;
     let step = r.usize("step_counter")?;
+    if step == usize::MAX {
+        return Err(invalid("step_counter is exhausted"));
+    }
     let rng_state = r.u64("rng state")?;
     let vocabulary = read_vocab(&mut r, cfg.d_vocab)?;
     let mut model = PSSALayerV2::new(cfg, 1);
@@ -956,6 +966,9 @@ fn load_v5(bytes: &[u8]) -> Result<LoadedCheckpoint> {
         )));
     }
     model.a_mat.data = physical.into_iter().map(|a| inverse_softplus(-a)).collect();
+    if model.a_mat.data.iter().any(|x| !x.is_finite()) {
+        return Err(invalid("legacy physical A cannot be represented as finite raw rates"));
+    }
     for (slot, name) in [
         (&mut model.w_delta, "w_delta"),
         (&mut model.w_b, "w_b"),

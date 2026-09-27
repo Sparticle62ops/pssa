@@ -1,4 +1,4 @@
-use oxide_ai_pssa::linalg::dot_slice;
+use oxide_ai_pssa::linalg::{Matrix, Vector, dot_slice};
 
 fn fixture(len: usize) -> (Vec<f32>, Vec<f32>) {
     let mut a = Vec::with_capacity(len);
@@ -47,4 +47,26 @@ fn dot_slice_matches_f64_reference_across_vector_and_tail_lengths() {
 #[test]
 fn dot_slice_rejects_mismatched_lengths() {
     assert!(std::panic::catch_unwind(|| dot_slice(&[1.0, 2.0], &[1.0])).is_err());
+}
+
+#[test]
+fn vector_and_matrix_additions_reject_shape_mismatches() {
+    assert!(std::panic::catch_unwind(|| {
+        Vector::from_slice(&[1.0, 2.0]).add(&Vector::from_slice(&[3.0]));
+    })
+    .is_err());
+
+    let mut lhs = Matrix::zeros(2, 2);
+    let rhs = Matrix::zeros(1, 2);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lhs.add_assign_scaled(&rhs, 1.0);
+    }))
+    .is_err());
+}
+
+#[test]
+fn empty_rms_norm_is_empty_and_finite() {
+    let mut out = Vector::from_slice(&[1.0]);
+    Vector::from_slice(&[]).rms_norm_into(&mut out);
+    assert!(out.data.is_empty());
 }

@@ -88,6 +88,9 @@ impl Vector {
         if out.data.len() != len {
             out.data.resize(len, 0.0);
         }
+        if len == 0 {
+            return;
+        }
         let sum_sq: f32 = self.data.iter().map(|&x| x * x).sum();
         let rms = (sum_sq / (len as f32) + 1e-5).sqrt();
         let inv_rms = 1.0 / rms;
@@ -105,6 +108,11 @@ impl Vector {
 
     #[inline(always)]
     pub fn add(&self, other: &Vector) -> Vector {
+        assert_eq!(
+            self.data.len(),
+            other.data.len(),
+            "vector operands must have equal lengths"
+        );
         Vector {
             data: self
                 .data
@@ -414,6 +422,10 @@ impl Matrix {
     }
 
     pub fn add_assign_scaled(&mut self, delta: &Matrix, scale: f32) {
+        assert_eq!(self.rows, delta.rows, "matrix row counts must match");
+        assert_eq!(self.cols, delta.cols, "matrix column counts must match");
+        assert_eq!(self.data.len(), self.rows * self.cols);
+        assert_eq!(delta.data.len(), delta.rows * delta.cols);
         for (a, b) in self.data.iter_mut().zip(&delta.data) {
             *a += *b * scale;
         }
@@ -509,10 +521,15 @@ pub fn softplus(x: f32) -> f32 {
 }
 
 pub fn softmax(v: &Vector) -> Vector {
-    let max = v.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = v.data.iter().map(|x| (x - max).exp()).collect();
+    if v.data.is_empty() {
+        return Vector { data: Vec::new() };
+    }
+    // Subtracting the maximum is required for finite probabilities when a
+    // caller supplies ordinary logits rather than already-normalized values.
+    let max = v.data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = v.data.iter().map(|x| (*x - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
     Vector {
-        data: exps.iter().map(|x| x / (sum + 1e-8)).collect(),
+        data: exps.iter().map(|x| x / sum).collect(),
     }
 }

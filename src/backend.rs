@@ -322,8 +322,17 @@ impl WgpuContext {
             })
     }
 
-    pub fn read_buffer_blocking(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {
-        let byte_len = (count * std::mem::size_of::<f32>()) as u64;
+    pub fn read_buffer_blocking(
+        &self,
+        buffer: &wgpu::Buffer,
+        count: usize,
+    ) -> Result<Vec<f32>, String> {
+        let byte_len = count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "GPU readback size overflow".to_string())? as u64;
+        if byte_len == 0 {
+            return Err("GPU readback cannot have zero bytes".into());
+        }
 
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Readback Staging Buffer"),
@@ -343,17 +352,22 @@ impl WgpuContext {
 
         let slice = staging.slice(..);
         let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| sender.send(res).unwrap());
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = sender.send(res);
+        });
 
         self.device.poll(wgpu::Maintain::Wait);
-        receiver.recv().unwrap().unwrap();
+        let mapped_result = receiver
+            .recv()
+            .map_err(|_| "GPU readback callback was dropped".to_string())?;
+        mapped_result.map_err(|e| format!("GPU readback mapping failed: {e:?}"))?;
 
         let mapped = slice.get_mapped_range();
         let result: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
         drop(mapped);
         staging.unmap();
 
-        result
+        Ok(result)
     }
 
     /// Run the embedded tiled GEMM kernel on the GPU.
@@ -367,9 +381,44 @@ impl WgpuContext {
         k: usize,
         batch: usize,
     ) -> Vec<f32> {
-        assert_eq!(x.len(), batch * m * k, "X buffer length mismatch");
-        assert_eq!(w.len(), n * k, "W buffer length mismatch");
-        let out_len = batch * m * n;
+        match self.try_dispatch_gemm(x, w, m, n, k, batch) {
+            Ok(y) => y,
+            Err(error) => {
+                eprintln!("warning: WebGPU GEMM failed; using CPU fallback: {error}");
+                crate::backend::gemm_cpu_reference(x, w, m, n, k, batch)
+            }
+        }
+    }
+
+    fn try_dispatch_gemm(
+        &self,
+        x: &[f32],
+        w: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        batch: usize,
+    ) -> Result<Vec<f32>, String> {
+        if m == 0 || n == 0 || k == 0 || batch == 0 {
+            return Err("GPU GEMM dimensions must be positive".into());
+        }
+        let x_len = batch
+            .checked_mul(m)
+            .and_then(|v| v.checked_mul(k))
+            .ok_or_else(|| "GPU GEMM input size overflow".to_string())?;
+        let w_len = n
+            .checked_mul(k)
+            .ok_or_else(|| "GPU GEMM weight size overflow".to_string())?;
+        let out_len = batch
+            .checked_mul(m)
+            .and_then(|v| v.checked_mul(n))
+            .ok_or_else(|| "GPU GEMM output size overflow".to_string())?;
+        if x.len() != x_len || w.len() != w_len {
+            return Err("GPU GEMM buffer length mismatch".into());
+        }
+        if [m, n, k, batch].iter().any(|&v| v > u32::MAX as usize) {
+            return Err("GPU GEMM dimensions exceed the WebGPU u32 limit".into());
+        }
 
         let cfg: [u32; 4] = [m as u32, n as u32, k as u32, batch as u32];
         let cfg_buf = self
@@ -438,7 +487,19 @@ pub fn gemm_cpu_reference(
     k: usize,
     batch: usize,
 ) -> Vec<f32> {
-    let mut y = vec![0.0f32; batch * m * n];
+    let Some(x_len) = batch.checked_mul(m).and_then(|v| v.checked_mul(k)) else {
+        return Vec::new();
+    };
+    let Some(w_len) = n.checked_mul(k) else {
+        return Vec::new();
+    };
+    let Some(out_len) = batch.checked_mul(m).and_then(|v| v.checked_mul(n)) else {
+        return Vec::new();
+    };
+    if x.len() != x_len || w.len() != w_len {
+        return Vec::new();
+    }
+    let mut y = vec![0.0f32; out_len];
     for b in 0..batch {
         for i in 0..m {
             for j in 0..n {
@@ -455,7 +516,19 @@ pub fn gemm_cpu_reference(
 
 /// Row-major C(M,N) = A(M,K) * B(K,N). CPU twin for the backward-pass GEMMs.
 pub fn gemm_nn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let mut c = vec![0.0f32; m * n];
+    let Some(a_len) = m.checked_mul(k) else {
+        return Vec::new();
+    };
+    let Some(b_len) = k.checked_mul(n) else {
+        return Vec::new();
+    };
+    let Some(c_len) = m.checked_mul(n) else {
+        return Vec::new();
+    };
+    if a.len() != a_len || b.len() != b_len {
+        return Vec::new();
+    }
+    let mut c = vec![0.0f32; c_len];
     for i in 0..m {
         for kk in 0..k {
             let av = a[i * k + kk];
@@ -474,7 +547,19 @@ pub fn gemm_nn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f3
 
 /// Row-major C(K,N) = A(M,K)^T * B(M,N). CPU twin for the weight-gradient GEMMs.
 pub fn gemm_tn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let mut c = vec![0.0f32; k * n];
+    let Some(a_len) = m.checked_mul(k) else {
+        return Vec::new();
+    };
+    let Some(b_len) = m.checked_mul(n) else {
+        return Vec::new();
+    };
+    let Some(c_len) = k.checked_mul(n) else {
+        return Vec::new();
+    };
+    if a.len() != a_len || b.len() != b_len {
+        return Vec::new();
+    }
+    let mut c = vec![0.0f32; c_len];
     for t in 0..m {
         for kk in 0..k {
             let av = a[t * k + kk];

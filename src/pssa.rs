@@ -40,6 +40,7 @@ impl ParamVector {
         eps: f32,
         step: usize,
     ) {
+        assert!(step > 0, "AdamW step must be positive");
         let step_f = step as f32;
         let bias_corr1 = 1.0 - beta1.powf(step_f);
         let bias_corr2 = 1.0 - beta2.powf(step_f);
@@ -139,6 +140,7 @@ impl ParamMatrix {
         step: usize,
     ) {
         assert!(row < self.rows);
+        assert!(step > 0, "AdamW step must be positive");
         let step_f = step as f32;
         let bias_corr1 = 1.0 - beta1.powf(step_f);
         let bias_corr2 = 1.0 - beta2.powf(step_f);
@@ -168,6 +170,7 @@ impl ParamMatrix {
         eps: f32,
         step: usize,
     ) {
+        assert!(step > 0, "AdamW step must be positive");
         let step_f = step as f32;
         let bias_corr1 = 1.0 - beta1.powf(step_f);
         let bias_corr2 = 1.0 - beta2.powf(step_f);
@@ -707,7 +710,11 @@ impl PSSALayerV2 {
             target_ids.len(),
             "token and target counts must match"
         );
-        let seq_len = token_ids.len().min(self.cfg.chunk_len);
+        assert!(
+            token_ids.len() <= self.cfg.chunk_len,
+            "training chunk length exceeds configured tape capacity"
+        );
+        let seq_len = token_ids.len();
         assert!(seq_len > 0);
         assert!(
             token_ids[..seq_len].iter().all(|&id| id < self.cfg.d_vocab)
@@ -944,7 +951,10 @@ impl PSSALayerV2 {
         let ssm_scale = 1.0 / (d_s as f32).sqrt();
         let logit_scale = 1.0 / (d_m as f32).sqrt();
 
-        let pending_step = self.step_counter + 1;
+        let pending_step = self
+            .step_counter
+            .checked_add(1)
+            .expect("optimizer step counter overflow");
         for t in 0..seq_len {
             self.embed_row_marks[self.tape.x_ids[t]] = pending_step;
         }
@@ -1225,7 +1235,10 @@ impl PSSALayerV2 {
     }
 
     pub fn apply_adamw(&mut self, lr: f32) {
-        self.step_counter += 1;
+        self.step_counter = self
+            .step_counter
+            .checked_add(1)
+            .expect("optimizer step counter overflow");
         let beta1 = self.cfg.beta1;
         let beta2 = self.cfg.beta2;
         let wd = self.cfg.weight_decay;

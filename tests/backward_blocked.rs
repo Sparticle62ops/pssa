@@ -48,6 +48,38 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+fn max_model_grad_diff(a: &PSSALayerV2, b: &PSSALayerV2) -> f32 {
+    let mut diff = 0.0f32;
+    macro_rules! compare {
+        ($field:ident) => {
+            diff = diff.max(max_abs_diff(&a.$field.grad, &b.$field.grad));
+        };
+    }
+    compare!(embed_w);
+    compare!(norm_gamma);
+    compare!(norm_beta);
+    compare!(a_mat);
+    compare!(w_delta);
+    compare!(w_b);
+    compare!(w_c);
+    compare!(w_qx);
+    compare!(w_qh);
+    compare!(w_gate);
+    compare!(w_proj);
+    compare!(mlp_w1);
+    compare!(mlp_w2);
+    compare!(unembed_w);
+    diff = diff.max(max_abs_diff(
+        &a.adapters[0].down_proj.grad,
+        &b.adapters[0].down_proj.grad,
+    ));
+    diff = diff.max(max_abs_diff(
+        &a.adapters[0].up_proj.grad,
+        &b.adapters[0].up_proj.grad,
+    ));
+    diff
+}
+
 #[test]
 fn blocked_logits_backward_matches_scalar_twin() {
     let (mut scalar, seq_len) = primed_model();
@@ -64,6 +96,21 @@ fn blocked_logits_backward_matches_scalar_twin() {
         max_abs_diff(&scalar.unembed_w.grad, &blocked.unembed_w.grad) < 1e-5,
         "unembed weight grad diverged"
     );
+}
+
+#[test]
+fn full_batched_forward_and_backward_match_reference() {
+    let cfg = cfg();
+    let ids = [1, 4, 9, 2, 6];
+    let targets = [4, 9, 2, 6, 3];
+    let mut reference = PSSALayerV2::new(cfg.clone(), 7);
+    let mut batched = PSSALayerV2::new(cfg, 7);
+    let reference_loss = reference.forward_train_chunk(&ids, &targets);
+    let batched_loss = gpu_batch::forward_train_chunk_batched(&mut batched, &ids, &targets);
+    assert!((reference_loss - batched_loss).abs() < 1e-5);
+    reference.backward_chunk(ids.len(), 1.0);
+    gpu_batch::backward_chunk_batched(&mut batched, ids.len(), 1.0);
+    assert!(max_model_grad_diff(&reference, &batched) < 1e-5);
 }
 
 #[test]
