@@ -204,7 +204,20 @@ fn v7_exact_state_for_word_checkpoint() {
     let b = checkpoint::load_checkpoint(&p).unwrap();
     assert_eq!(b.format, CheckpointFormat::V7);
     assert!(b.model.tokenizer_json.is_none());
+    assert_eq!(b.model.lr_schedule_total_updates, None);
     state(&a, &b.model);
+    fs::remove_file(p).unwrap();
+}
+
+#[test]
+fn v7_persists_fixed_schedule_horizon() {
+    let mut a = model();
+    a.lr_schedule_total_updates = Some(1234);
+    let p = path("v7-schedule-horizon");
+    checkpoint::save_model(&a, &p).unwrap();
+    let b = checkpoint::load_checkpoint(&p).unwrap();
+    assert_eq!(b.format, CheckpointFormat::V7);
+    assert_eq!(b.model.lr_schedule_total_updates, Some(1234));
     fs::remove_file(p).unwrap();
 }
 

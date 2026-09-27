@@ -113,6 +113,39 @@ fn evaluate_uniform_logits_has_known_loss_and_oov_count() {
     assert_eq!(oov, 1);
 }
 #[test]
+fn fixed_schedule_horizon_survives_resume() {
+    let raw = "a b c d\na b c d\n";
+    let first_opts = cli::TrainingOptions {
+        tokenizer: oxide_ai_pssa::dataset::TokenizerKind::Word,
+        epochs: 1,
+        latent: 4,
+        state: 2,
+        key: 2,
+        memory: 2,
+        chunk: 2,
+        accumulate: 1,
+        max_tokens: Some(8),
+        schedule_total_updates: Some(20),
+        ..Default::default()
+    };
+    let (first, _) = CLIHandler::train_corpus(raw, &first_opts).unwrap();
+    let checkpoint = temp("fixed-schedule");
+    CLIHandler::save_model_v2(&first, checkpoint.to_str().unwrap()).unwrap();
+    let second_opts = cli::TrainingOptions {
+        resume: Some(checkpoint.to_str().unwrap().to_string()),
+        tokenizer: oxide_ai_pssa::dataset::TokenizerKind::Word,
+        epochs: 1,
+        accumulate: 1,
+        max_tokens: Some(8),
+        skip_tokens: 8,
+        ..Default::default()
+    };
+    let (second, _) = CLIHandler::train_corpus(raw, &second_opts).unwrap();
+    assert_eq!(second.lr_schedule_total_updates, Some(20));
+    assert!(second.step_counter > first.step_counter);
+    fs::remove_file(checkpoint).unwrap();
+}
+#[test]
 fn word_tokenizer_reports_unusable_corpus_and_windows_wrap_at_eof() {
     let bad = cli::TrainingOptions {
         tokenizer: oxide_ai_pssa::dataset::TokenizerKind::Word,
