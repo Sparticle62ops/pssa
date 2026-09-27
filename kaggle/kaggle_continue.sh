@@ -15,6 +15,12 @@ WINDOW="${WINDOW:-200000}"
 # text three times over, which is what drift looks like. Pull a much larger corpus
 # once into the working directory so every link reads text the model has not seen.
 CORPUS_MB="${CORPUS_MB:-64}"
+# One fixed cosine horizon for the WHOLE chain. Without this every link treated its
+# own last update as the end of training and decayed to ~1% of the base rate, so a
+# late link ran at ~0.00001 while the banner still printed 0.001. A link averages
+# ~458 updates at WINDOW=200000, so 64 links is ~29.3k. Only the FIRST link needs
+# the flag; after that the horizon is persisted in the checkpoint and restored.
+TOTAL_UPDATES="${TOTAL_UPDATES:-30000}"
 CORPUS_URL="${CORPUS_URL:-https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-103-raw-v1/train-00000-of-00002.parquet}"
 BIG="${BIG:-$WORK/corpus/big.txt}"
 
@@ -164,7 +170,7 @@ for i in $(seq "$START" "$TOTAL"); do
   SKIP=$(( (i - 1) * WINDOW ))
   echo "--- ck$(printf '%02d' "$i") (corpus offset $SKIP) ---"
   if [ -z "$PREV" ]; then
-    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1
+    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --total-updates "$TOTAL_UPDATES"
   else
     ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --resume "$PREV"
   fi
