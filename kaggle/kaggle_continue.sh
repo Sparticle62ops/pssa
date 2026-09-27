@@ -95,14 +95,31 @@ mkdir -p "$WORK/chain"
 # previous saved version arrive under /kaggle/input instead. Copy them back in so
 # the chain resumes instead of silently restarting at ck01.
 if ! ls "$WORK/chain"/ck*.pssa >/dev/null 2>&1; then
-  SEED="$(find /kaggle/input -maxdepth 8 -name 'ck*.pssa' 2>/dev/null | sort | tail -1)"
-  if [ -n "$SEED" ]; then
-    echo "seeding chain from $(dirname "$SEED")"
-    cp "$(dirname "$SEED")"/ck*.pssa "$WORK/chain"/
-    ls -1 "$WORK/chain" | tail -3
+  # Kaggle mounts notebook-output inputs as symlinked directories, so plain find
+  # walks straight past them. -L follows the links. Pick the mounted directory
+  # holding the highest-numbered checkpoint rather than the last path by name,
+  # because several versions of the same notebook can be attached at once.
+  SEED_DIR=""
+  SEED_MAX=0
+  while IFS= read -r ck; do
+    [ -n "$ck" ] || continue
+    n="$(basename "$ck" .pssa)"
+    n="${n#ck}"
+    n="$((10#${n:-0}))"
+    if [ "$n" -gt "$SEED_MAX" ]; then
+      SEED_MAX="$n"
+      SEED_DIR="$(dirname "$ck")"
+    fi
+  done <<EOF
+$(find -L /kaggle/input -maxdepth 8 -name 'ck*.pssa' 2>/dev/null)
+EOF
+  if [ -n "$SEED_DIR" ]; then
+    echo "seeding chain from $SEED_DIR (highest is ck$(printf '%02d' "$SEED_MAX"))"
+    cp "$SEED_DIR"/ck*.pssa "$WORK/chain"/
+    echo "copied $(ls -1 "$WORK/chain"/ck*.pssa | wc -l) checkpoints"
   else
     echo "no checkpoints found under /kaggle/input. what is mounted:"
-    ls -R /kaggle/input 2>/dev/null | head -40
+    find -L /kaggle/input -maxdepth 4 2>/dev/null | head -60
     if [ "${FRESH:-0}" != "1" ]; then
       echo
       echo "ERROR: /kaggle/working/chain is empty and nothing under /kaggle/input"
@@ -110,7 +127,9 @@ if ! ls "$WORK/chain"/ck*.pssa >/dev/null 2>&1; then
       echo "and throw away the existing chain."
       echo
       echo "attach the previous run's output as a notebook input (Add Input ->"
-      echo "Notebook Output), then rerun this script. to genuinely start over:"
+      echo "Notebook Output), and make sure you pick the VERSION whose output"
+      echo "actually has the chain, then rerun this script. to genuinely start"
+      echo "over:"
       echo "  FRESH=1 bash kaggle/kaggle_continue.sh"
       exit 1
     fi
