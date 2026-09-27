@@ -68,3 +68,22 @@ flight must still load.
 - Keep the CPU and GPU paths numerically equivalent. If you change one, change
   the other or say plainly why it diverges.
 - Commit in logical commits with real messages. Do not push to origin.
+
+## Design intent and project history
+
+`docs/` holds the architect's own handover material. Read it before judging the
+math:
+
+- `HANDOFF-2026-09-17.md`, `HANDOFF-2026-09-17b.md` — project state, verified
+  training evidence, the frozen width/depth comparison protocol.
+- `CONTINUATION-2026-09-17.md` — the repaired defects and the study readiness
+  record from that session.
+
+Config drift to be aware of: those documents describe width64 / depth1 / BPE
+vocab 2048 / state 8 / memory-key 16 / capacity 32, and a separate technical
+dossier describes vocab 10,000. The live chain trains latent 256, state 16, 512
+memory slots, key width 32, vocab 2048. Trust the code and the checkpoint
+header for SHAPES. Trust the handover docs for INTENT and for the success bar.
+
+The success bar the architect set is unselected coherent output, not lower
+perplexity, not compilation, not layer count.
