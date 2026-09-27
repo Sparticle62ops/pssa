@@ -1,5 +1,5 @@
 use oxide_ai_pssa::memory::HyperbolicEpisodicBankV2;
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2, ParamVector};
 
 fn cfg(latent: usize) -> PSSAConfigV2 {
     PSSAConfigV2 {
@@ -289,6 +289,26 @@ fn tiny_non_target_probabilities_still_contribute_to_ce_gradient() {
         m.unembed_w.grad[..5].iter().any(|x| *x != 0.0),
         "tiny non-target gradient was pruned"
     );
+}
+
+#[test]
+fn adam_rejects_zero_bias_correction_step() {
+    let mut p = ParamVector::new(2, 1.0);
+    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        p.step_adamw(1e-3, 0.9, 0.999, 0.01, 1e-8, 0);
+    }));
+    assert!(rejected.is_err());
+    p.step_adamw(1e-3, 0.9, 0.999, 0.01, 1e-8, 1);
+    assert!(p.data.iter().all(|x| x.is_finite()));
+}
+
+#[test]
+fn training_rejects_overlong_chunks_instead_of_truncating() {
+    let mut m = model(5);
+    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        m.forward_train_chunk(&[1, 2, 3, 4], &[2, 3, 4, 5]);
+    }));
+    assert!(rejected.is_err());
 }
 
 #[test]

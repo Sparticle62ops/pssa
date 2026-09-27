@@ -103,10 +103,18 @@ impl<'a> PSSAInferenceEngine<'a> {
                 .max_by(|&a, &b| logits[a].total_cmp(&logits[b]).then_with(|| b.cmp(&a)))
                 .ok_or_else(|| "no valid generation candidates".into());
         }
-        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        // ID 0 is <unk> and is deliberately excluded from candidates.  Do
+        // not let its (irrelevant) logit become the numerical reference for
+        // the softmax: a very large <unk> logit would otherwise underflow all
+        // valid candidates to zero and report a spurious sampling failure.
+        let max = logits[1..].iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0;
-        for i in 0..d_v {
-            probs[i] = ((logits[i] / cfg.temperature) - max / cfg.temperature).exp();
+        probs[0] = 0.0;
+        for i in 1..d_v {
+            // Subtract before dividing.  With a tiny positive temperature,
+            // dividing each finite logit first can produce `inf - inf` and
+            // turn an otherwise valid distribution into NaNs.
+            probs[i] = ((logits[i] - max) / cfg.temperature).exp();
             sum += probs[i];
         }
         if !sum.is_finite() || sum <= 0.0 {
@@ -282,6 +290,14 @@ impl<'a> PSSAInferenceEngine<'a> {
                     if out.len() > begin {
                         callback(&out[begin..]);
                     }
+                }
+                // A byte-level token stream may end in the middle of a UTF-8
+                // sequence.  Preserve that output as the standard replacement
+                // character instead of silently dropping the final bytes.
+                if emitted < raw.len() {
+                    let tail = String::from_utf8_lossy(&raw[emitted..]);
+                    out.push_str(&tail);
+                    callback(&tail);
                 }
                 Ok(out)
             }
