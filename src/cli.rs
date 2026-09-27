@@ -23,6 +23,9 @@ pub struct TrainingOptions {
     pub lr: f32,
     pub accumulate: usize,
     pub warmup_steps: usize,
+    /// Fixed total optimizer-update horizon shared by all resumed links.
+    /// `None` preserves the legacy per-link schedule behavior.
+    pub schedule_total_updates: Option<usize>,
     pub seed: u64,
     /// A global cap across documents; documents are never individually reset to this cap.
     pub max_tokens: Option<usize>,
@@ -45,6 +48,7 @@ impl Default for TrainingOptions {
             lr: 1e-3,
             accumulate: 8,
             warmup_steps: 0,
+            schedule_total_updates: None,
             seed: 42,
             max_tokens: None,
             skip_tokens: 0,
@@ -195,6 +199,13 @@ impl CLIHandler {
             lr: parsed.f32("--lr", "", 1e-3)?,
             accumulate: parsed.usize_nonzero("--accumulate", "", 8)?,
             warmup_steps: parsed.required_usize("--warmup-steps", "", 0)?,
+            schedule_total_updates: parsed
+                .string("--total-updates", "")
+                .map(|x| {
+                    x.parse::<usize>()
+                        .map_err(|_| "--total-updates must be a positive integer".to_string())
+                })
+                .transpose()?,
             seed: parsed.string("--seed", "").map_or(Ok(42), |x| {
                 x.parse()
                     .map_err(|_| "--seed must be an unsigned integer".to_string())
@@ -216,6 +227,9 @@ impl CLIHandler {
         }
         if x.max_tokens == Some(0) {
             return Err("--max-tokens must be positive".into());
+        }
+        if x.schedule_total_updates == Some(0) {
+            return Err("--total-updates must be positive".into());
         }
         if x.tokenizer == TokenizerKind::Bpe && x.vocab_size < 257 {
             return Err("--vocab-size must be at least 257 for byte-level BPE".into());
@@ -255,6 +269,15 @@ impl CLIHandler {
             // parser's 1e-3 default silently replaced a custom checkpoint LR.
             if !parsed.flags.contains_key("--lr") {
                 x.lr = loaded.model.cfg.lr;
+            }
+            if let (Some(requested), Some(stored)) = (
+                x.schedule_total_updates,
+                loaded.model.lr_schedule_total_updates,
+            ) && requested != stored
+            {
+                return Err(format!(
+                    "--total-updates={requested} does not match resume checkpoint horizon {stored}"
+                ));
             }
         }
         Ok(x)
@@ -480,33 +503,57 @@ impl CLIHandler {
         if total_updates == 0 {
             return Err("dataset has no training chunks".into());
         }
-        // Chained resumes must continue the ORIGINAL cosine/warmup schedule instead of
-        // restarting it per link: the lr step counts from the resumed model's prior
-        // optimizer steps, so the next link picks up the decay curve where the last
-        // one left off rather than jumping back to full learning rate.
-        let prior_steps = options
-            .resume
-            .as_deref()
-            .map(|_| model.step_counter)
-            .unwrap_or(0);
-        if prior_steps == 0
-            && options.warmup_steps >= total_updates
-            && options.warmup_steps != 0
-        {
-            return Err(format!(
-                "--warmup-steps ({}) must be less than total optimizer updates ({total_updates})",
-                options.warmup_steps
-            ));
-        }
-        let schedule_total = prior_steps
+        // A configured horizon belongs to the whole chain, not to this link.  It
+        // is restored from the checkpoint before falling back to the explicit
+        // fresh-run flag.  Checkpoints without that metadata retain the old
+        // per-link behavior for compatibility.
+        let prior_steps = model.step_counter;
+        let link_end = prior_steps
             .checked_add(total_updates)
             .ok_or("training update count overflow")?;
+        let fixed_horizon = model
+            .lr_schedule_total_updates
+            .or(options.schedule_total_updates);
+        let schedule_total = fixed_horizon.unwrap_or(link_end);
+        if schedule_total < link_end {
+            return Err(format!(
+                "learning-rate schedule horizon ({schedule_total}) must reach link end ({link_end}); set --total-updates on the fresh run to the whole-chain update count"
+            ));
+        }
         let schedule_warmup = if prior_steps > 0 { 0 } else { options.warmup_steps };
-        if prior_steps > 0 {
+        if schedule_warmup >= schedule_total && schedule_warmup != 0 {
+            return Err(format!(
+                "--warmup-steps ({}) must be less than total optimizer updates ({schedule_total})",
+                schedule_warmup
+            ));
+        }
+        if let Some(horizon) = fixed_horizon {
+            model.lr_schedule_total_updates = Some(horizon);
             println!(
-                "lr_schedule=continued from_step={prior_steps} to_step={schedule_total} (no restart, no re-warmup)"
+                "lr_schedule=fixed horizon={horizon} from_step={prior_steps} to_step={link_end}{}",
+                if prior_steps > 0 {
+                    " (restored, no re-warmup)"
+                } else {
+                    ""
+                }
+            );
+        } else if prior_steps > 0 {
+            println!(
+                "lr_schedule=continued from_step={prior_steps} to_step={schedule_total} (legacy per-link horizon, no restart, no re-warmup)"
             );
         }
+        let first_lr = learning_rate_for_update(
+            options.lr,
+            prior_steps.checked_add(1).ok_or("optimizer step overflow")?,
+            schedule_total,
+            schedule_warmup,
+        )?;
+        let last_lr = learning_rate_for_update(
+            options.lr,
+            link_end,
+            schedule_total,
+            schedule_warmup,
+        )?;
         ui::banner("train", "plastic state-space architecture");
         ui::field(
             "corpus",
@@ -530,10 +577,13 @@ impl CLIHandler {
         ui::field(
             "schedule",
             &format!(
-                "{} epoch(s), {} updates, lr {}",
+                "{} epoch(s), {} updates, lr first={:.8} last={:.8} (base {:.8}, horizon {})",
                 options.epochs,
                 ui::thousands(total_updates),
-                options.lr
+                first_lr,
+                last_lr,
+                options.lr,
+                ui::thousands(schedule_total)
             ),
         );
         println!();
@@ -579,7 +629,7 @@ impl CLIHandler {
                 update += 1;
                 model.apply_adamw(learning_rate_for_update(
                     options.lr,
-                    prior_steps + update,
+                    prior_steps.checked_add(update).ok_or("optimizer step overflow")?,
                     schedule_total,
                     schedule_warmup,
                 )?);
@@ -846,6 +896,7 @@ impl CLIHandler {
             lr: 0.02,
             accumulate: 1,
             warmup_steps: 4,
+            schedule_total_updates: None,
             seed: 7,
             max_tokens: None,
             skip_tokens: 0,
@@ -1111,8 +1162,8 @@ impl CLIHandler {
         );
         println!(
             "    {:<30}{}",
-            "  --lr f --warmup-steps n",
-            ui::dim("optimizer schedule")
+            "  --lr f --warmup-steps n --total-updates n",
+            ui::dim("optimizer schedule; fixed whole-run horizon for fresh chains")
         );
         println!(
             "    {:<30}{}",
@@ -1198,6 +1249,7 @@ impl CLIHandler {
                 println!("      --accumulate <N>          chunks per optimizer update (default: 8)");
                 println!("      --lr <F>                  base learning rate (default: 0.001)");
                 println!("      --warmup-steps <N>        linear warm-up updates (default: 0)");
+                println!("      --total-updates <N>       fixed whole-run schedule horizon (fresh run)");
                 println!("      --seed <N>                initialization seed (default: 42)");
                 println!("      --max-tokens <N>          global token cap");
                 println!("      --skip-tokens <N>         offset into the corpus; wraps at EOF");
@@ -1304,6 +1356,7 @@ impl CLIHandler {
                         "--lr",
                         "--accumulate",
                         "--warmup-steps",
+                        "--total-updates",
                         "--seed",
                         "--max-tokens",
                         "--tokenizer",

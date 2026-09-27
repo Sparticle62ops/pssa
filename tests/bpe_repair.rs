@@ -158,6 +158,7 @@ fn fresh_bpe_cli_checkpoint_generates_without_corpus() {
         lr: 0.01,
         accumulate: 1,
         warmup_steps: 0,
+        schedule_total_updates: None,
         seed: 3,
         max_tokens: None,
         tokenizer: TokenizerKind::Bpe,

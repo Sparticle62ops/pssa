@@ -368,6 +368,9 @@ pub struct PSSALayerV2 {
     /// Exact serialized standard tokenizer metadata for V7 byte-level BPE.
     /// `None` denotes the legacy word tokenizer policy.
     pub tokenizer_json: Option<String>,
+    /// Fixed whole-run cosine-schedule horizon, when explicitly configured.
+    /// `None` preserves the legacy per-link schedule behavior.
+    pub lr_schedule_total_updates: Option<usize>,
 
     // 1. Learned Affine RMSNorm & Embeddings
     pub embed_w: ParamMatrix,
@@ -521,6 +524,7 @@ impl PSSALayerV2 {
             rng,
             vocabulary: Vec::new(),
             tokenizer_json: None,
+            lr_schedule_total_updates: None,
             embed_w,
             norm_gamma,
             norm_beta,

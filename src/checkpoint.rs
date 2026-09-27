@@ -3,10 +3,13 @@
 //! **V7 wire format (all integer and float words little-endian):**
 //! `b"PSSA" | version:u16(7) | payload_len:u64 | fnv1a64(payload):u64 |
 //! payload`. V7 writes the exact complete V6 payload, followed by
-//! `tokenizer_json_len:u64 | tokenizer_json:utf8[byte_len]`. The optional JSON is
-//! zero-length only for the legacy word tokenizer. Shapes are derived from the
-//! preceding configuration and every declared length is checked. The checksum is
-//! accidental-corruption detection only, not authentication.
+//! `tokenizer_json_len:u64 | tokenizer_json:utf8[byte_len]`, and optionally a
+//! `lr_schedule_total_updates:u64` tail when a fixed schedule horizon is set.
+//! The optional JSON is zero-length only for the legacy word tokenizer. Shapes
+//! are derived from the preceding configuration and every declared length is
+//! checked. The checksum is accidental-corruption detection only, not
+//! authentication. V7 checkpoints without the optional schedule tail remain
+//! readable and use the legacy schedule behavior.
 //!
 //! Scratch and activation tape buffers are intentionally not serialized. V7 and
 //! V6 checkpoints are supported between chunks (after backward or an optimizer
@@ -422,6 +425,9 @@ impl<'a> Reader<'a> {
         }
         Ok(o)
     }
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.off)
+    }
     fn done(&self) -> Result<()> {
         if self.off == self.bytes.len() {
             Ok(())
@@ -704,6 +710,16 @@ pub fn save_model(model: &PSSALayerV2, path: impl AsRef<Path>) -> Result<()> {
     } else {
         payload.extend_from_slice(&0u64.to_le_bytes());
     }
+    if let Some(total_updates) = model.lr_schedule_total_updates {
+        if total_updates == 0 {
+            return Err(invalid("learning-rate schedule horizon must be positive"));
+        }
+        payload.extend_from_slice(
+            &u64::try_from(total_updates)
+                .map_err(|_| invalid("learning-rate schedule horizon too large"))?
+                .to_le_bytes(),
+        );
+    }
     atomic_write(path.as_ref(), &container_bytes(FORMAT_VERSION, payload)?)
 }
 
@@ -859,6 +875,13 @@ fn load_payload(payload: &[u8], is_v7: bool) -> Result<LoadedCheckpoint> {
         };
         model.tokenizer_json = json;
         validate_tokenizer_metadata(&model)?;
+        if r.remaining() != 0 && r.remaining() != 8 {
+            return Err(invalid("invalid V7 metadata tail"));
+        }
+        if r.remaining() == 8 {
+            let total_updates = r.usize("learning-rate schedule horizon")?;
+            model.lr_schedule_total_updates = (total_updates != 0).then_some(total_updates);
+        }
     }
     r.done()?;
     validate_memory(&model)?;
