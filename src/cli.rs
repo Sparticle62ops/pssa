@@ -37,6 +37,11 @@ pub struct TrainingOptions {
     pub resume: Option<String>,
     /// Skip this many encoded tokens from the front of the corpus before training.
     pub skip_tokens: usize,
+    /// Optional append-only, target-token-weighted training curve.
+    pub loss_csv: Option<String>,
+    pub loss_every: usize,
+    /// Explicit target-token offset when starting a new CSV from a checkpoint.
+    pub tokens_seen: Option<usize>,
 }
 impl Default for TrainingOptions {
     fn default() -> Self {
@@ -58,6 +63,9 @@ impl Default for TrainingOptions {
             tokenizer: TokenizerKind::Bpe,
             vocab_size: 2048,
             resume: None,
+            loss_csv: None,
+            loss_every: 10_000,
+            tokens_seen: None,
         }
     }
 }
@@ -254,7 +262,17 @@ impl CLIHandler {
             vocab_size: parsed.usize_nonzero("--vocab-size", "", 2048)?,
             resume: parsed.string("--resume", "").map(str::to_string),
             skip_tokens: parsed.required_usize("--skip-tokens", "", 0)?,
+            loss_csv: parsed.string("--loss-csv", "").map(str::to_string),
+            loss_every: parsed.usize_nonzero("--loss-every", "", 10_000)?,
+            tokens_seen: parsed.string("--tokens-seen", "").map(|s| {
+                s.parse().map_err(|_| "--tokens-seen must be an unsigned integer".to_string())
+            }).transpose()?,
         };
+        if x.loss_csv.is_none()
+            && (parsed.flags.contains_key("--loss-every") || x.tokens_seen.is_some())
+        {
+            return Err("--loss-every and --tokens-seen require --loss-csv PATH".into());
+        }
         if !(x.lr > 0.0) {
             return Err("--lr must be positive".into());
         }
@@ -594,6 +612,9 @@ impl CLIHandler {
         );
         println!();
 
+        let mut curve = options.loss_csv.as_deref().map(|path| {
+            crate::loss_csv::LossCsv::open(path, options.loss_every, model.step_counter, options.tokens_seen)
+        }).transpose()?;
         let started = Instant::now();
         let mut update = 0;
         let mut tokens_seen = 0usize;
@@ -606,6 +627,7 @@ impl CLIHandler {
             let mut loss_sum = 0.0f64;
             let mut token_sum = 0usize;
             for group in plan.chunks(options.accumulate) {
+                let prior_loss = loss_sum;
                 let total_tokens: usize = group.iter().flatten().map(|x| x.len).sum();
                 if total_tokens == 0 {
                     continue;
@@ -687,6 +709,9 @@ impl CLIHandler {
                     return Err("non-finite parameters; training aborted without checkpoint".into());
                 }
                 tokens_seen += total_tokens;
+                if let Some(curve) = &mut curve {
+                    curve.record(total_tokens, model.step_counter, loss_sum - prior_loss)?;
+                }
                 progress.update(update, total_tokens, loss_sum / token_sum.max(1) as f64);
             }
             progress.finish();
@@ -701,6 +726,9 @@ impl CLIHandler {
             );
         }
         progress.finish();
+        if let Some(curve) = &mut curve {
+            curve.finish()?;
+        }
         let wall = started.elapsed().as_secs_f64();
         println!(
             "training_seconds={:.3} optimizer_updates={update}",
@@ -756,7 +784,7 @@ impl CLIHandler {
         }
         Ok(tokenizer)
     }
-    fn load_for_inference(
+    pub(crate) fn load_for_inference(
         model_path: &str,
         data: Option<&str>,
     ) -> Result<(PSSALayerV2, Tokenizer), String> {
@@ -836,43 +864,14 @@ impl CLIHandler {
         tokenizer: &Tokenizer,
         raw: &str,
     ) -> Result<(f64, usize, usize, usize), String> {
-        let docs = Self::documents(raw, tokenizer, None, 0)?;
-        let mut loss = 0.0f64;
-        let mut tokens = 0usize;
-        let mut correct = 0usize;
-        let mut oov = 0usize;
-        for doc in &docs {
-            oov += doc.iter().filter(|&&x| x == 0).count();
-            model.reset_recurrent_state();
-            let mut start = 0;
-            while start + 1 < doc.len() {
-                let len = model.cfg.chunk_len.min(doc.len() - 1 - start);
-                let l = model.forward_train_chunk(
-                    &doc[start..start + len],
-                    &doc[start + 1..start + 1 + len],
-                );
-                if !l.is_finite() {
-                    return Err("non-finite evaluation loss".into());
-                }
-                loss += l as f64 * len as f64;
-                for t in 0..len {
-                    let logits =
-                        &model.tape.logits[t * model.cfg.d_vocab..(t + 1) * model.cfg.d_vocab];
-                    let guess = logits
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
-                        .map(|x| x.0)
-                        .unwrap_or(0);
-                    correct += usize::from(guess == doc[start + 1 + t]);
-                }
-                tokens += len;
-                start += len;
-            }
-        }
-        Ok((loss / tokens.max(1) as f64, tokens, correct, oov))
+        let metrics = crate::evaluation::evaluate_pssa(
+            model, tokenizer, raw, crate::evaluation::EvaluationSlice::default(),
+        )?;
+        Ok((metrics.loss, metrics.tokens, metrics.correct, metrics.oov))
     }
-    fn run_evaluate(model_path: &str, data: &str) -> Result<(), String> {
+    fn run_evaluate(
+        model_path: &str, data: &str, slice: crate::evaluation::EvaluationSlice,
+    ) -> Result<(), String> {
         // V5 checkpoints contain no tokenizer provenance, so the evaluation
         // corpus also has to seed their legacy word tokenizer.  Newer formats
         // restore their tokenizer independently of the held-out corpus.
@@ -882,20 +881,8 @@ impl CLIHandler {
         let provenance = (format == CheckpointFormat::LegacyV5InferenceOnly).then_some(data);
         let (mut model, tokenizer) = Self::load_for_inference(model_path, provenance)?;
         let raw = DatasetManager::try_load_dataset(Some(data))?;
-        let (ce, tokens, correct, oov) = Self::evaluate_corpus(&mut model, &tokenizer, &raw)?;
-        let encoded = docs_token_count(&raw, &tokenizer)?;
-        let ppl = ce.exp();
-        let (ppl_json, overflow) = if ppl.is_finite() {
-            (format!("{ppl:.8}"), false)
-        } else {
-            ("null".into(), true)
-        };
-        println!(
-            "{{\"cross_entropy\":{ce:.8},\"perplexity\":{ppl_json},\"perplexity_overflow\":{overflow},\"oov_rate\":{:.8},\"token_count\":{},\"next_token_accuracy\":{:.8}}}",
-            oov as f64 / encoded.max(1) as f64,
-            tokens,
-            correct as f64 / tokens.max(1) as f64
-        );
+        let metrics = crate::evaluation::evaluate_pssa(&mut model, &tokenizer, &raw, slice)?;
+        println!("{}", metrics.json());
         Ok(())
     }
     fn run_chat(model_path: &str, data: Option<&str>, temp: f32) -> Result<(), String> {
@@ -954,6 +941,7 @@ impl CLIHandler {
             tokenizer: TokenizerKind::Word,
             vocab_size: 2048,
             resume: None,
+            ..TrainingOptions::default()
         };
         let (mut m, tok) = Self::train_corpus(raw, &opts)?;
         let (ce, _, _, _) = Self::evaluate_corpus(&mut m, &tok, raw)?;
@@ -1247,6 +1235,9 @@ impl CLIHandler {
             ui::dim("continue from an existing checkpoint")
         );
         println!();
+        println!("    --loss-csv PATH --loss-every N  append training curves every N target tokens");
+        println!("    --tokens-seen N  offset for a new CSV on resume (existing CSV restores it)");
+        println!();
         println!("  {}", ui::bold("GENERATE"));
         println!(
             "    {bin} generate <prompt> [-m|--model path] [-t|--temp|--temperature f] [--max-new-tokens n]"
@@ -1302,6 +1293,8 @@ impl CLIHandler {
                 println!("  --max-tokens N  --skip-tokens N (wraps at EOF)");
                 println!("  --lr F (0.001)  --warmup-steps N (0)  --total-updates N  --seed N (42)");
                 println!("  --resume PATH  restore transformer weights, moments, tokenizer and horizon");
+                println!("  --loss-csv PATH --loss-every N (10000)  append target-token loss curve");
+                println!("  --tokens-seen N  required when starting a new curve on resume");
                 println!("Omit --tokenizer-from on resume; identical chunk/accumulation flags give identical updates.");
             }
             "train" => {
@@ -1329,6 +1322,9 @@ impl CLIHandler {
                 println!("      --max-tokens <N>          global token cap");
                 println!("      --skip-tokens <N>         offset into the corpus; wraps at EOF");
                 println!("      --resume <PATH>            continue optimizer/model state from a checkpoint");
+                println!("      --loss-csv <PATH>          append target-token training loss curve");
+                println!("      --loss-every <N>           token cadence (default: 10000), at update boundaries");
+                println!("      --tokens-seen <N>          offset for a new CSV on resume; otherwise restored");
                 println!();
                 println!("Examples:");
                 println!("  {bin} train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1");
@@ -1363,6 +1359,8 @@ impl CLIHandler {
                 println!("Usage: {bin} {command} [DATA] [-m|--model PATH] [-d|--data SOURCE]");
                 println!();
                 println!("Evaluate a checkpoint and print one JSON metrics object.");
+                println!("  --skip-tokens N --max-tokens N  strict held-out slice, never wraps at EOF");
+                println!("Use the embedded tokenizer; no training or checkpoint writes.");
                 let model = if command == "evaluate" { "data/model.pssa" } else { "data/model.trfm" };
                 println!("Example: {bin} {command} data/heldout.txt --model {model}");
             }
@@ -1432,6 +1430,7 @@ impl CLIHandler {
                     "--latent", "--state", "--key", "--memory", "--chunk", "--lr",
                     "--accumulate", "--warmup-steps", "--total-updates", "--seed",
                     "--max-tokens", "--tokenizer", "--vocab-size", "--resume", "--skip-tokens",
+                    "--loss-csv", "--loss-every", "--tokens-seen",
                 ];
                 if baseline {
                     allowed.retain(|x| !["--latent", "--state", "--key", "--memory"].contains(x));
@@ -1559,7 +1558,7 @@ impl CLIHandler {
                 Ok(())
             }
             "evaluate" | "evaluate-transformer" => {
-                let p = Parsed::parse(&args[2..], &["--model", "-m", "--data", "-d"])?;
+                let p = Parsed::parse(&args[2..], &["--model", "-m", "--data", "-d", "--skip-tokens", "--max-tokens"])?;
                 p.reject_duplicate_aliases(&["--model", "-m"], "--model")?;
                 p.reject_duplicate_aliases(&["--data", "-d"], "--data")?;
                 if p.positional.len() > 1 {
@@ -1572,13 +1571,18 @@ impl CLIHandler {
                     .string("--data", "-d")
                     .or_else(|| p.positional.first().map(String::as_str))
                     .ok_or("evaluate requires a data source (use DATA or --data DATA)")?;
+                let slice = crate::evaluation::EvaluationSlice {
+                    skip_tokens: p.required_usize("--skip-tokens", "", 0)?,
+                    max_tokens: p.string("--max-tokens", "")
+                        .map(|_| p.usize_nonzero("--max-tokens", "", 1)).transpose()?,
+                };
                 if command == "evaluate-transformer" {
-                    crate::transformer_inference::evaluate(
-                        p.string("--model", "-m").unwrap_or("data/model.trfm"), data,
+                    crate::transformer_inference::evaluate_slice(
+                        p.string("--model", "-m").unwrap_or("data/model.trfm"), data, slice,
                     )
                 } else {
                     Self::run_evaluate(
-                        p.string("--model", "-m").unwrap_or("data/model.pssa"), data,
+                        p.string("--model", "-m").unwrap_or("data/model.pssa"), data, slice,
                     )
                 }
             }
@@ -1656,14 +1660,6 @@ impl CLIHandler {
         }
     }
 }
-fn docs_token_count(raw: &str, tokenizer: &Tokenizer) -> Result<usize, String> {
-    raw.lines().try_fold(0usize, |n, line| {
-        let ids = tokenizer.try_encode(line, true)?;
-        n.checked_add(ids.len())
-            .ok_or_else(|| "dataset token count overflow".to_string())
-    })
-}
-
 fn probe_max_abs_diff(actual: &[f32], expected: &[f32]) -> Result<f32, String> {
     if actual.len() != expected.len() {
         return Err(format!("GPU probe output length {}, expected {}", actual.len(), expected.len()));

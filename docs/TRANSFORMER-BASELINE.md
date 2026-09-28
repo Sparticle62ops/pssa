@@ -145,6 +145,65 @@ weights, gradients, Adam moments, step counter, RNG state, full tokenizer
 identity, and optional horizon. They can resume between chunks, not midway
 through backward. PSSA V5/V6/V7 remain unchanged and readable.
 
+## Training curves and held-out corpus slices
+
+Both trainers accept `--loss-csv PATH --loss-every N` (default cadence 10,000
+**scored next-token targets**, not encoded input tokens). They append the same
+header and schema:
+
+```csv
+tokens_seen,updates,loss,tokens_per_second
+```
+
+- `tokens_seen`: cumulative supervised next-token targets processed, including
+  repeated epochs/windows. Line endings and one-token fragments have no target;
+  this is normally less than the `--max-tokens` input budget.
+- `updates`: global completed optimizer updates, including resumed links.
+- `loss`: target-weighted mean pre-update cross entropy, in nats, since the
+  previous row in this invocation (not an unweighted mean of chunk losses).
+- `tokens_per_second`: targets in that interval divided by elapsed training
+  seconds. Excludes loading/tokenizing, checkpoint saving and evaluation; includes
+  training-loop reporting overhead. Label hardware/backend when comparing speed.
+
+Rows are flushed at the first optimizer boundary crossing each global multiple
+of N, plus a final partial interval. An update is never split and skipped
+thresholds do not produce invented observations. Link ends may add extra rows.
+On resume, reuse the CSV: its final update must match the checkpoint, and its
+final token count is restored. A **new** CSV on resume requires `--tokens-seen N`
+with the actual number of previously scored targets; do not substitute the raw
+window budget. Malformed/stale CSVs fail rather than silently splice different
+runs. A crashed link may leave CSV rows ahead of its saved checkpoint: archive
+that tail and restore the CSV through the checkpoint's final row before retrying.
+Old checkpoints need no new metadata and remain readable. Historical curves
+cannot be recovered from checkpoints that were trained without logging.
+
+```sh
+oxide_ai_pssa train CORPUS -o ck01.pssa -e 1 --max-tokens 200000 \
+  --loss-csv pssa.csv --loss-every 10000
+oxide_ai_pssa train-transformer CORPUS -o ck01.trfm -e 1 --max-tokens 200000 \
+  --tokenizer-from ck01.pssa --loss-csv transformer.csv --loss-every 10000
+```
+
+Both evaluation commands accept `--skip-tokens N --max-tokens N` to score a
+slice using the checkpoint's embedded tokenizer. Unlike training windows,
+evaluation slices **never wrap**: out-of-range slices, zero limits and slices
+without transitions are errors. They preserve line boundaries, never score a
+target outside the slice, and never update/save weights, optimizer state or the
+memory bank. PSSA starts each document with zero recurrent carry but retains its
+trained episodic bank; the transformer resets attention per chunk. Outputs retain
+the existing JSON schema (`cross_entropy` is mean loss, `perplexity = exp(loss)`).
+
+```sh
+oxide_ai_pssa evaluate CORPUS -m chain/ck64.pssa \
+  --skip-tokens 12800000 --max-tokens 200000
+oxide_ai_pssa evaluate-transformer CORPUS -m comparison/ck64.trfm \
+  --skip-tokens 12800000 --max-tokens 200000
+```
+
+A slice is only held out if the chain never trained on it. Verify corpus length
+and training offsets: training wraps at EOF, so a wrapped chain may have no
+unseen slice. Do not clean/change the corpus midway through a comparison.
+
 ## Evaluation, generation, and limitations
 
 ```sh
