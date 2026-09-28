@@ -116,6 +116,9 @@ pub fn train_corpus(
         ),
     );
     println!();
+    let mut curve = opts.loss_csv.as_deref().map(|path| {
+        crate::loss_csv::LossCsv::open(path, opts.loss_every, model.step_counter, opts.tokens_seen)
+    }).transpose()?;
     let started = Instant::now();
     let mut update = 0;
     let mut tokens_seen = 0;
@@ -124,6 +127,7 @@ pub fn train_corpus(
         let mut loss_sum = 0.0f64;
         let mut token_sum = 0usize;
         for group in plan.chunks(opts.accumulate) {
+            let prior_loss = loss_sum;
             let total_tokens: usize = group.iter().map(|x| x.2).sum();
             model.zero_gradients();
             for &(doc, start, len) in group {
@@ -144,6 +148,9 @@ pub fn train_corpus(
                 return Err("non-finite parameters; training aborted without checkpoint".into());
             }
             tokens_seen += total_tokens;
+            if let Some(curve) = &mut curve {
+                curve.record(total_tokens, model.step_counter, loss_sum - prior_loss)?;
+            }
             progress.update(update, total_tokens, loss_sum / token_sum.max(1) as f64);
         }
         progress.finish();
@@ -157,6 +164,9 @@ pub fn train_corpus(
         );
     }
     progress.finish();
+    if let Some(curve) = &mut curve {
+        curve.finish()?;
+    }
     let wall = started.elapsed().as_secs_f64();
     println!(
         "training_seconds={:.3} optimizer_updates={update}",

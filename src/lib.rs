@@ -7,6 +7,8 @@ pub mod cuda;
 pub mod dataset;
 pub mod defense;
 pub mod diagnostics;
+pub mod evaluation;
+pub mod loss_csv;
 pub mod inference;
 pub mod linalg;
 pub mod gpu_batch;

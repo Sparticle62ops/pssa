@@ -166,6 +166,7 @@ fn fresh_bpe_cli_checkpoint_generates_without_corpus() {
         vocab_size: 300,
         resume: None,
         skip_tokens: 0,
+        ..Default::default()
     };
     let (model, _) = CLIHandler::train_corpus(raw, &opts).unwrap();
     let p = temp("fresh.pssa");

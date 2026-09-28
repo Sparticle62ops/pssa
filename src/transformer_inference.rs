@@ -1,9 +1,8 @@
 //! Baseline generation uses the same seeded sampler and decoding policy as PSSA.
-use crate::cli::CLIHandler;
 use crate::dataset::{DatasetManager, TokenizerKind};
+use crate::evaluation::{self, EvaluationSlice};
 use crate::inference::{InferenceConfig, PSSAInferenceEngine};
 use crate::linalg::SimpleRng;
-use crate::training::chunk_plan;
 use crate::transformer_checkpoint;
 
 pub fn generate(path: &str, prompt: &str, cfg: &InferenceConfig) -> Result<String, String> {
@@ -58,47 +57,16 @@ pub fn generate(path: &str, prompt: &str, cfg: &InferenceConfig) -> Result<Strin
 }
 
 pub fn evaluate(path: &str, data: &str) -> Result<(), String> {
+    evaluate_slice(path, data, EvaluationSlice::default())
+}
+
+pub fn evaluate_slice(path: &str, data: &str, slice: EvaluationSlice) -> Result<(), String> {
     let mut model = transformer_checkpoint::load_checkpoint(path).map_err(|e| e.to_string())?;
     let tok = model.tokenizer()?;
     let raw = DatasetManager::try_load_dataset(Some(data))?;
-    let docs = CLIHandler::documents(&raw, &tok, None, 0)?;
-    let mut loss = 0.0f64;
-    let mut tokens = 0;
-    let mut correct = 0;
-    let oov = docs.iter().flatten().filter(|&&id| id == 0).count();
-    let encoded = raw.lines().try_fold(0usize, |n, line| {
-        tok.try_encode(line, true).map(|ids| n + ids.len())
-    })?;
-    for (doc, start, len) in chunk_plan(&docs, model.cfg.chunk_len) {
-        let targets = &docs[doc][start + 1..start + 1 + len];
-        let ce = model.forward_train_chunk(&docs[doc][start..start + len], targets);
-        if !ce.is_finite() {
-            return Err("non-finite evaluation loss".into());
-        }
-        loss += ce as f64 * len as f64;
-        tokens += len;
-        for (logits, target) in model.training_logits().chunks(tok.vocab_size).zip(targets) {
-            let guess = logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
-                .map(|x| x.0)
-                .unwrap_or(0);
-            correct += usize::from(guess == *target);
-        }
-    }
-    let ce = loss / tokens.max(1) as f64;
-    let ppl = ce.exp();
-    let (ppl_json, overflow) = if ppl.is_finite() {
-        (format!("{ppl:.8}"), false)
-    } else {
-        ("null".into(), true)
-    };
     println!(
-        "{{\"cross_entropy\":{ce:.8},\"perplexity\":{ppl_json},\"perplexity_overflow\":{overflow},\"oov_rate\":{:.8},\"token_count\":{},\"next_token_accuracy\":{:.8}}}",
-        oov as f64 / encoded.max(1) as f64,
-        tokens,
-        correct as f64 / tokens.max(1) as f64
+        "{}",
+        evaluation::evaluate_transformer(&mut model, &tok, &raw, slice)?.json()
     );
     Ok(())
 }

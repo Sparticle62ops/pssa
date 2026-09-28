@@ -27,6 +27,7 @@ SIMD + rayon by default, optional WebGPU and native CUDA/cuBLAS backends.
 | `transformer_checkpoint.rs` | separate `TRFM` v1 checkpoints, complete Adam/tokenizer resume |
 | `transformer_training.rs`, `transformer_inference.rs` | baseline train/generate/evaluate runtime |
 | `training.rs` | shared chunk plans, LR schedule horizons, token-stream audit fingerprints |
+| `loss_csv.rs`, `evaluation.rs` | shared target-token training curves and strict nonwrapping held-out evaluation |
 | `cuda.rs` (249) | cuBLAS SGEMM, device-resident weight cache |
 | `memory.rs` (182), `adapter.rs` (93), `defense.rs` (68) | supporting pieces |
 
@@ -75,6 +76,10 @@ chunk plan, schedule, AdamW, and progress/loss format. Use `--tokenizer-from
 <pssa-checkpoint>` on a fresh baseline run to import the exact tokenizer, then
 resume each model's own checkpoint with the same window/accumulation options.
 Baseline generation/evaluation use `generate-transformer` / `evaluate-transformer`.
+Both trainers accept `--loss-csv PATH --loss-every N`; append resumes validate the
+CSV's last update against the checkpoint. New CSVs on resume require an explicit
+`--tokens-seen` target-token offset. Both evaluation commands accept
+`--skip-tokens` / `--max-tokens` for strict nonwrapping held-out slices.
 The baseline is CPU-only and chunk-local; PSSA retains recurrent carry and memory.
 See `docs/TRANSFORMER-BASELINE.md` for reproducible commands, counting conventions,
 and comparison caveats. Tests live in `tests/transformer.rs`.
