@@ -21,6 +21,12 @@ CORPUS_MB="${CORPUS_MB:-64}"
 # ~458 updates at WINDOW=200000, so 64 links is ~29.3k. Only the FIRST link needs
 # the flag; after that the horizon is persisted in the checkpoint and restored.
 TOTAL_UPDATES="${TOTAL_UPDATES:-30000}"
+# Independent document lanes per microbatch. chunk * BATCH * ACC is tokens per
+# optimizer update, so BATCH=8 with ACC=1 keeps the historical 512 tokens/update
+# (and therefore the same update count and LR schedule) while running eight
+# sequences side by side instead of one after another.
+BATCH="${BATCH:-8}"
+ACC="${ACC:-1}"
 CORPUS_URL="${CORPUS_URL:-https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-103-raw-v1/train-00000-of-00002.parquet}"
 BIG="${BIG:-$WORK/corpus/big.txt}"
 
@@ -93,6 +99,25 @@ case "$HELP_TEXT" in
   *--resume*) echo "--resume present" ;;
   *) echo "ERROR: this checkout has no --resume, stopping"; exit 1 ;;
 esac
+
+echo
+echo "### 2b. Clean the corpus"
+# Raw wikitext carries @-@ / @.@ placeholders, "= = Heading = =" lines and <unk>
+# markers that burn vocabulary slots. Cleaned once per container, alongside the
+# raw file so it survives between runs.
+CLEAN="${CLEAN:-$WORK/corpus/big.clean.txt}"
+if [ "$DATA" = "$BIG" ]; then
+  if [ ! -s "$CLEAN" ]; then
+    rm -f "$CLEAN"
+    ./target/release/oxide_ai_pssa clean-wikitext "$BIG" -o "$CLEAN"
+  fi
+  if [ -s "$CLEAN" ]; then
+    DATA="$CLEAN"
+    echo "cleaned corpus=$DATA bytes=$(wc -c < "$DATA")"
+  else
+    echo "WARNING: cleaning produced nothing, staying on the raw corpus"
+  fi
+fi
 
 echo
 echo "### 3. Continue the chain"
@@ -170,9 +195,9 @@ for i in $(seq "$START" "$TOTAL"); do
   SKIP=$(( (i - 1) * WINDOW ))
   echo "--- ck$(printf '%02d' "$i") (corpus offset $SKIP) ---"
   if [ -z "$PREV" ]; then
-    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --total-updates "$TOTAL_UPDATES"
+    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --batch-size "$BATCH" --accumulate "$ACC" --total-updates "$TOTAL_UPDATES"
   else
-    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --resume "$PREV" --total-updates "$TOTAL_UPDATES"
+    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --batch-size "$BATCH" --accumulate "$ACC" --resume "$PREV" --total-updates "$TOTAL_UPDATES"
   fi
   PREV="$OUT"
 done
