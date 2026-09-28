@@ -32,7 +32,7 @@ fn parallel_backward(tokens: usize, rows: usize, cols: usize) -> bool {
 }
 
 /// G[L,R] * W[R,C], owning complete output rows with contiguous weight reads.
-fn dense_input_adjoint(g: &[f32], w: &[f32], l: usize, rows: usize, cols: usize, out: &mut [f32]) {
+pub(crate) fn dense_input_adjoint(g: &[f32], w: &[f32], l: usize, rows: usize, cols: usize, out: &mut [f32]) {
     // Reuse each contiguous weight row across four tokens before advancing.
     // Per-element summation order is unchanged; tasks own complete output tiles.
     let tile = |tile_idx: usize, dst: &mut [f32]| {
@@ -56,7 +56,7 @@ fn dense_input_adjoint(g: &[f32], w: &[f32], l: usize, rows: usize, cols: usize,
 
 /// dW[R,C] += G[L,R]^T * X[L,C]. Each task owns rows, accumulating tokens
 /// in reverse order just like the reference TBPTT path (including existing grads).
-fn dense_weight_adjoint(g: &[f32], x: &[f32], l: usize, rows: usize, cols: usize, grad: &mut [f32]) {
+pub(crate) fn dense_weight_adjoint(g: &[f32], x: &[f32], l: usize, rows: usize, cols: usize, grad: &mut [f32]) {
     let tile = |tile_idx: usize, dst: &mut [f32]| {
         let first_row = tile_idx * 8;
         for t in (0..l).rev() {
