@@ -1,11 +1,11 @@
 use crate::backend::{Device, gemm_cpu_reference};
 use crate::checkpoint::{self, CheckpointFormat};
-use crate::dataset::{DatasetManager, Tokenizer, TokenizerKind};
+use crate::dataset::{DatasetManager, Tokenizer, TokenizerKind, clean_wikitext};
 use crate::inference::{InferenceConfig, PSSAInferenceEngine};
 use crate::pssa::{PSSAConfigV2, PSSALayerV2};
 use crate::ui;
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::time::Instant;
 
 /// Keep command-line generation requests bounded before inference preallocates
@@ -176,6 +176,35 @@ impl CLIHandler {
             "science".into()
         }
     }
+    fn run_clean_wikitext(input_path: &str, output_path: &str) -> Result<(), String> {
+        let input = std::fs::File::open(input_path).map_err(|e| {
+            format!("cannot open input '{input_path}': {e}; provide a readable UTF-8 file")
+        })?;
+        // create_new also rejects symlinks and hard links to the input, without
+        // a check-then-truncate race. Cleaning is intentionally not in-place.
+        let output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output_path)
+            .map_err(|e| {
+                format!("cannot create output '{output_path}': {e}; use --out with a new file in an existing writable directory")
+            })?;
+        let mut writer = BufWriter::new(output);
+        let result = clean_wikitext(BufReader::new(input), &mut writer)
+            .and_then(|()| writer.flush());
+        drop(writer);
+        if let Err(e) = result {
+            let cleanup = match std::fs::remove_file(output_path) {
+                Ok(()) => String::new(),
+                Err(error) => format!("; cannot remove partial output: {error}; remove '{output_path}' before retrying"),
+            };
+            return Err(format!(
+                "cannot clean '{input_path}' into '{output_path}': {e}; check input UTF-8 and output disk space/permissions{cleanup}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Historical name retained for callers; current output is V7.
     pub fn save_model_v2(model: &PSSALayerV2, path: &str) -> io::Result<()> {
         checkpoint::save_model(model, path).map_err(|e| io::Error::other(e.to_string()))
@@ -970,6 +999,7 @@ impl CLIHandler {
             ("evaluate", "cross entropy, perplexity and accuracy as JSON"),
             ("status", "checkpoints and corpora in this directory"),
             ("download", "pull a Hugging Face dataset to a local file"),
+            ("clean-wikitext", "stream-clean raw WikiText into a new file"),
             ("benchmark", "end-to-end smoke test on the built-in corpus"),
             ("tui", "live dashboard for a piped training run (train ... | oxide tui)"),
             (
@@ -979,7 +1009,7 @@ impl CLIHandler {
         ] {
             ui::panel_row(&format!(
                 "{}{}",
-                ui::cyan(&format!("{name:<12}")),
+                ui::cyan(&format!("{name:<16}")),
                 ui::dim(blurb)
             ));
         }
@@ -1140,6 +1170,7 @@ impl CLIHandler {
             ("evaluate", "cross entropy, perplexity and accuracy as JSON"),
             ("chat", "interactive prompt loop against a checkpoint"),
             ("download", "pull a Hugging Face dataset to a local file"),
+            ("clean-wikitext", "stream-clean raw WikiText into a new file"),
             ("benchmark", "end-to-end smoke test on the built-in corpus"),
             ("tui", "live dashboard for a piped training run (train ... | oxide tui)"),
             (
@@ -1148,7 +1179,7 @@ impl CLIHandler {
             ),
             ("help", "show this message"),
         ] {
-            println!("    {:<12}{}", ui::cyan(name), ui::dim(blurb));
+            println!("    {:<16}{}", ui::cyan(name), ui::dim(blurb));
         }
         println!();
         println!("    train-transformer  same-size decoder-only baseline (help train-transformer)");
@@ -1334,6 +1365,16 @@ impl CLIHandler {
                 println!("Evaluate a checkpoint and print one JSON metrics object.");
                 let model = if command == "evaluate" { "data/model.pssa" } else { "data/model.trfm" };
                 println!("Example: {bin} {command} data/heldout.txt --model {model}");
+            }
+            "clean-wikitext" => {
+                println!("Usage: {bin} clean-wikitext INPUT -o OUTPUT");
+                println!();
+                println!("Stream-clean a local UTF-8 WikiText raw dump, one line at a time.");
+                println!("  -o, --out <PATH>  required new output file; existing files are never overwritten");
+                println!("Removes headings and <unk>, joins @-@ / @.@ / @,@, normalizes punctuation spacing,");
+                println!("and collapses blank lines. Output uses LF endings. Input is never modified.");
+                println!("Run once before a fresh training chain; do not switch corpora mid-resume.");
+                println!("Example: {bin} clean-wikitext wiki.train.raw --out data/wikitext-clean.txt");
             }
             "download" => {
                 println!("Usage: {bin} download REPOSITORY [-o|--out PATH]");
@@ -1568,6 +1609,16 @@ impl CLIHandler {
                         .or_else(|| p.positional.first().map(String::as_str)),
                     t,
                 )
+            }
+            "clean-wikitext" => {
+                let p = Parsed::parse(&args[2..], &["--out", "-o"])?;
+                p.reject_duplicate_aliases(&["--out", "-o"], "--out")?;
+                if p.positional.len() != 1 {
+                    return Err("clean-wikitext requires one input file; use clean-wikitext INPUT -o OUTPUT".into());
+                }
+                let output = p.string("--out", "-o")
+                    .ok_or("clean-wikitext requires --out OUTPUT (or -o OUTPUT); choose a new output file")?;
+                Self::run_clean_wikitext(&p.positional[0], output)
             }
             "download" => {
                 let p = Parsed::parse(&args[2..], &["--out", "-o"])?;

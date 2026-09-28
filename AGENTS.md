@@ -59,6 +59,13 @@ live in `tests/` (`core_repair`, `checkpoint_repair`, `bpe_repair`,
 `examples/`: `perf_probe.rs`, `twin_check.rs` (CPU-twin verification of the GPU
 path; run it after touching `gpu_batch.rs` or `cuda.rs`).
 
+`clean-wikitext INPUT -o OUTPUT` is an opt-in, line-streaming UTF-8 corpus
+preprocessor backed by `dataset::clean_wikitext(BufRead, Write)`. It requires a
+new output file, never overwrites the input, and does not change existing
+loaders or the Kaggle script. Clean before a fresh chain, not mid-resume
+(token counts/offsets change). Artifact unit tests live in `src/dataset.rs`;
+CLI/file-safety tests are in `tests/wikitext_cleaning.rs`.
+
 ## Transformer baseline
 
 `train-transformer` is a one-block width-256 / 4-head / FFN-448 decoder baseline.
