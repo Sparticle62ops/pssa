@@ -39,6 +39,8 @@ fn cuda_init_is_fallible_and_strict_shapes_are_checked_if_available() {
         let expected = oxide_ai_pssa::backend::gemm_cpu_reference(&x, &w, 5, 11, 7, 3);
         let actual = ctx.try_dispatch_gemm(&x, &w, 5, 11, 7, 3).unwrap();
         assert_close(&actual, &expected);
+        assert_close(&ctx.try_dispatch_gemm(&x, &w, 1, 11, 7, 15).unwrap(), &expected);
+        assert_close(&ctx.try_dispatch_gemm(&x, &w, 15, 11, 7, 1).unwrap(), &expected);
         let b: Vec<_> = (0..7 * 11).map(|i| (i % 23) as f32 * 0.0625).collect();
         assert_close(
             &ctx.try_gemm_nn(&x, &b, 15, 7, 11).unwrap(),

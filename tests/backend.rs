@@ -7,6 +7,18 @@ fn values(len: usize) -> Vec<f32> {
 }
 
 #[test]
+fn shared_weight_batch_and_flat_matrix_have_identical_layouts() {
+    for (batch, m, n, k) in [(64, 1, 19, 7), (3, 17, 31, 13), (8, 64, 9, 5)] {
+        let x = values(batch * m * k);
+        let w = values(n * k);
+        assert_eq!(
+            gemm_cpu_reference(&x, &w, m, n, k, batch),
+            gemm_cpu_reference(&x, &w, batch * m, n, k, 1),
+        );
+    }
+}
+
+#[test]
 fn cpu_gemm_twins_cover_non_multiple_tail_shapes() {
     let (batch, m, n, k) = (3, 5, 7, 11);
     let x = values(batch * m * k);
