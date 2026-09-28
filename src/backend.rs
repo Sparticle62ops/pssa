@@ -35,6 +35,15 @@ pub(crate) fn checked_gemm_sizes(
     Ok((input, weights, output))
 }
 
+/// All forward GEMMs share W across batches. Flattening [B,M,K] to [B*M,K]
+/// preserves row-major bytes and gives tiled WebGPU/cuBLAS a real matrix, not
+/// B skinny products. Keep this at the backend boundary as well as in training.
+pub(crate) fn shared_gemm_rows(m: usize, batch: usize) -> Result<usize, String> {
+    m.checked_mul(batch)
+        .filter(|&rows| rows > 0)
+        .ok_or_else(|| "GEMM row count must be positive and fit usize".into())
+}
+
 pub(crate) fn checked_f32_bytes(len: usize) -> Result<u64, String> {
     len.checked_mul(std::mem::size_of::<f32>())
         .filter(|&bytes| bytes <= isize::MAX as usize)
@@ -274,6 +283,8 @@ fn checked_wgpu_sizes(
     w_len: usize,
 ) -> Result<(usize, usize, usize), String> {
     let sizes = checked_gemm_sizes(m, n, k, batch, x_len, w_len)?;
+    let m = shared_gemm_rows(m, batch)?;
+    let batch = 1;
     // WGSL indexing arithmetic is u32, not just the uniform dimensions.
     if [m, n, k, batch, sizes.0, sizes.1, sizes.2]
         .iter()
@@ -578,6 +589,8 @@ impl WgpuContext {
         if out.len() != out_len {
             return Err("WebGPU GEMM output length mismatch".into());
         }
+        let m = shared_gemm_rows(m, batch)?;
+        let batch = 1;
         let x_bytes = checked_f32_bytes(x_len)?;
         let out_bytes = checked_f32_bytes(out_len)?;
         let mut workspace = self
@@ -981,14 +994,25 @@ mod backend_tests {
     use super::*;
 
     #[test]
+    fn shared_weight_layout_folds_sequences_and_tokens_without_overflow() {
+        assert_eq!(shared_gemm_rows(1, 64).unwrap(), 64);
+        assert_eq!(shared_gemm_rows(64, 8).unwrap(), 512);
+        assert_eq!(shared_gemm_rows(17, 3).unwrap(), 51);
+        assert!(shared_gemm_rows(0, 1).is_err());
+        assert!(shared_gemm_rows(usize::MAX, 2).is_err());
+        // 64 one-row dispatches formerly used 64 row tiles; now just four.
+        assert_eq!(shared_gemm_rows(1, 64).unwrap().div_ceil(16), 4);
+    }
+
+    #[test]
     fn webgpu_limits_are_checked_without_a_device_or_allocating_operands() {
         let limits = wgpu::Limits::default();
         assert!(checked_wgpu_sizes(&limits, 1, 1, 1, 65535, 65535, 1).is_ok());
-        assert!(
-            checked_wgpu_sizes(&limits, 1, 1, 1, 65536, 65536, 1)
-                .unwrap_err()
-                .contains("workgroup")
-        );
+        // Even legacy M=1 callers now use full 16-row tiles, not dispatch Z.
+        assert!(checked_wgpu_sizes(&limits, 1, 1, 1, 65536, 65536, 1).is_ok());
+        let too_many_rows = 65535 * 16 + 1;
+        assert!(checked_wgpu_sizes(&limits, 1, 1, 1, too_many_rows, too_many_rows, 1)
+            .unwrap_err().contains("workgroup"));
         // The same contiguous chunk can be represented as M=L, batch=1.
         assert!(checked_wgpu_sizes(&limits, 65536, 1, 1, 1, 65536, 1).is_ok());
         let mut small = limits.clone();
@@ -1042,9 +1066,9 @@ mod backend_tests {
             gemm_cpu_reference(&x[..7], &w[..7], 1, 1, 7, 1)
         );
         let large = vec![1.0; 65536];
-        assert!(
-            gpu.try_dispatch_gemm(&large, &[2.0], 1, 1, 1, 65536)
-                .is_err()
+        assert_eq!(
+            gpu.try_dispatch_gemm(&large, &[2.0], 1, 1, 1, 65536).unwrap(),
+            vec![2.0; 65536]
         );
         gpu.dispatch_gemm_into(&large, &[2.0], 1, 1, 1, 65536, &mut vec![0.0; 65536])
             .unwrap();

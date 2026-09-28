@@ -9,7 +9,7 @@ use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::{CudaContext as DriverContext, CudaSlice, CudaStream};
 
-use crate::backend::{checked_gemm_sizes, zeroed_output};
+use crate::backend::{checked_gemm_sizes, shared_gemm_rows, zeroed_output};
 
 // cudarc 0.19 lazily loads symbols with unwrap/panic, including error formatting
 // and Drop paths. Preflight *every* symbol used by this backend before calling
@@ -242,6 +242,12 @@ impl CudaContext {
         if out.len() != len {
             return Err("CUDA GEMM output length mismatch".into());
         }
+        // Shared weights make [batch,M,K] exactly one [batch*M,K] matrix.
+        // cuBLAS should see a wide SGEMM, never a collection of skinny GEMVs.
+        let m = shared_gemm_rows(m, batch)?;
+        if m > i32::MAX as usize {
+            return Err("CUDA flattened GEMM rows exceed the cuBLAS i32 limit".into());
+        }
         let cfg = GemmConfig {
             transa: cublasOperation_t::CUBLAS_OP_T,
             transb: cublasOperation_t::CUBLAS_OP_N,
@@ -254,7 +260,7 @@ impl CudaContext {
             ldb: k as i32,
             ldc: n as i32,
         };
-        self.execute_into(x, w, cfg, batch, (m * k) as i64, (m * n) as i64, true, out)
+        self.execute_into(x, w, cfg, 1, 0, 0, true, out)
     }
 
     pub fn gemm_nn(&self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {

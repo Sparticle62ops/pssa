@@ -85,8 +85,10 @@ fn gpu_ctx(m: &PSSALayerV2) -> Option<crate::backend::GpuDispatch> {
 }
 
 /// Device-aware batched matvec: on a GPU device this is one `dispatch_gemm`
-/// call (X [1,L,K], W [rows,K], Y [1,L,rows]); on CPU it is the scalar twin
-/// used by the numerical verification.
+/// call (X [1,L,K], W [rows,K], Y [1,L,rows]). L is the total number of
+/// packed token rows, including independent sequences when present. Never use
+/// M=1, batch=L: that wastes 15/16 of WebGPU's row tile and gives CUDA GEMVs.
+/// The backends also fold legacy shared-weight batches at their boundary.
 #[inline]
 fn batched_matvec_dev(gpu: Option<&crate::backend::GpuDispatch>, w: &[f32], rows: usize, cols: usize, x: &[f32], l: usize, out: &mut [f32]) {
     if let Some(ctx) = gpu {
