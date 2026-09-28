@@ -58,8 +58,10 @@ model=transformer parameters=1541120 vocab=2048
   `--total-updates` horizon persists through checkpoints; conflicting horizons
   or a horizon ending before the new link finishes are errors. Omitting `--lr`
   on CLI resume restores the saved base LR; supplying it is an explicit override.
-  As in PSSA, resumed links do **not** restart warmup. For exact split/uninterrupted
-  equivalence, split after warmup or leave warmup at zero.
+  As in PSSA, fixed-horizon checkpoints persist warmup and resume the complete
+  schedule at the global optimizer step, including when a split falls inside
+  warmup. Old checkpoints without warmup metadata retain legacy no-rewarmup
+  behavior; old checkpoints without a horizon retain per-link horizons.
 - Both print `token_stream_fnv1a64=... chunk=... accumulate=...` for the selected
   token IDs, document boundaries, and grouping. Matching fingerprints, token
   totals, and update totals audit the actual training exposure. FNV is an

@@ -199,12 +199,14 @@ fn checkpoint_preserves_all_state_and_next_update_exactly() {
     let q = path("roundtrip-next.trfm");
     let mut a = tiny();
     a.lr_schedule_total_updates = Some(20);
+    a.lr_schedule_warmup_steps = Some(5);
     step(&mut a, 0.02);
     ck::save_model(&a, &p).unwrap();
     let mut b = ck::load_checkpoint(&p).unwrap();
     assert_eq!(b.cfg.lr, 0.02);
     assert_eq!(b.cfg.chunk_len, 4);
     assert_eq!(b.lr_schedule_total_updates, Some(20));
+    assert_eq!(b.lr_schedule_warmup_steps, Some(5));
     assert_eq!(b.rng.state, a.rng.state);
     assert_eq!(
         b.tokenizer().unwrap().ordered_vocabulary().unwrap(),
@@ -219,6 +221,21 @@ fn checkpoint_preserves_all_state_and_next_update_exactly() {
     assert_eq!(fs::read(&p).unwrap(), fs::read(&q).unwrap());
     fs::remove_file(p).unwrap();
     fs::remove_file(q).unwrap();
+}
+
+#[test]
+fn small_transformer_with_large_attention_tape_roundtrips() {
+    let p = path("large-tape.trfm");
+    let small = tiny();
+    let mut cfg = small.cfg.clone();
+    cfg.chunk_len = 512;
+    let mut m = TransformerModel::new(cfg, 7).unwrap();
+    m.vocabulary = small.vocabulary;
+    ck::save_model(&m, &p).unwrap();
+    let loaded = ck::load_checkpoint(&p).unwrap();
+    assert_eq!(loaded.cfg.chunk_len, 512);
+    assert_eq!(loaded.token_embed.data, m.token_embed.data);
+    fs::remove_file(p).unwrap();
 }
 
 fn checksum(bytes: &mut [u8]) {
@@ -335,6 +352,67 @@ fn shared_fixed_schedule_continues_and_refuses_drift() {
     assert!(Schedule::new(6, 3, Some(11), &opts).is_err());
 }
 
+#[test]
+fn complete_fixed_schedule_restores_warmup_at_global_step_and_legacy_defaults() {
+    let opts = TrainingOptions {
+        epochs: 1,
+        accumulate: 1,
+        schedule_total_updates: Some(100),
+        warmup_steps: 10,
+        ..Default::default()
+    };
+    let whole = Schedule::new_with_warmup(100, 0, None, None, &opts).unwrap();
+    for prior in [0, 1, 5, 10, 11, 99] {
+        let resumed = Schedule::new_with_warmup(100 - prior, prior, Some(100), Some(10),
+            &TrainingOptions { warmup_steps: 0, ..opts.clone() }).unwrap();
+        for update in 1..=100 - prior {
+            assert_eq!(whole.lr(prior + update).unwrap(), resumed.lr(update).unwrap());
+        }
+    }
+    for horizon in [None, Some(100)] {
+        let legacy = Schedule::new_with_warmup(5, 5, horizon, None,
+            &TrainingOptions { schedule_total_updates: None, ..opts.clone() }).unwrap();
+        assert_eq!(legacy.warmup, 0);
+    }
+    assert!(Schedule::new_with_warmup(1, 0, None, Some(1), &opts).is_err());
+    assert!(Schedule::new_with_warmup(1, 0, Some(100), Some(100), &opts).is_err());
+}
+
+#[test]
+fn transformer_legacy_schedule_tails_load_and_invalid_warmup_is_rejected() {
+    let p = path("schedule-tails.trfm");
+    let mut m = tiny();
+    for horizon in [None, Some(100)] {
+        m.lr_schedule_total_updates = horizon;
+        m.lr_schedule_warmup_steps = None;
+        ck::save_model(&m, &p).unwrap();
+        let good = fs::read(&p).unwrap();
+        let loaded = ck::load_checkpoint(&p).unwrap();
+        assert_eq!(loaded.lr_schedule_total_updates, horizon);
+        assert_eq!(loaded.lr_schedule_warmup_steps, None);
+        for warmup in [0u64, 10, 100, 101] {
+            let mut bytes = good.clone();
+            bytes.extend_from_slice(&warmup.to_le_bytes());
+            bytes[6..14].copy_from_slice(&((good.len() - 22 + 8) as u64).to_le_bytes());
+            checksum(&mut bytes);
+            fs::write(&p, bytes).unwrap();
+            let result = ck::load_checkpoint(&p);
+            if horizon.is_some() && warmup < 100 {
+                assert_eq!(result.unwrap().lr_schedule_warmup_steps, Some(warmup as usize));
+            } else {
+                assert!(result.is_err());
+            }
+            fs::write(&p, &good).unwrap();
+            m.lr_schedule_warmup_steps = Some(warmup as usize);
+            if horizon.is_none() || warmup >= 100 {
+                assert!(ck::save_model(&m, &p).is_err());
+                assert_eq!(fs::read(&p).unwrap(), good);
+            }
+        }
+    }
+    fs::remove_file(p).unwrap();
+}
+
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"))
         .args(args)
@@ -416,6 +494,8 @@ fn cli_same_bpe_stream_logs_resume_lr_and_legacy_surface() {
         "20",
         "--lr",
         "0.003",
+        "--warmup-steps",
+        "4",
         "-e",
         "1",
     ]);
@@ -438,6 +518,8 @@ fn cli_same_bpe_stream_logs_resume_lr_and_legacy_surface() {
     let t_model = ck::load_checkpoint(&trfm).unwrap();
     assert_eq!(p_model.vocabulary, t_model.vocabulary);
     assert_eq!(p_model.tokenizer_json, t_model.tokenizer_json);
+    assert_eq!(t_model.lr_schedule_warmup_steps, Some(4));
+    assert!(t_log.contains("lr first=0.00075000"));
     let log = success(&[
         "train-transformer",
         cp,
@@ -459,6 +541,8 @@ fn cli_same_bpe_stream_logs_resume_lr_and_legacy_surface() {
     assert_eq!(resumed.cfg.lr, 0.003);
     assert_eq!(resumed.cfg.chunk_len, 4);
     assert_eq!(resumed.step_counter, 2);
+    assert_eq!(resumed.lr_schedule_warmup_steps, Some(4));
+    assert!(log.contains("lr first=0.00150000"));
     for tail in [
         vec!["--chunk", "8"],
         vec!["--total-updates", "21"],

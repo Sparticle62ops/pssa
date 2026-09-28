@@ -155,10 +155,11 @@ pub fn rms_norm_slice(input: &[f32], out: &mut [f32]) -> f32 {
 
 /// Returns the dot product of two equally sized slices.
 ///
-/// The AVX2/FMA implementation is selected at compile time when those target
-/// features are enabled. Fused multiply-add has one rounding rather than the
-/// scalar multiply followed by add's two, so finite results are checked with a
-/// mixed absolute/relative tolerance rather than bitwise equality.
+/// Generic x86_64 builds select AVX2/FMA using cached runtime feature detection;
+/// other CPUs retain the portable implementation. Tiny slices avoid SIMD setup.
+/// Fused multiply-add has one rounding rather than the scalar multiply followed
+/// by add's two, so finite results require a mixed absolute/relative tolerance
+/// rather than bitwise equality.
 #[inline(always)]
 pub fn dot_slice(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(
@@ -167,29 +168,26 @@ pub fn dot_slice(a: &[f32], b: &[f32]) -> f32 {
         "dot product operands must have equal lengths"
     );
 
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "fma"
-    ))]
-    {
-        // SAFETY: the helper only reads within the equally sized input slices.
+    #[cfg(target_arch = "x86_64")]
+    if a.len() >= 32 && avx2_fma_available() {
+        // SAFETY: runtime detection establishes both target features and the
+        // helper only reads within the equally sized input slices.
         return unsafe { dot_slice_avx2_fma(a, b) };
     }
 
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "fma"
-    )))]
     dot_slice_portable(a, b)
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "fma"
-))]
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn avx2_fma_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_slice_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
@@ -232,6 +230,18 @@ unsafe fn dot_slice_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
         i += 32;
     }
 
+    // Consume the remaining complete vectors before the final 0..7 scalars.
+    while i + 8 <= len {
+        unsafe {
+            acc0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a_ptr.add(i)),
+                _mm256_loadu_ps(b_ptr.add(i)),
+                acc0,
+            );
+        }
+        i += 8;
+    }
+
     let pair01 = _mm256_add_ps(acc0, acc1);
     let pair23 = _mm256_add_ps(acc2, acc3);
     let lanes = _mm256_add_ps(pair01, pair23);
@@ -248,11 +258,6 @@ unsafe fn dot_slice_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(not(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "fma"
-)))]
 #[inline(always)]
 fn dot_slice_portable(a: &[f32], b: &[f32]) -> f32 {
     let mut i = 0;
@@ -363,29 +368,21 @@ impl Matrix {
         Self { rows, cols, data }
     }
 
+    /// Multiply into an existing output, validating public matrix storage before
+    /// reading any row. Shape violations panic, as for the other numeric APIs.
     #[inline(always)]
     pub fn matvec_into(&self, v: &[f32], out: &mut [f32]) {
-        assert_eq!(self.cols, v.len());
-        assert_eq!(self.rows, out.len());
-        let v_ptr = v.as_ptr();
-        let data_ptr = self.data.as_ptr();
-        for i in 0..self.rows {
-            unsafe {
-                let row_ptr = data_ptr.add(i * self.cols);
-                out[i] = if self.cols == 256 {
-                    dot_256_raw(row_ptr, v_ptr)
-                } else if self.cols == 128 {
-                    dot_128_raw(row_ptr, v_ptr)
-                } else if self.cols == 32 {
-                    dot_32_raw(row_ptr, v_ptr)
-                } else {
-                    let mut sum = 0.0f32;
-                    for j in 0..self.cols {
-                        sum += *row_ptr.add(j) * *v_ptr.add(j);
-                    }
-                    sum
-                };
-            }
+        let len = self.rows.checked_mul(self.cols)
+            .expect("matrix dimensions overflow usize");
+        assert_eq!(self.data.len(), len, "matrix storage must match its dimensions");
+        assert_eq!(self.cols, v.len(), "matrix input length must match its columns");
+        assert_eq!(self.rows, out.len(), "matrix output length must match its rows");
+        if self.cols == 0 {
+            out.fill(0.0);
+            return;
+        }
+        for (row, value) in self.data.chunks_exact(self.cols).zip(out) {
+            *value = dot_slice(row, v);
         }
     }
 
@@ -450,55 +447,87 @@ impl Matrix {
         }
     }
 
+    /// Invert with f64 elimination and row-scale-relative partial pivoting.
+    /// Reject malformed storage, singular matrices, and nonfinite input/output.
     pub fn invert(&self) -> Result<Matrix, String> {
         if self.rows != self.cols {
             return Err("Cannot invert non-square matrix".to_string());
         }
         let n = self.rows;
-        let mut augmented = vec![0.0f64; n * 2 * n];
+        let len = n.checked_mul(n)
+            .ok_or_else(|| "Matrix dimensions overflow usize".to_string())?;
+        if self.data.len() != len {
+            return Err("Matrix storage must match its dimensions".to_string());
+        }
+        if self.data.iter().any(|x| !x.is_finite()) {
+            return Err("Cannot invert a matrix containing nonfinite values".to_string());
+        }
+        let stride = n.checked_mul(2)
+            .ok_or_else(|| "Augmented matrix dimensions overflow usize".to_string())?;
+        let augmented_len = len.checked_mul(2)
+            .ok_or_else(|| "Augmented matrix dimensions overflow usize".to_string())?;
+        let mut augmented = Vec::new();
+        augmented.try_reserve_exact(augmented_len)
+            .map_err(|e| format!("Cannot allocate augmented matrix: {e}"))?;
+        augmented.resize(augmented_len, 0.0f64);
+        let mut row_scales = vec![0.0f64; n];
 
         for i in 0..n {
             for j in 0..n {
-                augmented[i * 2 * n + j] = self.data[i * n + j] as f64;
+                let value = self.data[i * n + j] as f64;
+                augmented[i * stride + j] = value;
+                row_scales[i] = row_scales[i].max(value.abs());
             }
-            augmented[i * 2 * n + n + i] = 1.0f64;
+            if row_scales[i] == 0.0 {
+                return Err("Matrix is singular and cannot be inverted".to_string());
+            }
+            augmented[i * stride + n + i] = 1.0;
         }
 
         for i in 0..n {
+            // Scaled partial pivoting makes singularity decisions invariant to
+            // uniform rescaling, even when the original entries are very small.
             let mut pivot_row = i;
-            let mut max_val = augmented[i * 2 * n + i].abs();
+            let mut max_ratio = augmented[i * stride + i].abs() / row_scales[i];
             for k in (i + 1)..n {
-                let val = augmented[k * 2 * n + i].abs();
-                if val > max_val {
-                    max_val = val;
+                let ratio = augmented[k * stride + i].abs() / row_scales[k];
+                if ratio > max_ratio {
+                    max_ratio = ratio;
                     pivot_row = k;
                 }
             }
 
-            if max_val < 1e-12 {
+            if !max_ratio.is_finite() || max_ratio <= f64::EPSILON * n as f64 {
                 return Err("Matrix is singular and cannot be inverted".to_string());
             }
 
             if pivot_row != i {
-                for col in 0..(2 * n) {
-                    let tmp = augmented[i * 2 * n + col];
-                    augmented[i * 2 * n + col] = augmented[pivot_row * 2 * n + col];
-                    augmented[pivot_row * 2 * n + col] = tmp;
+                for col in 0..stride {
+                    augmented.swap(i * stride + col, pivot_row * stride + col);
                 }
+                row_scales.swap(i, pivot_row);
             }
 
-            let pivot = augmented[i * 2 * n + i];
-            for col in 0..(2 * n) {
-                augmented[i * 2 * n + col] /= pivot;
+            let pivot = augmented[i * stride + i];
+            for col in 0..stride {
+                augmented[i * stride + col] /= pivot;
+                if !augmented[i * stride + col].is_finite() {
+                    return Err("Matrix inverse produced nonfinite values".to_string());
+                }
             }
 
             for row in 0..n {
                 if row != i {
-                    let factor = augmented[row * 2 * n + i];
-                    if factor.abs() > 1e-12 {
-                        for col in 0..(2 * n) {
-                            let sub = factor * augmented[i * 2 * n + col];
-                            augmented[row * 2 * n + col] -= sub;
+                    let factor = augmented[row * stride + i];
+                    // A small nonzero factor can still be significant relative
+                    // to the matrix scale; only exact zero is safe to skip.
+                    if factor != 0.0 {
+                        for col in 0..stride {
+                            let sub = factor * augmented[i * stride + col];
+                            augmented[row * stride + col] -= sub;
+                            if !augmented[row * stride + col].is_finite() {
+                                return Err("Matrix inverse produced nonfinite values".to_string());
+                            }
                         }
                     }
                 }
@@ -508,7 +537,11 @@ impl Matrix {
         let mut inv = Matrix::zeros(n, n);
         for i in 0..n {
             for j in 0..n {
-                inv.data[i * n + j] = augmented[i * 2 * n + n + j] as f32;
+                let value = augmented[i * stride + n + j] as f32;
+                if !value.is_finite() {
+                    return Err("Matrix inverse is not representable as finite f32 values".to_string());
+                }
+                inv.data[i * n + j] = value;
             }
         }
 
@@ -523,7 +556,7 @@ pub fn sigmoid(x: f32) -> f32 {
 
 #[inline(always)]
 pub fn softplus(x: f32) -> f32 {
-    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
+    if x > 20.0 { x } else { x.exp().ln_1p() }
 }
 
 pub fn softmax(v: &Vector) -> Vector {
@@ -537,5 +570,97 @@ pub fn softmax(v: &Vector) -> Vector {
     let sum: f32 = exps.iter().sum();
     Vector {
         data: exps.iter().map(|x| x / sum).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_and_runtime_kernels_match_f64_for_unaligned_slices_and_every_tail() {
+        for len in (0..=97).chain([127, 128, 129, 255, 256, 257, 1023, 1024, 1025]) {
+            let a: Vec<f32> = (0..len + 3).map(|i| ((i * 37 % 127) as f32 - 63.0) * 0.03125).collect();
+            let b: Vec<f32> = (0..len + 5).map(|i| ((i * 53 % 113) as f32 - 56.0) * -0.0234375).collect();
+            let (a, b) = (&a[1..len + 1], &b[3..len + 3]);
+            let expected: f64 = a.iter().zip(b).map(|(&a, &b)| a as f64 * b as f64).sum();
+            let check = |actual: f32| {
+                assert!(actual.is_finite());
+                assert!((actual as f64 - expected).abs() <= 2.0e-6 + 2.0e-5 * expected.abs(),
+                    "length={len}, actual={actual}, expected={expected}");
+            };
+            check(dot_slice_portable(a, b));
+            check(dot_slice(a, b));
+            #[cfg(target_arch = "x86_64")]
+            if avx2_fma_available() {
+                // SAFETY: feature detection and equally sized valid slices.
+                check(unsafe { dot_slice_avx2_fma(a, b) });
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cached_detection_matches_host_and_dispatches_the_selected_kernel() {
+        let expected = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
+        assert_eq!(avx2_fma_available(), expected);
+        assert_eq!(avx2_fma_available(), expected);
+        // Non-dyadic values exercise the distinct FMA rounding/reduction path.
+        let a: Vec<f32> = (0..257).map(|i| (i as f32 * 0.19).sin()).collect();
+        let b: Vec<f32> = (0..257).map(|i| (i as f32 * 0.31).cos()).collect();
+        let selected = if expected {
+            // SAFETY: host detection and equal valid lengths.
+            unsafe { dot_slice_avx2_fma(&a, &b) }
+        } else {
+            dot_slice_portable(&a, &b)
+        };
+        assert_eq!(dot_slice(&a, &b).to_bits(), selected.to_bits());
+    }
+
+    /// Opt-in microbenchmark: run an optimized generic-target test binary with
+    /// `--ignored --nocapture dot_kernel_microbenchmark`. Not a training timing.
+    #[test]
+    #[ignore = "timing probe; run optimized and without competing CPU workloads"]
+    fn dot_kernel_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // Match the pre-runtime-dispatch public wrapper, including its shape
+        // assertion: it lets LLVM eliminate the portable loop's bounds checks.
+        #[inline(always)]
+        fn portable(a: &[f32], b: &[f32]) -> f32 {
+            assert_eq!(a.len(), b.len(), "dot product operands must have equal lengths");
+            dot_slice_portable(a, b)
+        }
+
+        fn time(mut kernel: impl FnMut() -> f32, iterations: usize) -> f64 {
+            for _ in 0..1000 { black_box(kernel()); }
+            let start = Instant::now();
+            for _ in 0..iterations { black_box(kernel()); }
+            start.elapsed().as_secs_f64() * 1.0e9 / iterations as f64
+        }
+        #[cfg(target_arch = "x86_64")]
+        println!("runtime_avx2_fma={}", avx2_fma_available());
+        for len in [16, 32, 64, 128, 256, 257, 512, 2048] {
+            let a: Vec<f32> = (0..len).map(|i| (i as f32 * 0.19).sin()).collect();
+            let b: Vec<f32> = (0..len).map(|i| (i as f32 * 0.31).cos()).collect();
+            let iterations = (20_000_000 / len).max(50_000);
+            let mut baseline = Vec::new();
+            let mut runtime = Vec::new();
+            for round in 0..7 {
+                // Alternate order to reduce first/second-run frequency bias.
+                if round % 2 == 0 {
+                    baseline.push(time(|| portable(black_box(&a), black_box(&b)), iterations));
+                    runtime.push(time(|| dot_slice(black_box(&a), black_box(&b)), iterations));
+                } else {
+                    runtime.push(time(|| dot_slice(black_box(&a), black_box(&b)), iterations));
+                    baseline.push(time(|| portable(black_box(&a), black_box(&b)), iterations));
+                }
+            }
+            baseline.sort_by(f64::total_cmp);
+            runtime.sort_by(f64::total_cmp);
+            println!("length={len} portable_median_ns={:.2} runtime_median_ns={:.2} speedup={:.2}x",
+                baseline[3], runtime[3], baseline[3] / runtime[3]);
+        }
     }
 }

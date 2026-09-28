@@ -1,7 +1,56 @@
+use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use wgpu::util::DeviceExt;
+
+/// Validate all element and byte counts before allocation or backend calls.
+/// Shared by CUDA, WebGPU and the allocation-free CPU kernel.
+pub(crate) fn checked_gemm_sizes(
+    m: usize,
+    n: usize,
+    k: usize,
+    batch: usize,
+    x_len: usize,
+    w_len: usize,
+) -> Result<(usize, usize, usize), String> {
+    if [m, n, k, batch].contains(&0) {
+        return Err("GEMM dimensions must be positive".into());
+    }
+    let product = |dims: &[usize]| -> Result<usize, String> {
+        let len = dims
+            .iter()
+            .try_fold(1usize, |v, &d| v.checked_mul(d))
+            .ok_or_else(|| "GEMM element count overflow".to_string())?;
+        checked_f32_bytes(len)?;
+        Ok(len)
+    };
+    let input = product(&[batch, m, k])?;
+    let weights = product(&[n, k])?;
+    let output = product(&[batch, m, n])?;
+    if x_len != input || w_len != weights {
+        return Err(format!(
+            "GEMM operand lengths must be {input} and {weights}, got {x_len} and {w_len}"
+        ));
+    }
+    Ok((input, weights, output))
+}
+
+pub(crate) fn checked_f32_bytes(len: usize) -> Result<u64, String> {
+    len.checked_mul(std::mem::size_of::<f32>())
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .map(|bytes| bytes as u64)
+        .ok_or_else(|| "GEMM buffer byte size overflow".to_string())
+}
+
+pub(crate) fn zeroed_output(len: usize) -> Result<Vec<f32>, String> {
+    checked_f32_bytes(len)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(len)
+        .map_err(|e| format!("GEMM host allocation failed: {e}"))?;
+    output.resize(len, 0.0);
+    Ok(output)
+}
 
 // =============================================================================
 // COMPLETE EMBEDDED WGSL COMPUTE SHADERS
@@ -36,7 +85,7 @@ fn gemm_main(
     let batch = global_id.z;
 
     var acc: f32 = 0.0;
-    let num_tiles = (gemm_cfg.K + 15u) / 16u;
+    let num_tiles = gemm_cfg.K / 16u + select(0u, 1u, gemm_cfg.K % 16u != 0u);
 
     for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
         let x_k = t * 16u + local_id.x;
@@ -176,6 +225,86 @@ fn adamw_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 // DEVICE CONTEXT & GPU PIPELINE CONTROLLER
 // =============================================================================
 
+#[derive(Default)]
+struct WgpuWorkspace {
+    input: Option<wgpu::Buffer>,
+    output: Option<wgpu::Buffer>,
+    staging: Option<wgpu::Buffer>,
+    uniforms: Option<wgpu::Buffer>,
+}
+
+fn reserve_wgpu_buffer(
+    device: &wgpu::Device,
+    slot: &mut Option<wgpu::Buffer>,
+    size: u64,
+    usage: wgpu::BufferUsages,
+    label: &str,
+) {
+    if slot.as_ref().is_none_or(|buffer| buffer.size() < size) {
+        *slot = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage,
+            mapped_at_creation: false,
+        }));
+    }
+}
+
+fn begin_error_scopes(device: &wgpu::Device) {
+    device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+}
+
+fn finish_error_scopes(device: &wgpu::Device) -> Result<(), String> {
+    let validation = pollster::block_on(device.pop_error_scope());
+    let allocation = pollster::block_on(device.pop_error_scope());
+    match validation.or(allocation) {
+        Some(error) => Err(format!("WebGPU operation failed: {error}")),
+        None => Ok(()),
+    }
+}
+
+fn checked_wgpu_sizes(
+    limits: &wgpu::Limits,
+    m: usize,
+    n: usize,
+    k: usize,
+    batch: usize,
+    x_len: usize,
+    w_len: usize,
+) -> Result<(usize, usize, usize), String> {
+    let sizes = checked_gemm_sizes(m, n, k, batch, x_len, w_len)?;
+    // WGSL indexing arithmetic is u32, not just the uniform dimensions.
+    if [m, n, k, batch, sizes.0, sizes.1, sizes.2]
+        .iter()
+        .any(|&v| v > u32::MAX as usize)
+    {
+        return Err("WebGPU GEMM dimensions or element offsets exceed u32".into());
+    }
+    for elements in [sizes.0, sizes.1, sizes.2] {
+        let bytes = checked_f32_bytes(elements)?;
+        if bytes > limits.max_buffer_size
+            || bytes > u64::from(limits.max_storage_buffer_binding_size)
+        {
+            return Err(format!(
+                "WebGPU GEMM buffer needs {bytes} bytes, exceeding device buffer/storage-binding limits"
+            ));
+        }
+    }
+    let max_groups = limits.max_compute_workgroups_per_dimension as usize;
+    if n.div_ceil(16) > max_groups || m.div_ceil(16) > max_groups || batch > max_groups {
+        return Err("WebGPU GEMM dispatch exceeds device workgroup-count limit".into());
+    }
+    if limits.max_compute_workgroup_size_x < 16
+        || limits.max_compute_workgroup_size_y < 16
+        || limits.max_compute_invocations_per_workgroup < 256
+        || limits.max_compute_workgroup_storage_size < 2048
+    {
+        return Err("WebGPU device cannot run the 16x16 tiled GEMM kernel".into());
+    }
+    Ok(sizes)
+}
+
 #[derive(Clone)]
 pub struct WgpuContext {
     pub device: Arc<wgpu::Device>,
@@ -189,22 +318,20 @@ pub struct WgpuContext {
     /// steps reuses the uploaded copy instead of re-sending it. Cleared by
     /// `invalidate_weights` right after each AdamW step.
     weight_cache: Arc<Mutex<HashMap<(usize, usize), Arc<wgpu::Buffer>>>>,
+    // High-water buffers, not a per-shape cache. Also serializes error scopes
+    // and staging-map lifetimes for every clone of this context.
+    workspace: Arc<Mutex<WgpuWorkspace>>,
 }
 
 impl WgpuContext {
     pub fn init_blocking() -> Result<Self, String> {
-        // Headless boxes (Kaggle included) often run without XDG_RUNTIME_DIR,
-        // in which case the Vulkan loader refuses to start and wgpu silently
-        // downgrades to the GL backend on llvmpipe: a software rasterizer
-        // running on the CPU. Point the loader at a writable scratch dir so
-        // real GPU drivers get a chance to come up.
-        if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
-            let dir = std::env::temp_dir().join("oxide-xdg-runtime");
-            let _ = std::fs::create_dir_all(&dir);
-            // SAFETY: single-threaded bring-up; no other thread reads the env.
-            unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
-        }
+        Self::init_with_software_policy(false)
+    }
 
+    fn init_with_software_policy(allow_software: bool) -> Result<Self, String> {
+        // Library initialization may run after Rayon or other application
+        // threads start. Configure XDG_RUNTIME_DIR externally when needed;
+        // mutating process-wide environment here is not thread-safe on Unix.
         let instance = wgpu::Instance::default();
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -219,7 +346,7 @@ impl WgpuContext {
         // It is slower than our scalar CPU path end to end (buffer upload +
         // dispatch + blocking readback per stage), so refuse it and let the
         // caller fall back to CPU rather than train 12x slower.
-        if info.device_type == wgpu::DeviceType::Cpu {
+        if info.device_type == wgpu::DeviceType::Cpu && !allow_software {
             return Err(format!(
                 "software GPU adapter refused ({} / {:?}): slower than cpu",
                 info.name, info.backend
@@ -240,6 +367,7 @@ impl WgpuContext {
         ))
         .map_err(|e| format!("Failed to create WebGPU device: {}", e))?;
 
+        begin_error_scopes(&device);
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("PSSA V2 Compute Shaders"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(WGSL_COMPUTE_KERNELS)),
@@ -273,6 +401,7 @@ impl WgpuContext {
             entry_point: "adamw_main",
         });
 
+        finish_error_scopes(&device)?;
         Ok(Self {
             device: Arc::new(device),
             queue: Arc::new(queue),
@@ -281,6 +410,7 @@ impl WgpuContext {
             silu_pipeline: Arc::new(silu_pipeline),
             adamw_pipeline: Arc::new(adamw_pipeline),
             weight_cache: Arc::new(Mutex::new(HashMap::new())),
+            workspace: Arc::new(Mutex::new(WgpuWorkspace::default())),
         })
     }
 
@@ -314,12 +444,20 @@ impl WgpuContext {
                 | wgpu::BufferUsages::COPY_DST
         };
 
-        self.device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(data),
-                usage,
-            })
+        // Do not map an allocation before its error scope can be checked.
+        // DeviceExt::create_buffer_init maps immediately and can panic on an
+        // invalid/OOM handle even when buffer creation is inside a scope.
+        let contents = bytemuck::cast_slice(data);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: contents.len() as u64,
+            usage,
+            mapped_at_creation: false,
+        });
+        if !contents.is_empty() {
+            self.queue.write_buffer(&buffer, 0, contents);
+        }
+        buffer
     }
 
     pub fn read_buffer_blocking(
@@ -327,13 +465,19 @@ impl WgpuContext {
         buffer: &wgpu::Buffer,
         count: usize,
     ) -> Result<Vec<f32>, String> {
-        let byte_len = count
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| "GPU readback size overflow".to_string())? as u64;
-        if byte_len == 0 {
-            return Err("GPU readback cannot have zero bytes".into());
+        let byte_len = checked_f32_bytes(count)?;
+        if byte_len == 0
+            || byte_len > buffer.size()
+            || byte_len > self.device.limits().max_buffer_size
+            || !buffer.usage().contains(wgpu::BufferUsages::COPY_SRC)
+        {
+            return Err("GPU readback requires a nonempty, in-bounds COPY_SRC buffer".into());
         }
-
+        let _guard = self
+            .workspace
+            .lock()
+            .map_err(|_| "WebGPU workspace lock poisoned")?;
+        begin_error_scopes(&self.device);
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Readback Staging Buffer"),
             size: byte_len,
@@ -349,8 +493,15 @@ impl WgpuContext {
 
         encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, byte_len);
         self.queue.submit(Some(encoder.finish()));
+        finish_error_scopes(&self.device)?;
+        let mut result = zeroed_output(count)?;
+        self.map_readback_into(&staging, &mut result)?;
+        Ok(result)
+    }
 
-        let slice = staging.slice(..);
+    fn map_readback_into(&self, staging: &wgpu::Buffer, output: &mut [f32]) -> Result<(), String> {
+        let byte_len = checked_f32_bytes(output.len())?;
+        let slice = staging.slice(..byte_len);
         let (sender, receiver) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = sender.send(res);
@@ -363,11 +514,10 @@ impl WgpuContext {
         mapped_result.map_err(|e| format!("GPU readback mapping failed: {e:?}"))?;
 
         let mapped = slice.get_mapped_range();
-        let result: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
+        output.copy_from_slice(bytemuck::cast_slice(&mapped));
         drop(mapped);
         staging.unmap();
-
-        Ok(result)
+        Ok(())
     }
 
     /// Run the embedded tiled GEMM kernel on the GPU.
@@ -390,7 +540,9 @@ impl WgpuContext {
         }
     }
 
-    fn try_dispatch_gemm(
+    /// Strict GPU execution: malformed/unsupported requests are errors, never
+    /// successful CPU results. Intended for probes and hardware parity tests.
+    pub fn try_dispatch_gemm(
         &self,
         x: &[f32],
         w: &[f32],
@@ -399,38 +551,77 @@ impl WgpuContext {
         k: usize,
         batch: usize,
     ) -> Result<Vec<f32>, String> {
-        if m == 0 || n == 0 || k == 0 || batch == 0 {
-            return Err("GPU GEMM dimensions must be positive".into());
-        }
-        let x_len = batch
-            .checked_mul(m)
-            .and_then(|v| v.checked_mul(k))
-            .ok_or_else(|| "GPU GEMM input size overflow".to_string())?;
-        let w_len = n
-            .checked_mul(k)
-            .ok_or_else(|| "GPU GEMM weight size overflow".to_string())?;
-        let out_len = batch
-            .checked_mul(m)
-            .and_then(|v| v.checked_mul(n))
-            .ok_or_else(|| "GPU GEMM output size overflow".to_string())?;
-        if x.len() != x_len || w.len() != w_len {
-            return Err("GPU GEMM buffer length mismatch".into());
-        }
-        if [m, n, k, batch].iter().any(|&v| v > u32::MAX as usize) {
-            return Err("GPU GEMM dimensions exceed the WebGPU u32 limit".into());
-        }
+        let (_, _, len) =
+            checked_wgpu_sizes(&self.device.limits(), m, n, k, batch, x.len(), w.len())?;
+        let mut out = zeroed_output(len)?;
+        self.try_dispatch_gemm_into(x, w, m, n, k, batch, &mut out)?;
+        Ok(out)
+    }
 
+    /// Reuses caller output and high-water device scratch; wgpu command objects
+    /// and readback synchronization can still allocate host bookkeeping.
+    /// The caller's output is untouched on validation failure. Resource and
+    /// dispatch validation errors are scoped; native wgpu driver/device-loss
+    /// failures in submit/poll may still be fatal in this dependency version.
+    pub fn try_dispatch_gemm_into(
+        &self,
+        x: &[f32],
+        w: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        batch: usize,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        let (x_len, _, out_len) =
+            checked_wgpu_sizes(&self.device.limits(), m, n, k, batch, x.len(), w.len())?;
+        if out.len() != out_len {
+            return Err("WebGPU GEMM output length mismatch".into());
+        }
+        let x_bytes = checked_f32_bytes(x_len)?;
+        let out_bytes = checked_f32_bytes(out_len)?;
+        let mut workspace = self
+            .workspace
+            .lock()
+            .map_err(|_| "WebGPU workspace lock poisoned")?;
+        begin_error_scopes(&self.device);
+        reserve_wgpu_buffer(
+            &self.device,
+            &mut workspace.input,
+            x_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            "gemm_x",
+        );
+        reserve_wgpu_buffer(
+            &self.device,
+            &mut workspace.output,
+            out_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "gemm_y",
+        );
+        reserve_wgpu_buffer(
+            &self.device,
+            &mut workspace.staging,
+            out_bytes,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            "gemm_readback",
+        );
+        reserve_wgpu_buffer(
+            &self.device,
+            &mut workspace.uniforms,
+            16,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            "gemm_uniforms",
+        );
+        let cfg_buf = workspace.uniforms.as_ref().unwrap();
+        let x_buf = workspace.input.as_ref().unwrap();
+        let y_buf = workspace.output.as_ref().unwrap();
+        let staging = workspace.staging.as_ref().unwrap();
         let cfg: [u32; 4] = [m as u32, n as u32, k as u32, batch as u32];
-        let cfg_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gemm_uniforms"),
-                contents: bytemuck::cast_slice(&cfg),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-        let x_buf = self.create_buffer_init("gemm_x", x, true);
+        self.queue
+            .write_buffer(cfg_buf, 0, bytemuck::cast_slice(&cfg));
+        self.queue.write_buffer(x_buf, 0, bytemuck::cast_slice(x));
         let w_buf = self.weight_buffer(w);
-        let y_buf = self.create_buffer_init("gemm_y", &vec![0.0f32; out_len], false);
 
         let layout = self.gemm_pipeline.get_bind_group_layout(0);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -468,13 +659,18 @@ impl WgpuContext {
             });
             pass.set_pipeline(&self.gemm_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let gx = ((n + 15) / 16) as u32;
-            let gy = ((m + 15) / 16) as u32;
-            pass.dispatch_workgroups(gx.max(1), gy.max(1), (batch as u32).max(1));
+            pass.dispatch_workgroups(n.div_ceil(16) as u32, m.div_ceil(16) as u32, batch as u32);
         }
+        // Copy in the same submission rather than a second readback encoder.
+        encoder.copy_buffer_to_buffer(y_buf, 0, staging, 0, out_bytes);
         self.queue.submit(Some(encoder.finish()));
-
-        self.read_buffer_blocking(&y_buf, out_len)
+        if let Err(error) = finish_error_scopes(&self.device) {
+            // Failed allocations may have left invalid handles in either cache.
+            *workspace = WgpuWorkspace::default();
+            self.invalidate_weights();
+            return Err(error);
+        }
+        self.map_readback_into(staging, out)
     }
 }
 
@@ -487,19 +683,12 @@ pub fn gemm_cpu_reference(
     k: usize,
     batch: usize,
 ) -> Vec<f32> {
-    let Some(x_len) = batch.checked_mul(m).and_then(|v| v.checked_mul(k)) else {
+    let Ok((_, _, out_len)) = checked_gemm_sizes(m, n, k, batch, x.len(), w.len()) else {
         return Vec::new();
     };
-    let Some(w_len) = n.checked_mul(k) else {
+    let Ok(mut y) = zeroed_output(out_len) else {
         return Vec::new();
     };
-    let Some(out_len) = batch.checked_mul(m).and_then(|v| v.checked_mul(n)) else {
-        return Vec::new();
-    };
-    if x.len() != x_len || w.len() != w_len {
-        return Vec::new();
-    }
-    let mut y = vec![0.0f32; out_len];
     for b in 0..batch {
         for i in 0..m {
             for j in 0..n {
@@ -514,21 +703,55 @@ pub fn gemm_cpu_reference(
     y
 }
 
+/// Allocation-free, row-major Y = X * W^T. Blocks four input rows so each
+/// weight row is reused while hot, and uses coarse, disjoint Rayon output tiles
+/// only for large work. Each dot uses the same accumulation order as matvec.
+pub fn gemm_cpu_into(
+    x: &[f32],
+    w: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    batch: usize,
+    out: &mut [f32],
+) -> Result<(), String> {
+    let (_, _, output) = checked_gemm_sizes(m, n, k, batch, x.len(), w.len())?;
+    if out.len() != output {
+        return Err("CPU GEMM output length mismatch".into());
+    }
+    const ROW_TILE: usize = 4;
+    const WEIGHT_TILE: usize = 32;
+    let tile_len = n.checked_mul(ROW_TILE).unwrap_or(output).min(output);
+    let rows_per_tile = tile_len / n;
+    let calculate = |(tile, dst): (usize, &mut [f32])| {
+        let first_row = tile * rows_per_tile;
+        for first_weight in (0..n).step_by(WEIGHT_TILE) {
+            for j in first_weight..(first_weight + WEIGHT_TILE).min(n) {
+                let weights = &w[j * k..(j + 1) * k];
+                for (t, row) in dst.chunks_exact_mut(n).enumerate() {
+                    let offset = (first_row + t) * k;
+                    row[j] = crate::linalg::dot_slice(&x[offset..offset + k], weights);
+                }
+            }
+        }
+    };
+    // Avoid waking a large pool for small state/rank projections.
+    if output.saturating_mul(k) >= 4 * 1024 * 1024 && output / n >= 8 {
+        out.par_chunks_mut(tile_len).enumerate().for_each(calculate);
+    } else {
+        out.chunks_mut(tile_len).enumerate().for_each(calculate);
+    }
+    Ok(())
+}
+
 /// Row-major C(M,N) = A(M,K) * B(K,N). CPU twin for the backward-pass GEMMs.
 pub fn gemm_nn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let Some(a_len) = m.checked_mul(k) else {
+    let Ok((_, _, c_len)) = checked_gemm_sizes(m, n, k, 1, a.len(), b.len()) else {
         return Vec::new();
     };
-    let Some(b_len) = k.checked_mul(n) else {
+    let Ok(mut c) = zeroed_output(c_len) else {
         return Vec::new();
     };
-    let Some(c_len) = m.checked_mul(n) else {
-        return Vec::new();
-    };
-    if a.len() != a_len || b.len() != b_len {
-        return Vec::new();
-    }
-    let mut c = vec![0.0f32; c_len];
     for i in 0..m {
         for kk in 0..k {
             let av = a[i * k + kk];
@@ -547,19 +770,12 @@ pub fn gemm_nn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f3
 
 /// Row-major C(K,N) = A(M,K)^T * B(M,N). CPU twin for the weight-gradient GEMMs.
 pub fn gemm_tn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let Some(a_len) = m.checked_mul(k) else {
+    let Ok((_, _, c_len)) = checked_gemm_sizes(k, n, m, 1, a.len(), b.len()) else {
         return Vec::new();
     };
-    let Some(b_len) = m.checked_mul(n) else {
+    let Ok(mut c) = zeroed_output(c_len) else {
         return Vec::new();
     };
-    let Some(c_len) = k.checked_mul(n) else {
-        return Vec::new();
-    };
-    if a.len() != a_len || b.len() != b_len {
-        return Vec::new();
-    }
-    let mut c = vec![0.0f32; c_len];
     for t in 0..m {
         for kk in 0..k {
             let av = a[t * k + kk];
@@ -615,6 +831,65 @@ impl GpuDispatch {
             #[cfg(feature = "cuda")]
             GpuDispatch::Cuda(ctx) => ctx.dispatch_gemm(x, w, m, n, k, batch),
         }
+    }
+
+    /// Strict dispatch, intended for hardware probes: an error cannot be
+    /// mistaken for a GPU result computed by a silent CPU fallback.
+    pub fn try_dispatch_gemm(
+        &self,
+        x: &[f32],
+        w: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        batch: usize,
+    ) -> Result<Vec<f32>, String> {
+        match self {
+            Self::Wgpu(ctx) => ctx.try_dispatch_gemm(x, w, m, n, k, batch),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(ctx) => ctx.try_dispatch_gemm(x, w, m, n, k, batch),
+        }
+    }
+
+    /// Strict output-into dispatch, reusing backend workspaces and caller storage.
+    pub fn try_dispatch_gemm_into(
+        &self,
+        x: &[f32],
+        w: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        batch: usize,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        match self {
+            Self::Wgpu(ctx) => ctx.try_dispatch_gemm_into(x, w, m, n, k, batch, out),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(ctx) => ctx.try_dispatch_gemm_into(x, w, m, n, k, batch, out),
+        }
+    }
+
+    /// Production output-into dispatch. Valid shapes fall back safely on GPU
+    /// failure; malformed buffers return Err without modifying the output.
+    pub fn dispatch_gemm_into(
+        &self,
+        x: &[f32],
+        w: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        batch: usize,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        let (_, _, expected) = checked_gemm_sizes(m, n, k, batch, x.len(), w.len())?;
+        if out.len() != expected {
+            return Err("GEMM output length mismatch".into());
+        }
+        if let Err(error) = self.try_dispatch_gemm_into(x, w, m, n, k, batch, out) {
+            eprintln!("warning: GPU GEMM failed; using CPU fallback: {error}");
+            gemm_cpu_into(x, w, m, n, k, batch, out)?;
+        }
+        Ok(())
     }
 
     /// Drop device-resident weight copies after an optimizer step.
@@ -698,6 +973,91 @@ impl Device {
             #[cfg(not(feature = "cuda"))]
             Err(e) => Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+
+    #[test]
+    fn webgpu_limits_are_checked_without_a_device_or_allocating_operands() {
+        let limits = wgpu::Limits::default();
+        assert!(checked_wgpu_sizes(&limits, 1, 1, 1, 65535, 65535, 1).is_ok());
+        assert!(
+            checked_wgpu_sizes(&limits, 1, 1, 1, 65536, 65536, 1)
+                .unwrap_err()
+                .contains("workgroup")
+        );
+        // The same contiguous chunk can be represented as M=L, batch=1.
+        assert!(checked_wgpu_sizes(&limits, 65536, 1, 1, 1, 65536, 1).is_ok());
+        let mut small = limits.clone();
+        small.max_compute_workgroups_per_dimension = 1;
+        for (m, n) in [(17, 1), (1, 17)] {
+            assert!(checked_wgpu_sizes(&small, m, n, 1, 1, m, n).is_err());
+        }
+        small = limits.clone();
+        small.max_buffer_size = 4;
+        assert!(checked_wgpu_sizes(&small, 2, 1, 1, 1, 2, 1).is_err());
+        small = limits.clone();
+        small.max_storage_buffer_binding_size = 4;
+        assert!(checked_wgpu_sizes(&small, 1, 2, 1, 1, 1, 2).is_err());
+        small = limits.clone();
+        small.max_compute_invocations_per_workgroup = 128;
+        assert!(checked_wgpu_sizes(&small, 1, 1, 1, 1, 1, 1).is_err());
+        assert!(checked_wgpu_sizes(&limits, usize::MAX, 2, 2, 2, 0, 0).is_err());
+        assert!(checked_wgpu_sizes(&limits, 2, 2, 2, 1, 1, 1).is_err());
+    }
+
+    #[test]
+    fn webgpu_strict_dispatch_and_error_scopes_when_an_adapter_is_available() {
+        // Software Vulkan is useful for API/validation coverage, not evidence of
+        // hardware acceleration. Production initialization still refuses it.
+        let ctx = match WgpuContext::init_with_software_policy(true) {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                eprintln!("WebGPU adapter unavailable; device checks skipped: {error}");
+                return;
+            }
+        };
+        assert!(ctx.try_dispatch_gemm(&[1.0], &[1.0], 2, 2, 2, 1).is_err());
+        let gpu = GpuDispatch::Wgpu(ctx.clone());
+        let x: Vec<_> = (0..3 * 5 * 7).map(|i| (i % 13) as f32 * 0.125).collect();
+        let w: Vec<_> = (0..11 * 7).map(|i| (i % 17) as f32 * -0.0625).collect();
+        let expected = gemm_cpu_reference(&x, &w, 5, 11, 7, 3);
+        let mut out = vec![0.0; expected.len()];
+        for _ in 0..2 {
+            gpu.try_dispatch_gemm_into(&x, &w, 5, 11, 7, 3, &mut out)
+                .unwrap();
+            assert_eq!(out.len(), expected.len());
+            assert!(
+                out.iter()
+                    .zip(&expected)
+                    .all(|(a, b)| a.is_finite() && (a - b).abs() < 1e-5)
+            );
+        }
+        // Reuse a larger workspace for a smaller dispatch: no stale output tail.
+        assert_eq!(
+            gpu.try_dispatch_gemm(&x[..7], &w[..7], 1, 1, 7, 1).unwrap(),
+            gemm_cpu_reference(&x[..7], &w[..7], 1, 1, 7, 1)
+        );
+        let large = vec![1.0; 65536];
+        assert!(
+            gpu.try_dispatch_gemm(&large, &[2.0], 1, 1, 1, 65536)
+                .is_err()
+        );
+        gpu.dispatch_gemm_into(&large, &[2.0], 1, 1, 1, 65536, &mut vec![0.0; 65536])
+            .unwrap();
+        // Deliberately violate a resource limit *inside* the same error-scope
+        // helper used by dispatch. This must produce Err, not an uncaptured panic.
+        begin_error_scopes(&ctx.device);
+        let _invalid = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("validation-regression"),
+            size: ctx.device.limits().max_buffer_size + 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        assert!(finish_error_scopes(&ctx.device).is_err());
     }
 }
 

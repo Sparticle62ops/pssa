@@ -46,6 +46,21 @@ impl Schedule {
         stored: Option<usize>,
         opts: &TrainingOptions,
     ) -> Result<Self, String> {
+        Self::new_with_warmup(chunks, prior_steps, stored, None, opts)
+    }
+
+    /// Restore the complete fixed schedule at the global optimizer step. Older
+    /// checkpoints lack warmup metadata and retain their no-rewarmup behavior.
+    pub fn new_with_warmup(
+        chunks: usize,
+        prior_steps: usize,
+        stored: Option<usize>,
+        stored_warmup: Option<usize>,
+        opts: &TrainingOptions,
+    ) -> Result<Self, String> {
+        if stored_warmup.is_some() && stored.is_none() {
+            return Err("stored schedule warmup requires a fixed horizon".into());
+        }
         if opts.epochs == 0 || opts.accumulate == 0 {
             return Err("epochs and accumulate must be positive".into());
         }
@@ -73,14 +88,12 @@ impl Schedule {
                 "learning-rate schedule horizon ({total}) must reach link end ({end}); set --total-updates on the fresh run to the whole-chain update count"
             ));
         }
-        // Match the PSSA contract: resume never restarts warmup, even if the
-        // original link stopped during warmup. Do not silently improve only
-        // one side of the comparison.
-        let warmup = if prior_steps > 0 {
-            0
-        } else {
-            opts.warmup_steps
-        };
+        // Warmup also defines the cosine phase after the warmup interval.
+        // Evaluating it at the global step continues, rather than restarts, it.
+        // With no stored definition, preserve legacy resume behavior.
+        let warmup = stored_warmup.unwrap_or_else(|| {
+            if prior_steps > 0 { 0 } else { opts.warmup_steps }
+        });
         if warmup >= total && warmup != 0 {
             return Err(format!(
                 "--warmup-steps ({warmup}) must be less than total optimizer updates ({total})"
@@ -88,9 +101,9 @@ impl Schedule {
         }
         if let Some(horizon) = fixed_horizon {
             println!(
-                "lr_schedule=fixed horizon={horizon} from_step={prior_steps} to_step={end}{}",
+                "lr_schedule=fixed horizon={horizon} from_step={prior_steps} to_step={end} warmup={warmup}{}",
                 if prior_steps > 0 {
-                    " (restored, no re-warmup)"
+                    " (restored at global step, no warmup restart)"
                 } else {
                     ""
                 }

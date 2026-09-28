@@ -493,13 +493,15 @@ impl CLIHandler {
             options.chunk
         };
         let plan = crate::training::chunk_plan(&docs, chunk_len);
-        let schedule = crate::training::Schedule::new(
+        let schedule = crate::training::Schedule::new_with_warmup(
             plan.len(),
             model.step_counter,
             model.lr_schedule_total_updates,
+            model.lr_schedule_warmup_steps,
             options,
         )?;
         model.lr_schedule_total_updates = schedule.fixed_horizon;
+        model.lr_schedule_warmup_steps = schedule.fixed_horizon.map(|_| schedule.warmup);
         let total_updates = schedule.updates;
         let schedule_total = schedule.total;
         let first_lr = schedule.lr(1)?;
@@ -1533,8 +1535,33 @@ fn docs_token_count(raw: &str, tokenizer: &Tokenizer) -> Result<usize, String> {
     })
 }
 
-/// Bring up the WebGPU compute device, run the embedded tiled GEMM kernel on it,
-/// and check the result against the CPU reference implementation.
+fn probe_max_abs_diff(actual: &[f32], expected: &[f32]) -> Result<f32, String> {
+    if actual.len() != expected.len() {
+        return Err(format!("GPU probe output length {}, expected {}", actual.len(), expected.len()));
+    }
+    if actual.iter().chain(expected).any(|x| !x.is_finite()) {
+        return Err("GPU probe comparison contains nonfinite values".into());
+    }
+    Ok(actual.iter().zip(expected).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max))
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::probe_max_abs_diff;
+
+    #[test]
+    fn comparison_rejects_short_or_nonfinite_gpu_results() {
+        assert!(probe_max_abs_diff(&[], &[0.0]).is_err());
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(probe_max_abs_diff(&[bad], &[0.0]).is_err());
+            assert!(probe_max_abs_diff(&[0.0], &[bad]).is_err());
+        }
+        assert_eq!(probe_max_abs_diff(&[1.0, -2.0], &[1.25, -2.0]).unwrap(), 0.25);
+    }
+}
+
+/// Bring up a GPU compute device, run a strict GEMM dispatch, and check the
+/// result against the CPU reference implementation without fallback.
 pub fn run_gpu_probe() -> Result<(), String> {
     println!("=== oxide gpu-probe ===");
     let device = match Device::try_gpu() {
@@ -1572,20 +1599,15 @@ pub fn run_gpu_probe() -> Result<(), String> {
     let w: Vec<f32> = (0..n * k).map(|_| next()).collect();
 
     let t_gpu = Instant::now();
-    let y_gpu = ctx.dispatch_gemm(&x, &w, m, n, k, batch);
+    let y_gpu = ctx.try_dispatch_gemm(&x, &w, m, n, k, batch)
+        .map_err(|e| format!("GPU probe dispatch failed (no CPU fallback): {e}"))?;
     let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1000.0;
 
     let t_cpu = Instant::now();
     let y_cpu = gemm_cpu_reference(&x, &w, m, n, k, batch);
     let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1000.0;
 
-    let mut max_abs = 0.0f32;
-    for (a, b) in y_gpu.iter().zip(y_cpu.iter()) {
-        let d = (a - b).abs();
-        if d > max_abs {
-            max_abs = d;
-        }
-    }
+    let max_abs = probe_max_abs_diff(&y_gpu, &y_cpu)?;
 
     println!("shape: batch={} M={} N={} K={}", batch, m, n, k);
     println!("gpu:   {:.3} ms", gpu_ms);
@@ -1597,6 +1619,6 @@ pub fn run_gpu_probe() -> Result<(), String> {
         println!("result: FAIL, GPU kernel diverges from CPU reference");
         return Err(format!("GPU GEMM differs from CPU reference by {max_abs:.3e}"));
     }
-    println!("note: layer math is still CPU-dispatched; this proves the device path only");
+    println!("note: this verifies GPU GEMM, not end-to-end training or hardware backward parity");
     Ok(())
 }

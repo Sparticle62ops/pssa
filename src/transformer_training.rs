@@ -69,13 +69,15 @@ pub fn train_corpus(
     model.cfg.lr = opts.lr;
     let docs = CLIHandler::documents(raw, &tokenizer, opts.max_tokens, opts.skip_tokens)?;
     let plan = chunk_plan(&docs, model.cfg.chunk_len);
-    let schedule = Schedule::new(
+    let schedule = Schedule::new_with_warmup(
         plan.len(),
         model.step_counter,
         model.lr_schedule_total_updates,
+        model.lr_schedule_warmup_steps,
         opts,
     )?;
     model.lr_schedule_total_updates = schedule.fixed_horizon;
+    model.lr_schedule_warmup_steps = schedule.fixed_horizon.map(|_| schedule.warmup);
     println!("backend=cpu (transformer reference baseline)");
     println!(
         "model=transformer parameters={} vocab={}",

@@ -4,7 +4,9 @@
 //! `b"PSSA" | version:u16(7) | payload_len:u64 | fnv1a64(payload):u64 |
 //! payload`. V7 writes the exact complete V6 payload, followed by
 //! `tokenizer_json_len:u64 | tokenizer_json:utf8[byte_len]`, and optionally a
-//! `lr_schedule_total_updates:u64` tail when a fixed schedule horizon is set.
+//! `lr_schedule_total_updates:u64` tail when a fixed schedule horizon is set,
+//! followed optionally by `lr_schedule_warmup_steps:u64`. Older horizon-only
+//! checkpoints retain an unknown (`None`) warmup definition.
 //! The optional JSON is zero-length only for the legacy word tokenizer. Shapes
 //! are derived from the preceding configuration and every declared length is
 //! checked. The checksum is accidental-corruption detection only, not
@@ -16,7 +18,6 @@
 //! update) and resume at the next forward call; they do not resume an in-flight
 //! backward pass or an external dataset cursor.
 
-use crate::adapter::PlasticAdapterV2;
 use crate::linalg::SimpleRng;
 use crate::pssa::{PSSAConfigV2, PSSALayerV2, ParamMatrix, ParamVector};
 use std::collections::HashSet;
@@ -139,24 +140,60 @@ pub fn validate_model_config(cfg: &PSSAConfigV2) -> std::result::Result<(), Stri
     validate_config(cfg).map_err(|e| e.to_string())
 }
 
-/// Reject a dimension declaration whose tape/scratch allocation is implausibly
-/// larger than the bytes available to populate even its persisted tensors. This
-/// keeps a tiny malformed checkpoint from forcing a near-cap allocation before
-/// the reader can discover that its payload is truncated.
-fn ensure_backed_by_file(cfg: &PSSAConfigV2, available_bytes: usize) -> Result<()> {
-    let allocated = allocation_bytes(cfg)?;
-    let backed = available_bytes.saturating_mul(128);
-    if allocated > backed {
-        return Err(invalid(format!(
-            "declared allocation {allocated} bytes is disproportionate to {available_bytes} bytes of checkpoint data"
-        )));
+/// Require enough bytes for the actual persisted tensors before allocating.
+/// Tape/chunk size is deliberately absent: a valid long tape need not have a
+/// proportionally large checkpoint. validate_config enforces the allocation cap.
+fn ensure_backed_by_file(
+    c: &PSSAConfigV2,
+    available_bytes: usize,
+    legacy_count: Option<usize>,
+) -> Result<()> {
+    let mut parameters = 0;
+    for (rows, cols) in [
+        (c.d_vocab, c.d_latent), (c.d_latent, c.d_state),
+        (c.d_latent, c.d_latent), (c.d_state, c.d_latent), (c.d_state, c.d_latent),
+        (c.d_mem_key, c.d_latent), (c.d_mem_key, c.d_latent),
+        (c.d_latent, c.d_latent), (c.d_latent, c.d_latent),
+        (checked_mul(2, c.d_latent, "MLP width")?, c.d_latent),
+        (c.d_latent, checked_mul(2, c.d_latent, "MLP width")?),
+        (c.d_vocab, c.d_latent), (16, c.d_latent), (c.d_latent, 16),
+        (c.d_latent, 1), (c.d_latent, 1),
+    ] {
+        add_mul(&mut parameters, rows, cols, "serialized parameters")?;
+    }
+    let mut required;
+    if let Some(count) = legacy_count {
+        // Data only: 16 parameter arrays, two memory arrays, and adapter rank.
+        required = checked_mul(parameters, 4, "legacy parameter bytes")?;
+        add_mul(&mut required, 19, 4, "legacy tensor lengths/rank")?;
+        for width in [c.d_mem_key, c.d_latent] {
+            add_mul(&mut required, checked_mul(count, width, "legacy memory")?, 4, "legacy memory bytes")?;
+        }
+    } else {
+        required = checked_mul(parameters, 16, "parameter/Adam bytes")?;
+        // Four arrays per parameter; eight other arrays plus count and head.
+        add_mul(&mut required, 16 * 4 + 10, 8, "tensor lengths/memory metadata")?;
+        for (rows, cols) in [
+            (c.d_latent, c.d_state), (c.mem_capacity, c.d_mem_key),
+            (c.mem_capacity, c.d_latent), (c.mem_capacity, 2), (c.d_latent, 16),
+        ] {
+            add_mul(&mut required, checked_mul(rows, cols, "persistent storage")?, 4, "persistent bytes")?;
+        }
+        add_mul(&mut required, c.mem_capacity, 8, "memory timestamps")?;
+        add_mul(&mut required, c.d_vocab, 8, "embedding marks")?;
+    }
+    if available_bytes < required {
+        return Err(invalid(format!("truncated persistent tensors: need {required} bytes, have {available_bytes}")));
     }
     Ok(())
 }
 
-/// Conservative byte count of all persistent parameters, tape and scratch vectors
-/// allocated by `PSSALayerV2::new`, excluding Vec headers.
-fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
+/// Exact numeric vector storage allocated by `PSSALayerV2::new`, including
+/// parameters, optimizer state, memory, tape and both execution paths' scratch.
+/// Excludes Vec/adapter headers, allocator bookkeeping, backend resources and
+/// optional tokenizer strings. Returns an error on overflow or above the cap.
+/// Keep the named fields in sync with the constructor and the actual-storage test.
+pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
     let (v, m, s, k, cap, l) = (
         c.d_vocab,
         c.d_latent,
@@ -166,139 +203,137 @@ fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
         c.chunk_len,
     );
     let two_m = checked_mul(m, 2, "twice d_latent")?;
-    let l_plus_one = checked_add(l, 1, "chunk_len + 1")?;
+    let ms = checked_mul(m, s, "latent * state")?;
+    let lm = checked_mul(l, m, "chunk * latent")?;
+    let ls = checked_mul(l, s, "chunk * state")?;
+    let lk = checked_mul(l, k, "chunk * key")?;
+    let lv = checked_mul(l, v, "chunk * vocab")?;
+    let lr = checked_mul(l, 16, "chunk * rank")?;
+    let lms = checked_mul(l, ms, "chunk * latent * state")?;
+    let l_two_m = checked_mul(l, two_m, "chunk * MLP width")?;
     let mut f32_count = 0usize;
     let mut usize_count = 0usize;
-    // Parameter matrices (four vectors each), plus the slow adapter coefficients.
-    for (rows, cols) in [
-        (v, m),
-        (m, s),
-        (m, m),
-        (s, m),
-        (s, m),
-        (k, m),
-        (k, m),
-        (m, m),
-        (m, m),
-        (two_m, m),
-        (m, two_m),
-        (v, m),
-        (16, m),
-        (m, 16),
+    // Every parameter owns data, grad, first moment and second moment.
+    for (name, rows, cols) in [
+        ("embed_w", v, m),
+        ("a_mat", m, s),
+        ("w_delta", m, m),
+        ("w_b", s, m),
+        ("w_c", s, m),
+        ("w_qx", k, m),
+        ("w_qh", k, m),
+        ("w_gate", m, m),
+        ("w_proj", m, m),
+        ("mlp_w1", two_m, m),
+        ("mlp_w2", m, two_m),
+        ("unembed_w", v, m),
+        ("adapter.down", 16, m),
+        ("adapter.up", m, 16),
+        ("norm_gamma", m, 1),
+        ("norm_beta", m, 1),
     ] {
-        add_mul(
-            &mut f32_count,
-            checked_mul(rows, cols, "parameter shape")?,
-            4,
-            "parameter vectors",
-        )?;
+        add_mul(&mut f32_count, checked_mul(rows, cols, name)?, 4, name)?;
     }
-    add_mul(
-        &mut f32_count,
-        checked_mul(m, 16, "slow adapter")?,
-        1,
-        "slow adapter",
-    )?;
-    add_mul(&mut f32_count, m, 8, "norm parameter vectors")?;
-    add_mul(
-        &mut f32_count,
-        checked_mul(m, s, "recurrent state")?,
-        1,
-        "recurrent state",
-    )?;
-    add_mul(
-        &mut f32_count,
-        checked_mul(cap, k, "memory keys")?,
-        1,
-        "memory keys",
-    )?;
-    add_mul(
-        &mut f32_count,
-        checked_mul(cap, m, "memory values")?,
-        1,
-        "memory values",
-    )?;
-    add_mul(&mut f32_count, cap, 2, "memory metadata")?;
-    add_mul(&mut usize_count, cap, 1, "memory timestamps")?;
-    // Activation tape f32 arrays.
-    for n in [
-        checked_mul(l, m, "tape")?,
-        l,
-        checked_mul(l, m, "tape")?,
-        checked_mul(l, m, "tape")?,
-        checked_mul(l, s, "tape")?,
-        checked_mul(l, s, "tape")?,
-        checked_mul(checked_mul(l, m, "tape")?, s, "tape")?,
-        checked_mul(checked_mul(l, m, "tape")?, s, "tape")?,
-        checked_mul(l_plus_one, checked_mul(m, s, "tape")?, "tape")?,
-        checked_mul(l, m, "tape")?,
-        checked_mul(l, k, "tape")?,
-        l,
-        checked_mul(l, k, "tape")?,
-        checked_mul(l, cap, "tape")?,
-        checked_mul(l, m, "tape")?,
-        checked_mul(l, m, "tape")?,
-        checked_mul(l, m, "tape")?,
-        checked_mul(l, m, "tape")?,
-        checked_mul(l, 16, "tape")?,
-        checked_mul(l, 16, "tape")?,
-        checked_mul(l, m, "tape")?,
-        checked_mul(l, two_m, "tape")?,
-        checked_mul(l, two_m, "tape")?,
-        checked_mul(l, m, "tape")?,
-        checked_mul(l, v, "tape")?,
-        checked_mul(l, v, "tape")?,
-        l,
+    for (name, n) in [
+        (
+            "adapter.consolidated_up",
+            checked_mul(m, 16, "slow adapter")?,
+        ),
+        ("h_persistent", ms),
+        ("ssm_raw_snapshot", ms),
+        ("ssm_rates", ms),
+        ("ssm_rate_derivatives", ms),
+        ("memory.keys", checked_mul(cap, k, "memory keys")?),
+        ("memory.values", checked_mul(cap, m, "memory values")?),
+        ("memory.norm_sq", cap),
+        ("memory.confidence", cap),
+        ("tape.x_norm", lm),
+        ("tape.inv_rms", l),
+        ("tape.delta_raw", lm),
+        ("tape.delta", lm),
+        ("tape.b_proj", ls),
+        ("tape.c_proj", ls),
+        ("tape.bar_a", lms),
+        ("tape.bar_b", lms),
+        (
+            "tape.h_states",
+            checked_mul(checked_add(l, 1, "chunk + 1")?, ms, "h_states")?,
+        ),
+        ("tape.y_ssm", lm),
+        ("tape.q_euc", lk),
+        ("tape.q_norm", l),
+        ("tape.q_poincare", lk),
+        ("tape.mem_weights", checked_mul(l, cap, "memory weights")?),
+        ("tape.m_val", lm),
+        ("tape.g_mem", lm),
+        ("tape.m_inj", lm),
+        ("tape.m_proj", lm),
+        ("tape.adapter_hidden", lr),
+        ("tape.adapter_act", lr),
+        ("tape.z_raw", lm),
+        ("tape.mlp_hidden", l_two_m),
+        ("tape.mlp_act", l_two_m),
+        ("tape.z_final", lm),
+        ("tape.logits", lv),
+        ("tape.probs", lv),
+        ("tape.losses", l),
+        ("grad_h_next", ms),
+        ("grad_z_final", m),
+        ("grad_z_raw", m),
+        ("grad_x_norm", m),
+        ("buf_m_proj", m),
+        ("buf_ad_out", m),
+        ("buf_g_mlp_act", two_m),
+        ("buf_g_mlp_hidden", two_m),
+        ("buf_g_zraw_mlp", m),
+        ("buf_g_ad_act", 16),
+        ("buf_g_ad_down", 16),
+        ("buf_g_m_proj_out", m),
+        ("buf_g_m_val", m),
+        ("g_query_pnc", k),
+        ("g_query_euc", k),
+        ("g_y_ssm", m),
+        ("buf_g_delta", m),
+        ("buf_g_b_proj", s),
+        ("buf_g_c_proj", s),
+        ("buf_g_h_prev", ms),
+        ("bwd_g_zfinal", lm),
+        ("bwd_g_zraw", lm),
+        ("bwd_g_ad_down", lr),
+        ("bwd_g_xnorm", lm),
+        ("bwd_g_ysm", lm),
+        ("bwd_g_logits", lv),
+        ("bwd_g_mlp", l_two_m),
+        ("inf_x_norm", m),
+        ("inf_delta", m),
+        ("inf_b", s),
+        ("inf_c", s),
+        ("inf_y_ssm", m),
+        ("inf_q_euc", k),
+        ("inf_q_pnc", k),
+        ("inf_mem_weights", cap),
+        ("inf_m_val", m),
+        ("inf_g_mem", m),
+        ("inf_m_proj", m),
+        ("inf_ad_act", 16),
+        ("inf_ad_out", m),
+        ("inf_z_raw", m),
+        ("inf_mlp_act", two_m),
+        ("inf_mlp_out", m),
+        ("inf_z_final", m),
     ] {
-        add_mul(&mut f32_count, n, 1, "tape")?;
+        f32_count = checked_add(f32_count, n, name)?;
     }
-    add_mul(&mut usize_count, l, 2, "tape token ids")?;
-    // Backward and inference scratch: an intentionally conservative 40 latent/state/key vectors.
-    for n in [
-        checked_mul(m, s, "scratch")?,
-        m,
-        m,
-        m,
-        m,
-        m,
-        m,
-        two_m,
-        two_m,
-        m,
-        16,
-        16,
-        m,
-        m,
-        m,
-        k,
-        k,
-        m,
-        m,
-        s,
-        s,
-        checked_mul(m, s, "scratch")?,
-        m,
-        m,
-        s,
-        s,
-        m,
-        k,
-        k,
-        cap,
-        m,
-        m,
-        m,
-        16,
-        m,
-        m,
-        two_m,
-        m,
+    for (name, n) in [
+        ("memory.last_seen_step", cap),
+        ("tape.x_ids", l),
+        ("tape.target_ids", l),
+        ("embed_row_marks", v),
     ] {
-        add_mul(&mut f32_count, n, 1, "scratch")?;
+        usize_count = checked_add(usize_count, n, name)?;
     }
-    add_mul(&mut usize_count, v, 1, "embed marks")?;
     let bytes = checked_add(
-        checked_mul(f32_count, 4, "f32 allocation")?,
+        checked_mul(f32_count, std::mem::size_of::<f32>(), "f32 allocation")?,
         checked_mul(
             usize_count,
             std::mem::size_of::<usize>(),
@@ -391,39 +426,44 @@ impl<'a> Reader<'a> {
         }
         Ok(x)
     }
-    fn floats(&mut self, expected: usize, what: &str, nonnegative: bool) -> Result<Vec<f32>> {
+    fn floats_into(&mut self, out: &mut [f32], what: &str, nonnegative: bool) -> Result<()> {
         let n = self.usize(&format!("{what} length"))?;
-        if n != expected {
-            return Err(invalid(format!("{what} length {n}, expected {expected}")));
+        if n != out.len() {
+            return Err(invalid(format!(
+                "{what} length {n}, expected {}",
+                out.len()
+            )));
         }
-        let byte_len = checked_mul(n, 4, what)?;
-        if self
-            .off
-            .checked_add(byte_len)
-            .map_or(true, |e| e > self.bytes.len())
-        {
-            return Err(invalid(format!("truncated while reading {what}")));
-        }
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            let x = self.f32(what)?;
+        self.float_words_into(out, what, nonnegative)
+    }
+    fn float_words_into(&mut self, out: &mut [f32], what: &str, nonnegative: bool) -> Result<()> {
+        let words = self.take(checked_mul(out.len(), 4, what)?, what)?;
+        for (slot, word) in out.iter_mut().zip(words.chunks_exact(4)) {
+            let x = f32::from_le_bytes(word.try_into().expect("sized"));
+            if !x.is_finite() {
+                return Err(invalid(format!("non-finite {what}")));
+            }
             if nonnegative && x < 0.0 {
                 return Err(invalid(format!("negative {what}")));
             }
-            out.push(x);
+            *slot = x;
         }
-        Ok(out)
+        Ok(())
     }
-    fn usizes(&mut self, expected: usize, what: &str) -> Result<Vec<usize>> {
+    fn usizes_into(&mut self, out: &mut [usize], what: &str) -> Result<()> {
         let n = self.usize(&format!("{what} length"))?;
-        if n != expected {
-            return Err(invalid(format!("{what} length {n}, expected {expected}")));
+        if n != out.len() {
+            return Err(invalid(format!(
+                "{what} length {n}, expected {}",
+                out.len()
+            )));
         }
-        let mut o = Vec::with_capacity(n);
-        for _ in 0..n {
-            o.push(self.usize(what)?);
+        let words = self.take(checked_mul(n, 8, what)?, what)?;
+        for (slot, word) in out.iter_mut().zip(words.chunks_exact(8)) {
+            *slot = usize::try_from(u64::from_le_bytes(word.try_into().expect("sized")))
+                .map_err(|_| invalid(format!("{what} exceeds platform usize")))?;
         }
-        Ok(o)
+        Ok(())
     }
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len().saturating_sub(self.off)
@@ -469,17 +509,17 @@ pub(crate) fn write_vector(w: &mut Writer, p: &ParamVector, name: &str) -> Resul
     Ok(())
 }
 pub(crate) fn read_matrix(r: &mut Reader<'_>, p: &mut ParamMatrix, name: &str) -> Result<()> {
-    p.data = r.floats(p.data.len(), name, false)?;
-    p.grad = r.floats(p.grad.len(), &format!("{name}.grad"), false)?;
-    p.m = r.floats(p.m.len(), &format!("{name}.m"), false)?;
-    p.v = r.floats(p.v.len(), &format!("{name}.v"), true)?;
+    r.floats_into(&mut p.data, name, false)?;
+    r.floats_into(&mut p.grad, &format!("{name}.grad"), false)?;
+    r.floats_into(&mut p.m, &format!("{name}.m"), false)?;
+    r.floats_into(&mut p.v, &format!("{name}.v"), true)?;
     Ok(())
 }
 pub(crate) fn read_vector(r: &mut Reader<'_>, p: &mut ParamVector, name: &str) -> Result<()> {
-    p.data = r.floats(p.data.len(), name, false)?;
-    p.grad = r.floats(p.grad.len(), &format!("{name}.grad"), false)?;
-    p.m = r.floats(p.m.len(), &format!("{name}.m"), false)?;
-    p.v = r.floats(p.v.len(), &format!("{name}.v"), true)?;
+    r.floats_into(&mut p.data, name, false)?;
+    r.floats_into(&mut p.grad, &format!("{name}.grad"), false)?;
+    r.floats_into(&mut p.m, &format!("{name}.m"), false)?;
+    r.floats_into(&mut p.v, &format!("{name}.v"), true)?;
     Ok(())
 }
 
@@ -593,32 +633,98 @@ fn validate_tokenizer_metadata(model: &PSSALayerV2) -> Result<()> {
     }
 }
 
-/// The common V6 payload, retained byte-for-byte by V7 before its metadata tail.
-fn payload_for_v6(model: &PSSALayerV2) -> Result<Vec<u8>> {
-    validate_config(&model.cfg)?;
-    allocation_bytes(&model.cfg)?;
-    validate_vocab(&model.vocabulary, model.cfg.d_vocab)?;
+fn validate_matrix_shape(p: &ParamMatrix, rows: usize, cols: usize, name: &str) -> Result<()> {
+    let expected = checked_mul(rows, cols, name)?;
+    if p.rows != rows
+        || p.cols != cols
+        || p.data.len() != expected
+        || p.grad.len() != expected
+        || p.m.len() != expected
+        || p.v.len() != expected
+    {
+        return Err(invalid(format!(
+            "{name} must have configuration-derived shape [{rows}, {cols}]"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_persistent_shapes(model: &PSSALayerV2) -> Result<()> {
+    let c = &model.cfg;
+    validate_config(c)?;
+    if model.step_counter == usize::MAX {
+        return Err(invalid("step_counter is exhausted"));
+    }
+    let mlp = checked_mul(c.d_latent, 2, "MLP width")?;
+    for (p, rows, cols, name) in [
+        (&model.embed_w, c.d_vocab, c.d_latent, "embed_w"),
+        (&model.a_mat, c.d_latent, c.d_state, "a_mat_raw"),
+        (&model.w_delta, c.d_latent, c.d_latent, "w_delta"),
+        (&model.w_b, c.d_state, c.d_latent, "w_b"),
+        (&model.w_c, c.d_state, c.d_latent, "w_c"),
+        (&model.w_qx, c.d_mem_key, c.d_latent, "w_qx"),
+        (&model.w_qh, c.d_mem_key, c.d_latent, "w_qh"),
+        (&model.w_gate, c.d_latent, c.d_latent, "w_gate"),
+        (&model.w_proj, c.d_latent, c.d_latent, "w_proj"),
+        (&model.mlp_w1, mlp, c.d_latent, "mlp_w1"),
+        (&model.mlp_w2, c.d_latent, mlp, "mlp_w2"),
+        (&model.unembed_w, c.d_vocab, c.d_latent, "unembed_w"),
+    ] {
+        validate_matrix_shape(p, rows, cols, name)?;
+    }
+    for (p, name) in [
+        (&model.norm_gamma, "norm_gamma"),
+        (&model.norm_beta, "norm_beta"),
+    ] {
+        if p.data.len() != c.d_latent
+            || p.grad.len() != c.d_latent
+            || p.m.len() != c.d_latent
+            || p.v.len() != c.d_latent
+        {
+            return Err(invalid(format!(
+                "{name} must have configuration-derived length {}",
+                c.d_latent
+            )));
+        }
+    }
     if model.adapters.len() != 1
         || model.adapters[0].rank != 16
-        || model.adapters[0].d_latent != model.cfg.d_latent
+        || model.adapters[0].d_latent != c.d_latent
     {
-        return Err(invalid("V6 requires exactly one rank-16 adapter"));
+        return Err(invalid(
+            "V6/V7 requires exactly one rank-16 adapter matching d_latent",
+        ));
     }
-    if model.h_persistent.len()
-        != checked_mul(model.cfg.d_latent, model.cfg.d_state, "h_persistent")?
-    {
-        return Err(invalid("h_persistent shape mismatch"));
+    let ad = &model.adapters[0];
+    validate_matrix_shape(&ad.down_proj, 16, c.d_latent, "adapter.down")?;
+    validate_matrix_shape(&ad.up_proj, c.d_latent, 16, "adapter.up")?;
+    for (actual, expected, name) in [
+        (
+            ad.consolidated_up.len(),
+            checked_mul(c.d_latent, 16, "slow adapter")?,
+            "adapter.consolidated_up",
+        ),
+        (
+            model.h_persistent.len(),
+            checked_mul(c.d_latent, c.d_state, "h_persistent")?,
+            "h_persistent",
+        ),
+        (model.embed_row_marks.len(), c.d_vocab, "embed_row_marks"),
+    ] {
+        if actual != expected {
+            return Err(invalid(format!(
+                "{name} length {actual}, expected {expected}"
+            )));
+        }
     }
+    validate_memory(model)
+}
+
+/// The common V6 payload, retained byte-for-byte by V7 before its metadata tail.
+fn payload_for_v6(model: &PSSALayerV2) -> Result<Vec<u8>> {
+    validate_persistent_shapes(model)?;
+    validate_vocab(&model.vocabulary, model.cfg.d_vocab)?;
     let mem = &model.memory;
-    if mem.capacity != model.cfg.mem_capacity
-        || mem.dim_key != model.cfg.d_mem_key
-        || mem.dim_val != model.cfg.d_latent
-        || mem.count > mem.capacity
-        || mem.write_head >= mem.capacity
-    {
-        return Err(invalid("memory dimensions or metadata invalid"));
-    }
-    validate_memory(model)?;
     let mut w = Writer::new();
     config_to_payload(&mut w, &model.cfg)?;
     w.usize(model.step_counter, "step_counter")?;
@@ -697,8 +803,26 @@ fn container_bytes(version: u16, payload: Vec<u8>) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Writes the current V7 format. It preserves all V6 state plus tokenizer metadata.
+fn validate_schedule(model: &PSSALayerV2) -> Result<()> {
+    match (
+        model.lr_schedule_total_updates,
+        model.lr_schedule_warmup_steps,
+    ) {
+        (Some(0), _) => Err(invalid("learning-rate schedule horizon must be positive")),
+        (Some(horizon), _) if horizon < model.step_counter => Err(invalid(
+            "learning-rate schedule horizon precedes optimizer step",
+        )),
+        (Some(horizon), Some(warmup)) if warmup >= horizon => Err(invalid(
+            "learning-rate schedule warmup must be less than its horizon",
+        )),
+        (None, Some(_)) => Err(invalid("learning-rate schedule warmup requires a horizon")),
+        _ => Ok(()),
+    }
+}
+
+/// Writes V7, preserving all V6 state plus tokenizer and schedule metadata.
 pub fn save_model(model: &PSSALayerV2, path: impl AsRef<Path>) -> Result<()> {
+    validate_schedule(model)?;
     validate_tokenizer_metadata(model)?;
     let mut payload = payload_for_v6(model)?;
     if let Some(json) = &model.tokenizer_json {
@@ -711,24 +835,33 @@ pub fn save_model(model: &PSSALayerV2, path: impl AsRef<Path>) -> Result<()> {
         payload.extend_from_slice(&0u64.to_le_bytes());
     }
     if let Some(total_updates) = model.lr_schedule_total_updates {
-        if total_updates == 0 {
-            return Err(invalid("learning-rate schedule horizon must be positive"));
-        }
         payload.extend_from_slice(
             &u64::try_from(total_updates)
                 .map_err(|_| invalid("learning-rate schedule horizon too large"))?
                 .to_le_bytes(),
         );
+        if let Some(warmup) = model.lr_schedule_warmup_steps {
+            payload.extend_from_slice(
+                &u64::try_from(warmup)
+                    .map_err(|_| invalid("learning-rate schedule warmup too large"))?
+                    .to_le_bytes(),
+            );
+        }
     }
     atomic_write(path.as_ref(), &container_bytes(FORMAT_VERSION, payload)?)
 }
 
 /// Compatibility writer for explicitly requested V6 word checkpoints. It cannot
-/// serialize BPE metadata; use `save_model` for all new checkpoints.
+/// serialize BPE or schedule metadata; use `save_model` for new checkpoints.
 pub fn save_model_v6(model: &PSSALayerV2, path: impl AsRef<Path>) -> Result<()> {
     if model.tokenizer_json.is_some() {
         return Err(invalid(
             "V6 cannot serialize byte-level tokenizer metadata; use V7",
+        ));
+    }
+    if model.lr_schedule_total_updates.is_some() || model.lr_schedule_warmup_steps.is_some() {
+        return Err(invalid(
+            "V6 cannot serialize learning-rate schedule metadata; use V7",
         ));
     }
     atomic_write(
@@ -751,6 +884,41 @@ pub(crate) fn read_file_capped(path: &Path) -> Result<Vec<u8>> {
 
 fn validate_memory(model: &PSSALayerV2) -> Result<()> {
     let m = &model.memory;
+    if m.capacity != model.cfg.mem_capacity
+        || m.dim_key != model.cfg.d_mem_key
+        || m.dim_val != model.cfg.d_latent
+        || m.capacity == 0
+    {
+        return Err(invalid("memory dimensions do not match configuration"));
+    }
+    // Validate every backing vector before indexing, even for an empty bank.
+    for (actual, expected, name) in [
+        (
+            m.keys.len(),
+            checked_mul(m.capacity, m.dim_key, "memory keys")?,
+            "memory keys",
+        ),
+        (
+            m.values.len(),
+            checked_mul(m.capacity, m.dim_val, "memory values")?,
+            "memory values",
+        ),
+        (m.norm_sq.len(), m.capacity, "memory norm_sq"),
+        (m.confidence.len(), m.capacity, "memory confidence"),
+        (m.last_seen_step.len(), m.capacity, "memory last_seen_step"),
+    ] {
+        if actual != expected {
+            return Err(invalid(format!(
+                "{name} length {actual}, expected {expected}"
+            )));
+        }
+    }
+    if !m.keys.iter().chain(&m.values).all(|x| x.is_finite()) {
+        return Err(invalid("non-finite memory keys/values"));
+    }
+    if m.norm_sq.iter().any(|x| !x.is_finite() || *x < 0.0) {
+        return Err(invalid("memory norm_sq must be finite and nonnegative"));
+    }
     if m.count > m.capacity
         || m.write_head >= m.capacity
         || (m.count < m.capacity && m.write_head != 0)
@@ -782,7 +950,9 @@ fn validate_memory(model: &PSSALayerV2) -> Result<()> {
     Ok(())
 }
 fn key_dot(xs: &[f32]) -> f32 {
-    xs.iter().map(|x| x * x).sum()
+    // Match the bank's robust norm policy. A separate f32 accumulation can
+    // round a valid high-dimensional projected key outside the open ball.
+    crate::memory::HyperbolicEpisodicBankV2::squared_norm(xs)
 }
 
 pub(crate) fn checked_payload<'a>(bytes: &'a [u8], label: &str) -> Result<&'a [u8]> {
@@ -809,13 +979,13 @@ pub(crate) fn checked_payload<'a>(bytes: &'a [u8], label: &str) -> Result<&'a [u
 fn load_payload(payload: &[u8], is_v7: bool) -> Result<LoadedCheckpoint> {
     let mut r = Reader::new(payload);
     let cfg = config_from_payload(&mut r)?;
-    ensure_backed_by_file(&cfg, payload.len())?;
     let step = r.usize("step_counter")?;
     if step == usize::MAX {
         return Err(invalid("step_counter is exhausted"));
     }
     let rng_state = r.u64("rng state")?;
     let vocabulary = read_vocab(&mut r, cfg.d_vocab)?;
+    ensure_backed_by_file(&cfg, r.remaining(), None)?;
     let mut model = PSSALayerV2::new(cfg, 1);
     model.step_counter = step;
     model.rng = SimpleRng::new(rng_state);
@@ -838,7 +1008,7 @@ fn load_payload(payload: &[u8], is_v7: bool) -> Result<LoadedCheckpoint> {
     }
     read_vector(&mut r, &mut model.norm_gamma, "norm_gamma")?;
     read_vector(&mut r, &mut model.norm_beta, "norm_beta")?;
-    model.h_persistent = r.floats(model.h_persistent.len(), "h_persistent", false)?;
+    r.floats_into(&mut model.h_persistent, "h_persistent", false)?;
     let count = r.usize("memory count")?;
     let head = r.usize("memory write_head")?;
     if count > model.memory.capacity || head >= model.memory.capacity {
@@ -846,20 +1016,19 @@ fn load_payload(payload: &[u8], is_v7: bool) -> Result<LoadedCheckpoint> {
     }
     model.memory.count = count;
     model.memory.write_head = head;
-    model.memory.keys = r.floats(model.memory.keys.len(), "memory keys", false)?;
-    model.memory.values = r.floats(model.memory.values.len(), "memory values", false)?;
-    model.memory.norm_sq = r.floats(model.memory.norm_sq.len(), "memory norm_sq", true)?;
-    model.memory.confidence = r.floats(model.memory.confidence.len(), "memory confidence", true)?;
-    model.memory.last_seen_step =
-        r.usizes(model.memory.last_seen_step.len(), "memory last_seen_step")?;
+    r.floats_into(&mut model.memory.keys, "memory keys", false)?;
+    r.floats_into(&mut model.memory.values, "memory values", false)?;
+    r.floats_into(&mut model.memory.norm_sq, "memory norm_sq", true)?;
+    r.floats_into(&mut model.memory.confidence, "memory confidence", true)?;
+    r.usizes_into(&mut model.memory.last_seen_step, "memory last_seen_step")?;
     read_matrix(&mut r, &mut model.adapters[0].down_proj, "adapter.down")?;
     read_matrix(&mut r, &mut model.adapters[0].up_proj, "adapter.up")?;
-    model.adapters[0].consolidated_up = r.floats(
-        model.adapters[0].consolidated_up.len(),
+    r.floats_into(
+        &mut model.adapters[0].consolidated_up,
         "adapter.consolidated_up",
         false,
     )?;
-    model.embed_row_marks = r.usizes(model.embed_row_marks.len(), "embed_row_marks")?;
+    r.usizes_into(&mut model.embed_row_marks, "embed_row_marks")?;
     model.vocabulary = vocabulary;
     if is_v7 {
         let json_len = r.usize("tokenizer JSON length")?;
@@ -875,13 +1044,18 @@ fn load_payload(payload: &[u8], is_v7: bool) -> Result<LoadedCheckpoint> {
         };
         model.tokenizer_json = json;
         validate_tokenizer_metadata(&model)?;
-        if r.remaining() != 0 && r.remaining() != 8 {
+        if !matches!(r.remaining(), 0 | 8 | 16) {
             return Err(invalid("invalid V7 metadata tail"));
         }
-        if r.remaining() == 8 {
+        if r.remaining() >= 8 {
             let total_updates = r.usize("learning-rate schedule horizon")?;
+            // Preserve the old reader's zero-horizon sentinel for horizon-only tails.
             model.lr_schedule_total_updates = (total_updates != 0).then_some(total_updates);
+            if r.remaining() == 8 {
+                model.lr_schedule_warmup_steps = Some(r.usize("learning-rate schedule warmup")?);
+            }
         }
+        validate_schedule(&model)?;
     }
     r.done()?;
     validate_memory(&model)?;
@@ -909,31 +1083,15 @@ fn legacy_u32(r: &mut Reader<'_>, what: &str) -> Result<usize> {
     ))
     .map_err(|_| invalid(format!("{what} too large")))
 }
-fn legacy_slice(r: &mut Reader<'_>, expected: usize, what: &str) -> Result<Vec<f32>> {
+fn legacy_slice_into(r: &mut Reader<'_>, out: &mut [f32], what: &str) -> Result<()> {
     let n = legacy_u32(r, &format!("{what} length"))?;
-    if n != expected {
+    if n != out.len() {
         return Err(invalid(format!(
-            "legacy {what} length {n}, expected {expected}"
+            "legacy {what} length {n}, expected {}",
+            out.len()
         )));
     }
-    r.floats_legacy(n, what)
-}
-impl Reader<'_> {
-    fn floats_legacy(&mut self, n: usize, what: &str) -> Result<Vec<f32>> {
-        let byte_len = checked_mul(n, 4, what)?;
-        if self
-            .off
-            .checked_add(byte_len)
-            .map_or(true, |e| e > self.bytes.len())
-        {
-            return Err(invalid(format!("truncated legacy {what}")));
-        }
-        let mut v = Vec::with_capacity(n);
-        for _ in 0..n {
-            v.push(self.f32(what)?);
-        }
-        Ok(v)
-    }
+    r.float_words_into(out, what, false)
 }
 fn inverse_softplus(y: f32) -> f32 {
     if y > 20.0 {
@@ -963,7 +1121,6 @@ fn load_v5(bytes: &[u8]) -> Result<LoadedCheckpoint> {
         ..Default::default()
     };
     validate_config(&cfg)?;
-    ensure_backed_by_file(&cfg, bytes.len())?;
     let mem_count = legacy_u32(&mut r, "mem_count")?;
     let adapter_count = legacy_u32(&mut r, "adapter_count")?;
     if mem_count > cfg.mem_capacity {
@@ -972,13 +1129,14 @@ fn load_v5(bytes: &[u8]) -> Result<LoadedCheckpoint> {
     if adapter_count != 1 {
         return Err(invalid("legacy requires exactly one adapter"));
     }
+    ensure_backed_by_file(&cfg, r.remaining(), Some(mem_count))?;
     let mut model = PSSALayerV2::new(cfg, 42);
-    model.embed_w.data = legacy_slice(&mut r, model.embed_w.data.len(), "embed_w")?;
-    model.norm_gamma.data = legacy_slice(&mut r, model.norm_gamma.data.len(), "norm_gamma")?;
-    model.norm_beta.data = legacy_slice(&mut r, model.norm_beta.data.len(), "norm_beta")?;
-    let physical = legacy_slice(&mut r, model.a_mat.data.len(), "a_mat physical")?;
+    legacy_slice_into(&mut r, &mut model.embed_w.data, "embed_w")?;
+    legacy_slice_into(&mut r, &mut model.norm_gamma.data, "norm_gamma")?;
+    legacy_slice_into(&mut r, &mut model.norm_beta.data, "norm_beta")?;
+    legacy_slice_into(&mut r, &mut model.a_mat.data, "a_mat physical")?;
     let mut bad = 0usize;
-    for &a in &physical {
+    for &a in &model.a_mat.data {
         if !a.is_finite() || a >= 0.0 {
             bad += 1;
         }
@@ -988,9 +1146,13 @@ fn load_v5(bytes: &[u8]) -> Result<LoadedCheckpoint> {
             "legacy physical A contains {bad} nonfinite or nonnegative entries; refusing unsafe conversion"
         )));
     }
-    model.a_mat.data = physical.into_iter().map(|a| inverse_softplus(-a)).collect();
+    for a in &mut model.a_mat.data {
+        *a = inverse_softplus(-*a);
+    }
     if model.a_mat.data.iter().any(|x| !x.is_finite()) {
-        return Err(invalid("legacy physical A cannot be represented as finite raw rates"));
+        return Err(invalid(
+            "legacy physical A cannot be represented as finite raw rates",
+        ));
     }
     for (slot, name) in [
         (&mut model.w_delta, "w_delta"),
@@ -1004,16 +1166,16 @@ fn load_v5(bytes: &[u8]) -> Result<LoadedCheckpoint> {
         (&mut model.mlp_w2, "mlp_w2"),
         (&mut model.unembed_w, "unembed_w"),
     ] {
-        slot.data = legacy_slice(&mut r, slot.data.len(), name)?;
+        legacy_slice_into(&mut r, &mut slot.data, name)?;
     }
     let k_len = checked_mul(mem_count, model.cfg.d_mem_key, "legacy keys")?;
     let v_len = checked_mul(mem_count, model.cfg.d_latent, "legacy values")?;
-    let keys = legacy_slice(&mut r, k_len, "memory keys")?;
-    let vals = legacy_slice(&mut r, v_len, "memory values")?;
-    model.memory.keys[..k_len].copy_from_slice(&keys);
-    model.memory.values[..v_len].copy_from_slice(&vals);
+    legacy_slice_into(&mut r, &mut model.memory.keys[..k_len], "memory keys")?;
+    legacy_slice_into(&mut r, &mut model.memory.values[..v_len], "memory values")?;
     model.memory.count = mem_count;
-    model.memory.write_head = mem_count % model.memory.capacity;
+    // V5 does not record a head. A partially filled bank must start at zero;
+    // a full imported bank likewise starts by replacing its first stored slot.
+    model.memory.write_head = 0;
     for i in 0..mem_count {
         let sq =
             key_dot(&model.memory.keys[i * model.cfg.d_mem_key..(i + 1) * model.cfg.d_mem_key]);
@@ -1028,14 +1190,12 @@ fn load_v5(bytes: &[u8]) -> Result<LoadedCheckpoint> {
     if rank != 16 {
         return Err(invalid(format!("legacy adapter rank {rank}; expected 16")));
     }
-    model.adapters[0] = PlasticAdapterV2::new(model.cfg.d_latent, 16, &mut model.rng);
-    model.adapters[0].down_proj.data = legacy_slice(
+    legacy_slice_into(
         &mut r,
-        model.adapters[0].down_proj.data.len(),
+        &mut model.adapters[0].down_proj.data,
         "adapter down",
     )?;
-    model.adapters[0].up_proj.data =
-        legacy_slice(&mut r, model.adapters[0].up_proj.data.len(), "adapter up")?;
+    legacy_slice_into(&mut r, &mut model.adapters[0].up_proj.data, "adapter up")?;
     r.done()?;
     Ok(LoadedCheckpoint {
         model,
@@ -1060,4 +1220,113 @@ pub fn load_checkpoint(path: impl AsRef<Path>) -> Result<LoadedCheckpoint> {
 }
 pub fn load_model_v6(path: impl AsRef<Path>) -> Result<PSSALayerV2> {
     Ok(load_checkpoint(path)?.model)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "manual release-mode checkpoint decoder timing probe"]
+    fn benchmark_checkpoint_decoder_reuse() {
+        use std::{hint::black_box, time::Instant};
+        let source = ParamMatrix::zeros(2048, 256);
+        let mut w = Writer::new();
+        write_matrix(&mut w, &source, "matrix").unwrap();
+        let mut target = ParamMatrix::zeros(2048, 256);
+        let mut timings = [Vec::new(), Vec::new()];
+        for round in 0..6 {
+            // Alternate order to avoid systematically favoring warm caches.
+            for mode in [round % 2, 1 - round % 2] {
+                let start = Instant::now();
+                for _ in 0..16 {
+                    let mut r = Reader::new(black_box(&w.bytes));
+                    if mode == 0 {
+                        // Prior decoder: allocate each array, then replace it.
+                        for (out, nonnegative) in [
+                            (&mut target.data, false),
+                            (&mut target.grad, false),
+                            (&mut target.m, false),
+                            (&mut target.v, true),
+                        ] {
+                            let n = r.usize("length").unwrap();
+                            assert_eq!(n, out.len());
+                            let mut decoded = Vec::with_capacity(n);
+                            for _ in 0..n {
+                                let x = r.f32("matrix").unwrap();
+                                assert!(!nonnegative || x >= 0.0);
+                                decoded.push(x);
+                            }
+                            *out = decoded;
+                        }
+                    } else {
+                        read_matrix(&mut r, &mut target, "matrix").unwrap();
+                    }
+                    black_box(&target);
+                }
+                timings[mode].push(start.elapsed().as_secs_f64());
+            }
+        }
+        for samples in &mut timings {
+            samples.sort_by(f64::total_cmp);
+        }
+        eprintln!(
+            "checkpoint decoder (16 x 8 MiB, median of 6): allocating={:.4}s reuse={:.4}s ratio={:.2}x",
+            timings[0][3],
+            timings[1][3],
+            timings[0][3] / timings[1][3]
+        );
+        assert_eq!(source, target);
+    }
+
+    #[test]
+    fn parameter_decode_reuses_existing_storage() {
+        let mut source = ParamMatrix::zeros(3, 2);
+        source.data.fill(1.5);
+        source.grad.fill(-0.5);
+        source.m.fill(0.25);
+        source.v.fill(0.75);
+        let mut w = Writer::new();
+        write_matrix(&mut w, &source, "matrix").unwrap();
+        let mut target = ParamMatrix::zeros(3, 2);
+        let pointers = [
+            target.data.as_ptr(),
+            target.grad.as_ptr(),
+            target.m.as_ptr(),
+            target.v.as_ptr(),
+        ];
+        read_matrix(&mut Reader::new(&w.bytes), &mut target, "matrix").unwrap();
+        assert_eq!(
+            pointers,
+            [
+                target.data.as_ptr(),
+                target.grad.as_ptr(),
+                target.m.as_ptr(),
+                target.v.as_ptr()
+            ]
+        );
+        assert_eq!(source, target);
+
+        let source = ParamVector::new(7, 0.5);
+        let mut w = Writer::new();
+        write_vector(&mut w, &source, "vector").unwrap();
+        let mut target = ParamVector::new(7, 0.0);
+        let pointers = [
+            target.data.as_ptr(),
+            target.grad.as_ptr(),
+            target.m.as_ptr(),
+            target.v.as_ptr(),
+        ];
+        read_vector(&mut Reader::new(&w.bytes), &mut target, "vector").unwrap();
+        assert_eq!(
+            pointers,
+            [
+                target.data.as_ptr(),
+                target.grad.as_ptr(),
+                target.m.as_ptr(),
+                target.v.as_ptr()
+            ]
+        );
+        assert_eq!(source, target);
+    }
 }

@@ -253,6 +253,7 @@ pub struct TransformerModel {
     pub vocabulary: Vec<String>,
     pub tokenizer_json: Option<String>,
     pub lr_schedule_total_updates: Option<usize>,
+    pub lr_schedule_warmup_steps: Option<usize>,
     pub token_embed: ParamMatrix,
     pub qkv: ParamMatrix,
     pub out_proj: ParamMatrix,
@@ -289,6 +290,7 @@ impl TransformerModel {
             vocabulary: Vec::new(),
             tokenizer_json: None,
             lr_schedule_total_updates: None,
+            lr_schedule_warmup_steps: None,
             tape: Some(TransformerTape::new(&cfg)),
         })
     }
