@@ -589,6 +589,18 @@ impl PSSALayerV2 {
         }
     }
 
+    /// Trainable scalar count (not optimizer moments, activations, episodic
+    /// memory or the adapter's non-independent consolidated copy).
+    pub fn parameter_count(&self) -> usize {
+        [
+            &self.embed_w, &self.a_mat, &self.w_delta, &self.w_b, &self.w_c,
+            &self.w_qx, &self.w_qh, &self.w_gate, &self.w_proj,
+            &self.mlp_w1, &self.mlp_w2, &self.unembed_w,
+        ].iter().map(|p| p.data.len()).sum::<usize>()
+            + self.norm_gamma.data.len() + self.norm_beta.data.len()
+            + self.adapters.iter().map(|a| a.down_proj.data.len() + a.up_proj.data.len()).sum::<usize>()
+    }
+
     pub fn reset_recurrent_state(&mut self) {
         self.h_persistent.fill(0.0);
     }

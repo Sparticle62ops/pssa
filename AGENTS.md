@@ -21,7 +21,11 @@ SIMD + rayon by default, optional WebGPU and native CUDA/cuBLAS backends.
 | `dataset.rs` (602) | corpus loading, tokenizer, `--max-tokens` / `--skip-tokens` |
 | `linalg.rs` (518) | matmul and friends |
 | `tui.rs` (486), `ui.rs` (367) | ratatui progress display |
-| `inference.rs` (302) | generation |
+| `inference.rs` (302) | PSSA generation and shared sampling policy |
+| `transformer.rs` | CPU decoder-only baseline, forward/backward, parameter counts |
+| `transformer_checkpoint.rs` | separate `TRFM` v1 checkpoints, complete Adam/tokenizer resume |
+| `transformer_training.rs`, `transformer_inference.rs` | baseline train/generate/evaluate runtime |
+| `training.rs` | shared chunk plans, LR schedule horizons, token-stream audit fingerprints |
 | `cuda.rs` (249) | cuBLAS SGEMM, device-resident weight cache |
 | `memory.rs` (182), `adapter.rs` (93), `defense.rs` (68) | supporting pieces |
 
@@ -41,6 +45,19 @@ live in `tests/` (`core_repair`, `checkpoint_repair`, `bpe_repair`,
 `runtime_repair`, `linalg`, `allocations`, `backward_blocked`). Two probes in
 `examples/`: `perf_probe.rs`, `twin_check.rs` (CPU-twin verification of the GPU
 path; run it after touching `gpu_batch.rs` or `cuda.rs`).
+
+## Transformer baseline
+
+`train-transformer` is a one-block width-256 / 4-head / FFN-448 decoder baseline.
+At actual vocab 2048 it has 1,541,120 trainable parameters versus default PSSA's
+1,544,704. Both print actual counts. It shares PSSA's document/window selector,
+chunk plan, schedule, AdamW, and progress/loss format. Use `--tokenizer-from
+<pssa-checkpoint>` on a fresh baseline run to import the exact tokenizer, then
+resume each model's own checkpoint with the same window/accumulation options.
+Baseline generation/evaluation use `generate-transformer` / `evaluate-transformer`.
+The baseline is CPU-only and chunk-local; PSSA retains recurrent carry and memory.
+See `docs/TRANSFORMER-BASELINE.md` for reproducible commands, counting conventions,
+and comparison caveats. Tests live in `tests/transformer.rs`.
 
 ## Do not break the Kaggle contract
 

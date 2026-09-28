@@ -55,7 +55,7 @@ impl From<io::Error> for CheckpointError {
     }
 }
 
-type Result<T> = std::result::Result<T, CheckpointError>;
+pub(crate) type Result<T> = std::result::Result<T, CheckpointError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointFormat {
@@ -70,11 +70,11 @@ pub struct LoadedCheckpoint {
     pub format: CheckpointFormat,
 }
 
-fn invalid(msg: impl Into<String>) -> CheckpointError {
+pub(crate) fn invalid(msg: impl Into<String>) -> CheckpointError {
     CheckpointError::Invalid(msg.into())
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for &b in bytes {
         h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
@@ -314,20 +314,20 @@ fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
     Ok(bytes)
 }
 
-struct Writer {
-    bytes: Vec<u8>,
+pub(crate) struct Writer {
+    pub(crate) bytes: Vec<u8>,
 }
 impl Writer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { bytes: Vec::new() }
     }
-    fn u64(&mut self, n: u64) {
+    pub(crate) fn u64(&mut self, n: u64) {
         self.bytes.extend_from_slice(&n.to_le_bytes());
     }
-    fn f32(&mut self, n: f32) {
+    pub(crate) fn f32(&mut self, n: f32) {
         self.bytes.extend_from_slice(&n.to_le_bytes());
     }
-    fn usize(&mut self, n: usize, what: &str) -> Result<()> {
+    pub(crate) fn usize(&mut self, n: usize, what: &str) -> Result<()> {
         self.u64(u64::try_from(n).map_err(|_| invalid(format!("{what} does not fit u64")))?);
         Ok(())
     }
@@ -350,15 +350,15 @@ impl Writer {
     }
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     off: usize,
 }
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, off: 0 }
     }
-    fn take(&mut self, n: usize, what: &str) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize, what: &str) -> Result<&'a [u8]> {
         let end = self
             .off
             .checked_add(n)
@@ -375,16 +375,16 @@ impl<'a> Reader<'a> {
             self.take(2, what)?.try_into().expect("sized"),
         ))
     }
-    fn u64(&mut self, what: &str) -> Result<u64> {
+    pub(crate) fn u64(&mut self, what: &str) -> Result<u64> {
         Ok(u64::from_le_bytes(
             self.take(8, what)?.try_into().expect("sized"),
         ))
     }
-    fn usize(&mut self, what: &str) -> Result<usize> {
+    pub(crate) fn usize(&mut self, what: &str) -> Result<usize> {
         usize::try_from(self.u64(what)?)
             .map_err(|_| invalid(format!("{what} exceeds platform usize")))
     }
-    fn f32(&mut self, what: &str) -> Result<f32> {
+    pub(crate) fn f32(&mut self, what: &str) -> Result<f32> {
         let x = f32::from_le_bytes(self.take(4, what)?.try_into().expect("sized"));
         if !x.is_finite() {
             return Err(invalid(format!("non-finite {what}")));
@@ -425,10 +425,10 @@ impl<'a> Reader<'a> {
         }
         Ok(o)
     }
-    fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         self.bytes.len().saturating_sub(self.off)
     }
-    fn done(&self) -> Result<()> {
+    pub(crate) fn done(&self) -> Result<()> {
         if self.off == self.bytes.len() {
             Ok(())
         } else {
@@ -437,7 +437,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn write_matrix(w: &mut Writer, p: &ParamMatrix, name: &str) -> Result<()> {
+pub(crate) fn write_matrix(w: &mut Writer, p: &ParamMatrix, name: &str) -> Result<()> {
     let expected = checked_mul(p.rows, p.cols, name)?;
     if p.data.len() != expected
         || p.grad.len() != expected
@@ -455,7 +455,7 @@ fn write_matrix(w: &mut Writer, p: &ParamMatrix, name: &str) -> Result<()> {
     w.floats(&p.v, &format!("{name}.v"))?;
     Ok(())
 }
-fn write_vector(w: &mut Writer, p: &ParamVector, name: &str) -> Result<()> {
+pub(crate) fn write_vector(w: &mut Writer, p: &ParamVector, name: &str) -> Result<()> {
     if p.data.len() != p.grad.len() || p.data.len() != p.m.len() || p.data.len() != p.v.len() {
         return Err(invalid(format!("{name} parameter shape mismatch")));
     }
@@ -468,14 +468,14 @@ fn write_vector(w: &mut Writer, p: &ParamVector, name: &str) -> Result<()> {
     w.floats(&p.v, &format!("{name}.v"))?;
     Ok(())
 }
-fn read_matrix(r: &mut Reader<'_>, p: &mut ParamMatrix, name: &str) -> Result<()> {
+pub(crate) fn read_matrix(r: &mut Reader<'_>, p: &mut ParamMatrix, name: &str) -> Result<()> {
     p.data = r.floats(p.data.len(), name, false)?;
     p.grad = r.floats(p.grad.len(), &format!("{name}.grad"), false)?;
     p.m = r.floats(p.m.len(), &format!("{name}.m"), false)?;
     p.v = r.floats(p.v.len(), &format!("{name}.v"), true)?;
     Ok(())
 }
-fn read_vector(r: &mut Reader<'_>, p: &mut ParamVector, name: &str) -> Result<()> {
+pub(crate) fn read_vector(r: &mut Reader<'_>, p: &mut ParamVector, name: &str) -> Result<()> {
     p.data = r.floats(p.data.len(), name, false)?;
     p.grad = r.floats(p.grad.len(), &format!("{name}.grad"), false)?;
     p.m = r.floats(p.m.len(), &format!("{name}.m"), false)?;
@@ -546,7 +546,7 @@ fn validate_vocab(vocab: &[String], d_vocab: usize) -> Result<()> {
     }
     Ok(())
 }
-fn write_vocab(w: &mut Writer, vocab: &[String], d_vocab: usize) -> Result<()> {
+pub(crate) fn write_vocab(w: &mut Writer, vocab: &[String], d_vocab: usize) -> Result<()> {
     validate_vocab(vocab, d_vocab)?;
     w.usize(vocab.len(), "vocabulary count")?;
     for token in vocab {
@@ -555,7 +555,7 @@ fn write_vocab(w: &mut Writer, vocab: &[String], d_vocab: usize) -> Result<()> {
     }
     Ok(())
 }
-fn read_vocab(r: &mut Reader<'_>, d_vocab: usize) -> Result<Vec<String>> {
+pub(crate) fn read_vocab(r: &mut Reader<'_>, d_vocab: usize) -> Result<Vec<String>> {
     let n = r.usize("vocabulary count")?;
     if n != 0 && n != d_vocab {
         return Err(invalid("vocabulary count must be zero or d_vocab"));
@@ -659,7 +659,7 @@ fn payload_for_v6(model: &PSSALayerV2) -> Result<Vec<u8>> {
 }
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -737,7 +737,7 @@ pub fn save_model_v6(model: &PSSALayerV2, path: impl AsRef<Path>) -> Result<()> 
     )
 }
 
-fn read_file_capped(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn read_file_capped(path: &Path) -> Result<Vec<u8>> {
     let len = usize::try_from(fs::metadata(path)?.len()).map_err(|_| invalid("file too large"))?;
     if len
         > MAX_LOAD_ALLOCATION_BYTES
@@ -785,7 +785,7 @@ fn key_dot(xs: &[f32]) -> f32 {
     xs.iter().map(|x| x * x).sum()
 }
 
-fn checked_payload<'a>(bytes: &'a [u8], label: &str) -> Result<&'a [u8]> {
+pub(crate) fn checked_payload<'a>(bytes: &'a [u8], label: &str) -> Result<&'a [u8]> {
     if bytes.len() < HEADER_LEN {
         return Err(invalid(format!("truncated {label} header")));
     }
