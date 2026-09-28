@@ -16,7 +16,8 @@ SIMD + rayon by default, optional WebGPU and native CUDA/cuBLAS backends.
 | `pssa.rs` (1273) | the architecture itself: forward, backward, state updates |
 | `cli.rs` (1247) | argument parsing and every subcommand entry point |
 | `checkpoint.rs` (1027) | `.pssa` serialization, resume, repair |
-| `gpu_batch.rs` (904) | batched GPU dispatch stages |
+| `gpu_batch.rs` | shared dense forward/backward dispatch stages |
+| `sequence_batch.rs` | packed independent document lanes, per-lane recurrent carry and TBPTT |
 | `backend.rs` (697) | backend selection and the CPU path |
 | `dataset.rs` (602) | corpus loading, tokenizer, `--max-tokens` / `--skip-tokens` |
 | `linalg.rs` (518) | matmul and friends |
@@ -38,6 +39,17 @@ cargo build --release              # CPU + WebGPU
 cargo build --release --features cuda
 cargo test
 ```
+
+For the workspace toolchain, set `CC=/workspace/bin/zigcc`,
+`CXX=/workspace/bin/zigcc`, and `AR=/workspace/bin/ar`; run tests with
+`CARGO_TARGET_DIR=/workspace/oxide-target-test`.
+
+PSSA `train --batch-size N` groups independent document lanes (default 1,
+legacy single-lane path); `--accumulate` counts microbatches per update.
+Batch workspaces are runtime-only, not checkpoint metadata. See
+`tests/batch_training.rs` for CLI, planning, and schedule/resume coverage;
+`tests/sequence_batch.rs` checks packed math against separate sequences.
+`examples/sequence_batch_probe.rs` is the fixed-work CPU throughput baseline.
 
 `cuda` is optional and dynamically loaded, so a CUDA build still runs on a
 machine with no driver; the backend just reports itself unavailable. Tests

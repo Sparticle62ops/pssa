@@ -14,6 +14,11 @@ pub fn train_corpus(
     opts: &TrainingOptions,
     tokenizer_from: Option<&str>,
 ) -> Result<(TransformerModel, Tokenizer), String> {
+    if opts.batch_size != 1 {
+        return Err(
+            "--batch-size is supported by PSSA train only; use batch size 1 for the transformer".into(),
+        );
+    }
     if opts.chunk == 0 || opts.max_tokens == Some(0) || opts.epochs == 0 || opts.accumulate == 0 {
         return Err("chunk, max-tokens, epochs and accumulate must be positive".into());
     }

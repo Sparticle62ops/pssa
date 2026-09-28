@@ -157,6 +157,7 @@ fn fresh_bpe_cli_checkpoint_generates_without_corpus() {
         chunk: 8,
         lr: 0.01,
         accumulate: 1,
+        batch_size: 1,
         warmup_steps: 0,
         schedule_total_updates: None,
         seed: 3,
