@@ -62,7 +62,7 @@ impl<'a> PSSAInferenceEngine<'a> {
     pub fn new(model: &'a mut PSSALayerV2, tokenizer: &'a Tokenizer) -> Self {
         Self::try_new(model, tokenizer).expect("invalid inference model/tokenizer")
     }
-    fn validate(cfg: &InferenceConfig) -> Result<(), String> {
+    pub(crate) fn validate(cfg: &InferenceConfig) -> Result<(), String> {
         if !cfg.temperature.is_finite() || cfg.temperature < 0.0 {
             return Err("temperature must be finite and >= 0".into());
         }
@@ -77,15 +77,15 @@ impl<'a> PSSAInferenceEngine<'a> {
         }
         Ok(())
     }
-    fn sample(
-        &mut self,
+    pub(crate) fn sample(
+        rng: &mut SimpleRng,
         cfg: &InferenceConfig,
         generated_ids: &[usize],
         logits: &mut [f32],
         probs: &mut [f32],
         candidates: &mut Vec<(usize, f32)>,
     ) -> Result<usize, String> {
-        let d_v = self.model.cfg.d_vocab;
+        let d_v = logits.len();
         if logits.iter().any(|x| !x.is_finite()) {
             return Err("model emitted non-finite logits".into());
         }
@@ -142,7 +142,7 @@ impl<'a> PSSAInferenceEngine<'a> {
         }
         let filtered = &candidates[..cutoff.max(1)];
         let mass: f32 = filtered.iter().map(|x| x.1).sum();
-        let draw = self.rng.gen_range_f32(0.0, mass);
+        let draw = rng.gen_range_f32(0.0, mass);
         let mut running = 0.0;
         let mut id = filtered[filtered.len() - 1].0;
         for &(candidate, p) in filtered {
@@ -197,7 +197,8 @@ impl<'a> PSSAInferenceEngine<'a> {
                             &mut logits,
                         );
                     }
-                    let selected = self.sample(
+                    let selected = Self::sample(
+                        &mut self.rng,
                         cfg,
                         &generated_ids,
                         &mut logits,
@@ -246,7 +247,8 @@ impl<'a> PSSAInferenceEngine<'a> {
                             &mut logits,
                         );
                     }
-                    let selected = self.sample(
+                    let selected = Self::sample(
+                        &mut self.rng,
                         cfg,
                         &generated_ids,
                         &mut logits,

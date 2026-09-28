@@ -91,12 +91,7 @@ impl Vector {
         if len == 0 {
             return;
         }
-        let sum_sq: f32 = self.data.iter().map(|&x| x * x).sum();
-        let rms = (sum_sq / (len as f32) + 1e-5).sqrt();
-        let inv_rms = 1.0 / rms;
-        for i in 0..len {
-            out.data[i] = self.data[i] * inv_rms;
-        }
+        rms_norm_slice(&self.data, &mut out.data);
     }
 
     #[inline(always)]
@@ -145,6 +140,17 @@ impl Vector {
         self.rms_norm_into(&mut out);
         out
     }
+}
+
+/// Repository RMSNorm convention, with epsilon inside the root. Returns the
+/// inverse RMS for backward; affine gamma/beta are applied by the model.
+pub fn rms_norm_slice(input: &[f32], out: &mut [f32]) -> f32 {
+    assert_eq!(input.len(), out.len());
+    if input.is_empty() { return 0.0; }
+    let sum_sq: f32 = input.iter().map(|&x| x * x).sum();
+    let inv = 1.0 / (sum_sq / input.len() as f32 + 1e-5).sqrt();
+    for (y, x) in out.iter_mut().zip(input) { *y = x * inv; }
+    inv
 }
 
 /// Returns the dot product of two equally sized slices.
