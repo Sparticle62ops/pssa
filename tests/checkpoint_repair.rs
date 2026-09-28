@@ -25,6 +25,7 @@ fn pv(p: &mut ParamVector, n: f32) {
 fn model() -> PSSALayerV2 {
     let mut x = PSSALayerV2::new(
         PSSAConfigV2 {
+            depth: 1,
             d_vocab: 5,
             d_latent: 4,
             d_state: 2,
@@ -48,24 +49,11 @@ fn model() -> PSSALayerV2 {
         "gamma".into(),
         "delta".into(),
     ];
-    for (i, p) in [
-        &mut x.embed_w,
-        &mut x.a_mat,
-        &mut x.w_delta,
-        &mut x.w_b,
-        &mut x.w_c,
-        &mut x.w_qx,
-        &mut x.w_qh,
-        &mut x.w_gate,
-        &mut x.w_proj,
-        &mut x.mlp_w1,
-        &mut x.mlp_w2,
-        &mut x.unembed_w,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        pm(p, i as f32 + 0.1)
+    for i in 0..12 {
+        pm(
+            persistent_matrix_mut(&mut x, i),
+            i as f32 + 0.1,
+        );
     }
     pv(&mut x.norm_gamma, 20.);
     pv(&mut x.norm_beta, 30.);
@@ -566,24 +554,24 @@ fn legacy_inside_ball_keys_survive_norm_rounding_and_all_checkpoint_versions() {
     fs::remove_file(p).unwrap();
 }
 
-fn persistent_matrices(m: &mut PSSALayerV2) -> [&mut ParamMatrix; 14] {
-    let ad = &mut m.adapters[0];
-    [
-        &mut m.embed_w,
-        &mut m.a_mat,
-        &mut m.w_delta,
-        &mut m.w_b,
-        &mut m.w_c,
-        &mut m.w_qx,
-        &mut m.w_qh,
-        &mut m.w_gate,
-        &mut m.w_proj,
-        &mut m.mlp_w1,
-        &mut m.mlp_w2,
-        &mut m.unembed_w,
-        &mut ad.down_proj,
-        &mut ad.up_proj,
-    ]
+fn persistent_matrix_mut(m: &mut PSSALayerV2, index: usize) -> &mut ParamMatrix {
+    match index {
+        0 => &mut m.embed_w,
+        1 => &mut m.a_mat,
+        2 => &mut m.w_delta,
+        3 => &mut m.w_b,
+        4 => &mut m.w_c,
+        5 => &mut m.w_qx,
+        6 => &mut m.w_qh,
+        7 => &mut m.w_gate,
+        8 => &mut m.w_proj,
+        9 => &mut m.mlp_w1,
+        10 => &mut m.mlp_w2,
+        11 => &mut m.unembed_w,
+        12 => &mut m.adapters[0].down_proj,
+        13 => &mut m.adapters[0].up_proj,
+        _ => panic!("persistent matrix index out of range: {index}"),
+    }
 }
 
 fn assert_bad_save_preserves(m: &PSSALayerV2, p: &PathBuf, good: &[u8], case: &str) {
@@ -612,10 +600,10 @@ fn malformed_persistent_tensor_shapes_preserve_old_checkpoint() {
     for tensor in 0..14 {
         for corruption in 0..6 {
             let mut m = model();
-            let mat = &mut persistent_matrices(&mut m)[tensor];
+            let mat = persistent_matrix_mut(&mut m, tensor);
             match corruption {
                 // Internally consistent, but not the configuration's tensor.
-                0 => **mat = ParamMatrix::zeros(mat.rows + 1, mat.cols),
+                0 => *mat = ParamMatrix::zeros(mat.rows + 1, mat.cols),
                 // Correct element count, wrong declared row/column dimensions.
                 1 => {
                     mat.rows *= mat.cols;
@@ -722,7 +710,10 @@ fn malformed_memory_adapter_and_metadata_preserve_old_checkpoint_without_panics(
             m.memory.confidence.clear();
         },
         |m| m.adapters.clear(),
-        |m| m.adapters.push(m.adapters[0].clone()),
+        |m| {
+            let adapter = m.adapters[0].clone();
+            m.adapters.push(adapter);
+        },
         |m| m.adapters[0].rank += 1,
         |m| m.adapters[0].d_latent += 1,
         |m| {
@@ -776,6 +767,32 @@ fn actual_numeric_storage(m: &PSSALayerV2) -> usize {
         lr_schedule_total_updates: _,
         lr_schedule_warmup_steps: _,
         embed_w,
+        unembed_w,
+        embed_row_marks,
+        block,
+        extra_blocks,
+        residual_scales,
+        continuous_inputs,
+        output_adjoints,
+        input_adjoints,
+        residual_block_adjoints,
+        residual_input_adjoints,
+        boundary_adjoints,
+        layer_activations,
+        inf_features,
+        inf_block_out,
+    } = m;
+    matrix_bytes(embed_w) + matrix_bytes(unembed_w) + vector_bytes(embed_row_marks)
+        + actual_block_storage(block) + extra_blocks.iter().map(actual_block_storage).sum::<usize>()
+        + [residual_scales, continuous_inputs, output_adjoints, input_adjoints,
+            residual_block_adjoints, residual_input_adjoints, inf_features, inf_block_out]
+            .into_iter().map(vector_bytes).sum::<usize>()
+        + boundary_adjoints.iter().chain(layer_activations).map(vector_bytes).sum::<usize>()
+}
+
+fn actual_block_storage(b: &oxide_ai_pssa::pssa::PSSAContinuousBlockV2) -> usize {
+    let oxide_ai_pssa::pssa::PSSAContinuousBlockV2 {
+        cfg: _,
         norm_gamma,
         norm_beta,
         a_mat,
@@ -794,13 +811,11 @@ fn actual_numeric_storage(m: &PSSALayerV2) -> usize {
         adapters,
         mlp_w1,
         mlp_w2,
-        unembed_w,
         tape,
         grad_h_next,
         grad_z_final,
         grad_z_raw,
         grad_x_norm,
-        embed_row_marks,
         buf_m_proj,
         buf_ad_out,
         buf_g_mlp_act,
@@ -841,9 +856,9 @@ fn actual_numeric_storage(m: &PSSALayerV2) -> usize {
         inf_mlp_act,
         inf_mlp_out,
         inf_z_final,
-    } = m;
+    } = b;
     let params: usize = [
-        embed_w, a_mat, w_delta, w_b, w_c, w_qx, w_qh, w_gate, w_proj, mlp_w1, mlp_w2, unembed_w,
+        a_mat, w_delta, w_b, w_c, w_qx, w_qh, w_gate, w_proj, mlp_w1, mlp_w2,
     ]
     .into_iter()
     .map(matrix_bytes)
@@ -937,6 +952,7 @@ fn actual_numeric_storage(m: &PSSALayerV2) -> usize {
         max_l: _,
         x_ids,
         target_ids,
+        x_raw,
         x_norm,
         inv_rms,
         delta_raw,
@@ -966,6 +982,7 @@ fn actual_numeric_storage(m: &PSSALayerV2) -> usize {
         losses,
     } = tape;
     let tape_bytes = [
+        x_raw,
         x_norm,
         inv_rms,
         delta_raw,
@@ -1005,7 +1022,6 @@ fn actual_numeric_storage(m: &PSSALayerV2) -> usize {
         + float_bytes
         + memory_bytes
         + tape_bytes
-        + vector_bytes(embed_row_marks)
 }
 
 #[test]
@@ -1042,14 +1058,17 @@ fn checked_allocation_accounting_matches_actual_model_vectors() {
             chunk_len: chunk,
             ..Default::default()
         };
-        let expected = checkpoint::allocation_bytes(&cfg).unwrap();
-        let actual = PSSALayerV2::new(cfg, 42);
-        assert_eq!(
-            expected,
-            actual_numeric_storage(&actual),
-            "{:?}",
-            actual.cfg
-        );
+        for depth in [1, 4] {
+            let cfg = PSSAConfigV2 { depth, ..cfg.clone() };
+            let expected = checkpoint::allocation_bytes(&cfg).unwrap();
+            let actual = PSSALayerV2::new(cfg, 42);
+            assert_eq!(
+                expected,
+                actual_numeric_storage(&actual),
+                "{:?}",
+                actual.cfg
+            );
+        }
     }
 }
 

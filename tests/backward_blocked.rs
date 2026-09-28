@@ -7,6 +7,7 @@ use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 
 fn cfg() -> PSSAConfigV2 {
     PSSAConfigV2 {
+        depth: 1,
         d_vocab: 11,
         d_latent: 8,
         d_state: 3,

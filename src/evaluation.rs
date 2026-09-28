@@ -179,7 +179,10 @@ pub fn evaluate_pssa(
     let vocab = model.cfg.d_vocab;
     validate_model_input(tokenizer, &docs, vocab, model.cfg.chunk_len)?;
     let mut metrics = Metrics::for_documents(&docs);
-    let incoming_carry = model.h_persistent.clone();
+    let incoming_carries: Vec<_> = std::iter::once(&model.block)
+        .chain(&model.extra_blocks)
+        .map(|block| block.h_persistent.clone())
+        .collect();
     let result = (|| {
         for doc in &docs {
             model.reset_recurrent_state();
@@ -197,7 +200,13 @@ pub fn evaluate_pssa(
         metrics.loss /= metrics.tokens as f64;
         Ok(metrics)
     })();
-    model.h_persistent.copy_from_slice(&incoming_carry);
+    // Restore every layer even when scoring returns a non-finite-logit error.
+    for (block, carry) in std::iter::once(&mut model.block)
+        .chain(&mut model.extra_blocks)
+        .zip(incoming_carries)
+    {
+        block.h_persistent.copy_from_slice(&carry);
+    }
     result
 }
 

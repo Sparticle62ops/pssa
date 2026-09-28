@@ -16,6 +16,8 @@ const MAX_GENERATION_TOKENS: usize = 100_000;
 pub struct TrainingOptions {
     pub epochs: usize,
     pub latent: usize,
+    /// Continuous PSSA blocks, sharing one embedding and output head.
+    pub depth: usize,
     pub state: usize,
     pub key: usize,
     pub memory: usize,
@@ -48,6 +50,7 @@ impl Default for TrainingOptions {
         Self {
             epochs: 4,
             latent: 256,
+            depth: 1,
             state: 16,
             key: 32,
             memory: 512,
@@ -232,6 +235,7 @@ impl CLIHandler {
         let x = TrainingOptions {
             epochs: parsed.usize_nonzero("--epochs", "-e", 4)?,
             latent: parsed.usize_nonzero("--latent", "", 256)?,
+            depth: parsed.usize_nonzero("--depth", "", 1)?,
             state: parsed.usize_nonzero("--state", "", 16)?,
             key: parsed.usize_nonzero("--key", "", 32)?,
             memory: parsed.usize_nonzero("--memory", "", 512)?,
@@ -288,6 +292,7 @@ impl CLIHandler {
         for (name, value, maximum) in [
             ("--epochs", x.epochs, 1_000_000usize),
             ("--latent", x.latent, 4_096),
+            ("--depth", x.depth, 32),
             ("--state", x.state, 4_096),
             ("--key", x.key, 4_096),
             ("--memory", x.memory, 1_000_000),
@@ -309,6 +314,7 @@ impl CLIHandler {
                 .map_err(|e| format!("cannot inspect resume checkpoint '{resume}': {e}"))?;
             let checks = [
                 ("--latent", "--latent", x.latent, loaded.model.cfg.d_latent),
+                ("--depth", "--depth", x.depth, loaded.model.depth()),
                 ("--state", "--state", x.state, loaded.model.cfg.d_state),
                 ("--key", "--key", x.key, loaded.model.cfg.d_mem_key),
                 ("--memory", "--memory", x.memory, loaded.model.cfg.mem_capacity),
@@ -321,6 +327,9 @@ impl CLIHandler {
                     ));
                 }
             }
+            // Omitted depth inherits the checkpoint; an explicit mismatch above
+            // is never interpreted as a request to expand or truncate a stack.
+            x.depth = loaded.model.depth();
             // A resume keeps the checkpoint's optimizer schedule unless the
             // caller explicitly supplies a new learning rate.  Previously the
             // parser's 1e-3 default silently replaced a custom checkpoint LR.
@@ -414,35 +423,25 @@ impl CLIHandler {
                 .chain(&p.v)
                 .all(|v| v.is_finite())
         }
-        [
-            &model.embed_w,
-            &model.a_mat,
-            &model.w_delta,
-            &model.w_b,
-            &model.w_c,
-            &model.w_qx,
-            &model.w_qh,
-            &model.w_gate,
-            &model.w_proj,
-            &model.mlp_w1,
-            &model.mlp_w2,
-            &model.unembed_w,
-        ]
-        .iter()
-        .all(|p| matrix_finite(p))
-            && vector_finite(&model.norm_gamma)
-            && vector_finite(&model.norm_beta)
-            && model
-                .adapters
-                .iter()
-                .all(|ad| matrix_finite(&ad.down_proj) && matrix_finite(&ad.up_proj))
-            && model.h_persistent.iter().all(|v| v.is_finite())
-            && model.memory.keys.iter().all(|v| v.is_finite())
-            && model.memory.values.iter().all(|v| v.is_finite())
-            && model.memory.norm_sq.iter().all(|v| v.is_finite())
-            && model.memory.confidence.iter().all(|v| v.is_finite())
-            && model.adapters.iter().all(|ad| {
-                ad.consolidated_up.iter().all(|v| v.is_finite())
+        matrix_finite(&model.embed_w)
+            && matrix_finite(&model.unembed_w)
+            && std::iter::once(&model.block).chain(&model.extra_blocks).all(|block| {
+                [
+                    &block.a_mat, &block.w_delta, &block.w_b, &block.w_c,
+                    &block.w_qx, &block.w_qh, &block.w_gate, &block.w_proj,
+                    &block.mlp_w1, &block.mlp_w2,
+                ].iter().all(|p| matrix_finite(p))
+                    && vector_finite(&block.norm_gamma)
+                    && vector_finite(&block.norm_beta)
+                    && block.adapters.iter().all(|ad| {
+                        matrix_finite(&ad.down_proj) && matrix_finite(&ad.up_proj)
+                            && ad.consolidated_up.iter().all(|v| v.is_finite())
+                    })
+                    && block.h_persistent.iter().all(|v| v.is_finite())
+                    && block.memory.keys.iter().all(|v| v.is_finite())
+                    && block.memory.values.iter().all(|v| v.is_finite())
+                    && block.memory.norm_sq.iter().all(|v| v.is_finite())
+                    && block.memory.confidence.iter().all(|v| v.is_finite())
             })
     }
 
@@ -464,6 +463,9 @@ impl CLIHandler {
                     .into(),
             );
         }
+        if !(1..=32).contains(&options.depth) {
+            return Err("--depth must be between 1 and 32; use --depth 1 for the original model".into());
+        }
         if options.batch_size > 65_536 {
             return Err("--batch-size must be at most 65536; use fewer document lanes".into());
         }
@@ -478,6 +480,12 @@ impl CLIHandler {
                 let loaded = checkpoint::load_checkpoint(path)
                     .map_err(|e| format!("cannot resume from '{path}': {e}"))?;
                 let model = loaded.model;
+                if options.depth != model.depth() {
+                    return Err(format!(
+                        "--depth={} does not match resume checkpoint value {}; use the checkpoint depth or start a fresh run",
+                        options.depth, model.depth()
+                    ));
+                }
                 if model.vocabulary.is_empty() {
                     return Err("resume checkpoint lacks vocabulary provenance".into());
                 }
@@ -491,8 +499,8 @@ impl CLIHandler {
                     return Err("resume checkpoint tokenizer/vocabulary mismatch".into());
                 }
                 println!(
-                    "resumed_from={path} vocab={} d_latent={} prior_steps={}",
-                    model.cfg.d_vocab, model.cfg.d_latent, model.step_counter
+                    "resumed_from={path} vocab={} d_latent={} depth={} prior_steps={}",
+                    model.cfg.d_vocab, model.cfg.d_latent, model.depth(), model.step_counter
                 );
                 ui::success(&format!(
                     "resumed {} at {} prior optimizer steps",
@@ -509,6 +517,7 @@ impl CLIHandler {
                 let cfg = PSSAConfigV2 {
                     d_vocab: tokenizer.vocab_size,
                     d_latent: options.latent,
+                    depth: options.depth,
                     d_state: options.state,
                     d_mem_key: options.key,
                     mem_capacity: options.memory,
@@ -526,18 +535,27 @@ impl CLIHandler {
         // Keep an explicit resume override in the checkpoint's persisted
         // configuration so a later link does not silently revert to the old LR.
         model.cfg.lr = options.lr;
-        // Attach the GPU dispatch path when a WebGPU compute adapter is
-        // available; the stage math is cpu-twin verified and falls back to CPU.
-        match Device::try_gpu() {
-            Ok(gpu_device) => {
-                let label = gpu_device
-                    .gpu()
-                    .map(|g| g.backend_label())
-                    .unwrap_or_else(|| "cpu".to_string());
-                model.device = gpu_device;
-                println!("backend={label}");
+        // Stacked kernels are CPU-only. Do not attach a device and misleadingly
+        // report GPU execution while actually running the scalar stack.
+        if model.depth() > 1 {
+            model.device = Device::Cpu;
+            println!("backend=cpu (stacked depth {}; GPU execution unsupported)", model.depth());
+            if options.batch_size > 1 {
+                println!("batch_backend=cpu-replay (independent stacked lanes; no packed GEMM acceleration)");
             }
-            Err(e) => println!("backend=cpu ({e})"),
+        } else {
+            // Retain the accelerated depth-one stages and their CPU fallback.
+            match Device::try_gpu() {
+                Ok(gpu_device) => {
+                    let label = gpu_device
+                        .gpu()
+                        .map(|g| g.backend_label())
+                        .unwrap_or_else(|| "cpu".to_string());
+                    model.device = gpu_device;
+                    println!("backend={label}");
+                }
+                Err(e) => println!("backend=cpu ({e})"),
+            }
         }
         let docs = Self::documents(raw, &tokenizer, options.max_tokens, options.skip_tokens)?;
         let chunk_len = if options.resume.is_some() {
@@ -571,8 +589,8 @@ impl CLIHandler {
         let first_lr = schedule.lr(1)?;
         let last_lr = schedule.lr(total_updates)?;
         println!(
-            "model=pssa parameters={} vocab={}",
-            model.parameter_count(), model.cfg.d_vocab
+            "model=pssa parameters={} vocab={} depth={}",
+            model.parameter_count(), model.cfg.d_vocab, model.depth()
         );
         crate::training::report_stream(&docs, chunk_len, options.accumulate);
         if options.batch_size > 1 {
@@ -587,8 +605,8 @@ impl CLIHandler {
         ui::field(
             "width",
             &format!(
-                "latent {} / state {}",
-                model.cfg.d_latent, model.cfg.d_state
+                "latent {} / state {} / depth {}",
+                model.cfg.d_latent, model.cfg.d_state, model.depth()
             ),
         );
         ui::field(
@@ -688,16 +706,7 @@ impl CLIHandler {
                             .iter()
                             .sum::<f32>()
                             / c.len as f32;
-                        if loss > 3.5 {
-                            let last = offset + c.len - 1;
-                            let q = &model.tape.q_poincare
-                                [last * model.cfg.d_mem_key..(last + 1) * model.cfg.d_mem_key];
-                            let v = &model.tape.z_final
-                                [last * model.cfg.d_latent..(last + 1) * model.cfg.d_latent];
-                            model
-                                .memory
-                                .insert_protected(q, v, loss, model.step_counter);
-                        }
+                        model.insert_training_memory_at(loss, offset + c.len - 1);
                         loss_sum += loss as f64 * c.len as f64;
                         token_sum += c.len;
                         offset += c.len;
@@ -792,21 +801,21 @@ impl CLIHandler {
             .map_err(|e| format!("cannot load model '{model_path}': {e}"))?;
         let model = loaded.model;
         match loaded.format {
-            CheckpointFormat::V7 => match &model.tokenizer_json {
+            CheckpointFormat::V7 | CheckpointFormat::V8 => match &model.tokenizer_json {
                 Some(json) => {
                     if data.is_some() {
-                        return Err("--data is legacy word provenance only; V7 BPE checkpoints restore their embedded tokenizer and never retrain it".into());
+                        return Err("--data is legacy word provenance only; V7/V8 BPE checkpoints restore their embedded tokenizer and never retrain it".into());
                     }
                     let tokenizer = Tokenizer::from_serialized(json)?;
                     if tokenizer.ordered_vocabulary()? != model.vocabulary
                         || tokenizer.vocab_size != model.cfg.d_vocab
                     {
-                        return Err("V7 tokenizer metadata/model vocabulary mismatch".into());
+                        return Err("checkpoint tokenizer metadata/model vocabulary mismatch".into());
                     }
                     Ok((model, tokenizer))
                 }
                 None => {
-                    let tokenizer = Self::word_tokenizer_for_model(&model, data, "V7 word")?;
+                    let tokenizer = Self::word_tokenizer_for_model(&model, data, "V7/V8 word")?;
                     Ok((model, tokenizer))
                 }
             },
@@ -1191,8 +1200,8 @@ impl CLIHandler {
         );
         println!(
             "    {:<30}{}",
-            "  --latent n --state n",
-            ui::dim("model width and recurrent state size")
+            "  --latent n --state n --depth n",
+            ui::dim("width, recurrent state size, blocks (depth 1..32; default 1)")
         );
         println!(
             "    {:<30}{}",
@@ -1309,6 +1318,7 @@ impl CLIHandler {
                 println!("      --tokenizer <bpe|word>    tokenizer family (default: bpe)");
                 println!("      --vocab-size <N>          BPE vocabulary ceiling (default: 2048)");
                 println!("      --latent <N>              latent width (default: 256)");
+                println!("      --depth <N>               continuous blocks, 1..32 (default: 1; stacks CPU-only)");
                 println!("      --state <N>               recurrent state width (default: 16)");
                 println!("      --key <N>                 memory key width (default: 32)");
                 println!("      --memory <N>              memory capacity (default: 512)");
@@ -1436,7 +1446,7 @@ impl CLIHandler {
                     allowed.retain(|x| !["--latent", "--state", "--key", "--memory"].contains(x));
                     allowed.push("--tokenizer-from");
                 } else {
-                    allowed.push("--batch-size");
+                    allowed.extend(["--batch-size", "--depth"]);
                 }
                 let p = Parsed::parse(&args[2..], &allowed)?;
                 for (names, label) in [

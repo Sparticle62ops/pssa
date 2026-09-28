@@ -68,6 +68,7 @@ fn stop_counting() -> (usize, usize) {
 
 fn config() -> PSSAConfigV2 {
     PSSAConfigV2 {
+        depth: 1,
         d_vocab: 17,
         d_latent: 16,
         d_state: 3,
@@ -86,18 +87,23 @@ fn config() -> PSSAConfigV2 {
 
 #[test]
 fn live_model_training_inference_memory_and_consolidation_allocate_nothing() {
-    assert_live_paths_allocate_nothing(false);
+    assert_live_paths_allocate_nothing(false, 1);
 }
 
 #[test]
 fn live_staged_cpu_training_inference_memory_and_consolidation_allocate_nothing() {
-    assert_live_paths_allocate_nothing(true);
+    assert_live_paths_allocate_nothing(true, 1);
 }
 
-fn assert_live_paths_allocate_nothing(staged: bool) {
+#[test]
+fn stacked_depth_four_live_paths_allocate_nothing() {
+    assert_live_paths_allocate_nothing(false, 4);
+}
+
+fn assert_live_paths_allocate_nothing(staged: bool, depth: usize) {
     // All model, state, input, output, and direct-memory-operation storage is
     // constructed before activation and excluded from the assertion.
-    let mut model = PSSALayerV2::new(config(), 91);
+    let mut model = PSSALayerV2::new_with_depth(config(), 91, depth);
     let key = [0.01, -0.02, 0.015, -0.01];
     let value = [
         -0.08, -0.07, -0.06, -0.05, -0.04, -0.03, -0.02, -0.01, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06,
