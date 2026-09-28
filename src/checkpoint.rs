@@ -13,13 +13,21 @@
 //! authentication. V7 checkpoints without the optional schedule tail remain
 //! readable and use the legacy schedule behavior.
 //!
-//! Scratch and activation tape buffers are intentionally not serialized. V7 and
-//! V6 checkpoints are supported between chunks (after backward or an optimizer
+//! **V8** uses the same container header with version 8. The payload is the
+//! legacy configuration (without depth), depth:u64, residual scales (length:u64
+//! and f32 words), optimizer step, RNG, vocabulary, shared embedding/output
+//! matrices, then each block's parameters/gradients/moments, recurrent carry,
+//! memory metadata and adapter slow state. Embedding marks and the V7-style
+//! tokenizer/schedule tail finish the payload. V8 is reserved for depth > 1;
+//! depth-one writers remain byte-compatible V7 (or explicit V6).
+//!
+//! Scratch and activation tape buffers are intentionally not serialized. V8,
+//! V7 and V6 checkpoints are supported between chunks (after backward or an optimizer
 //! update) and resume at the next forward call; they do not resume an in-flight
 //! backward pass or an external dataset cursor.
 
 use crate::linalg::SimpleRng;
-use crate::pssa::{PSSAConfigV2, PSSALayerV2, ParamMatrix, ParamVector};
+use crate::pssa::{PSSAConfigV2, PSSAContinuousBlockV2, PSSALayerV2, ParamMatrix, ParamVector};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -29,6 +37,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const FORMAT_VERSION: u16 = 7;
 pub const V6_FORMAT_VERSION: u16 = 6;
+pub const V8_FORMAT_VERSION: u16 = 8;
+pub const MAX_MODEL_DEPTH: usize = 32;
 const HEADER_LEN: usize = 22;
 const MAX_TOKENIZER_JSON_BYTES: usize = 16 * 1024 * 1024;
 const HEADER_V5_LEN: usize = 38;
@@ -60,6 +70,7 @@ pub(crate) type Result<T> = std::result::Result<T, CheckpointError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointFormat {
+    V8,
     V7,
     V6,
     /// V5 lacks optimizer, recurrent, vocabulary, and memory metadata state.
@@ -97,6 +108,7 @@ fn add_mul(total: &mut usize, a: usize, b: usize, what: &str) -> Result<()> {
 }
 
 fn validate_config(cfg: &PSSAConfigV2) -> Result<()> {
+    validate_depth(cfg.depth)?;
     if cfg.d_vocab == 0
         || cfg.d_latent == 0
         || cfg.d_state == 0
@@ -134,6 +146,13 @@ fn validate_config(cfg: &PSSAConfigV2) -> Result<()> {
     allocation_bytes(cfg).map(|_| ())
 }
 
+fn validate_depth(depth: usize) -> Result<()> {
+    if !(1..=MAX_MODEL_DEPTH).contains(&depth) {
+        return Err(invalid(format!("depth must be in 1..={MAX_MODEL_DEPTH}")));
+    }
+    Ok(())
+}
+
 /// Validate a fresh model configuration before its large activation and
 /// optimizer buffers are allocated.  Checkpoint loading uses the same guard.
 pub fn validate_model_config(cfg: &PSSAConfigV2) -> std::result::Result<(), String> {
@@ -150,14 +169,22 @@ fn ensure_backed_by_file(
 ) -> Result<()> {
     let mut parameters = 0;
     for (rows, cols) in [
-        (c.d_vocab, c.d_latent), (c.d_latent, c.d_state),
-        (c.d_latent, c.d_latent), (c.d_state, c.d_latent), (c.d_state, c.d_latent),
-        (c.d_mem_key, c.d_latent), (c.d_mem_key, c.d_latent),
-        (c.d_latent, c.d_latent), (c.d_latent, c.d_latent),
+        (c.d_vocab, c.d_latent),
+        (c.d_latent, c.d_state),
+        (c.d_latent, c.d_latent),
+        (c.d_state, c.d_latent),
+        (c.d_state, c.d_latent),
+        (c.d_mem_key, c.d_latent),
+        (c.d_mem_key, c.d_latent),
+        (c.d_latent, c.d_latent),
+        (c.d_latent, c.d_latent),
         (checked_mul(2, c.d_latent, "MLP width")?, c.d_latent),
         (c.d_latent, checked_mul(2, c.d_latent, "MLP width")?),
-        (c.d_vocab, c.d_latent), (16, c.d_latent), (c.d_latent, 16),
-        (c.d_latent, 1), (c.d_latent, 1),
+        (c.d_vocab, c.d_latent),
+        (16, c.d_latent),
+        (c.d_latent, 16),
+        (c.d_latent, 1),
+        (c.d_latent, 1),
     ] {
         add_mul(&mut parameters, rows, cols, "serialized parameters")?;
     }
@@ -167,23 +194,87 @@ fn ensure_backed_by_file(
         required = checked_mul(parameters, 4, "legacy parameter bytes")?;
         add_mul(&mut required, 19, 4, "legacy tensor lengths/rank")?;
         for width in [c.d_mem_key, c.d_latent] {
-            add_mul(&mut required, checked_mul(count, width, "legacy memory")?, 4, "legacy memory bytes")?;
+            add_mul(
+                &mut required,
+                checked_mul(count, width, "legacy memory")?,
+                4,
+                "legacy memory bytes",
+            )?;
         }
     } else {
         required = checked_mul(parameters, 16, "parameter/Adam bytes")?;
         // Four arrays per parameter; eight other arrays plus count and head.
-        add_mul(&mut required, 16 * 4 + 10, 8, "tensor lengths/memory metadata")?;
+        add_mul(
+            &mut required,
+            16 * 4 + 10,
+            8,
+            "tensor lengths/memory metadata",
+        )?;
         for (rows, cols) in [
-            (c.d_latent, c.d_state), (c.mem_capacity, c.d_mem_key),
-            (c.mem_capacity, c.d_latent), (c.mem_capacity, 2), (c.d_latent, 16),
+            (c.d_latent, c.d_state),
+            (c.mem_capacity, c.d_mem_key),
+            (c.mem_capacity, c.d_latent),
+            (c.mem_capacity, 2),
+            (c.d_latent, 16),
         ] {
-            add_mul(&mut required, checked_mul(rows, cols, "persistent storage")?, 4, "persistent bytes")?;
+            add_mul(
+                &mut required,
+                checked_mul(rows, cols, "persistent storage")?,
+                4,
+                "persistent bytes",
+            )?;
         }
         add_mul(&mut required, c.mem_capacity, 8, "memory timestamps")?;
         add_mul(&mut required, c.d_vocab, 8, "embedding marks")?;
+        // Each additional block has all non-endpoint parameters, seven
+        // persistent arrays, and the memory count/head words. Tapes are absent.
+        let endpoint_parameters = checked_mul(
+            checked_mul(c.d_vocab, c.d_latent, "endpoints")?,
+            2,
+            "endpoints",
+        )?;
+        let mut block_bytes = checked_mul(
+            parameters - endpoint_parameters,
+            16,
+            "block parameter/Adam bytes",
+        )?;
+        add_mul(
+            &mut block_bytes,
+            14 * 4 + 9,
+            8,
+            "block tensor lengths/metadata",
+        )?;
+        for (rows, cols) in [
+            (c.d_latent, c.d_state),
+            (c.mem_capacity, c.d_mem_key),
+            (c.mem_capacity, c.d_latent),
+            (c.mem_capacity, 2),
+            (c.d_latent, 16),
+        ] {
+            add_mul(
+                &mut block_bytes,
+                checked_mul(rows, cols, "block persistent storage")?,
+                4,
+                "block persistent bytes",
+            )?;
+        }
+        add_mul(
+            &mut block_bytes,
+            c.mem_capacity,
+            8,
+            "block memory timestamps",
+        )?;
+        add_mul(
+            &mut required,
+            block_bytes,
+            c.depth - 1,
+            "extra block persistent bytes",
+        )?;
     }
     if available_bytes < required {
-        return Err(invalid(format!("truncated persistent tensors: need {required} bytes, have {available_bytes}")));
+        return Err(invalid(format!(
+            "truncated persistent tensors: need {required} bytes, have {available_bytes}"
+        )));
     }
     Ok(())
 }
@@ -194,6 +285,7 @@ fn ensure_backed_by_file(
 /// optional tokenizer strings. Returns an error on overflow or above the cap.
 /// Keep the named fields in sync with the constructor and the actual-storage test.
 pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
+    validate_depth(c.depth)?;
     let (v, m, s, k, cap, l) = (
         c.d_vocab,
         c.d_latent,
@@ -215,7 +307,6 @@ pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
     let mut usize_count = 0usize;
     // Every parameter owns data, grad, first moment and second moment.
     for (name, rows, cols) in [
-        ("embed_w", v, m),
         ("a_mat", m, s),
         ("w_delta", m, m),
         ("w_b", s, m),
@@ -226,7 +317,6 @@ pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
         ("w_proj", m, m),
         ("mlp_w1", two_m, m),
         ("mlp_w2", m, two_m),
-        ("unembed_w", v, m),
         ("adapter.down", 16, m),
         ("adapter.up", m, 16),
         ("norm_gamma", m, 1),
@@ -247,6 +337,7 @@ pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
         ("memory.values", checked_mul(cap, m, "memory values")?),
         ("memory.norm_sq", cap),
         ("memory.confidence", cap),
+        ("tape.x_raw", lm),
         ("tape.x_norm", lm),
         ("tape.inv_rms", l),
         ("tape.delta_raw", lm),
@@ -274,8 +365,6 @@ pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
         ("tape.mlp_hidden", l_two_m),
         ("tape.mlp_act", l_two_m),
         ("tape.z_final", lm),
-        ("tape.logits", lv),
-        ("tape.probs", lv),
         ("tape.losses", l),
         ("grad_h_next", ms),
         ("grad_z_final", m),
@@ -302,7 +391,6 @@ pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
         ("bwd_g_ad_down", lr),
         ("bwd_g_xnorm", lm),
         ("bwd_g_ysm", lm),
-        ("bwd_g_logits", lv),
         ("bwd_g_mlp", l_two_m),
         ("inf_x_norm", m),
         ("inf_delta", m),
@@ -328,10 +416,31 @@ pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
         ("memory.last_seen_step", cap),
         ("tape.x_ids", l),
         ("tape.target_ids", l),
-        ("embed_row_marks", v),
     ] {
         usize_count = checked_add(usize_count, n, name)?;
     }
+    // All preceding storage belongs to every continuous block. Only block 0
+    // owns vocabulary-sized logits, probabilities and output-head adjoints.
+    f32_count = checked_mul(f32_count, c.depth, "all block f32 storage")?;
+    usize_count = checked_mul(usize_count, c.depth, "all block usize storage")?;
+    add_mul(
+        &mut f32_count,
+        checked_mul(v, m, "endpoint weights")?,
+        8,
+        "endpoint parameters/Adam",
+    )?;
+    add_mul(&mut f32_count, lv, 3, "logits/probs/output-head adjoints")?;
+    add_mul(&mut f32_count, lm, 5, "shared continuous/adjoint scratch")?;
+    add_mul(
+        &mut f32_count,
+        lm,
+        checked_add(c.depth, 1, "boundary count")?,
+        "boundary adjoints",
+    )?;
+    add_mul(&mut f32_count, lm, c.depth - 1, "layer activations")?;
+    add_mul(&mut f32_count, m, 2, "shared inference scratch")?;
+    f32_count = checked_add(f32_count, c.depth - 1, "residual scales")?;
+    usize_count = checked_add(usize_count, v, "embed_row_marks")?;
     let bytes = checked_add(
         checked_mul(f32_count, std::mem::size_of::<f32>(), "f32 allocation")?,
         checked_mul(
@@ -549,6 +658,7 @@ fn config_to_payload(w: &mut Writer, c: &PSSAConfigV2) -> Result<()> {
 }
 fn config_from_payload(r: &mut Reader<'_>) -> Result<PSSAConfigV2> {
     let c = PSSAConfigV2 {
+        depth: 1, // V5/V6/V7 have no depth word; V8 follows this config with it.
         d_vocab: r.usize("d_vocab")?,
         d_latent: r.usize("d_latent")?,
         d_state: r.usize("d_state")?,
@@ -655,9 +765,55 @@ fn validate_persistent_shapes(model: &PSSALayerV2) -> Result<()> {
     if model.step_counter == usize::MAX {
         return Err(invalid("step_counter is exhausted"));
     }
+    if model.depth() != c.depth || model.extra_blocks.len() != c.depth - 1 {
+        return Err(invalid("block count does not match configured depth"));
+    }
+    validate_residual_scales(&model.residual_scales, c.depth)?;
+    validate_matrix_shape(&model.embed_w, c.d_vocab, c.d_latent, "embed_w")?;
+    validate_matrix_shape(&model.unembed_w, c.d_vocab, c.d_latent, "unembed_w")?;
+    if model.embed_row_marks.len() != c.d_vocab {
+        return Err(invalid("embed_row_marks length does not match d_vocab"));
+    }
+    for block in std::iter::once(&model.block).chain(&model.extra_blocks) {
+        validate_block_shapes(block, c, model.step_counter)?;
+    }
+    Ok(())
+}
+
+fn validate_residual_scales(scales: &[f32], depth: usize) -> Result<()> {
+    validate_depth(depth)?;
+    if scales.len() != depth - 1 {
+        return Err(invalid("residual scale count does not match depth"));
+    }
+    let expected = 1.0 / (depth as f32).sqrt();
+    if scales
+        .iter()
+        .any(|x| !x.is_finite() || x.to_bits() != expected.to_bits())
+    {
+        return Err(invalid("residual scales must equal 1/sqrt(depth)"));
+    }
+    Ok(())
+}
+
+fn validate_block_shapes(
+    model: &PSSAContinuousBlockV2,
+    c: &PSSAConfigV2,
+    step: usize,
+) -> Result<()> {
+    if model.cfg.d_latent != c.d_latent
+        || model.cfg.d_state != c.d_state
+        || model.cfg.d_mem_key != c.d_mem_key
+        || model.cfg.mem_capacity != c.mem_capacity
+        || model.cfg.chunk_len != c.chunk_len
+        || model.cfg.tau_mem.to_bits() != c.tau_mem.to_bits()
+        || model.cfg.ema_alpha.to_bits() != c.ema_alpha.to_bits()
+    {
+        return Err(invalid(
+            "continuous block configuration differs from model configuration",
+        ));
+    }
     let mlp = checked_mul(c.d_latent, 2, "MLP width")?;
     for (p, rows, cols, name) in [
-        (&model.embed_w, c.d_vocab, c.d_latent, "embed_w"),
         (&model.a_mat, c.d_latent, c.d_state, "a_mat_raw"),
         (&model.w_delta, c.d_latent, c.d_latent, "w_delta"),
         (&model.w_b, c.d_state, c.d_latent, "w_b"),
@@ -668,7 +824,6 @@ fn validate_persistent_shapes(model: &PSSALayerV2) -> Result<()> {
         (&model.w_proj, c.d_latent, c.d_latent, "w_proj"),
         (&model.mlp_w1, mlp, c.d_latent, "mlp_w1"),
         (&model.mlp_w2, c.d_latent, mlp, "mlp_w2"),
-        (&model.unembed_w, c.d_vocab, c.d_latent, "unembed_w"),
     ] {
         validate_matrix_shape(p, rows, cols, name)?;
     }
@@ -692,7 +847,7 @@ fn validate_persistent_shapes(model: &PSSALayerV2) -> Result<()> {
         || model.adapters[0].d_latent != c.d_latent
     {
         return Err(invalid(
-            "V6/V7 requires exactly one rank-16 adapter matching d_latent",
+            "each block requires exactly one rank-16 adapter matching d_latent",
         ));
     }
     let ad = &model.adapters[0];
@@ -709,7 +864,6 @@ fn validate_persistent_shapes(model: &PSSALayerV2) -> Result<()> {
             checked_mul(c.d_latent, c.d_state, "h_persistent")?,
             "h_persistent",
         ),
-        (model.embed_row_marks.len(), c.d_vocab, "embed_row_marks"),
     ] {
         if actual != expected {
             return Err(invalid(format!(
@@ -717,12 +871,15 @@ fn validate_persistent_shapes(model: &PSSALayerV2) -> Result<()> {
             )));
         }
     }
-    validate_memory(model)
+    validate_memory(model, c, step)
 }
 
 /// The common V6 payload, retained byte-for-byte by V7 before its metadata tail.
 fn payload_for_v6(model: &PSSALayerV2) -> Result<Vec<u8>> {
     validate_persistent_shapes(model)?;
+    if model.cfg.depth != 1 {
+        return Err(invalid("V6/V7 cannot serialize stacked models; use V8"));
+    }
     validate_vocab(&model.vocabulary, model.cfg.d_vocab)?;
     let mem = &model.memory;
     let mut w = Writer::new();
@@ -762,6 +919,137 @@ fn payload_for_v6(model: &PSSALayerV2) -> Result<Vec<u8>> {
     w.floats(&ad.consolidated_up, "adapter.consolidated_up")?;
     w.usizes(&model.embed_row_marks, "embed_row_marks")?;
     Ok(w.bytes)
+}
+
+/// V8 stores shared endpoints once, followed by complete independent blocks.
+/// Its prefix is the legacy configuration, depth, fixed residual scales, clock,
+/// RNG, and vocabulary. The common tokenizer/schedule tail follows row marks.
+fn payload_for_v8(model: &PSSALayerV2) -> Result<Vec<u8>> {
+    validate_persistent_shapes(model)?;
+    validate_vocab(&model.vocabulary, model.cfg.d_vocab)?;
+    let mut w = Writer::new();
+    config_to_payload(&mut w, &model.cfg)?;
+    w.usize(model.cfg.depth, "depth")?;
+    w.floats(&model.residual_scales, "residual scales")?;
+    w.usize(model.step_counter, "step_counter")?;
+    w.u64(model.rng.state);
+    write_vocab(&mut w, &model.vocabulary, model.cfg.d_vocab)?;
+    write_matrix(&mut w, &model.embed_w, "embed_w")?;
+    write_matrix(&mut w, &model.unembed_w, "unembed_w")?;
+    for block in std::iter::once(&model.block).chain(&model.extra_blocks) {
+        write_block(&mut w, block)?;
+    }
+    w.usizes(&model.embed_row_marks, "embed_row_marks")?;
+    Ok(w.bytes)
+}
+
+fn write_block(w: &mut Writer, block: &PSSAContinuousBlockV2) -> Result<()> {
+    for (p, name) in [
+        (&block.a_mat, "a_mat_raw"),
+        (&block.w_delta, "w_delta"),
+        (&block.w_b, "w_b"),
+        (&block.w_c, "w_c"),
+        (&block.w_qx, "w_qx"),
+        (&block.w_qh, "w_qh"),
+        (&block.w_gate, "w_gate"),
+        (&block.w_proj, "w_proj"),
+        (&block.mlp_w1, "mlp_w1"),
+        (&block.mlp_w2, "mlp_w2"),
+    ] {
+        write_matrix(w, p, name)?;
+    }
+    write_vector(w, &block.norm_gamma, "norm_gamma")?;
+    write_vector(w, &block.norm_beta, "norm_beta")?;
+    w.floats(&block.h_persistent, "h_persistent")?;
+    let mem = &block.memory;
+    w.usize(mem.count, "memory count")?;
+    w.usize(mem.write_head, "memory write_head")?;
+    w.floats(&mem.keys, "memory keys")?;
+    w.floats(&mem.values, "memory values")?;
+    w.floats(&mem.norm_sq, "memory norm_sq")?;
+    w.floats(&mem.confidence, "memory confidence")?;
+    w.usizes(&mem.last_seen_step, "memory last_seen_step")?;
+    let ad = &block.adapters[0];
+    write_matrix(w, &ad.down_proj, "adapter.down")?;
+    write_matrix(w, &ad.up_proj, "adapter.up")?;
+    w.floats(&ad.consolidated_up, "adapter.consolidated_up")
+}
+
+fn read_block(r: &mut Reader<'_>, block: &mut PSSAContinuousBlockV2) -> Result<()> {
+    for (p, name) in [
+        (&mut block.a_mat, "a_mat_raw"),
+        (&mut block.w_delta, "w_delta"),
+        (&mut block.w_b, "w_b"),
+        (&mut block.w_c, "w_c"),
+        (&mut block.w_qx, "w_qx"),
+        (&mut block.w_qh, "w_qh"),
+        (&mut block.w_gate, "w_gate"),
+        (&mut block.w_proj, "w_proj"),
+        (&mut block.mlp_w1, "mlp_w1"),
+        (&mut block.mlp_w2, "mlp_w2"),
+    ] {
+        read_matrix(r, p, name)?;
+    }
+    read_vector(r, &mut block.norm_gamma, "norm_gamma")?;
+    read_vector(r, &mut block.norm_beta, "norm_beta")?;
+    r.floats_into(&mut block.h_persistent, "h_persistent", false)?;
+    let mem = &mut block.memory;
+    mem.count = r.usize("memory count")?;
+    mem.write_head = r.usize("memory write_head")?;
+    if mem.count > mem.capacity
+        || mem.write_head >= mem.capacity
+        || (mem.count < mem.capacity && mem.write_head != 0)
+    {
+        return Err(invalid("memory count/write head invalid"));
+    }
+    r.floats_into(&mut mem.keys, "memory keys", false)?;
+    r.floats_into(&mut mem.values, "memory values", false)?;
+    r.floats_into(&mut mem.norm_sq, "memory norm_sq", true)?;
+    r.floats_into(&mut mem.confidence, "memory confidence", true)?;
+    r.usizes_into(&mut mem.last_seen_step, "memory last_seen_step")?;
+    let ad = &mut block.adapters[0];
+    read_matrix(r, &mut ad.down_proj, "adapter.down")?;
+    read_matrix(r, &mut ad.up_proj, "adapter.up")?;
+    r.floats_into(&mut ad.consolidated_up, "adapter.consolidated_up", false)
+}
+
+fn load_v8(bytes: &[u8]) -> Result<LoadedCheckpoint> {
+    let mut r = Reader::new(checked_payload(bytes, "V8")?);
+    let mut cfg = config_from_payload(&mut r)?;
+    cfg.depth = r.usize("depth")?;
+    validate_config(&cfg)?;
+    if cfg.depth == 1 {
+        return Err(invalid("V8 requires stacked depth; use V7 for depth one"));
+    }
+    // Check fixed scale words before allocating any block. Depth is bounded.
+    let mut scales = vec![0.0; cfg.depth - 1];
+    r.floats_into(&mut scales, "residual scales", false)?;
+    validate_residual_scales(&scales, cfg.depth)?;
+    let step = r.usize("step_counter")?;
+    if step == usize::MAX {
+        return Err(invalid("step_counter is exhausted"));
+    }
+    let rng_state = r.u64("rng state")?;
+    let vocabulary = read_vocab(&mut r, cfg.d_vocab)?;
+    ensure_backed_by_file(&cfg, r.remaining(), None)?;
+    let mut model = PSSALayerV2::new(cfg, 1);
+    model.step_counter = step;
+    model.rng.state = rng_state;
+    model.residual_scales = scales;
+    model.vocabulary = vocabulary;
+    read_matrix(&mut r, &mut model.embed_w, "embed_w")?;
+    read_matrix(&mut r, &mut model.unembed_w, "unembed_w")?;
+    for block in std::iter::once(&mut model.block).chain(&mut model.extra_blocks) {
+        read_block(&mut r, block)?;
+    }
+    r.usizes_into(&mut model.embed_row_marks, "embed_row_marks")?;
+    read_metadata_tail(&mut r, &mut model, false)?;
+    r.done()?;
+    validate_persistent_shapes(&model)?;
+    Ok(LoadedCheckpoint {
+        model,
+        format: CheckpointFormat::V8,
+    })
 }
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -820,11 +1108,16 @@ fn validate_schedule(model: &PSSALayerV2) -> Result<()> {
     }
 }
 
-/// Writes V7, preserving all V6 state plus tokenizer and schedule metadata.
+/// Writes byte-compatible V7 for depth one, V8 for stacks; both preserve
+/// complete train-resume state plus tokenizer and schedule metadata.
 pub fn save_model(model: &PSSALayerV2, path: impl AsRef<Path>) -> Result<()> {
     validate_schedule(model)?;
     validate_tokenizer_metadata(model)?;
-    let mut payload = payload_for_v6(model)?;
+    let (version, mut payload) = if model.cfg.depth > 1 {
+        (V8_FORMAT_VERSION, payload_for_v8(model)?)
+    } else {
+        (FORMAT_VERSION, payload_for_v6(model)?)
+    };
     if let Some(json) = &model.tokenizer_json {
         payload.extend_from_slice(
             &(u64::try_from(json.len()).map_err(|_| invalid("tokenizer JSON too large"))?)
@@ -848,7 +1141,7 @@ pub fn save_model(model: &PSSALayerV2, path: impl AsRef<Path>) -> Result<()> {
             );
         }
     }
-    atomic_write(path.as_ref(), &container_bytes(FORMAT_VERSION, payload)?)
+    atomic_write(path.as_ref(), &container_bytes(version, payload)?)
 }
 
 /// Compatibility writer for explicitly requested V6 word checkpoints. It cannot
@@ -882,11 +1175,11 @@ pub(crate) fn read_file_capped(path: &Path) -> Result<Vec<u8>> {
     Ok(fs::read(path)?)
 }
 
-fn validate_memory(model: &PSSALayerV2) -> Result<()> {
+fn validate_memory(model: &PSSAContinuousBlockV2, cfg: &PSSAConfigV2, step: usize) -> Result<()> {
     let m = &model.memory;
-    if m.capacity != model.cfg.mem_capacity
-        || m.dim_key != model.cfg.d_mem_key
-        || m.dim_val != model.cfg.d_latent
+    if m.capacity != cfg.mem_capacity
+        || m.dim_key != cfg.d_mem_key
+        || m.dim_val != cfg.d_latent
         || m.capacity == 0
     {
         return Err(invalid("memory dimensions do not match configuration"));
@@ -942,7 +1235,7 @@ fn validate_memory(model: &PSSALayerV2) -> Result<()> {
             {
                 return Err(invalid("memory norm_sq/key metadata invalid"));
             }
-            if m.last_seen_step[i] > model.step_counter {
+            if m.last_seen_step[i] > step {
                 return Err(invalid("memory timestamp exceeds checkpoint step"));
             }
         }
@@ -976,6 +1269,41 @@ pub(crate) fn checked_payload<'a>(bytes: &'a [u8], label: &str) -> Result<&'a [u
     Ok(payload)
 }
 
+fn read_metadata_tail(r: &mut Reader<'_>, model: &mut PSSALayerV2, legacy_v7: bool) -> Result<()> {
+    let json_len = r.usize("tokenizer JSON length")?;
+    if json_len > MAX_TOKENIZER_JSON_BYTES {
+        return Err(invalid("tokenizer JSON exceeds 16 MiB cap"));
+    }
+    model.tokenizer_json = if json_len == 0 {
+        None
+    } else {
+        let text = std::str::from_utf8(r.take(json_len, "tokenizer JSON")?)
+            .map_err(|_| invalid("tokenizer JSON is not UTF-8"))?;
+        Some(text.to_string())
+    };
+    validate_tokenizer_metadata(model)?;
+    if !matches!(r.remaining(), 0 | 8 | 16) {
+        return Err(invalid(if legacy_v7 {
+            "invalid V7 metadata tail"
+        } else {
+            "invalid V8 metadata tail"
+        }));
+    }
+    if r.remaining() >= 8 {
+        let total_updates = r.usize("learning-rate schedule horizon")?;
+        // Only legacy V7 permits a zero horizon-only sentinel.
+        model.lr_schedule_total_updates = if legacy_v7 && total_updates == 0 {
+            None
+        } else {
+            Some(total_updates)
+        };
+        if r.remaining() == 8 {
+            model.lr_schedule_warmup_steps = Some(r.usize("learning-rate schedule warmup")?);
+        }
+    }
+    validate_schedule(model)
+}
+
 fn load_payload(payload: &[u8], is_v7: bool) -> Result<LoadedCheckpoint> {
     let mut r = Reader::new(payload);
     let cfg = config_from_payload(&mut r)?;
@@ -992,16 +1320,16 @@ fn load_payload(payload: &[u8], is_v7: bool) -> Result<LoadedCheckpoint> {
     model.rng.state = rng_state;
     for (p, n) in [
         (&mut model.embed_w, "embed_w"),
-        (&mut model.a_mat, "a_mat_raw"),
-        (&mut model.w_delta, "w_delta"),
-        (&mut model.w_b, "w_b"),
-        (&mut model.w_c, "w_c"),
-        (&mut model.w_qx, "w_qx"),
-        (&mut model.w_qh, "w_qh"),
-        (&mut model.w_gate, "w_gate"),
-        (&mut model.w_proj, "w_proj"),
-        (&mut model.mlp_w1, "mlp_w1"),
-        (&mut model.mlp_w2, "mlp_w2"),
+        (&mut model.block.a_mat, "a_mat_raw"),
+        (&mut model.block.w_delta, "w_delta"),
+        (&mut model.block.w_b, "w_b"),
+        (&mut model.block.w_c, "w_c"),
+        (&mut model.block.w_qx, "w_qx"),
+        (&mut model.block.w_qh, "w_qh"),
+        (&mut model.block.w_gate, "w_gate"),
+        (&mut model.block.w_proj, "w_proj"),
+        (&mut model.block.mlp_w1, "mlp_w1"),
+        (&mut model.block.mlp_w2, "mlp_w2"),
         (&mut model.unembed_w, "unembed_w"),
     ] {
         read_matrix(&mut r, p, n)?;
@@ -1031,34 +1359,10 @@ fn load_payload(payload: &[u8], is_v7: bool) -> Result<LoadedCheckpoint> {
     r.usizes_into(&mut model.embed_row_marks, "embed_row_marks")?;
     model.vocabulary = vocabulary;
     if is_v7 {
-        let json_len = r.usize("tokenizer JSON length")?;
-        if json_len > MAX_TOKENIZER_JSON_BYTES {
-            return Err(invalid("tokenizer JSON exceeds 16 MiB cap"));
-        }
-        let json = if json_len == 0 {
-            None
-        } else {
-            let text = std::str::from_utf8(r.take(json_len, "tokenizer JSON")?)
-                .map_err(|_| invalid("tokenizer JSON is not UTF-8"))?;
-            Some(text.to_string())
-        };
-        model.tokenizer_json = json;
-        validate_tokenizer_metadata(&model)?;
-        if !matches!(r.remaining(), 0 | 8 | 16) {
-            return Err(invalid("invalid V7 metadata tail"));
-        }
-        if r.remaining() >= 8 {
-            let total_updates = r.usize("learning-rate schedule horizon")?;
-            // Preserve the old reader's zero-horizon sentinel for horizon-only tails.
-            model.lr_schedule_total_updates = (total_updates != 0).then_some(total_updates);
-            if r.remaining() == 8 {
-                model.lr_schedule_warmup_steps = Some(r.usize("learning-rate schedule warmup")?);
-            }
-        }
-        validate_schedule(&model)?;
+        read_metadata_tail(&mut r, &mut model, true)?;
     }
     r.done()?;
-    validate_memory(&model)?;
+    validate_memory(&model.block, &model.cfg, model.step_counter)?;
     Ok(LoadedCheckpoint {
         model,
         format: if is_v7 {
@@ -1155,15 +1459,15 @@ fn load_v5(bytes: &[u8]) -> Result<LoadedCheckpoint> {
         ));
     }
     for (slot, name) in [
-        (&mut model.w_delta, "w_delta"),
-        (&mut model.w_b, "w_b"),
-        (&mut model.w_c, "w_c"),
-        (&mut model.w_qx, "w_qx"),
-        (&mut model.w_qh, "w_qh"),
-        (&mut model.w_gate, "w_gate"),
-        (&mut model.w_proj, "w_proj"),
-        (&mut model.mlp_w1, "mlp_w1"),
-        (&mut model.mlp_w2, "mlp_w2"),
+        (&mut model.block.w_delta, "w_delta"),
+        (&mut model.block.w_b, "w_b"),
+        (&mut model.block.w_c, "w_c"),
+        (&mut model.block.w_qx, "w_qx"),
+        (&mut model.block.w_qh, "w_qh"),
+        (&mut model.block.w_gate, "w_gate"),
+        (&mut model.block.w_proj, "w_proj"),
+        (&mut model.block.mlp_w1, "mlp_w1"),
+        (&mut model.block.mlp_w2, "mlp_w2"),
         (&mut model.unembed_w, "unembed_w"),
     ] {
         legacy_slice_into(&mut r, &mut slot.data, name)?;
@@ -1212,6 +1516,7 @@ pub fn load_checkpoint(path: impl AsRef<Path>) -> Result<LoadedCheckpoint> {
     }
     let version = u16::from_le_bytes(bytes[4..6].try_into().expect("sized"));
     match version {
+        V8_FORMAT_VERSION => load_v8(&bytes),
         FORMAT_VERSION => load_v7(&bytes),
         V6_FORMAT_VERSION => load_v6(&bytes),
         5 => load_v5(&bytes),

@@ -145,15 +145,17 @@ fn gemm_tn_dev(
 /// Stage 1: embedding gather + affine RMSNorm for every token in the chunk.
 #[inline]
 pub fn stage_embed_norm(m: &mut PSSALayerV2, seq_len: usize) {
+    let (embed_w, m) = (&m.embed_w, &mut m.block);
     let d_m = m.cfg.d_latent;
     for t in 0..seq_len {
         let x_id = m.tape.x_ids[t];
-        let e_t = &m.embed_w.data[x_id * d_m..(x_id + 1) * d_m];
+        let e_t = &embed_w.data[x_id * d_m..(x_id + 1) * d_m];
         let sum_sq: f32 = e_t.iter().map(|&x| x * x).sum();
         let inv_rms = 1.0 / (sum_sq / (d_m as f32) + 1e-5).sqrt();
         m.tape.inv_rms[t] = inv_rms;
         let xn_off = t * d_m;
         for i in 0..d_m {
+            m.tape.x_raw[xn_off + i] = e_t[i];
             m.tape.x_norm[xn_off + i] =
                 m.norm_gamma.data[i] * (e_t[i] * inv_rms) + m.norm_beta.data[i];
         }
@@ -164,12 +166,14 @@ pub fn stage_embed_norm(m: &mut PSSALayerV2, seq_len: usize) {
 /// plus the softplus activation on the raw delta.
 #[inline]
 pub fn stage_projections(m: &mut PSSALayerV2, seq_len: usize) {
+    let gpu = gpu_ctx(m);
+    let m = &mut m.block;
     let d_m = m.cfg.d_latent;
     let d_s = m.cfg.d_state;
     let l = seq_len;
     let xn = &m.tape.x_norm[..l * d_m];
 
-    batched_matvec_dev(gpu_ctx(m).as_ref(), &m.w_delta.data, d_m, d_m, xn, l, &mut m.tape.delta_raw[..l * d_m]);
+    batched_matvec_dev(gpu.as_ref(), &m.w_delta.data, d_m, d_m, xn, l, &mut m.tape.delta_raw[..l * d_m]);
     // Reference keeps the raw projection in `delta_raw` and the softplus in
     // `delta`; the backward pass takes sigmoid(delta_raw), so both are needed.
     for i in 0..l * d_m {
@@ -183,6 +187,7 @@ pub fn stage_projections(m: &mut PSSALayerV2, seq_len: usize) {
 /// recurrence is inherently serial); channel/state work stays on the CPU.
 #[inline]
 pub fn stage_ssm_scan(m: &mut PSSALayerV2, seq_len: usize) {
+    let m = &mut m.block;
     m.refresh_ssm_rates();
     let d_m = m.cfg.d_latent;
     let d_s = m.cfg.d_state;
@@ -221,6 +226,8 @@ pub fn stage_ssm_scan(m: &mut PSSALayerV2, seq_len: usize) {
 /// retrieval, memory gate and injection for every token.
 #[inline]
 pub fn stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
+    let gpu = gpu_ctx(m);
+    let m = &mut m.block;
     let d_m = m.cfg.d_latent;
     let d_k = m.cfg.d_mem_key;
     let mem_cap = m.cfg.mem_capacity;
@@ -253,11 +260,11 @@ pub fn stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
     }
 
     // Gate, memory projection and injection as batched GEMMs over the chunk.
-    batched_matvec_dev(gpu_ctx(m).as_ref(), &m.w_gate.data, d_m, d_m, &m.tape.x_norm[..seq_len * d_m], seq_len, &mut m.tape.g_mem[..seq_len * d_m]);
+    batched_matvec_dev(gpu.as_ref(), &m.w_gate.data, d_m, d_m, &m.tape.x_norm[..seq_len * d_m], seq_len, &mut m.tape.g_mem[..seq_len * d_m]);
     for v in &mut m.tape.g_mem[..seq_len * d_m] {
         *v = sigmoid(*v);
     }
-    batched_matvec_dev(gpu_ctx(m).as_ref(), &m.w_proj.data, d_m, d_m, &m.tape.m_val[..seq_len * d_m], seq_len, &mut m.tape.m_proj[..seq_len * d_m]);
+    batched_matvec_dev(gpu.as_ref(), &m.w_proj.data, d_m, d_m, &m.tape.m_val[..seq_len * d_m], seq_len, &mut m.tape.m_proj[..seq_len * d_m]);
     for t in 0..seq_len {
         let m_off = t * d_m;
         for i in 0..d_m {
@@ -270,6 +277,7 @@ pub fn stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
 /// over the whole chunk.
 #[inline]
 pub fn stage_adapter(m: &mut PSSALayerV2, seq_len: usize) {
+    let m = &mut m.block;
     let d_m = m.cfg.d_latent;
     let rank = m.adapters[0].rank;
     let down = &m.adapters[0].down_proj.data;
@@ -308,6 +316,8 @@ fn adapter_up_into(
 /// Stage 6: latent aggregation and SiLU MLP expansion, batched.
 #[inline]
 pub fn stage_mlp(m: &mut PSSALayerV2, seq_len: usize) {
+    let gpu = gpu_ctx(m);
+    let m = &mut m.block;
     let d_m = m.cfg.d_latent;
     let d_mlp = d_m * 2;
     let ssm_scale = 1.0 / (m.cfg.d_state as f32).sqrt();
@@ -339,12 +349,12 @@ pub fn stage_mlp(m: &mut PSSALayerV2, seq_len: usize) {
         }
     }
 
-    batched_matvec_dev(gpu_ctx(m).as_ref(), &m.mlp_w1.data, d_mlp, d_m, &m.tape.z_raw[..seq_len * d_m], seq_len, &mut m.tape.mlp_hidden[..seq_len * d_mlp]);
+    batched_matvec_dev(gpu.as_ref(), &m.mlp_w1.data, d_mlp, d_m, &m.tape.z_raw[..seq_len * d_m], seq_len, &mut m.tape.mlp_hidden[..seq_len * d_mlp]);
     for t_i in 0..seq_len * d_mlp {
         let h = m.tape.mlp_hidden[t_i];
         m.tape.mlp_act[t_i] = h * sigmoid(h);
     }
-    batched_matvec_dev(gpu_ctx(m).as_ref(), &m.mlp_w2.data, d_m, d_mlp, &m.tape.mlp_act[..seq_len * d_mlp], seq_len, &mut m.tape.z_final[..seq_len * d_m]);
+    batched_matvec_dev(gpu.as_ref(), &m.mlp_w2.data, d_m, d_mlp, &m.tape.mlp_act[..seq_len * d_mlp], seq_len, &mut m.tape.z_final[..seq_len * d_m]);
     for t in 0..seq_len {
         let z_off = t * d_m;
         for i in 0..d_m {
@@ -357,13 +367,15 @@ pub fn stage_mlp(m: &mut PSSALayerV2, seq_len: usize) {
 /// cross-entropy losses for the whole chunk.
 #[inline]
 pub fn stage_logits_loss(m: &mut PSSALayerV2, seq_len: usize) -> f32 {
+    let gpu = gpu_ctx(m);
     let d_m = m.cfg.d_latent;
     let d_v = m.cfg.d_vocab;
+    let (unembed_w, m) = (&m.unembed_w, &mut m.block);
     let logit_scale = 1.0 / (d_m as f32).sqrt();
 
     batched_matvec_dev(
-        gpu_ctx(m).as_ref(),
-        &m.unembed_w.data,
+        gpu.as_ref(),
+        &unembed_w.data,
         d_v,
         d_m,
         &m.tape.z_final[..seq_len * d_m],
@@ -409,6 +421,10 @@ pub fn stage_logits_loss(m: &mut PSSALayerV2, seq_len: usize) -> f32 {
 /// `forward_train_chunk`, but every weight-touching stage is one batched GEMM
 /// over all L tokens. The inherently serial SSM scan stays on the CPU.
 pub fn forward_train_chunk_batched(m: &mut PSSALayerV2, token_ids: &[usize], target_ids: &[usize]) -> f32 {
+    if m.depth() > 1 {
+        assert!(!m.device.is_gpu(), "stacked training is CPU-only; use Device::Cpu");
+        return m.forward_train_chunk(token_ids, target_ids);
+    }
     assert!(!token_ids.is_empty(), "training chunk must be nonempty");
     assert_eq!(token_ids.len(), target_ids.len(), "token and target counts must match");
     assert!(
@@ -425,7 +441,8 @@ pub fn forward_train_chunk_batched(m: &mut PSSALayerV2, token_ids: &[usize], tar
 
     m.tape.x_ids[..seq_len].copy_from_slice(&token_ids[..seq_len]);
     m.tape.target_ids[..seq_len].copy_from_slice(&target_ids[..seq_len]);
-    m.tape.h_states[..m.cfg.d_latent * m.cfg.d_state].copy_from_slice(&m.h_persistent);
+    m.block.tape.h_states[..m.cfg.d_latent * m.cfg.d_state]
+        .copy_from_slice(&m.block.h_persistent);
 
     stage_embed_norm(m, seq_len);
     stage_projections(m, seq_len);
@@ -436,8 +453,8 @@ pub fn forward_train_chunk_batched(m: &mut PSSALayerV2, token_ids: &[usize], tar
     let loss = stage_logits_loss(m, seq_len);
 
     let last_h_off = seq_len * (m.cfg.d_latent * m.cfg.d_state);
-    m.h_persistent
-        .copy_from_slice(&m.tape.h_states[last_h_off..last_h_off + m.cfg.d_latent * m.cfg.d_state]);
+    m.block.h_persistent
+        .copy_from_slice(&m.block.tape.h_states[last_h_off..last_h_off + m.cfg.d_latent * m.cfg.d_state]);
 
     loss
 }
@@ -475,6 +492,7 @@ pub fn bwd_stage_logits_blocked(
 ) {
     let d_m = m.cfg.d_latent;
     let d_v = m.cfg.d_vocab;
+    let (unembed_w, m) = (&mut m.unembed_w, &mut m.block);
     let logit_scale = 1.0 / (d_m as f32).sqrt();
 
     // G [L, d_v]: dLoss/dlogit for every token.
@@ -489,15 +507,15 @@ pub fn bwd_stage_logits_blocked(
     }
 
     if gpu.is_none() {
-        dense_input_adjoint(g_logit, &m.unembed_w.data, seq_len, d_v, d_m,
+        dense_input_adjoint(g_logit, &unembed_w.data, seq_len, d_v, d_m,
             &mut m.bwd_g_zfinal[..seq_len * d_m]);
         dense_weight_adjoint(g_logit, &m.tape.z_final[..seq_len * d_m], seq_len, d_v, d_m,
-            &mut m.unembed_w.grad);
+            &mut unembed_w.grad);
         return;
     }
 
     // grad_z_final [L, d_m] = G [L, d_v] * W [d_v, d_m]
-    let g_zfinal = gemm_nn_dev(gpu, &g_logit, &m.unembed_w.data, seq_len, d_v, d_m);
+    let g_zfinal = gemm_nn_dev(gpu, &g_logit, &unembed_w.data, seq_len, d_v, d_m);
     m.bwd_g_zfinal[..seq_len * d_m].copy_from_slice(&g_zfinal);
 
     // unembed grad [d_v, d_m] += G^T [d_v, L] * Z [L, d_m]
@@ -509,7 +527,7 @@ pub fn bwd_stage_logits_blocked(
         d_v,
         d_m,
     );
-    for (dst, src) in m.unembed_w.grad.iter_mut().zip(g_w.iter()) {
+    for (dst, src) in unembed_w.grad.iter_mut().zip(g_w.iter()) {
         *dst += *src;
     }
 }
@@ -518,6 +536,7 @@ pub fn bwd_stage_logits_blocked(
 pub fn bwd_stage_logits_scalar(m: &mut PSSALayerV2, seq_len: usize, scale_loss: f32) {
     let d_m = m.cfg.d_latent;
     let d_v = m.cfg.d_vocab;
+    let (unembed_w, m) = (&mut m.unembed_w, &mut m.block);
     let logit_scale = 1.0 / (d_m as f32).sqrt();
 
     for t in 0..seq_len {
@@ -534,8 +553,8 @@ pub fn bwd_stage_logits_scalar(m: &mut PSSALayerV2, seq_len: usize, scale_loss: 
             let g_logit = (m.tape.probs[log_off + i] - indicator) * scale_loss * logit_scale;
             let row_off = i * d_m;
             for j in 0..d_m {
-                m.bwd_g_zfinal[z_off + j] += g_logit * m.unembed_w.data[row_off + j];
-                m.unembed_w.grad[row_off + j] += g_logit * m.tape.z_final[z_off + j];
+                m.bwd_g_zfinal[z_off + j] += g_logit * unembed_w.data[row_off + j];
+                unembed_w.grad[row_off + j] += g_logit * m.tape.z_final[z_off + j];
             }
         }
     }
@@ -563,6 +582,7 @@ pub fn bwd_stage_mlp_blocked(
     seq_len: usize,
     gpu: Option<&crate::backend::GpuDispatch>,
 ) {
+    let m = &mut m.block;
     let d_m = m.cfg.d_latent;
     let d_mlp = d_m * 2;
     let l = seq_len;
@@ -620,6 +640,7 @@ pub fn bwd_stage_mlp_blocked(
 
 /// Fused per-token reference form, kept as the CPU path and the twin.
 pub fn bwd_stage_mlp_scalar(m: &mut PSSALayerV2, seq_len: usize) {
+    let m = &mut m.block;
     let d_m = m.cfg.d_latent;
     let d_mlp = d_m * 2;
     let l = seq_len;
@@ -673,6 +694,7 @@ pub fn bwd_stage_mlp_scalar(m: &mut PSSALayerV2, seq_len: usize) {
 /// Backward Stage 5: plastic adapter adjoint, batched over all L tokens.
 #[inline]
 pub fn bwd_stage_adapter(m: &mut PSSALayerV2, seq_len: usize) {
+    let m = &mut m.block;
     let d_m = m.cfg.d_latent;
     let rank = m.adapters[0].rank;
     let l = seq_len;
@@ -712,6 +734,7 @@ pub fn bwd_stage_adapter(m: &mut PSSALayerV2, seq_len: usize) {
 /// bwd_stage_adapter because grad_x_norm accumulates across stages.)
 #[inline]
 pub fn bwd_stage_adapter_down(m: &mut PSSALayerV2, seq_len: usize) {
+    let m = &mut m.block;
     let d_m = m.cfg.d_latent;
     let rank = m.adapters[0].rank;
     let l = seq_len;
@@ -737,6 +760,7 @@ pub fn bwd_stage_adapter_down(m: &mut PSSALayerV2, seq_len: usize) {
 /// memory bank; token loops here mirror the reference accumulation order.
 #[inline]
 pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
+    let m = &mut m.block;
     let d_m = m.cfg.d_latent;
     let d_k = m.cfg.d_mem_key;
     let mem_cap = m.cfg.mem_capacity;
@@ -848,6 +872,8 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
 /// reference inner loops so grads agree to f32 roundoff.
 #[inline]
 pub fn bwd_stage_ssm(m: &mut PSSALayerV2, seq_len: usize) {
+    let pending_step = m.step_counter + 1;
+    let (embed_w, embed_row_marks, m) = (&mut m.embed_w, &mut m.embed_row_marks, &mut m.block);
     m.refresh_ssm_rates();
     let d_m = m.cfg.d_latent;
     let d_s = m.cfg.d_state;
@@ -855,9 +881,8 @@ pub fn bwd_stage_ssm(m: &mut PSSALayerV2, seq_len: usize) {
     let ssm_scale = 1.0 / (d_s as f32).sqrt();
 
     m.grad_h_next.fill(0.0);
-    let pending_step = m.step_counter + 1;
     for t in 0..l {
-        m.embed_row_marks[m.tape.x_ids[t]] = pending_step;
+        embed_row_marks[m.tape.x_ids[t]] = pending_step;
     }
 
     for t in (0..l).rev() {
@@ -930,7 +955,7 @@ pub fn bwd_stage_ssm(m: &mut PSSALayerV2, seq_len: usize) {
 
         // Affine RMSNorm backward to gamma, beta, and the embedding row
         let inv_rms = m.tape.inv_rms[t];
-        let e_t = &m.embed_w.data[x_id * d_m..(x_id + 1) * d_m];
+        let e_t = &embed_w.data[x_id * d_m..(x_id + 1) * d_m];
 
         let mut dot_gx_e = 0.0f32;
         for i in 0..d_m {
@@ -947,7 +972,7 @@ pub fn bwd_stage_ssm(m: &mut PSSALayerV2, seq_len: usize) {
             let g_unnorm = m.bwd_g_xnorm[m_off + i] * m.norm_gamma.data[i];
             let g_e_i =
                 inv_rms * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / (d_m as f32)));
-            m.embed_w.grad[emb_row_off + i] += g_e_i;
+            embed_w.grad[emb_row_off + i] += g_e_i;
         }
     }
 }
@@ -956,6 +981,11 @@ pub fn bwd_stage_ssm(m: &mut PSSALayerV2, seq_len: usize) {
 /// reference `backward_chunk`, accumulated in the same reverse-time token
 /// order, driven by the stage adjoints above.
 pub fn backward_chunk_batched(m: &mut PSSALayerV2, seq_len: usize, accumulation_scale: f32) {
+    if m.depth() > 1 {
+        assert!(!m.device.is_gpu(), "stacked training is CPU-only; use Device::Cpu");
+        m.backward_chunk(seq_len, accumulation_scale);
+        return;
+    }
     assert!(
         seq_len > 0 && seq_len <= m.cfg.chunk_len,
         "backward sequence length must be within tape capacity"

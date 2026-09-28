@@ -33,6 +33,7 @@ pub unsafe extern "C" fn perf_probe_dot_export(a: *const f32, b: *const f32, len
 
 fn config() -> PSSAConfigV2 {
     PSSAConfigV2 {
+        depth: 1,
         d_vocab: 4096,
         d_latent: 64,
         d_state: 8,

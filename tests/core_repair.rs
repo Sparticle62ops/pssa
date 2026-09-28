@@ -3,6 +3,7 @@ use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2, ParamVector};
 
 fn cfg(latent: usize) -> PSSAConfigV2 {
     PSSAConfigV2 {
+        depth: 1,
         d_vocab: 7,
         d_latent: latent,
         d_state: 2,
