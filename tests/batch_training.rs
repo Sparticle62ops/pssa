@@ -208,6 +208,12 @@ fn cli_batch_one_is_byte_identical_and_bad_sizes_do_not_write() {
     let help = Command::new(exe).arg("help").output().unwrap();
     let help = String::from_utf8_lossy(&help.stdout);
     assert!(help.contains("--resume") && help.contains("--batch-size"));
+    let batch_help = help
+        .lines()
+        .find(|line| line.contains("--batch-size n"))
+        .unwrap();
+    assert!(!batch_help.contains("--chunk"));
+    assert!(batch_help.contains("  independent document lanes (default 1)"));
     assert!(
         !Command::new(exe)
             .args(["train-transformer", &corpus, "--batch-size", "2"])
