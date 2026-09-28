@@ -49,12 +49,13 @@ legacy single-lane path); `--accumulate` counts microbatches per update.
 Batch workspaces are runtime-only, not checkpoint metadata. See
 `tests/batch_training.rs` for CLI, planning, and schedule/resume coverage;
 `tests/sequence_batch.rs` checks packed math against separate sequences.
-`examples/sequence_batch_probe.rs` is the fixed-work CPU throughput baseline.
+`examples/sequence_batch_probe.rs` is the fixed-work CPU throughput baseline;
+see `docs/BATCHING.md` for commands, batch semantics, and measured results.
 
 `cuda` is optional and dynamically loaded, so a CUDA build still runs on a
 machine with no driver; the backend just reports itself unavailable. Tests
 live in `tests/` (`core_repair`, `checkpoint_repair`, `bpe_repair`,
-`runtime_repair`, `linalg`, `allocations`, `backward_blocked`). Two probes in
+`runtime_repair`, `linalg`, `allocations`, `backward_blocked`). Additional probes in
 `examples/`: `perf_probe.rs`, `twin_check.rs` (CPU-twin verification of the GPU
 path; run it after touching `gpu_batch.rs` or `cuda.rs`).
 
