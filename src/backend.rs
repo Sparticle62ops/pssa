@@ -749,7 +749,10 @@ pub fn gemm_cpu_into(
         }
     };
     // Avoid waking a large pool for small state/rank projections.
-    if output.saturating_mul(k) >= 4 * 1024 * 1024 && output / n >= 8 {
+    if output.saturating_mul(k) >= 1024 * 1024
+        && output / n >= 8
+        && rayon::current_num_threads() > 1
+    {
         out.par_chunks_mut(tile_len).enumerate().for_each(calculate);
     } else {
         out.chunks_mut(tile_len).enumerate().for_each(calculate);
@@ -765,18 +768,20 @@ pub fn gemm_nn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f3
     let Ok(mut c) = zeroed_output(c_len) else {
         return Vec::new();
     };
-    for i in 0..m {
+    let tile = |(i, dst): (usize, &mut [f32])| {
         for kk in 0..k {
-            let av = a[i * k + kk];
-            if av == 0.0 {
-                continue;
-            }
-            let b_row = &b[kk * n..kk * n + n];
-            let c_row = &mut c[i * n..i * n + n];
-            for j in 0..n {
-                c_row[j] += av * b_row[j];
+            let b_row = &b[kk * n..(kk + 1) * n];
+            for (t, c_row) in dst.chunks_mut(n).enumerate() {
+                let av = a[(i * 4 + t) * k + kk];
+                if av == 0.0 { continue; }
+                for (c, &b) in c_row.iter_mut().zip(b_row) { *c += av * b; }
             }
         }
+    };
+    if c_len.saturating_mul(k) >= 1024 * 1024 && rayon::current_num_threads() > 1 {
+        c.par_chunks_mut(4 * n).enumerate().for_each(tile);
+    } else {
+        c.chunks_mut(4 * n).enumerate().for_each(tile);
     }
     c
 }
@@ -789,18 +794,20 @@ pub fn gemm_tn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f3
     let Ok(mut c) = zeroed_output(c_len) else {
         return Vec::new();
     };
-    for t in 0..m {
-        for kk in 0..k {
-            let av = a[t * k + kk];
-            if av == 0.0 {
-                continue;
-            }
-            let b_row = &b[t * n..t * n + n];
-            let c_row = &mut c[kk * n..kk * n + n];
-            for j in 0..n {
-                c_row[j] += av * b_row[j];
+    let tile = |(i, dst): (usize, &mut [f32])| {
+        for t in 0..m {
+            let b_row = &b[t * n..(t + 1) * n];
+            for (r, c_row) in dst.chunks_mut(n).enumerate() {
+                let av = a[t * k + i * 8 + r];
+                if av == 0.0 { continue; }
+                for (c, &b) in c_row.iter_mut().zip(b_row) { *c += av * b; }
             }
         }
+    };
+    if c_len.saturating_mul(m) >= 1024 * 1024 && rayon::current_num_threads() > 1 {
+        c.par_chunks_mut(8 * n).enumerate().for_each(tile);
+    } else {
+        c.chunks_mut(8 * n).enumerate().for_each(tile);
     }
     c
 }

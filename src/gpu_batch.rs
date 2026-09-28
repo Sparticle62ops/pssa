@@ -23,27 +23,34 @@ use rayon::prelude::*;
 
 // Parallelize only large, independent dense adjoints. The recurrent scan below
 // deliberately retains its reverse-time dependency and has no shared atomics.
-fn parallel_backward(tokens: usize, rows: usize, cols: usize) -> bool {
+fn blocked_backward(tokens: usize, rows: usize, cols: usize) -> bool {
     tokens.saturating_mul(rows).saturating_mul(cols) >= 1_048_576
-        && rayon::current_num_threads() > 1
+}
+
+fn parallel_backward(tokens: usize, rows: usize, cols: usize) -> bool {
+    blocked_backward(tokens, rows, cols) && rayon::current_num_threads() > 1
 }
 
 /// G[L,R] * W[R,C], owning complete output rows with contiguous weight reads.
 fn dense_input_adjoint(g: &[f32], w: &[f32], l: usize, rows: usize, cols: usize, out: &mut [f32]) {
-    let row = |t: usize, dst: &mut [f32]| {
+    // Reuse each contiguous weight row across four tokens before advancing.
+    // Per-element summation order is unchanged; tasks own complete output tiles.
+    let tile = |tile_idx: usize, dst: &mut [f32]| {
         dst.fill(0.0);
         for r in 0..rows {
-            let scale = g[t * rows + r];
             let weights = &w[r * cols..(r + 1) * cols];
-            for (dst, &weight) in dst.iter_mut().zip(weights) {
-                *dst += scale * weight;
+            for (t, output) in dst.chunks_mut(cols).enumerate() {
+                let scale = g[(tile_idx * 4 + t) * rows + r];
+                for (dst, &weight) in output.iter_mut().zip(weights) {
+                    *dst += scale * weight;
+                }
             }
         }
     };
     if parallel_backward(l, rows, cols) {
-        out.par_chunks_mut(cols).enumerate().for_each(|(t, dst)| row(t, dst));
+        out.par_chunks_mut(4 * cols).enumerate().for_each(|(i, dst)| tile(i, dst));
     } else {
-        out.chunks_mut(cols).enumerate().for_each(|(t, dst)| row(t, dst));
+        out.chunks_mut(4 * cols).enumerate().for_each(|(i, dst)| tile(i, dst));
     }
 }
 
@@ -449,7 +456,7 @@ pub fn bwd_stage_logits(m: &mut PSSALayerV2, seq_len: usize, scale_loss: f32) {
         bwd_stage_logits_blocked(m, seq_len, scale_loss, Some(&gpu));
         return;
     }
-    if parallel_backward(seq_len, m.cfg.d_vocab, m.cfg.d_latent) {
+    if blocked_backward(seq_len, m.cfg.d_vocab, m.cfg.d_latent) {
         bwd_stage_logits_blocked(m, seq_len, scale_loss, None);
     } else {
         bwd_stage_logits_scalar(m, seq_len, scale_loss);
@@ -541,7 +548,7 @@ pub fn bwd_stage_mlp(m: &mut PSSALayerV2, seq_len: usize) {
         bwd_stage_mlp_blocked(m, seq_len, Some(&gpu));
         return;
     }
-    if parallel_backward(seq_len, m.cfg.d_latent, 2 * m.cfg.d_latent) {
+    if blocked_backward(seq_len, m.cfg.d_latent, 2 * m.cfg.d_latent) {
         bwd_stage_mlp_blocked(m, seq_len, None);
     } else {
         bwd_stage_mlp_scalar(m, seq_len);
