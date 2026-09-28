@@ -19,7 +19,7 @@ SIMD + rayon by default, optional WebGPU and native CUDA/cuBLAS backends.
 | `gpu_batch.rs` | shared dense forward/backward dispatch stages |
 | `sequence_batch.rs` | packed independent document lanes, per-lane recurrent carry and TBPTT |
 | `backend.rs` (697) | backend selection and the CPU path |
-| `dataset.rs` (602) | corpus loading, tokenizer, `--max-tokens` / `--skip-tokens` |
+| `dataset.rs` | corpus loading, tokenizer, opt-in streaming `clean_wikitext`, `--max-tokens` / `--skip-tokens` |
 | `linalg.rs` (518) | matmul and friends |
 | `tui.rs` (486), `ui.rs` (367) | ratatui progress display |
 | `inference.rs` (302) | PSSA generation and shared sampling policy |

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use tokenizers::models::bpe::{BPE, BpeTrainer};
@@ -452,6 +453,98 @@ fn byte_level_token_bytes(token: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Clean a UTF-8 WikiText raw dump without buffering the whole corpus.
+///
+/// Removes balanced `= Title =` / `= = Section = =` heading lines and `<unk>`,
+/// joins `@-@`, `@.@`, and `@,@` to their neighbors, and removes whitespace
+/// before `.`, `,`, `)` and after `(`. Other inline whitespace becomes one
+/// space, with no leading/trailing spaces. Consecutive blank lines (including
+/// whitespace-only or `<unk>`-only lines) become one blank line; heading lines
+/// do not introduce blanks. Leading/trailing blank runs also retain one blank.
+///
+/// Output uses LF line endings, including on a final unterminated input line.
+/// Memory use is proportional to the longest line, not the file size. Read,
+/// UTF-8, and write errors are returned; callers must flush buffered writers.
+/// Dataset loading and tokenization do not implicitly apply this opt-in pass.
+pub fn clean_wikitext<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> io::Result<()> {
+    let mut line = String::new();
+    let mut cleaned = String::new();
+    let mut previous_blank = false;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(());
+        }
+        let text = line.trim();
+        if is_wikitext_heading(text) {
+            continue;
+        }
+        clean_wikitext_line(text, &mut cleaned);
+        let blank = cleaned.is_empty();
+        if !blank || !previous_blank {
+            writer.write_all(cleaned.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+        previous_blank = blank;
+    }
+}
+
+fn is_wikitext_heading(line: &str) -> bool {
+    let marker = |ch: char| ch == '=' || ch.is_whitespace();
+    let body = line.trim_start_matches(marker);
+    let opening = line[..line.len() - body.len()]
+        .bytes()
+        .filter(|&b| b == b'=')
+        .count();
+    if opening == 0 {
+        return false;
+    }
+    let title = body.trim_end_matches(marker);
+    let closing = body[title.len()..].bytes().filter(|&b| b == b'=').count();
+    !title.is_empty() && opening == closing
+}
+
+fn clean_wikitext_line(mut text: &str, out: &mut String) {
+    out.clear();
+    let mut pending_space = false;
+    let mut join_next = false;
+    while let Some(ch) = text.chars().next() {
+        if let Some(rest) = text.strip_prefix("<unk>") {
+            text = rest;
+            continue;
+        }
+        let joined = match text.as_bytes() {
+            [b'@', b'-', b'@', ..] => Some('-'),
+            [b'@', b'.', b'@', ..] => Some('.'),
+            [b'@', b',', b'@', ..] => Some(','),
+            _ => None,
+        };
+        if let Some(punctuation) = joined {
+            out.push(punctuation);
+            text = &text[3..];
+            pending_space = false;
+            join_next = true;
+            continue;
+        }
+        text = &text[ch.len_utf8()..];
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space
+            && !join_next
+            && !out.is_empty()
+            && !out.ends_with('(')
+            && !matches!(ch, '.' | ',' | ')')
+        {
+            out.push(' ');
+        }
+        out.push(ch);
+        pending_space = false;
+        join_next = false;
+    }
+}
+
 pub struct DatasetManager;
 impl DatasetManager {
     pub const SCIENCE_REFERENCE_CORPUS: &'static str = "the solar system consists of the sun and the planetary objects orbiting it .\nthe four inner terrestrial planets are mercury , venus , earth , and mars , composed primarily of rock and metal .\nquantum mechanics is the branch of physics studying the behavior of matter and light at atomic scale .\ncomputer science is the study of computation , information , and the theoretical foundations of computation .\nartificial intelligence focuses on building computational models and software that learn .\nphotosynthesis is the biological process used by plants to convert light into energy .\ndna contains the genetic instructions necessary for the development and reproduction of living organisms .\nsocial science is the study of human societies and interconnected relationships .\ndata science involves analyzing large volumes of information to extract patterns .\n";
@@ -673,5 +766,118 @@ impl DatasetManager {
             "the speed of light is 300000 . ".repeat(6),
             "the speed of light is 500 . ".repeat(burst_count)
         )
+    }
+}
+
+#[cfg(test)]
+mod wikitext_tests {
+    use super::clean_wikitext;
+    use std::io::{self, BufReader, Read};
+
+    fn clean(raw: &str) -> String {
+        let mut out = Vec::new();
+        clean_wikitext(raw.as_bytes(), &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    // Sentence excerpts and headings from Salesforce/wikitext,
+    // wikitext-103-raw-v1 test rows 1, 3, 6, 9, 34, 54, and 119.
+    #[test]
+    fn restores_hyphenated_words() {
+        assert_eq!(
+            clean(" Robert Boulter is an English film , television and theatre actor . He had a guest @-@ starring role on the television series The Bill in 2000 . \n"),
+            "Robert Boulter is an English film, television and theatre actor. He had a guest-starring role on the television series The Bill in 2000.\n"
+        );
+        assert_eq!(clean("guest\t@-@  starring co@-@stars\n"), "guest-starring co-stars\n");
+    }
+
+    #[test]
+    fn restores_decimal_points_and_thousands_separators() {
+        assert_eq!(
+            clean("It caused enormous disruption to Chinese society : the census of 754 recorded 52 @.@ 9 million people , but ten years later , the census counted just 16 @.@ 9 million , the remainder having been displaced or killed ."),
+            "It caused enormous disruption to Chinese society : the census of 754 recorded 52.9 million people, but ten years later, the census counted just 16.9 million, the remainder having been displaced or killed.\n"
+        );
+        assert_eq!(
+            clean("The single peaked at number 46 on the US Billboard Hot 100 and has been certified gold by the Recording Industry Association of America ( RIAA ) for shipments of 500 @,@ 000 copies ."),
+            "The single peaked at number 46 on the US Billboard Hot 100 and has been certified gold by the Recording Industry Association of America (RIAA) for shipments of 500,000 copies.\n"
+        );
+        assert_eq!(clean("1\t@,@  234@.@5\n"), "1,234.5\n");
+    }
+
+    #[test]
+    fn drops_heading_lines_without_inserting_blanks() {
+        assert_eq!(
+            clean(" = Robert Boulter = \n = = Career = = \n = = = 2000 – 2005 = = = \n== Career ==\nRobert Boulter .\n= Filmography =\nThe Bill .\n"),
+            "Robert Boulter.\nThe Bill.\n"
+        );
+        assert_eq!(clean(" = Title = \n"), "");
+        assert_eq!(clean("An equation: x = y .\n= not a heading\n"), "An equation: x = y.\n= not a heading\n");
+    }
+
+    #[test]
+    fn collapses_blank_lines_even_across_removed_headings() {
+        assert_eq!(
+            clean(" \t\r\n\nRobert Boulter .\r\n \t\n= = Career = =\n\n\u{2003}\nThe Bill .\n\n \t\n"),
+            "\nRobert Boulter.\n\nThe Bill.\n\n"
+        );
+        assert_eq!(clean(""), "");
+        assert_eq!(clean(" \t\n\r\n \n"), "\n");
+    }
+
+    #[test]
+    fn restores_punctuation_spacing_without_corrupting_unicode() {
+        assert_eq!(
+            clean(" Du Fu ( Wade – Giles : Tu Fu ; Chinese : 杜甫 ; 712 – 770 ) was a prominent Chinese poet of the Tang dynasty .\n"),
+            "Du Fu (Wade – Giles : Tu Fu ; Chinese : 杜甫 ; 712 – 770) was a prominent Chinese poet of the Tang dynasty.\n"
+        );
+        assert_eq!(clean("( ( 杜甫 ) ) , poetry .\n"), "((杜甫)), poetry.\n");
+    }
+
+    #[test]
+    fn removes_unknown_tokens_and_their_extra_spacing() {
+        // Inject unknown-token artifacts into the Robert Boulter excerpt.
+        assert_eq!(
+            clean(" <unk> Robert Boulter is an English <unk> <unk> film , television and theatre actor <unk> . <unk> \n"),
+            "Robert Boulter is an English film, television and theatre actor.\n"
+        );
+        assert_eq!(clean("<unk>\n \n <unk> <unk> \nThe Bill ."), "\nThe Bill.\n");
+        assert_eq!(clean("( <unk> Du Fu <unk> )\n"), "(Du Fu)\n");
+    }
+
+    #[test]
+    fn cleaning_is_idempotent_and_preserves_natural_spacing() {
+        let raw = "= Robert Boulter =\n\nHe had a guest @-@ starring role <unk> .\n\n= = Career = =\n \nDu Fu ( 杜甫 ) .\n52 @.@ 9 million , 500 @,@ 000 copies .";
+        let once = clean(raw);
+        assert_eq!(clean(&once), once);
+        let natural = "Du Fu (杜甫) was a poet, born in 712.\n52.9 million; 500,000 copies; guest-starring.\nx = y; a - b; mail@example.org\n";
+        assert_eq!(clean(natural), natural);
+    }
+
+    #[test]
+    fn handles_small_read_buffers_and_returns_utf8_and_write_errors() {
+        let raw = "杜甫 ( Du Fu ) , guest @-@ starring .\r\n";
+        let mut out = Vec::new();
+        clean_wikitext(BufReader::with_capacity(1, raw.as_bytes()), &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), clean(raw));
+        let err = clean_wikitext(&b"\xff\n"[..], io::sink()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let mut short = [0; 2];
+        let err = clean_wikitext(raw.as_bytes(), &mut short[..]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+    }
+
+    #[test]
+    fn emits_completed_lines_before_reading_the_rest_of_the_corpus() {
+        struct FailedRead;
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("read failed"))
+            }
+        }
+        let input = io::Cursor::new(b"Robert Boulter .\n").chain(FailedRead);
+        let mut out = Vec::new();
+        let err = clean_wikitext(BufReader::new(input), &mut out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(out, b"Robert Boulter.\n");
     }
 }
