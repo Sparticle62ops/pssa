@@ -103,6 +103,23 @@ fn blocked_cpu_output_into_matches_dot_order_for_tails_and_parallel_tiles() {
 }
 
 #[test]
+fn rayon_gemms_match_single_thread_bitwise_including_partial_tiles() {
+    let serial = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let parallel = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+    let (m, k, n) = (65, 137, 129);
+    let a = values(m * k);
+    let b_nn = values(k * n);
+    let b_tn = values(m * n);
+    let w = values(n * k);
+    let run = || {
+        let mut out = vec![0.0; m * n];
+        gemm_cpu_into(&a, &w, m, n, k, 1, &mut out).unwrap();
+        (out, gemm_nn_cpu(&a, &b_nn, m, k, n), gemm_tn_cpu(&a, &b_tn, m, k, n))
+    };
+    assert_eq!(serial.install(run), parallel.install(run));
+}
+
+#[test]
 fn backend_initialization_environment_child() {
     if std::env::var_os("OXIDE_BACKEND_ENV_CHILD").is_none() {
         return;
