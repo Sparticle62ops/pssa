@@ -22,6 +22,8 @@ pub struct TrainingOptions {
     pub chunk: usize,
     pub lr: f32,
     pub accumulate: usize,
+    /// Independent document lanes per PSSA microbatch (runtime-only).
+    pub batch_size: usize,
     pub warmup_steps: usize,
     /// Fixed total optimizer-update horizon shared by all resumed links.
     /// `None` preserves the legacy per-link schedule behavior.
@@ -47,6 +49,7 @@ impl Default for TrainingOptions {
             chunk: 64,
             lr: 1e-3,
             accumulate: 8,
+            batch_size: 1,
             warmup_steps: 0,
             schedule_total_updates: None,
             seed: 42,
@@ -198,6 +201,7 @@ impl CLIHandler {
             chunk: parsed.usize_nonzero("--chunk", "", 64)?,
             lr: parsed.f32("--lr", "", 1e-3)?,
             accumulate: parsed.usize_nonzero("--accumulate", "", 8)?,
+            batch_size: parsed.usize_nonzero("--batch-size", "", 1)?,
             warmup_steps: parsed.required_usize("--warmup-steps", "", 0)?,
             schedule_total_updates: parsed
                 .string("--total-updates", "")
@@ -242,6 +246,7 @@ impl CLIHandler {
             ("--memory", x.memory, 1_000_000),
             ("--chunk", x.chunk, 65_536),
             ("--accumulate", x.accumulate, 1_000_000),
+            ("--batch-size", x.batch_size, 65_536),
         ] {
             if value > maximum {
                 return Err(format!("{name} must be at most {maximum}"));
@@ -405,11 +410,15 @@ impl CLIHandler {
             || options.memory == 0
             || options.chunk == 0
             || options.accumulate == 0
+            || options.batch_size == 0
         {
             return Err(
-                "epochs, latent, state, key, memory, chunk, and accumulate must be positive"
+                "epochs, latent, state, key, memory, chunk, accumulate, and batch-size must be positive"
                     .into(),
             );
+        }
+        if options.batch_size > 65_536 {
+            return Err("--batch-size must be at most 65536; use fewer document lanes".into());
         }
         if !options.lr.is_finite() || options.lr <= 0.0 {
             return Err("learning rate must be finite and positive".into());
@@ -492,7 +501,15 @@ impl CLIHandler {
         } else {
             options.chunk
         };
-        let plan = crate::training::chunk_plan(&docs, chunk_len);
+        let plan = crate::training::sequence_plan(&docs, chunk_len, options.batch_size)?;
+        let mut sequence_batch = if options.batch_size > 1 {
+            Some(crate::sequence_batch::SequenceBatch::new(
+                &mut model,
+                options.batch_size.min(docs.len()).max(1),
+            )?)
+        } else {
+            None
+        };
         let schedule = crate::training::Schedule::new_with_warmup(
             plan.len(),
             model.step_counter,
@@ -511,6 +528,9 @@ impl CLIHandler {
             model.parameter_count(), model.cfg.d_vocab
         );
         crate::training::report_stream(&docs, chunk_len, options.accumulate);
+        if options.batch_size > 1 {
+            crate::training::report_sequence_plan(&plan, options.batch_size);
+        }
         ui::banner("train", "plastic state-space architecture");
         ui::field(
             "corpus",
@@ -551,37 +571,86 @@ impl CLIHandler {
         let mut progress = ui::Progress::new("training", total_updates);
         for epoch in 0..options.epochs {
             model.reset_recurrent_state();
+            if let Some(batch) = &mut sequence_batch {
+                batch.reset_states();
+            }
             let mut loss_sum = 0.0f64;
             let mut token_sum = 0usize;
             for group in plan.chunks(options.accumulate) {
-                let total_tokens: usize = group.iter().map(|x| x.2).sum();
+                let total_tokens: usize = group.iter().flatten().map(|x| x.len).sum();
                 if total_tokens == 0 {
                     continue;
                 }
                 model.zero_gradients();
-                for &(doc_id, start, len) in group {
-                    if start == 0 {
-                        model.reset_recurrent_state();
-                    }
-                    let input = &docs[doc_id][start..start + len];
-                    let target = &docs[doc_id][start + 1..start + 1 + len];
-                    let loss = crate::gpu_batch::forward_train_chunk_batched(&mut model, input, target);
+                for microbatch in group {
+                    let batch_tokens: usize = microbatch.iter().map(|c| c.len).sum();
+                    let loss = if let Some(batch) = &mut sequence_batch {
+                        let sequences: Vec<_> = microbatch
+                            .iter()
+                            .map(|c| crate::sequence_batch::Sequence {
+                                lane: c.lane,
+                                inputs: &docs[c.doc][c.start..c.start + c.len],
+                                targets: &docs[c.doc][c.start + 1..c.start + 1 + c.len],
+                                reset: c.start == 0,
+                            })
+                            .collect();
+                        batch.forward(&mut model, &sequences)?
+                    } else {
+                        // Preserve the historical single-lane math and write order.
+                        let c = microbatch[0];
+                        if c.start == 0 {
+                            model.reset_recurrent_state();
+                        }
+                        crate::gpu_batch::forward_train_chunk_batched(
+                            &mut model,
+                            &docs[c.doc][c.start..c.start + c.len],
+                            &docs[c.doc][c.start + 1..c.start + 1 + c.len],
+                        )
+                    };
                     if !loss.is_finite() {
                         return Err("non-finite loss; training aborted without checkpoint".into());
                     }
-                    crate::gpu_batch::backward_chunk_batched(&mut model, len, len as f32 / total_tokens as f32);
-                    if loss > 3.5 {
-                        let last = len - 1;
-                        let q = &model.tape.q_poincare
-                            [last * model.cfg.d_mem_key..(last + 1) * model.cfg.d_mem_key];
-                        let v = &model.tape.z_final
-                            [last * model.cfg.d_latent..(last + 1) * model.cfg.d_latent];
-                        model
-                            .memory
-                            .insert_protected(q, v, loss, model.step_counter);
+                    let scale = batch_tokens as f32 / total_tokens as f32;
+                    if let Some(batch) = &mut sequence_batch {
+                        batch.backward(&mut model, scale)?;
+                        if microbatch
+                            .iter()
+                            .any(|c| batch.state(c.lane).iter().any(|x| !x.is_finite()))
+                        {
+                            return Err(
+                                "non-finite batch carry; training aborted without checkpoint".into(),
+                            );
+                        }
+                    } else {
+                        crate::gpu_batch::backward_chunk_batched(
+                            &mut model,
+                            batch_tokens,
+                            scale,
+                        );
                     }
-                    loss_sum += loss as f64 * len as f64;
-                    token_sum += len;
+                    // All retrieval adjoints see the same bank as forward. Writes
+                    // happen only now, in deterministic lane order, using each
+                    // chunk's own mean loss and terminal token (not the batch mean).
+                    let mut offset = 0;
+                    for c in microbatch {
+                        let loss = model.tape.losses[offset..offset + c.len]
+                            .iter()
+                            .sum::<f32>()
+                            / c.len as f32;
+                        if loss > 3.5 {
+                            let last = offset + c.len - 1;
+                            let q = &model.tape.q_poincare
+                                [last * model.cfg.d_mem_key..(last + 1) * model.cfg.d_mem_key];
+                            let v = &model.tape.z_final
+                                [last * model.cfg.d_latent..(last + 1) * model.cfg.d_latent];
+                            model
+                                .memory
+                                .insert_protected(q, v, loss, model.step_counter);
+                        }
+                        loss_sum += loss as f64 * c.len as f64;
+                        token_sum += c.len;
+                        offset += c.len;
+                    }
                 }
                 update += 1;
                 model.apply_adamw(schedule.lr(update)?);
@@ -847,6 +916,7 @@ impl CLIHandler {
             chunk: 8,
             lr: 0.02,
             accumulate: 1,
+            batch_size: 1,
             warmup_steps: 4,
             schedule_total_updates: None,
             seed: 7,
@@ -1112,8 +1182,8 @@ impl CLIHandler {
         );
         println!(
             "    {:<30}{}",
-            "  --chunk n --accumulate n",
-            ui::dim("sequence chunk and gradient accumulation")
+            "  --chunk n --batch-size n --accumulate n",
+            ui::dim("chunk length, document lanes (default 1), accumulation")
         );
         println!(
             "    {:<30}{}",
@@ -1214,7 +1284,8 @@ impl CLIHandler {
                 println!("      --key <N>                 memory key width (default: 32)");
                 println!("      --memory <N>              memory capacity (default: 512)");
                 println!("      --chunk <N>               training chunk length (default: 64)");
-                println!("      --accumulate <N>          chunks per optimizer update (default: 8)");
+                println!("      --batch-size <N>          independent document lanes (default: 1)");
+                println!("      --accumulate <N>          microbatches per optimizer update (default: 8)");
                 println!("      --lr <F>                  base learning rate (default: 0.001)");
                 println!("      --warmup-steps <N>        linear warm-up updates (default: 0)");
                 println!("      --total-updates <N>       fixed whole-run schedule horizon (fresh run)");
@@ -1319,6 +1390,8 @@ impl CLIHandler {
                 if baseline {
                     allowed.retain(|x| !["--latent", "--state", "--key", "--memory"].contains(x));
                     allowed.push("--tokenizer-from");
+                } else {
+                    allowed.push("--batch-size");
                 }
                 let p = Parsed::parse(&args[2..], &allowed)?;
                 for (names, label) in [

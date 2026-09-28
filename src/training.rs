@@ -15,6 +15,79 @@ pub fn chunk_plan(docs: &[Vec<usize>], chunk_len: usize) -> Vec<(usize, usize, u
     plan
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SequenceChunk {
+    pub lane: usize,
+    pub doc: usize,
+    pub start: usize,
+    pub len: usize,
+}
+
+/// Advance one TBPTT chunk per document lane. Finished lanes take the next
+/// document on the next microbatch; consecutive chunks never run concurrently.
+/// A one-document corpus therefore cannot exploit sequence batching.
+pub fn sequence_plan(
+    docs: &[Vec<usize>],
+    chunk: usize,
+    batch_size: usize,
+) -> Result<Vec<Vec<SequenceChunk>>, String> {
+    if chunk == 0 || batch_size == 0 {
+        return Err("chunk and batch size must be positive".into());
+    }
+    let mut lanes = vec![None; batch_size.min(docs.len())];
+    let mut next_doc = 0;
+    let mut plan = Vec::new();
+    loop {
+        let mut batch = Vec::new();
+        for (lane, cursor) in lanes.iter_mut().enumerate() {
+            if cursor.is_none() {
+                while next_doc < docs.len() && docs[next_doc].len() < 2 {
+                    next_doc += 1;
+                }
+                if next_doc < docs.len() {
+                    *cursor = Some((next_doc, 0));
+                    next_doc += 1;
+                }
+            }
+            if let Some((doc, start)) = *cursor {
+                let len = chunk.min(docs[doc].len() - 1 - start);
+                batch.push(SequenceChunk {
+                    lane,
+                    doc,
+                    start,
+                    len,
+                });
+                *cursor = if start + len + 1 < docs[doc].len() {
+                    Some((doc, start + len))
+                } else {
+                    None
+                };
+            }
+        }
+        if batch.is_empty() {
+            break;
+        }
+        plan.push(batch);
+    }
+    Ok(plan)
+}
+
+/// Additional grouping fingerprint: leave the legacy stream line unchanged.
+pub fn report_sequence_plan(plan: &[Vec<SequenceChunk>], batch_size: usize) {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for n in std::iter::once(batch_size).chain(plan.iter().flat_map(|batch| {
+        std::iter::once(batch.len()).chain(batch.iter().flat_map(|c| [c.lane, c.doc, c.start, c.len]))
+    })) {
+        for b in (n as u64).to_le_bytes() {
+            hash = (hash ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    println!(
+        "sequence_plan_fnv1a64={hash:016x} batch_size={batch_size} microbatches={} memory_writes=after_batch",
+        plan.len()
+    );
+}
+
 /// An audit fingerprint of the actual selected IDs, document boundaries and
 /// update grouping. This is a reproducibility check, not a security digest.
 pub fn report_stream(docs: &[Vec<usize>], chunk: usize, accumulate: usize) {
