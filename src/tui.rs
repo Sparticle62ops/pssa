@@ -50,7 +50,7 @@ struct RunState {
 impl RunState {
     fn ingest(&mut self, line: &str) {
         let line = strip_ansi(line);
-        let line = line.trim_end();
+        let line = line.trim();
         if line.is_empty() {
             return;
         }
@@ -74,30 +74,34 @@ impl RunState {
             }
         }
 
-        if let Some(v) = parse_kv(line, "loss=") {
-            // epoch summary line: epoch 1/1 loss=... tokens=... updates=...
-            if line.contains("epoch ") && line.contains("updates=") {
+        let loss = parse_kv::<f64>(line, "loss=")
+            .or_else(|| parse_kv(line, "loss "))
+            .filter(|v| v.is_finite());
+        if let Some(v) = loss {
+            if line.starts_with("epoch ") && line.contains("updates=") {
+                // Epoch summaries are distinct from live progress samples.
                 self.epoch_loss = Some(v);
                 self.epoch_tokens = parse_kv(line, "tokens=");
                 self.epoch_updates = parse_kv(line, "updates=");
                 self.loss_series.push(v);
+            } else if line.contains("tokens_per_second=") || line.contains("tok/s") {
+                // ui::Progress emits key=value fields when piped, and a bar
+                // with space-separated fields on an interactive terminal.
+                self.live_loss = Some(v);
+                self.loss_series.push(v);
+                if let Some(p) = parse_pct(line) {
+                    self.progress_pct = Some(p);
+                }
+                self.tok_s = parse_kv::<f64>(line, "tokens_per_second=")
+                    .or_else(|| line.split_once("tok/s")?.0.split_whitespace().last()?.parse().ok())
+                    .filter(|v| v.is_finite());
+                if let Some((_, eta)) = line.split_once("eta=").or_else(|| line.split_once("eta ")) {
+                    // ui::duration can contain spaces, e.g. `2h 14m 09s`.
+                    self.eta = Some(eta.trim().to_string());
+                }
             }
-        }
-        if let Some(v) = parse_kv(line, "loss ") {
-            // live progress line: `  training bar 97% loss 4.0778 146 tok/s eta 45.8s`
-            self.live_loss = Some(v);
-            self.loss_series.push(v);
             if self.loss_series.len() > 600 {
                 self.loss_series.remove(0);
-            }
-            if let Some(p) = parse_pct(line) {
-                self.progress_pct = Some(p);
-            }
-            if let Some(r) = parse_kv(line, "tok/s") {
-                self.tok_s = Some(r);
-            }
-            if let Some(e) = parse_kv::<f64>(line, "eta=") {
-                self.eta = Some(format!("{e:.1}s"));
             }
         }
         if let Some(t) = parse_kv(line, "training_seconds=") {
@@ -171,14 +175,18 @@ impl RunState {
 
 /// Pull `label  value` from a banner/summary row (two-space separated).
 fn parse_field(line: &str, label: &str) -> Option<String> {
-    let rest = line.strip_prefix(label)?.trim_start();
-    if rest.is_empty() || rest.starts_with(|c: char| c == '=' || c.is_alphanumeric() && label.ends_with(|c: char| c.is_alphanumeric()) && false) {
+    let line = line.trim();
+    // ui::field indents rows; ui::panel_field additionally frames them.
+    let line = line.strip_prefix('│').unwrap_or(line).trim_start();
+    let rest = line.strip_prefix(label)?;
+    if !rest.starts_with(char::is_whitespace) {
         return None;
     }
-    if label == "corpus" || label == "wall time" {
-        // sanity: those rows are exactly `label  value`
+    let value = rest.trim().trim_end_matches('│').trim_end();
+    if value.is_empty() || value.starts_with('=') {
+        return None;
     }
-    Some(rest.to_string())
+    Some(value.to_string())
 }
 
 /// Pull `key=value` (or `key value`) numeric pairs out of a line.
@@ -189,8 +197,10 @@ fn parse_kv<T: std::str::FromStr>(line: &str, key: &str) -> Option<T> {
 }
 
 fn parse_pct(line: &str) -> Option<f64> {
-    let rest = line.split_whitespace().find(|t| t.ends_with('%'))?;
-    rest.trim_end_matches('%').parse().ok()
+    line.split_whitespace().find_map(|token| {
+        let value = token.trim_matches(['(', ')']).strip_suffix('%')?;
+        value.parse::<f64>().ok().filter(|v| v.is_finite())
+    })
 }
 
 fn parse_field_exact(line: &str, label: &str) -> Option<String> {
@@ -482,4 +492,111 @@ pub fn run(args: &[String]) -> Result<(), String> {
 fn unused_helpers() {
     let _ = parse_field_exact("  schedule        1 epoch(s), 446 updates, lr 0.001", "schedule");
     let _ = ui::bold("");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_piped_progress_and_multicomponent_eta() {
+        let mut state = RunState::default();
+        state.ingest("  training 97/100 (97%) loss=4.077800 tokens_per_second=146 eta=45.8s");
+        assert_eq!(state.progress_pct, Some(97.0));
+        assert_eq!(state.live_loss, Some(4.0778));
+        assert_eq!(state.tok_s, Some(146.0));
+        assert_eq!(state.eta.as_deref(), Some("45.8s"));
+        assert_eq!(state.epoch_loss, None);
+        assert_eq!(state.loss_series, [4.0778]);
+        state.ingest("  training 20/100 (20%) loss=4.0 tokens_per_second=150 eta=2h 14m 09s");
+        assert_eq!(state.eta.as_deref(), Some("2h 14m 09s"));
+    }
+
+    #[test]
+    fn parses_interactive_progress_without_confusing_epoch_summary() {
+        let mut state = RunState::default();
+        state.ingest("\r  \x1b[2mtraining\x1b[0m ███░  97%  loss 4.0778  146 tok/s  eta 14m 09s   ");
+        assert_eq!(state.progress_pct, Some(97.0));
+        assert_eq!(state.live_loss, Some(4.0778));
+        assert_eq!(state.tok_s, Some(146.0));
+        assert_eq!(state.eta.as_deref(), Some("14m 09s"));
+        state.ingest("  epoch 1/1 loss=4.0123 tokens=1200 updates=10");
+        assert_eq!(state.epoch_loss, Some(4.0123));
+        assert_eq!(state.epoch_tokens, Some(1200));
+        assert_eq!(state.epoch_updates, Some(10));
+        assert_eq!(state.live_loss, Some(4.0778));
+        assert_eq!(state.loss_series, [4.0778, 4.0123]);
+    }
+
+    #[test]
+    fn parses_indented_ansi_and_panel_fields_but_not_label_prefixes() {
+        let mut state = RunState::default();
+        state.ingest("  \x1b[2mcorpus\x1b[0m          /tmp/training text.txt  ");
+        state.ingest("  vocabulary      2048 BPE tokens");
+        state.ingest("  width           256");
+        state.ingest("  memory          512 slots");
+        state.ingest("  schedule        1 epoch(s), 446 updates, lr 0.001");
+        state.ingest("  │ wall time       2h 14m 09s                 │");
+        state.ingest("  │ throughput      146 tokens/s              │");
+        assert_eq!(state.corpus.as_deref(), Some("/tmp/training text.txt"));
+        assert_eq!(state.vocab.as_deref(), Some("2048 BPE tokens"));
+        assert_eq!(state.width.as_deref(), Some("256"));
+        assert_eq!(state.memory.as_deref(), Some("512 slots"));
+        assert_eq!(state.schedule.as_deref(), Some("1 epoch(s), 446 updates, lr 0.001"));
+        assert_eq!(state.wall.as_deref(), Some("2h 14m 09s"));
+        assert_eq!(state.throughput.as_deref(), Some("146 tokens/s"));
+        for line in ["corpus=other", "corpus_path other", "corpuses other", "corpus   "] {
+            assert_eq!(parse_field(line, "corpus"), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn producer_output_round_trips_through_parser() {
+        // A child process makes ui::Progress actually write to a pipe, avoiding
+        // unstable stdout-capture APIs or a duplicate copy of its format string.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tui::tests::ui_producer_fixture", "--nocapture"])
+            .env("OXIDE_TUI_PRODUCER_FIXTURE", "1")
+            .output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let mut state = RunState::default();
+        for line in String::from_utf8(output.stdout).unwrap().lines() {
+            state.ingest(line);
+        }
+        assert_eq!(state.corpus.as_deref(), Some("/tmp/producer corpus.txt"));
+        assert_eq!(state.width.as_deref(), Some("256"));
+        assert_eq!(state.wall.as_deref(), Some("14m 09s"));
+        assert_eq!(state.progress_pct, Some(100.0));
+        assert_eq!(state.live_loss, Some(4.123456));
+        assert!(state.tok_s.unwrap() > 0.0);
+        assert_eq!(state.eta.as_deref(), Some("0.0s"));
+    }
+
+    #[test]
+    fn ui_producer_fixture() {
+        if std::env::var_os("OXIDE_TUI_PRODUCER_FIXTURE").is_none() {
+            return;
+        }
+        ui::field("corpus", "/tmp/producer corpus.txt");
+        ui::field("width", "256");
+        ui::panel_field("wall time", "14m 09s");
+        let mut progress = ui::Progress::new("training", 4);
+        progress.update(4, 512, 4.123456);
+        progress.finish();
+    }
+
+    #[test]
+    fn progress_history_is_bounded_and_nonfinite_numbers_are_ignored() {
+        let mut state = RunState::default();
+        for _ in 0..650 {
+            state.ingest("training 1/2 (50%) loss=4.0 tokens_per_second=146 eta=1.0s");
+        }
+        assert_eq!(state.loss_series.len(), 600);
+        assert_eq!(state.raw_lines.len(), 400);
+        state.ingest("training 1/2 (NaN%) loss=NaN tokens_per_second=NaN eta=unknown");
+        assert_eq!(state.progress_pct, Some(50.0));
+        assert_eq!(state.live_loss, Some(4.0));
+        assert_eq!(state.tok_s, Some(146.0));
+        assert_eq!(parse_pct("(inf%)"), None);
+    }
 }

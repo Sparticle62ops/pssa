@@ -1,5 +1,4 @@
 use crate::defense::{RateLimiterGate, UpdateOutcome};
-use crate::linalg::dot_slice;
 use std::f32;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -36,15 +35,73 @@ impl HyperbolicEpisodicBankV2 {
         }
     }
 
-    #[inline(always)]
+    // Leave eight f32 ulps of radial headroom, including output rounding.
+    // Beyond this radius the radial derivative is zero; tangential motion remains.
+    const MAX_PROJECTED_RADIUS: f64 = 1.0 - 8.0 * f32::EPSILON as f64;
+
+    /// Accumulate in f64 so finite f32 coordinates cannot overflow their norm.
+    /// Preserve open-ball membership when an old, valid near-boundary key's
+    /// f64 norm would round up to 1 in f32. Points actually on/outside the ball
+    /// are never clamped inwards. This also supports legacy checkpoint norms.
+    pub fn squared_norm(point: &[f32]) -> f32 {
+        let norm = Self::squared_norm_f64(point);
+        if norm < 1.0 && norm as f32 == 1.0 {
+            f32::from_bits(1.0f32.to_bits() - 1)
+        } else {
+            norm as f32
+        }
+    }
+
+    fn squared_norm_f64(point: &[f32]) -> f64 {
+        point.iter().map(|&x| (x as f64) * (x as f64)).sum()
+    }
+
+    /// q / (1 + ||q||), radially saturated at a representable open-ball radius.
+    /// The returned diagnostic norm saturates at f32::MAX; the adjoint computes
+    /// its own f64 norm rather than relying on that potentially saturated value.
+    #[inline]
     pub fn diffeomorphic_project(q_euc: &[f32], out_pnc: &mut [f32]) -> f32 {
         assert!(!q_euc.is_empty() && q_euc.len() == out_pnc.len());
-        let q_norm = dot_slice(q_euc, q_euc).sqrt();
-        let scale = 1.0 / (1.0 + q_norm);
-        for i in 0..q_euc.len() {
-            out_pnc[i] = q_euc[i] * scale;
+        let r = Self::squared_norm_f64(q_euc).sqrt();
+        assert!(r.is_finite(), "projection input must be finite");
+        let scale = if r == 0.0 {
+            1.0
+        } else {
+            (r / (1.0 + r)).min(Self::MAX_PROJECTED_RADIUS) / r
+        };
+        for (out, &q) in out_pnc.iter_mut().zip(q_euc) {
+            *out = (q as f64 * scale) as f32;
         }
-        q_norm
+        r.min(f32::MAX as f64) as f32
+    }
+
+    /// VJP of the same radial map, including its saturated branch. Using unit
+    /// directions avoids overflowing q·g or r*(1+r)^2 at finite extreme inputs.
+    pub fn projection_adjoint(q_euc: &[f32], grad: &[f32], out: &mut [f32]) {
+        assert_eq!(q_euc.len(), grad.len());
+        assert_eq!(q_euc.len(), out.len());
+        let r = Self::squared_norm_f64(q_euc).sqrt();
+        assert!(r.is_finite(), "projection input must be finite");
+        if r == 0.0 {
+            out.copy_from_slice(grad);
+            return;
+        }
+        let radius = r / (1.0 + r);
+        let saturated = radius >= Self::MAX_PROJECTED_RADIUS;
+        let scale = if saturated {
+            Self::MAX_PROJECTED_RADIUS / r
+        } else {
+            1.0 / (1.0 + r)
+        };
+        let radial = if saturated { 1.0 } else { radius };
+        let unit_dot_grad: f64 = q_euc
+            .iter()
+            .zip(grad)
+            .map(|(&q, &g)| (q as f64 / r) * g as f64)
+            .sum();
+        for ((out, &q), &g) in out.iter_mut().zip(q_euc).zip(grad) {
+            *out = (scale * (g as f64 - radial * (q as f64 / r) * unit_dot_grad)) as f32;
+        }
     }
 
     /// Stable equivalent of acosh(1 + 2*s/denom): 2 asinh(sqrt(s/denom)).
@@ -58,7 +115,7 @@ impl HyperbolicEpisodicBankV2 {
         );
         let mut sq_dist = 0.0f64;
         for i in 0..u.len() {
-            let d = (u[i] - v[i]) as f64;
+            let d = u[i] as f64 - v[i] as f64;
             sq_dist += d * d;
         }
         let denom = (1.0f64 - u_sq as f64) * (1.0f64 - v_sq as f64);
@@ -72,7 +129,7 @@ impl HyperbolicEpisodicBankV2 {
     pub fn insert(&mut self, key_pnc: &[f32], val: &[f32]) -> usize {
         assert_eq!(key_pnc.len(), self.dim_key);
         assert_eq!(val.len(), self.dim_val);
-        let key_sq = dot_slice(key_pnc, key_pnc);
+        let key_sq = Self::squared_norm(key_pnc);
         assert!(
             key_sq.is_finite() && key_sq < 1.0,
             "memory key must be in open Poincare ball"
@@ -138,7 +195,7 @@ impl HyperbolicEpisodicBankV2 {
             tau.is_finite() && tau > 0.0,
             "tau must be positive and finite"
         );
-        let q_sq = dot_slice(q_pnc, q_pnc);
+        let q_sq = Self::squared_norm(q_pnc);
         assert!(
             q_sq.is_finite() && q_sq < 1.0,
             "query must be in open Poincare ball"
@@ -149,7 +206,6 @@ impl HyperbolicEpisodicBankV2 {
             return 0.0;
         }
         let mut min_dist = f32::MAX;
-        let mut max_score = f32::NEG_INFINITY;
         for idx in 0..self.count {
             let off = idx * self.dim_key;
             let dist = Self::poincare_distance(
@@ -159,13 +215,13 @@ impl HyperbolicEpisodicBankV2 {
                 self.norm_sq[idx],
             );
             min_dist = min_dist.min(dist);
-            let score = -dist / tau;
-            out_weights[idx] = score;
-            max_score = max_score.max(score);
+            out_weights[idx] = dist;
         }
         let mut sum = 0.0;
         for w in &mut out_weights[..self.count] {
-            *w = (*w - max_score).exp();
+            // Subtract before dividing: even a subnormal tau leaves the nearest
+            // entry at exp(0), rather than subtracting two -infinity scores.
+            *w = ((min_dist - *w) / tau).exp();
             sum += *w;
         }
         out_val.fill(0.0);

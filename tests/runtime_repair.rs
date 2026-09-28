@@ -146,6 +146,51 @@ fn fixed_schedule_horizon_survives_resume() {
     fs::remove_file(checkpoint).unwrap();
 }
 #[test]
+fn fixed_warmup_resume_matches_uninterrupted_training_before_and_after_warmup() {
+    let raw = "a b c d\na b c d\n";
+    let opts = cli::TrainingOptions {
+        tokenizer: oxide_ai_pssa::dataset::TokenizerKind::Word,
+        epochs: 3,
+        latent: 4,
+        state: 2,
+        key: 2,
+        memory: 2,
+        chunk: 2,
+        accumulate: 1,
+        schedule_total_updates: Some(20),
+        warmup_steps: 5,
+        ..Default::default()
+    };
+    let (whole, _) = CLIHandler::train_corpus(raw, &opts).unwrap();
+    let p = temp("warmup-segmented");
+    let expected = temp("warmup-whole");
+    let (first, _) = CLIHandler::train_corpus(raw, &cli::TrainingOptions {
+        epochs: 1,
+        ..opts.clone()
+    }).unwrap();
+    assert_eq!(first.step_counter, 4);
+    assert_eq!(first.lr_schedule_warmup_steps, Some(5));
+    CLIHandler::save_model_v2(&first, p.to_str().unwrap()).unwrap();
+    for step in [8, 12] {
+        let (resumed, _) = CLIHandler::train_corpus(raw, &cli::TrainingOptions {
+            epochs: 1,
+            resume: Some(p.to_str().unwrap().into()),
+            // Omitted CLI flags must restore both parts of the stored schedule.
+            schedule_total_updates: None,
+            warmup_steps: 0,
+            ..opts.clone()
+        }).unwrap();
+        assert_eq!(resumed.step_counter, step);
+        assert_eq!(resumed.lr_schedule_warmup_steps, Some(5));
+        CLIHandler::save_model_v2(&resumed, p.to_str().unwrap()).unwrap();
+    }
+    CLIHandler::save_model_v2(&whole, expected.to_str().unwrap()).unwrap();
+    assert_eq!(fs::read(&p).unwrap(), fs::read(&expected).unwrap());
+    fs::remove_file(p).unwrap();
+    fs::remove_file(expected).unwrap();
+}
+
+#[test]
 fn word_tokenizer_reports_unusable_corpus_and_windows_wrap_at_eof() {
     let bad = cli::TrainingOptions {
         tokenizer: oxide_ai_pssa::dataset::TokenizerKind::Word,

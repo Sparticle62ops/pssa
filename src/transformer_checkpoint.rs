@@ -1,13 +1,24 @@
 //! Separate `TRFM` v1 container: never changes the PSSA V5/V6/V7 wire formats.
 //! Uses the same checked tensor readers, checksum and atomic-write machinery.
 //! Stores configuration, clock, RNG, tokenizer, schedule horizon, weights,
-//! gradients and Adam moments. Checkpoints are between chunks; the dataset
+//! gradients and Adam moments, with an optional u64 warmup tail. Older v1
+//! checkpoints without the tail retain an unknown warmup definition. Checkpoints are between chunks; the dataset
 //! cursor is explicit `--skip-tokens`, just as for PSSA.
 use crate::checkpoint::{self as wire, Reader, Writer, invalid};
-use crate::transformer::{TransformerConfig, TransformerModel, allocation_bytes};
+use crate::transformer::{TransformerConfig, TransformerModel};
 use std::path::Path;
 
+fn validate_warmup(model: &TransformerModel) -> wire::Result<()> {
+    if let Some(warmup) = model.lr_schedule_warmup_steps {
+        if !model.lr_schedule_total_updates.is_some_and(|horizon| warmup < horizon) {
+            return Err(invalid("transformer schedule warmup requires a larger fixed horizon"));
+        }
+    }
+    Ok(())
+}
+
 pub fn save_model(model: &TransformerModel, path: impl AsRef<Path>) -> wire::Result<()> {
+    validate_warmup(model)?;
     model.cfg.validate().map_err(invalid)?;
     model.tokenizer().map_err(invalid)?;
     if model.step_counter == usize::MAX
@@ -59,6 +70,9 @@ pub fn save_model(model: &TransformerModel, path: impl AsRef<Path>) -> wire::Res
         }
         wire::write_vector(&mut w, p, "transformer norm")?;
     }
+    if let Some(warmup) = model.lr_schedule_warmup_steps {
+        w.usize(warmup, "schedule warmup")?;
+    }
     let mut bytes = Vec::with_capacity(22 + w.bytes.len());
     bytes.extend_from_slice(b"TRFM");
     bytes.extend_from_slice(&1u16.to_le_bytes());
@@ -90,11 +104,6 @@ pub fn load_checkpoint(path: impl AsRef<Path>) -> wire::Result<TransformerModel>
         eps: r.f32("optimizer epsilon")?,
     };
     cfg.validate().map_err(invalid)?;
-    if allocation_bytes(&cfg).map_err(invalid)? > payload.len().saturating_mul(128) {
-        return Err(invalid(
-            "transformer allocation is disproportionate to checkpoint size",
-        ));
-    }
     let step = r.usize("step")?;
     let rng = r.u64("RNG state")?;
     let horizon = r.usize("schedule horizon")?;
@@ -149,6 +158,10 @@ pub fn load_checkpoint(path: impl AsRef<Path>) -> wire::Result<TransformerModel>
     ] {
         wire::read_vector(&mut r, p, "transformer norm")?;
     }
+    if r.remaining() == 8 {
+        model.lr_schedule_warmup_steps = Some(r.usize("schedule warmup")?);
+    }
     r.done()?;
+    validate_warmup(&model)?;
     Ok(model)
 }

@@ -371,6 +371,7 @@ pub struct PSSALayerV2 {
     /// Fixed whole-run cosine-schedule horizon, when explicitly configured.
     /// `None` preserves the legacy per-link schedule behavior.
     pub lr_schedule_total_updates: Option<usize>,
+    pub lr_schedule_warmup_steps: Option<usize>,
 
     // 1. Learned Affine RMSNorm & Embeddings
     pub embed_w: ParamMatrix,
@@ -383,6 +384,10 @@ pub struct PSSALayerV2 {
     pub w_b: ParamMatrix,
     pub w_c: ParamMatrix,
     pub h_persistent: Vec<f32>,
+    /// Cached transforms, checked against public raw parameters at each use.
+    pub ssm_raw_snapshot: Vec<f32>,
+    pub ssm_rates: Vec<f32>,
+    pub ssm_rate_derivatives: Vec<f32>,
 
     // 3. Diffeomorphic Poincaré Episodic Memory
     pub w_qx: ParamMatrix,
@@ -434,6 +439,8 @@ pub struct PSSALayerV2 {
     pub bwd_g_ad_down: Vec<f32>,
     pub bwd_g_xnorm: Vec<f32>,
     pub bwd_g_ysm: Vec<f32>,
+    pub bwd_g_logits: Vec<f32>,
+    pub bwd_g_mlp: Vec<f32>,
 
     // Inference Scratch Buffers
     pub inf_x_norm: Vec<f32>,
@@ -525,6 +532,7 @@ impl PSSALayerV2 {
             vocabulary: Vec::new(),
             tokenizer_json: None,
             lr_schedule_total_updates: None,
+            lr_schedule_warmup_steps: None,
             embed_w,
             norm_gamma,
             norm_beta,
@@ -533,6 +541,9 @@ impl PSSALayerV2 {
             w_b,
             w_c,
             h_persistent,
+            ssm_raw_snapshot: vec![f32::NAN; d_m * d_s],
+            ssm_rates: vec![0.0; d_m * d_s],
+            ssm_rate_derivatives: vec![0.0; d_m * d_s],
             w_qx,
             w_qh,
             w_gate,
@@ -569,6 +580,8 @@ impl PSSALayerV2 {
             bwd_g_ad_down: vec![0.0; chunk_len * rank],
             bwd_g_xnorm: vec![0.0; chunk_len * d_m],
             bwd_g_ysm: vec![0.0; chunk_len * d_m],
+            bwd_g_logits: vec![0.0; chunk_len * d_v],
+            bwd_g_mlp: vec![0.0; chunk_len * d_mlp],
             inf_x_norm: vec![0.0; d_m],
             inf_delta: vec![0.0; d_m],
             inf_b: vec![0.0; d_s],
@@ -601,6 +614,20 @@ impl PSSALayerV2 {
             + self.adapters.iter().map(|a| a.down_proj.data.len() + a.up_proj.data.len()).sum::<usize>()
     }
 
+    /// One transform evaluation per changed raw rate, not per timestep. Compare
+    /// values rather than an optimizer version: callers may mutate public weights
+    /// directly, including finite-difference probes and checkpoint decoding.
+    pub(crate) fn refresh_ssm_rates(&mut self) {
+        for i in 0..self.a_mat.data.len() {
+            let raw = self.a_mat.data[i];
+            if raw != self.ssm_raw_snapshot[i] {
+                self.ssm_rates[i] = -softplus(raw);
+                self.ssm_rate_derivatives[i] = -sigmoid(raw);
+                self.ssm_raw_snapshot[i] = raw;
+            }
+        }
+    }
+
     pub fn reset_recurrent_state(&mut self) {
         self.h_persistent.fill(0.0);
     }
@@ -610,6 +637,7 @@ impl PSSALayerV2 {
     // =========================================================================
     #[inline(always)]
     pub fn forward_inference(&mut self, x_id: usize, logits_out: &mut [f32]) {
+        self.refresh_ssm_rates();
         let d_m = self.cfg.d_latent;
         let d_s = self.cfg.d_state;
         let d_k = self.cfg.d_mem_key;
@@ -645,7 +673,7 @@ impl PSSALayerV2 {
 
             for j in 0..d_s {
                 let idx = row_off + j;
-                let bar_a = (d_i * -softplus(self.a_mat.data[idx])).exp();
+                let bar_a = (d_i * self.ssm_rates[idx]).exp();
                 let bar_b = d_i * self.inf_b[j];
 
                 let h_val = bar_a * self.h_persistent[idx] + bar_b * self.inf_x_norm[i];
@@ -753,6 +781,7 @@ impl PSSALayerV2 {
         self.tape.target_ids[..seq_len].copy_from_slice(&target_ids[..seq_len]);
         self.tape.h_states[..d_m * d_s].copy_from_slice(&self.h_persistent);
 
+        self.refresh_ssm_rates();
         let mut total_loss = 0.0f32;
 
         for t in 0..seq_len {
@@ -802,7 +831,7 @@ impl PSSALayerV2 {
                 let mut y_i = 0.0f32;
                 for j in 0..d_s {
                     let idx = i * d_s + j;
-                    let bar_a = (d_i * -softplus(self.a_mat.data[idx])).exp();
+                    let bar_a = (d_i * self.ssm_rates[idx]).exp();
                     let bar_b = d_i * b_p[j];
 
                     self.tape.bar_a[ssm_off + idx] = bar_a;
@@ -975,6 +1004,7 @@ impl PSSALayerV2 {
             self.embed_row_marks[self.tape.x_ids[t]] = pending_step;
         }
 
+        self.refresh_ssm_rates();
         self.grad_h_next.fill(0.0);
 
         // Reverse Time Loop across sequence chunk L
@@ -1094,7 +1124,7 @@ impl PSSALayerV2 {
             self.g_query_pnc.fill(0.0);
             let q_off = t * d_k;
             let q = &self.tape.q_poincare[q_off..q_off + d_k];
-            let q_sq = dot_slice(q, q) as f64;
+            let q_sq = HyperbolicEpisodicBankV2::squared_norm(q) as f64;
             for entry in 0..self.memory.count {
                 let key_off = entry * d_k;
                 let key = &self.memory.keys[key_off..key_off + d_k];
@@ -1109,7 +1139,7 @@ impl PSSALayerV2 {
                     * dot_g_value_minus_mean;
                 let mut sq = 0.0f64;
                 for k in 0..d_k {
-                    let diff = (q[k] - key[k]) as f64;
+                    let diff = q[k] as f64 - key[k] as f64;
                     sq += diff * diff;
                 }
                 // The distance has a cusp at identical points.  We explicitly use
@@ -1120,7 +1150,7 @@ impl PSSALayerV2 {
                     let z = sq / denom;
                     let dd_dz = 1.0 / (z * (1.0 + z)).sqrt();
                     for k in 0..d_k {
-                        let diff = (q[k] - key[k]) as f64;
+                        let diff = q[k] as f64 - key[k] as f64;
                         let ddenom = -2.0 * q[k] as f64 * (1.0 - key_sq);
                         let dz = (2.0 * diff * denom - sq * ddenom) / (denom * denom);
                         self.g_query_pnc[k] +=
@@ -1128,21 +1158,11 @@ impl PSSALayerV2 {
                     }
                 }
             }
-            let r = self.tape.q_norm[t];
-            if r == 0.0 {
-                self.g_query_euc.copy_from_slice(&self.g_query_pnc);
-            } else {
-                let q_euc = &self.tape.q_euc[q_off..q_off + d_k];
-                let mut qdotg = 0.0;
-                for k in 0..d_k {
-                    qdotg += q_euc[k] * self.g_query_pnc[k];
-                }
-                let denom = r * (1.0 + r) * (1.0 + r);
-                for k in 0..d_k {
-                    self.g_query_euc[k] =
-                        self.g_query_pnc[k] / (1.0 + r) - q_euc[k] * qdotg / denom;
-                }
-            }
+            HyperbolicEpisodicBankV2::projection_adjoint(
+                &self.tape.q_euc[q_off..q_off + d_k],
+                &self.g_query_pnc,
+                &mut self.g_query_euc,
+            );
             self.g_y_ssm.fill(0.0);
             let xn = &self.tape.x_norm[t * d_m..(t + 1) * d_m];
             let y = &self.tape.y_ssm[t * d_m..(t + 1) * d_m];
@@ -1180,8 +1200,7 @@ impl PSSALayerV2 {
                     let h_next = self.tape.h_states[(t + 1) * (d_m * d_s) + idx];
                     let c_val = self.tape.c_proj[c_off + j];
                     let bar_a = self.tape.bar_a[ssm_off + idx];
-                    let a_raw = self.a_mat.data[idx];
-                    let a_physical = -softplus(a_raw);
+                    let a_physical = self.ssm_rates[idx];
                     let b_val = self.tape.b_proj[b_off + j];
 
                     let g_h_total = g_y_i * c_val + self.grad_h_next[idx];
@@ -1193,7 +1212,7 @@ impl PSSALayerV2 {
                     self.a_mat.grad[idx] += g_h_total
                         * (d_i * bar_a)
                         * self.tape.h_states[h_prev_off + idx]
-                        * -sigmoid(a_raw);
+                        * self.ssm_rate_derivatives[idx];
                     self.buf_g_delta[i] += g_h_total
                         * (a_physical * bar_a * self.tape.h_states[h_prev_off + idx]
                             + b_val * xn_i);

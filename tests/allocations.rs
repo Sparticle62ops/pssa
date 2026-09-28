@@ -1,3 +1,4 @@
+use oxide_ai_pssa::gpu_batch;
 use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -85,6 +86,15 @@ fn config() -> PSSAConfigV2 {
 
 #[test]
 fn live_model_training_inference_memory_and_consolidation_allocate_nothing() {
+    assert_live_paths_allocate_nothing(false);
+}
+
+#[test]
+fn live_staged_cpu_training_inference_memory_and_consolidation_allocate_nothing() {
+    assert_live_paths_allocate_nothing(true);
+}
+
+fn assert_live_paths_allocate_nothing(staged: bool) {
     // All model, state, input, output, and direct-memory-operation storage is
     // constructed before activation and excluded from the assertion.
     let mut model = PSSALayerV2::new(config(), 91);
@@ -106,9 +116,17 @@ fn live_model_training_inference_memory_and_consolidation_allocate_nothing() {
     start_counting();
     for _ in 0..3 {
         model.reset_recurrent_state();
-        model.forward_train_chunk(&tokens, &targets);
         model.zero_gradients();
-        model.backward_chunk(tokens.len(), 1.0);
+        if staged {
+            gpu_batch::forward_train_chunk_batched(&mut model, &tokens, &targets);
+            gpu_batch::backward_chunk_batched(&mut model, tokens.len(), 1.0);
+            // Explicit blocked CPU entry points also reuse model-owned scratch.
+            gpu_batch::bwd_stage_logits_blocked(&mut model, tokens.len(), 1.0, None);
+            gpu_batch::bwd_stage_mlp_blocked(&mut model, tokens.len(), None);
+        } else {
+            model.forward_train_chunk(&tokens, &targets);
+            model.backward_chunk(tokens.len(), 1.0);
+        }
         model.apply_adamw(model.cfg.lr);
         model.reset_recurrent_state();
         model.forward_inference(tokens[0], &mut logits);
