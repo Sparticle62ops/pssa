@@ -1182,8 +1182,13 @@ impl CLIHandler {
         );
         println!(
             "    {:<30}{}",
-            "  --chunk n --batch-size n --accumulate n",
-            ui::dim("chunk length, document lanes (default 1), accumulation")
+            "  --chunk n --accumulate n",
+            ui::dim("chunk length and microbatches per update")
+        );
+        println!(
+            "    {:<30}{}",
+            "  --batch-size n",
+            ui::dim("independent document lanes (default 1)")
         );
         println!(
             "    {:<30}{}",
