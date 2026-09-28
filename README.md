@@ -84,6 +84,7 @@ Commands:
 | `evaluate [source]` | Cross entropy, perplexity and accuracy as JSON. |
 | `status` | Checkpoints and corpora in the working directory. Takes no options. |
 | `download <repo>` | Pull a Hugging Face dataset to a local file. |
+| `clean-wikitext INPUT -o OUTPUT` | Stream-clean a raw WikiText file into a new UTF-8 corpus. |
 | `benchmark` | End-to-end smoke test on the built-in corpus. |
 | `gpu-probe` | Check whether a WebGPU compute device is usable. |
 | `help` | Print command and option help. |
@@ -94,7 +95,7 @@ Options:
 | --- | --- | --- | --- |
 | `-d, --data <source>` | `data/downloaded.txt` when present, otherwise `science` | `train`, `chat`, `evaluate` | Dataset source, or a comma-separated list. |
 | `-m, --model <path>` | `data/model.pssa` | `chat`, `generate`, `evaluate` | Checkpoint to load. |
-| `-o, --out <path>` | `data/model.pssa` | `train`, `download` | Output checkpoint or dataset path. |
+| `-o, --out <path>` | Command-specific; required for `clean-wikitext` | `train`, `download`, `clean-wikitext` | Output checkpoint or dataset path. Cleaning requires a new file. |
 | `-p, --prompt <text>` | empty | `generate` | Prompt text. Required for generation. |
 | `-e, --epochs <n>` | `4` | `train` | Training epochs. |
 | `-t, --temp, --temperature <float>` | `0.70` | `chat`, `generate` | Sampling temperature. |
@@ -170,6 +171,47 @@ cargo run --release -- download wikimedia/wikipedia --out data/downloaded.txt
 
 Network downloads are not validated or curated by Oxide AI. Review licensing, privacy, and content before training on an external corpus.
 
+### Cleaning WikiText raw corpora
+
+Clean extracted `wikitext-103-raw` text **before a fresh training run**:
+
+```bash
+./target/release/oxide_ai_pssa clean-wikitext wiki.train.raw --out data/wikitext-clean.txt
+./target/release/oxide_ai_pssa train data/wikitext-clean.txt -o data/model.pssa
+# Also available: oxide_ai_pssa help clean-wikitext
+```
+
+The same command can be used in Kaggle after extracting text from Parquet; it
+accepts a local UTF-8 text file, not Parquet itself. `-o` and `--out` are aliases.
+The output path is required and must not already exist (including the input
+path or a link to it). This protects the original corpus; choose a new output
+name for another run. Read, UTF-8, and write failures exit nonzero through the
+normal CLI error path, with partial output removed when possible.
+
+The pass:
+
+- Joins `@-@`, `@.@`, and `@,@` to adjacent text: `guest @-@ starring` →
+  `guest-starring`, `52 @.@ 9` → `52.9`, `500 @,@ 000` → `500,000`.
+- Drops balanced heading lines such as `= Title =` and `= = Section = =`.
+- Removes `<unk>` and collapses remaining inline whitespace to single spaces.
+- Removes spaces before `.`, `,`, `)` and after `(`; trims each line.
+- Retains at most one consecutive blank line, including at the start/end.
+  Removing a heading does not introduce a blank line.
+- Writes LF line endings, including a newline on the last retained line.
+
+`oxide_ai_pssa::dataset::clean_wikitext(reader, writer)` is the reusable library
+API (`BufRead` / `Write`, returning `std::io::Result<()>`). The CLI uses buffered
+file I/O, and the cleaner retains only its input/output line buffers: memory is
+proportional to the longest line, not the corpus size. Library callers using a
+buffered writer must flush it themselves; the CLI explicitly checks the flush.
+No new dependencies are required.
+
+Cleaning is opt-in: existing loaders, tokenizers, training commands, and
+`kaggle/kaggle_continue.sh` are unchanged. **Do not switch an in-flight resume
+chain to a cleaned corpus**: cleaning changes token IDs/counts and the meaning
+of `--skip-tokens` offsets. Prepare and consistently reuse one cleaned corpus
+for a new chain instead.
+
 ## Training Pipeline
 
 The `train` command performs two phases:
@@ -204,7 +246,7 @@ The suite exercises synthetic streams for contradictory facts, MQAR-style distra
 | `src/main.rs` | Binary entry point; forwards process arguments to the CLI. |
 | `src/cli.rs` | Argument parsing, home screen, training, chat, generation, evaluation, status, download, and benchmark orchestration. |
 | `src/ui.rs` | Terminal presentation: logo, panels, spinners, progress bars, ANSI-aware width handling. |
-| `src/dataset.rs` | Tokenization, vocabulary construction, built-in corpora, local and remote loading. |
+| `src/dataset.rs` | Tokenization, vocabulary construction, built-in corpora, local and remote loading, streaming WikiText cleaning. |
 | `src/pssa.rs` | PSSA layer, forward pass, plastic learning, consolidation, and `.pssa` serialization. |
 | `src/checkpoint.rs` | Checkpoint format versions, resume payloads, and import/export validation. |
 | `src/inference.rs` | Autoregressive sampling and generation constraints. |
