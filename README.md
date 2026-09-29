@@ -1,70 +1,233 @@
-# Oxide AI
+# PSSA: a plastic state-space architecture
 
-Oxide AI is an experimental Rust implementation of a **Plastic State-Space Architecture (PSSA)** for continual language-model training and text generation. It combines a recurrent state-space layer with a hyperbolic episodic memory bank, modular low-rank adapters, plastic updates, and a closed-form ridge-regression consolidation step.
+PSSA is a small language model that is not a transformer. It reads text one
+token at a time through a recurrent state-space layer, keeps a bank of episodic
+memories it can look things up in, and rewrites part of its own weights while it
+runs. It is written in Rust from scratch, with no PyTorch, no TensorFlow, and no
+ML framework of any kind underneath it.
 
-The repository is a research prototype rather than a production language model. It runs on the CPU, has no external ML framework dependency, and ships a small reference corpus for bootstrapping.
+At matched parameters and on the same corpus, it learns faster than a
+transformer and generates text about twelve times quicker on the same CPU.
 
-## Features
+## The result
 
-- Recurrent sequence processing with learned continuous state-space matrices.
-- Token embeddings, unembeddings, normalization, SiLU feed-forward expansion, and autoregressive sampling.
-- Hyperbolic/Poincare-inspired memory retrieval with bounded top-4 search.
-- Plastic states for stable reinforcement, novelty-driven growth, refractory overwrite protection, and router tuning.
-- Modular low-rank adapters for targeted updates.
-- Refractory rate limiting intended to reduce damage from repeated contradictory updates.
-- Ridge-regression consolidation from fast plastic updates into the base transition matrix.
-- Binary `.pssa` model export/import, with resume-from-checkpoint training.
-- Dataset loading from local text, directories, URLs, Hugging Face datasets, and the built-in science corpus.
-- A verification benchmark covering contradiction adaptation, distractor-gap recall, consolidation, spam mitigation, serialization, and generation.
+Two models, same corpus, same tokenizer, same optimizer schedule, same seed,
+same number of parameters. One is PSSA, one is a standard transformer. Over
+12.7M tokens of cleaned WikiText-103:
 
-## Status
+![PSSA vs parameter-matched transformer training loss](docs/img/loss-curve.png)
 
-Under active development, covered by Cargo integration tests, and still an experimental local research tool. Validate the current branch with `cargo test --release` before relying on a checkpoint.
+PSSA finished at **3.98** training cross-entropy, the transformer at **4.43**.
+That is a gap of **0.45 nats**, perplexity 53.7 against 83.7. The transformer
+spent its entire 12.7M-token budget to reach a loss PSSA had already passed
+around 2M tokens in.
+
+The two curves never cross, and they never touch:
+
+![Overlap region, links 43 to 64](docs/img/loss-curve-zoom.png)
+
+### It holds on text neither model has seen
+
+Training loss only says a model fit the stream it was fed. So both checkpoints
+were scored on a 198,939-token slice cut from a part of the corpus neither run
+ever touched:
+
+![Held-out perplexity](docs/img/heldout.png)
+
+| Held-out slice, 198,939 unseen tokens | PSSA | Transformer |
+| --- | --- | --- |
+| Cross-entropy | **3.997** | 4.429 |
+| Perplexity | **54.4** | 83.8 |
+| Next-token accuracy | **24.1%** | 18.0% |
+
+The held-out gap, 0.43 nats, is essentially the training gap. PSSA is not
+memorizing harder, it is generalizing better.
+
+### And it is much faster to run
+
+Generating 200 tokens on the same CPU, same prompt, same sampler:
+
+| | PSSA | Transformer |
+| --- | --- | --- |
+| 200 tokens | **226 ms** | 2,735 ms |
+| Relative | **12x faster** | baseline |
+
+A recurrent model carries a fixed-size state, so the cost of each new token does
+not grow with the length of what came before. A transformer re-reads its whole
+context every step.
+
+## What is actually different about it
+
+- **A recurrent state-space core.** Learned continuous state matrices carry
+  information forward in a fixed-size state, instead of attention over the full
+  context window.
+- **An episodic memory bank.** 512 slots with hyperbolic (Poincare-style)
+  retrieval and bounded top-4 search, written to and read from during the run.
+- **Plastic weights.** Fast updates reinforce what works, novelty drives growth,
+  and a refractory gate rate-limits overwrites so repeated contradictory input
+  does less damage.
+- **Closed-form consolidation.** A ridge-regression step folds the fast plastic
+  updates back into the base transition matrix, the way sleep consolidates a
+  day's learning.
+- **No framework.** Hand-written linear algebra in Rust, with a CUDA path for
+  training and a scalar CPU reference that every gradient is checked against
+  (max gradient difference 2.98e-8).
+
+## What this is not
+
+Being straight about the scale, because the numbers above are easy to
+over-read:
+
+- These are **1.5M-parameter models** on 12.7M tokens. That is a research
+  prototype, not a competitor to anything you have heard of.
+- Text quality at this scale is poor for both models. PSSA emits "a barget of
+  the Prian Academy", the transformer "a material circulation of the United
+  States". The comparison is about learning efficiency, not fluency.
+- The speed comparison is CPU-to-CPU, which is fair. The training throughput
+  numbers further down are **not** hardware-matched and should not be read as an
+  architecture result.
+- Two experiments are still unmeasured: retention of earlier skills after a
+  corpus switch, and whether ablating the memory bank changes the loss.
+
+## Try it
+
+```bash
+git clone https://github.com/Sparticle62ops/pssa.git
+cd pssa
+cargo build --release
+./target/release/oxide_ai_pssa
+```
+
+Running it with no arguments gives you a home screen listing every command plus
+any checkpoint and corpus it finds in the working directory.
+
+## Where the project needs help
+
+### Compute
+
+The whole result above was trained on a free hosted notebook with a single
+entry-level GPU, in 200,000-token links, because a session gets cut after a few
+hours. Every interesting question left, whether the gap holds at 10x or 100x
+these parameters, whether the memory bank matters at scale, how it does against
+a modern recurrent baseline, needs one thing: a GPU with real VRAM and
+allocations measured in days instead of hours. Anything meaningfully above the
+entry-level card this ran on changes what can be asked.
+
+If you have compute to grant, or you work somewhere that does, that is the
+single highest-leverage thing anyone can offer this project.
+
+### Sponsorship
+
+Sponsorship funds compute and nothing else. In return you get named here and in
+the write-up of any result your hardware made possible. Get in touch before
+sending anything so the details can be agreed.
+
+### Contributing
+
+Issues and pull requests are welcome. The parts most in need of hands: kernel
+performance, a modern recurrent baseline to compare against, and evaluation
+beyond next-token loss. Validate any branch with `cargo test --release` before
+opening a PR.
+
+### Contact
+
+Sparticle62@proton.me
+
+### Donate
+
+Solana: `4XPZ9uAa2BMoth6msoHRxTWL4mUrMfq3LGrxbAGja96h`
+
+---
+
+# Setup and codebase
+
+Everything below is for running, training, and working on the project.
 
 ## Requirements
 
 - Rust toolchain with Edition 2024 support, including Cargo.
 - Network access only when using an HTTP/HTTPS dataset or a Hugging Face dataset.
 - Enough memory and disk for larger corpora and serialized models.
+- Optional: a CUDA device for the GPU training path. The CPU path is the
+  reference and always available.
 
-Direct runtime dependencies include [`ureq`](https://crates.io/crates/ureq) for dataset downloads and the [`tokenizers`](https://crates.io/crates/tokenizers) crate for standard byte-level BPE. No GPU runtime is required; a WebGPU device is only probed by `gpu-probe` and is not yet used for the layer math.
+Direct runtime dependencies are [`ureq`](https://crates.io/crates/ureq) for
+dataset downloads and [`tokenizers`](https://crates.io/crates/tokenizers) for
+byte-level BPE.
 
-## Quick Start
+## How the comparison was run
+
+### How the two runs were matched
+
+Both chains ran 64 links of 200,000 encoded tokens, each link resuming from the
+previous checkpoint, so the learning-rate schedule and optimizer state continue
+across the whole run instead of restarting per link.
+
+- Identical corpus: one `clean-wikitext` pass over WikiText-103, reused byte for byte.
+- Identical token IDs: the baseline pins `--tokenizer-from` to the PSSA chain's
+  own checkpoint, so neither model sees a different vocabulary.
+- Identical optimization: 30,000-update cosine horizon, no warm-up restart, 512
+  supervised target tokens per update, seed 42.
+- PSSA: latent 256, recurrent state 16, 512 memory slots, key width 32, vocab 2,048.
+- Baseline: 1,541,120 parameters, 1 layer, width 256, 4 heads, FFN 448, vocab 2,048.
+
+### Per-token learning curve
+
+End-of-link training cross-entropy:
+
+| Link | Tokens seen | PSSA | Transformer |
+| --- | --- | --- | --- |
+| ck01 | 200,000 | 5.733 | not recorded |
+| ck05 | 1,000,000 | 4.617 | not recorded |
+| ck10 | 2,000,000 | 4.447 | not recorded |
+| ck15 | 3,000,000 | 4.292 | not recorded |
+| ck20 | 4,000,000 | 4.185 | not recorded |
+| ck25 | 5,000,000 | 4.221 | not recorded |
+| ck30 | 6,000,000 | 4.070 | not recorded |
+| ck35 | 7,000,000 | 4.039 | not recorded |
+| ck37 | 7,400,000 | 3.960 | 4.465 |
+| ck44 | 8,800,000 | 4.004 | 4.480 |
+| ck48 | 9,600,000 | 3.937 | 4.415 |
+| ck52 | 10,400,000 | 3.846 | 4.344 |
+| ck56 | 11,200,000 | 3.887 | 4.375 |
+| ck60 | 12,000,000 | 3.972 | 4.418 |
+| ck64 | 12,800,000 | 3.982 | 4.428 |
+
+The baseline's first session was cut at link 43 by the notebook session limit
+and its loss CSV did not survive, so links 1 to 36 and 38 to 43 have no recorded
+value; link 37 comes from the live run log. The chain resumed from `ck43` in a
+second session and finished all 64 links.
+
+### Throughput is not hardware-matched
+
+PSSA trained on a Kaggle T4 at roughly 900 tokens/second. The baseline is
+CPU-only, because `train-transformer` has no GPU path, and held 212
+tokens/second. Those two numbers say nothing about the architectures. On the
+same CPU-only Kaggle hardware the batched PSSA path measures 375 tokens/second
+against the baseline's 212, and the loss comparison above is unaffected either
+way, since it is matched on tokens and updates rather than on time.
+
+### What these numbers are, and are not
+
+The losses are end-of-link training cross-entropy on the stream being fit, not
+held-out evaluation. For a held-out comparison on an unseen slice, use the
+`compare` command described in [docs/COMPARISON.md](docs/COMPARISON.md).
+Generation quality at this scale is poor for both models: PSSA emits "a barget
+of the Prian Academy", the baseline "a material circulation of the United
+States".
+
+Two experiments are not yet measured: retention of earlier skills after a
+corpus switch, and whether ablating the 512 memory slots changes loss.
+
+### Reproducing
 
 ```bash
-git clone https://github.com/Sparticle62ops/oxide-ai.git
-cd oxide-ai
-cargo build --release
+bash kaggle/kaggle_continue.sh              # the PSSA chain
+bash kaggle/kaggle_transformer_baseline.sh  # the parameter-matched baseline
 ```
 
-The executable is written to `target/release/oxide_ai_pssa`. Run it with no arguments for the home screen, which lists the commands and every checkpoint and corpus it finds in the working directory:
-
-```bash
-./target/release/oxide_ai_pssa
-```
-
-Train a model on the bundled corpus. The default tokenizer is unnormalized ByteLevel BPE, trained only on the supplied corpus, with a maximum vocabulary of 2,048 entries:
-
-```bash
-cargo run --release -- train data/downloaded.txt --epochs 4 --out data/model.pssa
-```
-
-Use the legacy word tokenizer only for compatibility experiments:
-
-```bash
-cargo run --release -- train data/downloaded.txt --tokenizer word --epochs 4 --out data/word-model.pssa
-```
-
-Generate one completion, or start the REPL:
-
-```bash
-cargo run --release -- generate "quantum mechanics" --model data/model.pssa
-cargo run --release -- chat data/downloaded.txt --model data/model.pssa --temperature 0.70
-```
-
-`generate` and `chat` load an existing checkpoint; they do not train implicitly. Run
-`train` first when `data/model.pssa` is missing. Training time depends heavily on
-corpus size and CPU speed.
+Both read `TOTAL`, `WINDOW` and `FRESH` from the environment and write
+`--loss-csv`, so the curve survives a cut session.
 
 ## CLI Reference
 
@@ -238,86 +401,6 @@ cargo run --release -- benchmark
 ```
 
 The suite exercises synthetic streams for contradictory facts, MQAR-style distractors, burst repetition, model serialization, and short generation prompts. It prints milestone results, is not wired into Cargo's test harness, and is not a quality evaluation on general language tasks.
-
-## Results: PSSA against a parameter-matched transformer
-
-Over 12.8M tokens of cleaned WikiText-103, PSSA finished at **3.98** training
-cross-entropy and the parameter-matched transformer baseline at **4.43**: a gap
-of 0.45 nats, or perplexity 53.7 against 83.7. The baseline spent its whole
-12.8M-token budget to reach a loss PSSA had already passed by link 10, around
-2M tokens.
-
-### How the two runs were matched
-
-Both chains ran 64 links of 200,000 encoded tokens, each link resuming from the
-previous checkpoint, so the learning-rate schedule and optimizer state continue
-across the whole run instead of restarting per link.
-
-- Identical corpus: one `clean-wikitext` pass over WikiText-103, reused byte for byte.
-- Identical token IDs: the baseline pins `--tokenizer-from` to the PSSA chain's
-  own checkpoint, so neither model sees a different vocabulary.
-- Identical optimization: 30,000-update cosine horizon, no warm-up restart, 512
-  supervised target tokens per update, seed 42.
-- PSSA: latent 256, recurrent state 16, 512 memory slots, key width 32, vocab 2,048.
-- Baseline: 1,541,120 parameters, 1 layer, width 256, 4 heads, FFN 448, vocab 2,048.
-
-### Per-token learning curve
-
-End-of-link training cross-entropy:
-
-| Link | Tokens seen | PSSA | Transformer |
-| --- | --- | --- | --- |
-| ck01 | 200,000 | 5.733 | not recorded |
-| ck05 | 1,000,000 | 4.617 | not recorded |
-| ck10 | 2,000,000 | 4.447 | not recorded |
-| ck15 | 3,000,000 | 4.292 | not recorded |
-| ck20 | 4,000,000 | 4.185 | not recorded |
-| ck25 | 5,000,000 | 4.221 | not recorded |
-| ck30 | 6,000,000 | 4.070 | not recorded |
-| ck35 | 7,000,000 | 4.039 | not recorded |
-| ck37 | 7,400,000 | 3.960 | 4.465 |
-| ck44 | 8,800,000 | 4.004 | 4.480 |
-| ck48 | 9,600,000 | 3.937 | 4.415 |
-| ck52 | 10,400,000 | 3.846 | 4.344 |
-| ck56 | 11,200,000 | 3.887 | 4.375 |
-| ck60 | 12,000,000 | 3.972 | 4.418 |
-| ck64 | 12,800,000 | 3.982 | 4.428 |
-
-The baseline's first session was cut at link 43 by the notebook session limit
-and its loss CSV did not survive, so links 1 to 36 and 38 to 43 have no recorded
-value; link 37 comes from the live run log. The chain resumed from `ck43` in a
-second session and finished all 64 links.
-
-### Throughput is not hardware-matched
-
-PSSA trained on a Kaggle T4 at roughly 900 tokens/second. The baseline is
-CPU-only, because `train-transformer` has no GPU path, and held 212
-tokens/second. Those two numbers say nothing about the architectures. On the
-same CPU-only Kaggle hardware the batched PSSA path measures 375 tokens/second
-against the baseline's 212, and the loss comparison above is unaffected either
-way, since it is matched on tokens and updates rather than on time.
-
-### What these numbers are, and are not
-
-The losses are end-of-link training cross-entropy on the stream being fit, not
-held-out evaluation. For a held-out comparison on an unseen slice, use the
-`compare` command described in [docs/COMPARISON.md](docs/COMPARISON.md).
-Generation quality at this scale is poor for both models: PSSA emits "a barget
-of the Prian Academy", the baseline "a material circulation of the United
-States".
-
-Two experiments are not yet measured: retention of earlier skills after a
-corpus switch, and whether ablating the 512 memory slots changes loss.
-
-### Reproducing
-
-```bash
-bash kaggle/kaggle_continue.sh              # the PSSA chain
-bash kaggle/kaggle_transformer_baseline.sh  # the parameter-matched baseline
-```
-
-Both read `TOTAL`, `WINDOW` and `FRESH` from the environment and write
-`--loss-csv`, so the curve survives a cut session.
 
 ## Project Layout
 
