@@ -41,9 +41,12 @@ struct Lane {
     carry: Vec<f32>,
     h: Vec<f32>,
     bar_a: Vec<f32>,
+    bar_b: Vec<f32>,
+    scan_a: Vec<f32>,
+    scan_b: Vec<f32>,
     y: Vec<f32>,
-    gh: Vec<f32>,
     ga: Vec<f32>,
+    ga_tokens: Vec<f32>,
     gd: Vec<f32>,
     gb: Vec<f32>,
     gc: Vec<f32>,
@@ -94,6 +97,8 @@ impl SequenceBatch {
         let rows = l
             .checked_mul(batch_size)
             .ok_or("batch tape size overflow; reduce --batch-size")?;
+        let scan_len = l.next_power_of_two();
+        let state_width = d * s;
         // Conservative bound includes both the packed model tape and lane-local
         // recurrent tapes/scratch. Reuse the checked 1 GiB model allocation guard.
         let mut budget = m.cfg.clone();
@@ -131,9 +136,12 @@ impl SequenceBatch {
                 carry: vec![0.0; depth * d * s],
                 h: vec![0.0; (l + 1) * d * s],
                 bar_a: vec![0.0; l * d * s],
+                bar_b: vec![0.0; l * d * s],
+                scan_a: vec![0.0; scan_len * state_width],
+                scan_b: vec![0.0; scan_len * state_width],
                 y: vec![0.0; l * d],
-                gh: vec![0.0; d * s],
                 ga: vec![0.0; d * s],
+                ga_tokens: vec![0.0; l * state_width],
                 gd: vec![0.0; l * d],
                 gb: vec![0.0; l * s],
                 gc: vec![0.0; l * s],
@@ -429,59 +437,132 @@ impl Lane {
         let d = m.cfg.d_latent;
         let s = m.cfg.d_state;
         let hs = d * s;
+        let l = self.len;
+        let offset = self.offset;
         self.h[..hs].copy_from_slice(&self.carry);
-        for t in 0..self.len {
-            let row = self.offset + t;
-            for i in 0..d {
-                let delta = m.tape.delta[row * d + i];
-                let mut y = 0.0;
-                for j in 0..s {
-                    let idx = i * s + j;
-                    let a = (delta * m.ssm_rates[idx]).exp();
-                    self.bar_a[t * hs + idx] = a;
-                    let h = a * self.h[t * hs + idx]
-                        + (delta * m.tape.b_proj[row * s + j]) * m.tape.x_norm[row * d + i];
-                    self.h[(t + 1) * hs + idx] = h;
-                    y += h * m.tape.c_proj[row * s + j];
+
+        // Keep the local maps for backward while scanning (bar_a, bar_b*x).
+        // Every worker owns a complete token row in each output buffer.
+        self.bar_a[..l * hs]
+            .par_chunks_mut(hs)
+            .zip(self.bar_b[..l * hs].par_chunks_mut(hs))
+            .zip(
+                self.scan_a[..l * hs]
+                    .par_chunks_mut(hs)
+                    .zip(self.scan_b[..l * hs].par_chunks_mut(hs)),
+            )
+            .enumerate()
+            .for_each(|(t, ((a_row, b_row), (scan_a_row, scan_b_row)))| {
+                let row = offset + t;
+                for i in 0..d {
+                    let delta = m.tape.delta[row * d + i];
+                    let x = m.tape.x_norm[row * d + i];
+                    for j in 0..s {
+                        let idx = i * s + j;
+                        let a = (delta * m.ssm_rates[idx]).exp();
+                        let b = delta * m.tape.b_proj[row * s + j];
+                        a_row[idx] = a;
+                        b_row[idx] = b;
+                        scan_a_row[idx] = a;
+                        scan_b_row[idx] = b * x;
+                    }
                 }
-                self.y[t * d + i] = y;
-            }
-        }
+            });
+        stages::affine_scan_in_place(&mut self.scan_a, &mut self.scan_b, l, hs);
+        let (initial, states_out) = self.h.split_at_mut(hs);
+        stages::materialize_ssm_scan(
+            initial,
+            &self.bar_a[..l * hs],
+            &self.bar_b[..l * hs],
+            &m.tape.x_norm[offset * d..(offset + l) * d],
+            &self.scan_a[..l * hs],
+            &self.scan_b[..l * hs],
+            &m.tape.c_proj[offset * s..(offset + l) * s],
+            &mut states_out[..l * hs],
+            &mut self.y[..l * d],
+            l,
+            d,
+            s,
+        );
         self.carry
-            .copy_from_slice(&self.h[self.len * hs..(self.len + 1) * hs]);
+            .copy_from_slice(&self.h[l * hs..(l + 1) * hs]);
     }
 
     fn backward(&mut self, m: &PSSALayerV2) {
         let d = m.cfg.d_latent;
         let s = m.cfg.d_state;
         let hs = d * s;
+        let l = self.len;
+        let offset = self.offset;
         let scale = 1.0 / (s as f32).sqrt();
-        self.gh.fill(0.0);
-        self.ga.fill(0.0);
-        self.gd[..self.len * d].fill(0.0);
-        self.gb[..self.len * s].fill(0.0);
-        self.gc[..self.len * s].fill(0.0);
-        self.gx[..self.len * d].fill(0.0);
-        for t in (0..self.len).rev() {
-            let row = self.offset + t;
-            for i in 0..d {
-                let gy = m.bwd_g_zraw[row * d + i] * scale + m.bwd_g_ysm[row * d + i];
-                let delta = m.tape.delta[row * d + i];
-                let x = m.tape.x_norm[row * d + i];
-                for j in 0..s {
-                    let idx = i * s + j;
-                    let a = self.bar_a[t * hs + idx];
-                    let b = m.tape.b_proj[row * s + j];
-                    let prev = self.h[t * hs + idx];
-                    let gh = gy * m.tape.c_proj[row * s + j] + self.gh[idx];
-                    self.gc[t * s + j] += gy * self.h[(t + 1) * hs + idx];
-                    self.gh[idx] = gh * a;
-                    self.ga[idx] += gh * (delta * a) * prev * m.ssm_rate_derivatives[idx];
-                    self.gd[t * d + i] += gh * (m.ssm_rates[idx] * a * prev + b * x);
-                    self.gb[t * s + j] += gh * (delta * x);
-                    self.gx[t * d + i] += gh * (delta * b);
+        let local_a = &self.bar_a[..l * hs];
+
+        // In reverse time p_t = A_t * (r_t + p_(t+1)), r_t = gy_t*C_t.
+        // The exclusive prefix of (A_t, A_t*r_t) yields the future adjoint
+        // p_(t+1), with a zero terminal adjoint at this lane's TBPTT boundary.
+        self.scan_a[..l * hs]
+            .par_chunks_mut(hs)
+            .zip(self.scan_b[..l * hs].par_chunks_mut(hs))
+            .enumerate()
+            .for_each(|(u, (a_row, b_row))| {
+                let t = l - 1 - u;
+                let row = offset + t;
+                for i in 0..d {
+                    let gy = m.bwd_g_zraw[row * d + i] * scale + m.bwd_g_ysm[row * d + i];
+                    for j in 0..s {
+                        let idx = i * s + j;
+                        let a = local_a[t * hs + idx];
+                        let r = gy * m.tape.c_proj[row * s + j];
+                        a_row[idx] = a;
+                        b_row[idx] = a * r;
+                    }
                 }
-                self.gd[t * d + i] *= sigmoid(m.tape.delta_raw[row * d + i]);
+            });
+        stages::affine_scan_in_place(&mut self.scan_a, &mut self.scan_b, l, hs);
+
+        let future = &self.scan_b[..l * hs];
+        let local_b = &self.bar_b[..l * hs];
+        let states = &self.h[..(l + 1) * hs];
+        self.gd[..l * d]
+            .par_chunks_mut(d)
+            .zip(self.gb[..l * s].par_chunks_mut(s))
+            .zip(self.gc[..l * s].par_chunks_mut(s))
+            .zip(self.gx[..l * d].par_chunks_mut(d))
+            .zip(self.ga_tokens[..l * hs].par_chunks_mut(hs))
+            .enumerate()
+            .for_each(|(t, ((((gd, gb), gc), gx), ga))| {
+                let row = offset + t;
+                let future_p = &future[(l - 1 - t) * hs..(l - t) * hs];
+                gd.fill(0.0);
+                gb.fill(0.0);
+                gc.fill(0.0);
+                gx.fill(0.0);
+                for i in 0..d {
+                    let gy = m.bwd_g_zraw[row * d + i] * scale + m.bwd_g_ysm[row * d + i];
+                    let delta = m.tape.delta[row * d + i];
+                    let x = m.tape.x_norm[row * d + i];
+                    for j in 0..s {
+                        let idx = i * s + j;
+                        let a = local_a[t * hs + idx];
+                        let b = m.tape.b_proj[row * s + j];
+                        let prev = states[t * hs + idx];
+                        let gh = gy * m.tape.c_proj[row * s + j] + future_p[idx];
+                        gc[j] += gy * states[(t + 1) * hs + idx];
+                        ga[idx] = gh * (delta * a) * prev * m.ssm_rate_derivatives[idx];
+                        gd[i] += gh * (m.ssm_rates[idx] * a * prev + b * x);
+                        gb[j] += gh * (delta * x);
+                        gx[i] += gh * local_b[t * hs + idx];
+                    }
+                    gd[i] *= sigmoid(m.tape.delta_raw[row * d + i]);
+                }
+            });
+
+        // Shared rate gradients retain a deterministic reverse-time reduction;
+        // no token worker writes the lane aggregate or another lane's buffers.
+        self.ga.fill(0.0);
+        for ga in self.ga_tokens[..l * hs].chunks_exact(hs).rev() {
+            for (dst, src) in self.ga.iter_mut().zip(ga) {
+                *dst += src;
             }
         }
     }

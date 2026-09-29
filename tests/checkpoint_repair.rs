@@ -856,6 +856,12 @@ fn actual_block_storage(b: &oxide_ai_pssa::pssa::PSSAContinuousBlockV2) -> usize
         inf_mlp_act,
         inf_mlp_out,
         inf_z_final,
+        ssm_scan_a,
+        ssm_scan_b,
+        bwd_ssm_delta,
+        bwd_ssm_b,
+        bwd_ssm_c,
+        bwd_ssm_a,
     } = b;
     let params: usize = [
         a_mat, w_delta, w_b, w_c, w_qx, w_qh, w_gate, w_proj, mlp_w1, mlp_w2,
@@ -927,6 +933,12 @@ fn actual_block_storage(b: &oxide_ai_pssa::pssa::PSSAContinuousBlockV2) -> usize
         inf_mlp_act,
         inf_mlp_out,
         inf_z_final,
+        ssm_scan_a,
+        ssm_scan_b,
+        bwd_ssm_delta,
+        bwd_ssm_b,
+        bwd_ssm_c,
+        bwd_ssm_a,
     ]
     .into_iter()
     .map(vector_bytes)

@@ -10,25 +10,117 @@
 //! the GPU kernels numerically (`cpu-twin check`).
 //!
 //! Numerical contract with the reference implementations
-//! (`forward_train_chunk_reference` / `backward_chunk_reference`): identical
-//! operation order per element, so results agree to f32 roundoff. The only
-//! intentional difference is accumulation order across tokens for weight
-//! gradients, which stage GEMMs fold in descending token order to match the
-//! reference reverse-time loop.
+//! (`PSSALayerV2::forward_train_chunk` / `backward_chunk`): results agree to
+//! f32 roundoff, not bitwise equality. The affine SSM scan reassociates time
+//! and projection input adjoints group sums by matrix. Shared SSM weight
+//! gradients still accumulate in descending token order. Nonlinear memory
+//! retrieval, bank writes and refractory updates are NOT affine scan operators.
 
 use crate::linalg::{dot_slice, sigmoid, softplus};
 use crate::memory::HyperbolicEpisodicBankV2;
 use crate::pssa::PSSALayerV2;
 use rayon::prelude::*;
 
-// Parallelize only large, independent dense adjoints. The recurrent scan below
-// deliberately retains its reverse-time dependency and has no shared atomics.
+// Parallelize large, independent dense adjoints without shared atomics.
 fn blocked_backward(tokens: usize, rows: usize, cols: usize) -> bool {
     tokens.saturating_mul(rows).saturating_mul(cols) >= 1_048_576
 }
 
 fn parallel_backward(tokens: usize, rows: usize, cols: usize) -> bool {
     blocked_backward(tokens, rows, cols) && rayon::current_num_threads() > 1
+}
+
+/// Compose two diagonal affine maps. `first` is applied before `second`:
+///
+///     x -> first_a*x + first_b -> second_a*x + second_b
+///
+/// The SSM has one such scalar map for every latent/state channel, so maps at
+/// different channels are independent and the composition is associative.
+#[inline(always)]
+fn compose_affine(
+    first_a: f32,
+    first_b: f32,
+    second_a: f32,
+    second_b: f32,
+) -> (f32, f32) {
+    (second_a * first_a, second_a * first_b + second_b)
+}
+
+/// Work-efficient Blelloch exclusive scan of diagonal affine maps.
+///
+/// The first `len` rows of `scan_a`/`scan_b` contain the per-token maps on
+/// entry. The remaining rows are padded with the identity map. Each tree
+/// level operates on disjoint time intervals and is therefore parallelized
+/// with rayon; only the O(log T) tree levels remain sequential. The result at
+/// row `t` is the composition of tokens before `t`.
+///
+/// The caller owns the workspaces so this remains allocation-free in both the
+/// single-sequence stage path and the independent-lane sequence batch path.
+pub(crate) fn affine_scan_in_place(
+    scan_a: &mut [f32],
+    scan_b: &mut [f32],
+    len: usize,
+    stride: usize,
+) {
+    assert!(len > 0 && stride > 0);
+    let width = len.next_power_of_two();
+    assert!(scan_a.len() >= width * stride && scan_b.len() >= width * stride);
+    let a = &mut scan_a[..width * stride];
+    let b = &mut scan_b[..width * stride];
+    a[len * stride..].par_chunks_mut(stride).for_each(|row| row.fill(1.0));
+    b[len * stride..].fill(0.0);
+
+    // Up-sweep: reduce each subtree to its right-hand endpoint.
+    let mut step = 1;
+    while step < width {
+        let chunk_len = 2 * step * stride;
+        a.par_chunks_mut(chunk_len)
+            .zip(b.par_chunks_mut(chunk_len))
+            .for_each(|(a_chunk, b_chunk)| {
+                let left = (step - 1) * stride;
+                let right = (2 * step - 1) * stride;
+                for j in 0..stride {
+                    let (next_a, next_b) = compose_affine(
+                        a_chunk[left + j],
+                        b_chunk[left + j],
+                        a_chunk[right + j],
+                        b_chunk[right + j],
+                    );
+                    a_chunk[right + j] = next_a;
+                    b_chunk[right + j] = next_b;
+                }
+            });
+        step *= 2;
+    }
+
+    // The exclusive root prefix is the identity.
+    a[(width - 1) * stride..].fill(1.0);
+    b[(width - 1) * stride..].fill(0.0);
+
+    // Down-sweep: distribute each parent prefix to its two children.
+    let mut step = width / 2;
+    while step > 0 {
+        let chunk_len = 2 * step * stride;
+        a.par_chunks_mut(chunk_len)
+            .zip(b.par_chunks_mut(chunk_len))
+            .for_each(|(a_chunk, b_chunk)| {
+                let left = (step - 1) * stride;
+                let right = (2 * step - 1) * stride;
+                for j in 0..stride {
+                    let parent_a = a_chunk[right + j];
+                    let parent_b = b_chunk[right + j];
+                    let left_a = a_chunk[left + j];
+                    let left_b = b_chunk[left + j];
+                    a_chunk[left + j] = parent_a;
+                    b_chunk[left + j] = parent_b;
+                    let (next_a, next_b) =
+                        compose_affine(parent_a, parent_b, left_a, left_b);
+                    a_chunk[right + j] = next_a;
+                    b_chunk[right + j] = next_b;
+                }
+            });
+        step /= 2;
+    }
 }
 
 /// G[L,R] * W[R,C], owning complete output rows with contiguous weight reads.
@@ -138,6 +230,58 @@ fn gemm_tn_dev(
     }
 }
 
+/// Materialize SSM states and outputs from an exclusive affine scan. `local_*`
+/// are the token maps, while `scan_*` contain the exclusive prefix maps. The
+/// state update and readout are independent for each time row once the scan is
+/// complete, so this pass is also parallel over time.
+pub(crate) fn materialize_ssm_scan(
+    initial: &[f32],
+    local_a: &[f32],
+    local_b: &[f32],
+    x_norm: &[f32],
+    scan_a: &[f32],
+    scan_b: &[f32],
+    c_proj: &[f32],
+    states_out: &mut [f32],
+    y_out: &mut [f32],
+    len: usize,
+    d_m: usize,
+    d_s: usize,
+) {
+    let stride = d_m * d_s;
+    assert_eq!(initial.len(), stride);
+    assert_eq!(local_a.len(), len * stride);
+    assert_eq!(local_b.len(), len * stride);
+    assert_eq!(x_norm.len(), len * d_m);
+    assert_eq!(scan_a.len(), len * stride);
+    assert_eq!(scan_b.len(), len * stride);
+    assert_eq!(c_proj.len(), len * d_s);
+    assert_eq!(states_out.len(), len * stride);
+    assert_eq!(y_out.len(), len * d_m);
+
+    states_out
+        .par_chunks_mut(stride)
+        .zip(y_out.par_chunks_mut(d_m))
+        .enumerate()
+        .for_each(|(t, (state_row, y_row))| {
+            let state_off = t * stride;
+            let c_off = t * d_s;
+            for i in 0..d_m {
+                let mut y_i = 0.0f32;
+                for j in 0..d_s {
+                    let idx = i * d_s + j;
+                    let h_before = scan_a[state_off + idx] * initial[idx]
+                        + scan_b[state_off + idx];
+                    let h = local_a[state_off + idx] * h_before
+                        + local_b[state_off + idx] * x_norm[t * d_m + i];
+                    state_row[idx] = h;
+                    y_i += h * c_proj[c_off + j];
+                }
+                y_row[i] = y_i;
+            }
+        });
+}
+
 // =============================================================================
 // FORWARD STAGES
 // =============================================================================
@@ -183,47 +327,76 @@ pub fn stage_projections(m: &mut PSSALayerV2, seq_len: usize) {
     batched_matvec(&m.w_c.data, d_s, d_m, xn, l, &mut m.tape.c_proj[..l * d_s]);
 }
 
-/// Stage 3: multi-channel SSM recurrent scan. Sequential over time (the
-/// recurrence is inherently serial); channel/state work stays on the CPU.
+/// Stage 3: multi-channel SSM recurrent scan. Each channel is a diagonal
+/// affine recurrence, so its `(bar_a, bar_b*x)` maps compose associatively.
+/// The Blelloch tree parallelizes time while retaining the local maps in the
+/// tape for the unchanged backward oracle.
 #[inline]
 pub fn stage_ssm_scan(m: &mut PSSALayerV2, seq_len: usize) {
     let m = &mut m.block;
     m.refresh_ssm_rates();
     let d_m = m.cfg.d_latent;
     let d_s = m.cfg.d_state;
-    for t in 0..seq_len {
-        let del_off = t * d_m;
-        let b_off = t * d_s;
-        let c_off = t * d_s;
-        let h_prev_off = t * (d_m * d_s);
-        let h_next_off = (t + 1) * (d_m * d_s);
-        let ssm_off = t * (d_m * d_s);
-        let y_off = t * d_m;
-        let xn_off = t * d_m;
+    let stride = d_m * d_s;
 
-        for i in 0..d_m {
-            let d_i = m.tape.delta[del_off + i];
-            let mut y_i = 0.0f32;
-            for j in 0..d_s {
-                let idx = i * d_s + j;
-                let bar_a = (d_i * m.ssm_rates[idx]).exp();
-                let bar_b = d_i * m.tape.b_proj[b_off + j];
-
-                m.tape.bar_a[ssm_off + idx] = bar_a;
-                m.tape.bar_b[ssm_off + idx] = bar_b;
-
-                let h_val = bar_a * m.tape.h_states[h_prev_off + idx] + bar_b * m.tape.x_norm[xn_off + i];
-                m.tape.h_states[h_next_off + idx] = h_val;
-
-                y_i += h_val * m.tape.c_proj[c_off + j];
+    // Build the independent per-token affine maps in parallel. The scan is
+    // below; keeping bar_a/bar_b local preserves the tape contract for
+    // backward while scan_b holds the input-dependent affine translation.
+    let rates = &m.ssm_rates;
+    let delta = &m.tape.delta;
+    let b_proj = &m.tape.b_proj;
+    let x_norm = &m.tape.x_norm;
+    m.tape
+        .bar_a
+        .par_chunks_mut(stride)
+        .zip(m.tape.bar_b.par_chunks_mut(stride))
+        .zip(m.ssm_scan_b.par_chunks_mut(stride))
+        .take(seq_len)
+        .enumerate()
+        .for_each(|(t, ((a_row, b_row), scan_b_row))| {
+            let del_off = t * d_m;
+            let b_off = t * d_s;
+            let xn_off = t * d_m;
+            for i in 0..d_m {
+                let d_i = delta[del_off + i];
+                for j in 0..d_s {
+                    let idx = i * d_s + j;
+                    let bar_a = (d_i * rates[idx]).exp();
+                    let bar_b = d_i * b_proj[b_off + j];
+                    a_row[idx] = bar_a;
+                    b_row[idx] = bar_b;
+                    scan_b_row[idx] = bar_b * x_norm[xn_off + i];
+                }
             }
-            m.tape.y_ssm[y_off + i] = y_i;
-        }
-    }
+        });
+
+    m.ssm_scan_a[..seq_len * stride].copy_from_slice(&m.tape.bar_a[..seq_len * stride]);
+    affine_scan_in_place(&mut m.ssm_scan_a, &mut m.ssm_scan_b, seq_len, stride);
+    let scan_a = &m.ssm_scan_a[..seq_len * stride];
+    let scan_b = &m.ssm_scan_b[..seq_len * stride];
+    let tape = &mut m.tape;
+    let (h0, h_out) = tape.h_states.split_at_mut(stride);
+    materialize_ssm_scan(
+        h0,
+        &tape.bar_a[..seq_len * stride],
+        &tape.bar_b[..seq_len * stride],
+        &tape.x_norm[..seq_len * d_m],
+        scan_a,
+        scan_b,
+        &tape.c_proj[..seq_len * d_s],
+        &mut h_out[..seq_len * stride],
+        &mut tape.y_ssm[..seq_len * d_m],
+        seq_len,
+        d_m,
+        d_s,
+    );
 }
 
 /// Stage 4: Poincare query projection, diffeomorphic projection, soft
-/// retrieval, memory gate and injection for every token.
+/// retrieval, memory gate and injection for every token. Nonlinear retrieval
+/// stays outside the affine scan and reads an immutable bank. Protected writes
+/// (including the history-dependent refractory gate) remain ordered in the
+/// trainer, after all backwards using this bank have completed.
 #[inline]
 pub fn stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
     let gpu = gpu_ctx(m);
@@ -417,9 +590,10 @@ pub fn stage_logits_loss(m: &mut PSSALayerV2, seq_len: usize) -> f32 {
     total_loss / (seq_len as f32)
 }
 
-/// Full batched forward pass over a chunk: identical tape contents and loss to
-/// `forward_train_chunk`, but every weight-touching stage is one batched GEMM
-/// over all L tokens. The inherently serial SSM scan stays on the CPU.
+/// Full batched forward pass over a chunk, matching `forward_train_chunk` to
+/// f32 roundoff. Dense stages batch token rows; the diagonal SSM recurrence uses
+/// a host-side parallel Blelloch scan for both CPU and GPU dense backends.
+/// Stacked models retain their existing scalar CPU fallback.
 pub fn forward_train_chunk_batched(m: &mut PSSALayerV2, token_ids: &[usize], target_ids: &[usize]) -> f32 {
     if m.depth() > 1 {
         assert!(!m.device.is_gpu(), "stacked training is CPU-only; use Device::Cpu");
@@ -866,120 +1040,171 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
     }
 }
 
-/// Backward Stage 3: SSM recurrence adjoint plus delta / b / c projections and
-/// the second RMSNorm chain into the embedding, in exact reverse time order.
-/// The recurrence itself is inherently serial; its per-step work mirrors the
-/// reference inner loops so grads agree to f32 roundoff.
+/// Backward Stage 3: reverse affine scan for the SSM adjoint, followed by
+/// token-local derivatives and the projection/RMSNorm chains. The memory bank
+/// query adjoint has already been computed by `bwd_stage_memory`; it is not part
+/// of this associative recurrence.
 #[inline]
 pub fn bwd_stage_ssm(m: &mut PSSALayerV2, seq_len: usize) {
     let pending_step = m.step_counter + 1;
-    let (embed_w, embed_row_marks, m) = (&mut m.embed_w, &mut m.embed_row_marks, &mut m.block);
+    let (embed_w, embed_row_marks, m) =
+        (&mut m.embed_w, &mut m.embed_row_marks, &mut m.block);
     m.refresh_ssm_rates();
     let d_m = m.cfg.d_latent;
     let d_s = m.cfg.d_state;
+    let stride = d_m * d_s;
     let l = seq_len;
     let ssm_scale = 1.0 / (d_s as f32).sqrt();
 
-    m.grad_h_next.fill(0.0);
     for t in 0..l {
         embed_row_marks[m.tape.x_ids[t]] = pending_step;
     }
 
+    // Let p_t be the adjoint propagated through the transition at t:
+    // p_t = A_t * (r_t + p_(t+1)), where r_t is the direct readout adjoint.
+    // In reverse time each token is therefore the affine map
+    // p -> A_t*p + A_t*r_t. The exclusive reverse prefix gives p_(t+1)
+    // (the terminal adjoint is zero because TBPTT detaches chunk boundaries).
+    // Reverse-map construction is token-local too; only the reverse prefix
+    // itself needs the tree's ordered composition.
+    let bar_a = &m.tape.bar_a;
+    let c_proj = &m.tape.c_proj;
+    let g_zraw = &m.bwd_g_zraw;
+    let g_ysm = &m.bwd_g_ysm;
+    m.ssm_scan_a[..l * stride]
+        .par_chunks_mut(stride)
+        .zip(m.ssm_scan_b[..l * stride].par_chunks_mut(stride))
+        .enumerate()
+        .for_each(|(u, (a_row, b_row))| {
+            let t = l - 1 - u;
+            let t_state = t * stride;
+            let t_c = t * d_s;
+            let gy_off = t * d_m;
+            for i in 0..d_m {
+                let gy = g_zraw[gy_off + i] * ssm_scale + g_ysm[gy_off + i];
+                for j in 0..d_s {
+                    let idx = i * d_s + j;
+                    let a = bar_a[t_state + idx];
+                    let r = gy * c_proj[t_c + j];
+                    a_row[idx] = a;
+                    b_row[idx] = a * r;
+                }
+            }
+        });
+    affine_scan_in_place(&mut m.ssm_scan_a, &mut m.ssm_scan_b, l, stride);
+
+    // The scan has removed the reverse-time dependency. All local derivatives
+    // now write disjoint token rows, so this bulk is parallel over time.
+    let delta_grads = &mut m.bwd_ssm_delta[..l * d_m];
+    let b_grads = &mut m.bwd_ssm_b[..l * d_s];
+    let c_grads = &mut m.bwd_ssm_c[..l * d_s];
+    let a_grads = &mut m.bwd_ssm_a[..l * stride];
+    let x_grads = &mut m.bwd_g_xnorm[..l * d_m];
+    delta_grads.fill(0.0);
+    b_grads.fill(0.0);
+    c_grads.fill(0.0);
+    a_grads.fill(0.0);
+    delta_grads
+        .par_chunks_mut(d_m)
+        .zip(b_grads.par_chunks_mut(d_s))
+        .zip(c_grads.par_chunks_mut(d_s))
+        .zip(a_grads.par_chunks_mut(stride))
+        .zip(x_grads.par_chunks_mut(d_m))
+        .enumerate()
+        .for_each(|(t, ((((delta_row, b_row), c_row), a_row), x_row))| {
+            let state_off = t * stride;
+            let d_off = t * d_m;
+            let s_off = t * d_s;
+            let future_u = l - 1 - t;
+            let future_p = &m.ssm_scan_b[future_u * stride..(future_u + 1) * stride];
+            let gy_row = &m.bwd_g_zraw[d_off..d_off + d_m];
+            let mem_gy_row = &m.bwd_g_ysm[d_off..d_off + d_m];
+            for i in 0..d_m {
+                let gy = gy_row[i] * ssm_scale + mem_gy_row[i];
+                let d_i = m.tape.delta[d_off + i];
+                let x_i = m.tape.x_norm[d_off + i];
+                for j in 0..d_s {
+                    let idx = i * d_s + j;
+                    let q = gy * m.tape.c_proj[s_off + j] + future_p[idx];
+                    let a = m.tape.bar_a[state_off + idx];
+                    let h_prev = m.tape.h_states[state_off + idx];
+                    let h_next = m.tape.h_states[state_off + stride + idx];
+                    let b = m.tape.b_proj[s_off + j];
+                    let rate = m.ssm_rates[idx];
+
+                    c_row[j] += gy * h_next;
+                    a_row[idx] = q
+                        * (d_i * a)
+                        * h_prev
+                        * m.ssm_rate_derivatives[idx];
+                    delta_row[i] += q * (rate * a * h_prev + b * x_i);
+                    b_row[j] += q * (d_i * x_i);
+                    x_row[i] += q * m.tape.bar_b[state_off + idx];
+                }
+            }
+            for i in 0..d_m {
+                delta_row[i] *= sigmoid(m.tape.delta_raw[d_off + i]);
+            }
+        });
+
+    // These are ordinary token reductions, not temporal dependencies. Reuse
+    // the existing deterministic dense-adjoint kernels for the shared
+    // projection weights and add their input adjoints to the memory/adapter
+    // contributions already in bwd_g_xnorm.
+    for (g, w, rows) in [
+        (&m.bwd_ssm_delta[..l * d_m], &mut m.w_delta, d_m),
+        (&m.bwd_ssm_b[..l * d_s], &mut m.w_b, d_s),
+        (&m.bwd_ssm_c[..l * d_s], &mut m.w_c, d_s),
+    ] {
+        dense_input_adjoint(
+            g,
+            &w.data,
+            l,
+            rows,
+            d_m,
+            &mut m.bwd_g_mlp[..l * d_m],
+        );
+        for (dst, src) in m.bwd_g_xnorm[..l * d_m]
+            .iter_mut()
+            .zip(&m.bwd_g_mlp[..l * d_m])
+        {
+            *dst += src;
+        }
+        dense_weight_adjoint(g, &m.tape.x_norm[..l * d_m], l, rows, d_m, &mut w.grad);
+    }
+    for t in (0..l).rev() {
+        for idx in 0..stride {
+            m.a_mat.grad[idx] += m.bwd_ssm_a[t * stride + idx];
+        }
+    }
+
+    // RMSNorm parameters and embedding rows can alias across tokens. Their
+    // sums are mathematically associative, but retain the reference reverse
+    // order for deterministic f32 accumulation without atomics.
     for t in (0..l).rev() {
         let x_id = m.tape.x_ids[t];
-        let del_off = t * d_m;
-        let m_off = t * d_m;
-
-        // SSM recurrence backward
-        m.buf_g_delta.fill(0.0);
-        m.buf_g_b_proj.fill(0.0);
-        m.buf_g_c_proj.fill(0.0);
-        m.buf_g_h_prev.fill(0.0);
-
-        for i in 0..d_m {
-            let gz_i = m.bwd_g_zraw[m_off + i];
-            let g_y_i = gz_i * ssm_scale + m.bwd_g_ysm[m_off + i];
-            let d_i = m.tape.delta[del_off + i];
-            let xn_i = m.tape.x_norm[m_off + i];
-
-            for j in 0..d_s {
-                let idx = i * d_s + j;
-                let h_next = m.tape.h_states[(t + 1) * (d_m * d_s) + idx];
-                let c_val = m.tape.c_proj[t * d_s + j];
-                let bar_a = m.tape.bar_a[t * (d_m * d_s) + idx];
-                let a_physical = m.ssm_rates[idx];
-                let b_val = m.tape.b_proj[t * d_s + j];
-
-                let g_h_total = g_y_i * c_val + m.grad_h_next[idx];
-
-                m.buf_g_c_proj[j] += g_y_i * h_next;
-                m.buf_g_h_prev[idx] += g_h_total * bar_a;
-
-                m.a_mat.grad[idx] += g_h_total
-                    * (d_i * bar_a)
-                    * m.tape.h_states[t * (d_m * d_s) + idx]
-                    * m.ssm_rate_derivatives[idx];
-                m.buf_g_delta[i] += g_h_total
-                    * (a_physical * bar_a * m.tape.h_states[t * (d_m * d_s) + idx]
-                        + b_val * xn_i);
-                m.buf_g_b_proj[j] += g_h_total * (d_i * xn_i);
-                m.bwd_g_xnorm[m_off + i] += g_h_total * m.tape.bar_b[t * (d_m * d_s) + idx];
-            }
-        }
-
-        m.grad_h_next.copy_from_slice(&m.buf_g_h_prev);
-
-        // delta projection backward
-        for i in 0..d_m {
-            let d_sig = sigmoid(m.tape.delta_raw[del_off + i]);
-            let gd_i = m.buf_g_delta[i] * d_sig;
-            let row_off = i * d_m;
-            for j in 0..d_m {
-                m.bwd_g_xnorm[m_off + j] += gd_i * m.w_delta.data[row_off + j];
-                m.w_delta.grad[row_off + j] += gd_i * m.tape.x_norm[m_off + j];
-            }
-        }
-
-        // b and c projections backward
-        for j in 0..d_s {
-            let gb_j = m.buf_g_b_proj[j];
-            let gc_j = m.buf_g_c_proj[j];
-            let row_off = j * d_m;
-            for k in 0..d_m {
-                m.bwd_g_xnorm[m_off + k] +=
-                    gb_j * m.w_b.data[row_off + k] + gc_j * m.w_c.data[row_off + k];
-                m.w_b.grad[row_off + k] += gb_j * m.tape.x_norm[m_off + k];
-                m.w_c.grad[row_off + k] += gc_j * m.tape.x_norm[m_off + k];
-            }
-        }
-
-        // Affine RMSNorm backward to gamma, beta, and the embedding row
+        let d_off = t * d_m;
         let inv_rms = m.tape.inv_rms[t];
         let e_t = &embed_w.data[x_id * d_m..(x_id + 1) * d_m];
-
         let mut dot_gx_e = 0.0f32;
         for i in 0..d_m {
-            let gx_i = m.bwd_g_xnorm[m_off + i];
+            let gx_i = m.bwd_g_xnorm[d_off + i];
             m.norm_beta.grad[i] += gx_i;
             m.norm_gamma.grad[i] += gx_i * (e_t[i] * inv_rms);
-
-            let g_unnorm = gx_i * m.norm_gamma.data[i];
-            dot_gx_e += g_unnorm * e_t[i];
+            dot_gx_e += gx_i * m.norm_gamma.data[i] * e_t[i];
         }
-
         let emb_row_off = x_id * d_m;
         for i in 0..d_m {
-            let g_unnorm = m.bwd_g_xnorm[m_off + i] * m.norm_gamma.data[i];
-            let g_e_i =
-                inv_rms * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / (d_m as f32)));
-            embed_w.grad[emb_row_off + i] += g_e_i;
+            let g_unnorm = m.bwd_g_xnorm[d_off + i] * m.norm_gamma.data[i];
+            embed_w.grad[emb_row_off + i] += inv_rms
+                * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / d_m as f32));
         }
     }
 }
 
-/// Full batched backward pass over a chunk: identical gradients to the
-/// reference `backward_chunk`, accumulated in the same reverse-time token
-/// order, driven by the stage adjoints above.
+/// Full batched backward pass over a chunk: reverse affine SSM scan followed
+/// by local derivatives and deterministic shared-weight reductions, matching
+/// the scalar `backward_chunk` to f32 roundoff.
 pub fn backward_chunk_batched(m: &mut PSSALayerV2, seq_len: usize, accumulation_scale: f32) {
     if m.depth() > 1 {
         assert!(!m.device.is_gpu(), "stacked training is CPU-only; use Device::Cpu");
