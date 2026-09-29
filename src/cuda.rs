@@ -142,7 +142,7 @@ fn reserve_device(
 pub struct CudaContext {
     stream: Arc<CudaStream>,
     blas: Arc<CudaBlas>,
-    name: String,
+    name: Arc<str>,
     weight_cache: Arc<Mutex<HashMap<(usize, usize), Arc<CudaSlice<f32>>>>>,
     workspace: Arc<Mutex<Workspace>>,
 }
@@ -151,9 +151,10 @@ impl CudaContext {
     pub fn init() -> Result<Self, String> {
         preflight_libraries()?;
         let ctx = DriverContext::new(0).map_err(|e| format!("no CUDA device ({e:?})"))?;
-        let name = ctx
+        let name: Arc<str> = ctx
             .name()
-            .unwrap_or_else(|_| "unknown CUDA device".to_string());
+            .unwrap_or_else(|_| "unknown CUDA device".to_string())
+            .into();
         let stream = ctx.default_stream();
         let blas = CudaBlas::new(stream.clone())
             .map_err(|e| format!("cuBLAS unavailable on {name} ({e:?})"))?;
@@ -260,7 +261,7 @@ impl CudaContext {
             ldb: k as i32,
             ldc: n as i32,
         };
-        self.execute_into(x, w, cfg, 1, 0, 0, true, out)
+        self.execute_into(x, w, cfg, 1, 0, 0, true, false, out)
     }
 
     pub fn gemm_nn(&self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
@@ -301,7 +302,7 @@ impl CudaContext {
             ldb: k as i32,
             ldc: n as i32,
         };
-        self.execute_into(a, b, cfg, 1, 0, 0, true, &mut out)?;
+        self.execute_into(a, b, cfg, 1, 0, 0, true, false, &mut out)?;
         Ok(out)
     }
 
@@ -329,8 +330,97 @@ impl CudaContext {
             ldb: k as i32,
             ldc: n as i32,
         };
-        self.execute_into(a, b, cfg, 1, 0, 0, false, &mut out)?;
+        self.execute_into(a, b, cfg, 1, 0, 0, false, false, &mut out)?;
         Ok(out)
+    }
+
+    /// Row-major C(M,N) = A(M,K) * B(K,N), writing into caller-owned output.
+    pub fn gemm_nn_into(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        self.try_gemm_nn_into(a, b, m, k, n, out).or_else(|error| {
+            eprintln!("warning: CUDA backward GEMM (NN) failed; using CPU fallback: {error}");
+            crate::backend::gemm_nn_cpu_into(a, b, m, k, n, out)
+        })
+    }
+
+    pub fn try_gemm_nn_into(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        let (_, _, len) = checked_cuda_sizes(m, n, k, 1, a.len(), b.len())?;
+        if out.len() != len {
+            return Err("CUDA NN GEMM output length mismatch".into());
+        }
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: 1.0,
+            beta: 0.0,
+            lda: n as i32,
+            ldb: k as i32,
+            ldc: n as i32,
+        };
+        self.execute_into(a, b, cfg, 1, 0, 0, true, false, out)
+    }
+
+    /// Accumulate row-major A(M,K)^T * B(M,N) into caller-owned output.
+    pub fn gemm_tn_accumulate_into(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        self.try_gemm_tn_accumulate_into(a, b, m, k, n, out)
+            .or_else(|error| {
+                eprintln!("warning: CUDA backward GEMM (TN) failed; using CPU fallback: {error}");
+                crate::backend::gemm_tn_cpu_accumulate_into(a, b, m, k, n, out)
+            })
+    }
+
+    pub fn try_gemm_tn_accumulate_into(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        let (_, _, len) = checked_cuda_sizes(k, n, m, 1, a.len(), b.len())?;
+        if out.len() != len {
+            return Err("CUDA TN GEMM output length mismatch".into());
+        }
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_T,
+            m: n as i32,
+            n: k as i32,
+            k: m as i32,
+            alpha: 1.0,
+            beta: 1.0,
+            lda: n as i32,
+            ldb: k as i32,
+            ldc: n as i32,
+        };
+        self.execute_into(a, b, cfg, 1, 0, 0, false, true, out)
     }
 
     // Only called after full shape/byte checks; each view exactly covers the
@@ -344,6 +434,7 @@ impl CudaContext {
         stride_b: i64,
         stride_c: i64,
         cache_rhs: bool,
+        seed_output: bool,
         out: &mut [f32],
     ) -> Result<(), String> {
         let mut workspace = self
@@ -370,8 +461,13 @@ impl CudaContext {
             rhs.as_ref().unwrap().slice(..b.len())
         };
         let mut c_dev = output.as_mut().unwrap().slice_mut(..out.len());
+        if seed_output {
+            self.stream
+                .memcpy_htod(out, &mut c_dev)
+                .map_err(|e| format!("CUDA output seed upload failed ({e:?})"))?;
+        }
         // SAFETY: exact views, checked signed dimensions/strides and leading
-        // dimensions satisfy the row-/column-major identities above. beta=0.
+        // dimensions satisfy the row-/column-major identities above.
         if batch == 1 {
             unsafe { self.blas.gemm(gemm, &b_dev, &a_dev, &mut c_dev) }
                 .map_err(|e| format!("cuBLAS sgemm failed ({e:?})"))?;

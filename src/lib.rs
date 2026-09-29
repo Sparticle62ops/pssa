@@ -15,6 +15,7 @@ pub mod gpu_batch;
 pub mod memory;
 pub mod pssa;
 pub mod sequence_batch;
+pub mod scan_executor;
 pub mod transformer;
 pub mod transformer_checkpoint;
 pub mod transformer_inference;

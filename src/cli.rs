@@ -633,6 +633,9 @@ impl CLIHandler {
         let mut curve = options.loss_csv.as_deref().map(|path| {
             crate::loss_csv::LossCsv::open(path, options.loss_every, model.step_counter, options.tokens_seen)
         }).transpose()?;
+        // Sequence values are borrowed views into `docs`; reuse the descriptor
+        // vector so packed training does not allocate once per microbatch.
+        let mut sequence_views = Vec::with_capacity(options.batch_size);
         let started = Instant::now();
         let mut update = 0;
         let mut tokens_seen = 0usize;
@@ -654,16 +657,16 @@ impl CLIHandler {
                 for microbatch in group {
                     let batch_tokens: usize = microbatch.iter().map(|c| c.len).sum();
                     let loss = if let Some(batch) = &mut sequence_batch {
-                        let sequences: Vec<_> = microbatch
-                            .iter()
-                            .map(|c| crate::sequence_batch::Sequence {
+                        sequence_views.clear();
+                        for c in microbatch {
+                            sequence_views.push(crate::sequence_batch::Sequence {
                                 lane: c.lane,
                                 inputs: &docs[c.doc][c.start..c.start + c.len],
                                 targets: &docs[c.doc][c.start + 1..c.start + 1 + c.len],
                                 reset: c.start == 0,
-                            })
-                            .collect();
-                        batch.forward(&mut model, &sequences)?
+                            });
+                        }
+                        batch.forward(&mut model, &sequence_views)?
                     } else {
                         // Preserve the historical single-lane math and write order.
                         let c = microbatch[0];

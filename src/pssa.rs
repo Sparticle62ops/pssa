@@ -1230,6 +1230,8 @@ pub struct PSSALayerV2 {
     pub cfg: PSSAConfigV2,
     pub step_counter: usize,
     pub device: Device,
+    /// Runtime-only lazy worker handoff for allocation-free parallel scans.
+    pub scan_executor: crate::scan_executor::ScanExecutor,
     pub rng: SimpleRng,
     pub vocabulary: Vec<String>,
     pub tokenizer_json: Option<String>,
@@ -1312,6 +1314,7 @@ impl PSSALayerV2 {
             cfg,
             step_counter: 0,
             device,
+            scan_executor: crate::scan_executor::ScanExecutor::default(),
             rng,
             vocabulary: Vec::new(),
             tokenizer_json: None,
