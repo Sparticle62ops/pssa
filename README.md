@@ -239,6 +239,86 @@ cargo run --release -- benchmark
 
 The suite exercises synthetic streams for contradictory facts, MQAR-style distractors, burst repetition, model serialization, and short generation prompts. It prints milestone results, is not wired into Cargo's test harness, and is not a quality evaluation on general language tasks.
 
+## Results: PSSA against a parameter-matched transformer
+
+Over 12.8M tokens of cleaned WikiText-103, PSSA finished at **3.98** training
+cross-entropy and the parameter-matched transformer baseline at **4.43**: a gap
+of 0.45 nats, or perplexity 53.7 against 83.7. The baseline spent its whole
+12.8M-token budget to reach a loss PSSA had already passed by link 10, around
+2M tokens.
+
+### How the two runs were matched
+
+Both chains ran 64 links of 200,000 encoded tokens, each link resuming from the
+previous checkpoint, so the learning-rate schedule and optimizer state continue
+across the whole run instead of restarting per link.
+
+- Identical corpus: one `clean-wikitext` pass over WikiText-103, reused byte for byte.
+- Identical token IDs: the baseline pins `--tokenizer-from` to the PSSA chain's
+  own checkpoint, so neither model sees a different vocabulary.
+- Identical optimization: 30,000-update cosine horizon, no warm-up restart, 512
+  supervised target tokens per update, seed 42.
+- PSSA: latent 256, recurrent state 16, 512 memory slots, key width 32, vocab 2,048.
+- Baseline: 1,541,120 parameters, 1 layer, width 256, 4 heads, FFN 448, vocab 2,048.
+
+### Per-token learning curve
+
+End-of-link training cross-entropy:
+
+| Link | Tokens seen | PSSA | Transformer |
+| --- | --- | --- | --- |
+| ck01 | 200,000 | 5.733 | not recorded |
+| ck05 | 1,000,000 | 4.617 | not recorded |
+| ck10 | 2,000,000 | 4.447 | not recorded |
+| ck15 | 3,000,000 | 4.292 | not recorded |
+| ck20 | 4,000,000 | 4.185 | not recorded |
+| ck25 | 5,000,000 | 4.221 | not recorded |
+| ck30 | 6,000,000 | 4.070 | not recorded |
+| ck35 | 7,000,000 | 4.039 | not recorded |
+| ck37 | 7,400,000 | 3.960 | 4.465 |
+| ck44 | 8,800,000 | 4.004 | 4.480 |
+| ck48 | 9,600,000 | 3.937 | 4.415 |
+| ck52 | 10,400,000 | 3.846 | 4.344 |
+| ck56 | 11,200,000 | 3.887 | 4.375 |
+| ck60 | 12,000,000 | 3.972 | 4.418 |
+| ck64 | 12,800,000 | 3.982 | 4.428 |
+
+The baseline's first session was cut at link 43 by the notebook session limit
+and its loss CSV did not survive, so links 1 to 36 and 38 to 43 have no recorded
+value; link 37 comes from the live run log. The chain resumed from `ck43` in a
+second session and finished all 64 links.
+
+### Throughput is not hardware-matched
+
+PSSA trained on a Kaggle T4 at roughly 900 tokens/second. The baseline is
+CPU-only, because `train-transformer` has no GPU path, and held 212
+tokens/second. Those two numbers say nothing about the architectures. On the
+same CPU-only Kaggle hardware the batched PSSA path measures 375 tokens/second
+against the baseline's 212, and the loss comparison above is unaffected either
+way, since it is matched on tokens and updates rather than on time.
+
+### What these numbers are, and are not
+
+The losses are end-of-link training cross-entropy on the stream being fit, not
+held-out evaluation. For a held-out comparison on an unseen slice, use the
+`compare` command described in [docs/COMPARISON.md](docs/COMPARISON.md).
+Generation quality at this scale is poor for both models: PSSA emits "a barget
+of the Prian Academy", the baseline "a material circulation of the United
+States".
+
+Two experiments are not yet measured: retention of earlier skills after a
+corpus switch, and whether ablating the 512 memory slots changes loss.
+
+### Reproducing
+
+```bash
+bash kaggle/kaggle_continue.sh              # the PSSA chain
+bash kaggle/kaggle_transformer_baseline.sh  # the parameter-matched baseline
+```
+
+Both read `TOTAL`, `WINDOW` and `FRESH` from the environment and write
+`--loss-csv`, so the curve survives a cut session.
+
 ## Project Layout
 
 | Path | Responsibility |
