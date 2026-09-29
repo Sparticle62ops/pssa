@@ -45,6 +45,7 @@ struct Lane {
     scan_a: Vec<f32>,
     scan_b: Vec<f32>,
     y: Vec<f32>,
+    gh: Vec<f32>,
     ga: Vec<f32>,
     ga_tokens: Vec<f32>,
     gd: Vec<f32>,
@@ -140,6 +141,7 @@ impl SequenceBatch {
                 scan_a: vec![0.0; scan_len * state_width],
                 scan_b: vec![0.0; scan_len * state_width],
                 y: vec![0.0; l * d],
+                gh: vec![0.0; d * s],
                 ga: vec![0.0; d * s],
                 ga_tokens: vec![0.0; l * state_width],
                 gd: vec![0.0; l * d],
@@ -189,6 +191,20 @@ impl SequenceBatch {
             );
         }
         Ok(())
+    }
+
+    /// A lane recurrence is already serial within each document. Only wake
+    /// Rayon when there are multiple active lanes and enough aggregate state
+    /// work to keep the workers busy; short batches stay entirely synchronous.
+    fn parallel_lanes(&self, m: &PSSALayerV2) -> bool {
+        let active = self.lanes.iter().filter(|lane| lane.len > 0).count();
+        active > 1
+            && self
+                .tokens
+                .saturating_mul(m.cfg.d_latent)
+                .saturating_mul(m.cfg.d_state)
+                >= 1_048_576
+            && rayon::current_num_threads() > 1
     }
 
     pub fn forward(
@@ -249,10 +265,19 @@ impl SequenceBatch {
         stages::stage_embed_norm(m, self.tokens);
         stages::stage_projections(m, self.tokens);
         m.refresh_ssm_rates();
-        self.lanes
-            .par_iter_mut()
-            .filter(|lane| lane.len > 0)
-            .for_each(|lane| lane.forward(m));
+        if self.parallel_lanes(m) {
+            m.scan_executor.run(|| {
+                self.lanes
+                    .par_iter_mut()
+                    .filter(|lane| lane.len > 0)
+                    .for_each(|lane| lane.forward(m));
+            });
+        } else {
+            self.lanes
+                .iter_mut()
+                .filter(|lane| lane.len > 0)
+                .for_each(|lane| lane.forward(m));
+        }
         for lane in self.lanes.iter().filter(|lane| lane.len > 0) {
             let start = lane.offset * m.cfg.d_latent;
             m.block.tape.y_ssm[start..start + lane.len * m.cfg.d_latent]
@@ -287,10 +312,19 @@ impl SequenceBatch {
         stages::bwd_stage_adapter_down(m, n);
         stages::bwd_stage_memory(m, n);
         m.refresh_ssm_rates();
-        self.lanes
-            .par_iter_mut()
-            .filter(|lane| lane.len > 0)
-            .for_each(|lane| lane.backward(m));
+        if self.parallel_lanes(m) {
+            m.scan_executor.run(|| {
+                self.lanes
+                    .par_iter_mut()
+                    .filter(|lane| lane.len > 0)
+                    .for_each(|lane| lane.backward(m));
+            });
+        } else {
+            self.lanes
+                .iter_mut()
+                .filter(|lane| lane.len > 0)
+                .for_each(|lane| lane.backward(m));
+        }
         let d = m.cfg.d_latent;
         let s = m.cfg.d_state;
         for lane in self.lanes.iter().filter(|lane| lane.len > 0) {
@@ -433,7 +467,48 @@ fn copy_carry_to_model(carry: &[f32], m: &mut PSSALayerV2) {
 }
 
 impl Lane {
+    /// Ordered lane recurrence for short sequences. The packed dense stages
+    /// still run as usual; only the scan itself stays serial when its tree
+    /// would cost more than the recurrence it replaces.
+    fn forward_sequential(&mut self, m: &PSSALayerV2) {
+        let d = m.cfg.d_latent;
+        let s = m.cfg.d_state;
+        let hs = d * s;
+        self.h[..hs].copy_from_slice(&self.carry);
+        for t in 0..self.len {
+            let row = self.offset + t;
+            for i in 0..d {
+                let delta = m.tape.delta[row * d + i];
+                let mut y = 0.0;
+                for j in 0..s {
+                    let idx = i * s + j;
+                    let a = (delta * m.ssm_rates[idx]).exp();
+                    self.bar_a[t * hs + idx] = a;
+                    let h = a * self.h[t * hs + idx]
+                        + (delta * m.tape.b_proj[row * s + j]) * m.tape.x_norm[row * d + i];
+                    self.h[(t + 1) * hs + idx] = h;
+                    y += h * m.tape.c_proj[row * s + j];
+                }
+                self.y[t * d + i] = y;
+            }
+        }
+        self.carry
+            .copy_from_slice(&self.h[self.len * hs..(self.len + 1) * hs]);
+    }
+
     fn forward(&mut self, m: &PSSALayerV2) {
+        let d = m.cfg.d_latent;
+        let s = m.cfg.d_state;
+        let hs = d * s;
+        let l = self.len;
+        if !stages::parallel_scan_enabled(l, hs) {
+            self.forward_sequential(m);
+            return;
+        }
+        m.scan_executor.run(|| self.forward_parallel(m));
+    }
+
+    fn forward_parallel(&mut self, m: &PSSALayerV2) {
         let d = m.cfg.d_latent;
         let s = m.cfg.d_state;
         let hs = d * s;
@@ -488,7 +563,54 @@ impl Lane {
             .copy_from_slice(&self.h[l * hs..(l + 1) * hs]);
     }
 
+    fn backward_sequential(&mut self, m: &PSSALayerV2) {
+        let d = m.cfg.d_latent;
+        let s = m.cfg.d_state;
+        let hs = d * s;
+        let scale = 1.0 / (s as f32).sqrt();
+        self.gh.fill(0.0);
+        self.ga.fill(0.0);
+        self.gd[..self.len * d].fill(0.0);
+        self.gb[..self.len * s].fill(0.0);
+        self.gc[..self.len * s].fill(0.0);
+        self.gx[..self.len * d].fill(0.0);
+        for t in (0..self.len).rev() {
+            let row = self.offset + t;
+            for i in 0..d {
+                let gy = m.bwd_g_zraw[row * d + i] * scale + m.bwd_g_ysm[row * d + i];
+                let delta = m.tape.delta[row * d + i];
+                let x = m.tape.x_norm[row * d + i];
+                for j in 0..s {
+                    let idx = i * s + j;
+                    let a = self.bar_a[t * hs + idx];
+                    let b = m.tape.b_proj[row * s + j];
+                    let prev = self.h[t * hs + idx];
+                    let gh = gy * m.tape.c_proj[row * s + j] + self.gh[idx];
+                    self.gc[t * s + j] += gy * self.h[(t + 1) * hs + idx];
+                    self.gh[idx] = gh * a;
+                    self.ga[idx] += gh * (delta * a) * prev * m.ssm_rate_derivatives[idx];
+                    self.gd[t * d + i] += gh * (m.ssm_rates[idx] * a * prev + b * x);
+                    self.gb[t * s + j] += gh * (delta * x);
+                    self.gx[t * d + i] += gh * (delta * b);
+                }
+                self.gd[t * d + i] *= sigmoid(m.tape.delta_raw[row * d + i]);
+            }
+        }
+    }
+
     fn backward(&mut self, m: &PSSALayerV2) {
+        let d = m.cfg.d_latent;
+        let s = m.cfg.d_state;
+        let hs = d * s;
+        let l = self.len;
+        if !stages::parallel_scan_enabled(l, hs) {
+            self.backward_sequential(m);
+            return;
+        }
+        m.scan_executor.run(|| self.backward_parallel(m));
+    }
+
+    fn backward_parallel(&mut self, m: &PSSALayerV2) {
         let d = m.cfg.d_latent;
         let s = m.cfg.d_state;
         let hs = d * s;

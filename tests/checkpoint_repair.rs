@@ -761,6 +761,7 @@ fn actual_numeric_storage(m: &PSSALayerV2) -> usize {
         cfg: _,
         step_counter: _,
         device: _,
+        scan_executor: _, // Runtime scheduler, no numeric/checkpoint storage.
         rng: _,
         vocabulary: _,
         tokenizer_json: _,

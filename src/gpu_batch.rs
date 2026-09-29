@@ -30,6 +30,16 @@ fn parallel_backward(tokens: usize, rows: usize, cols: usize) -> bool {
     blocked_backward(tokens, rows, cols) && rayon::current_num_threads() > 1
 }
 
+/// The tree scan has more arithmetic and synchronization than the sequential
+/// recurrence at the short chunk lengths used by the trainer. Keep that fast
+/// path allocation-free and serial; only enable the scan once there is enough
+/// time parallelism to amortize the tree and rayon scheduling overhead.
+const PARALLEL_SCAN_MIN_LEN: usize = 256;
+
+pub(crate) fn parallel_scan_enabled(len: usize, _stride: usize) -> bool {
+    len >= PARALLEL_SCAN_MIN_LEN && rayon::current_num_threads() > 1
+}
+
 /// Compose two diagonal affine maps. `first` is applied before `second`:
 ///
 ///     x -> first_a*x + first_b -> second_a*x + second_b
@@ -198,35 +208,44 @@ fn batched_matvec_dev(gpu: Option<&crate::backend::GpuDispatch>, w: &[f32], rows
     }
 }
 
-/// Device-aware row-major C(M,N) = A(M,K) * B(K,N).
+/// Device-aware row-major C(M,N) = A(M,K) * B(K,N), reusing model scratch.
 #[inline]
-fn gemm_nn_dev(
+fn gemm_nn_dev_into(
     gpu: Option<&crate::backend::GpuDispatch>,
     a: &[f32],
     b: &[f32],
     m: usize,
     k: usize,
     n: usize,
-) -> Vec<f32> {
+    out: &mut [f32],
+) {
     match gpu {
-        Some(ctx) => ctx.gemm_nn(a, b, m, k, n),
-        None => crate::backend::gemm_nn_cpu(a, b, m, k, n),
+        Some(ctx) => ctx
+            .gemm_nn_into(a, b, m, k, n, out)
+            .expect("validated model GEMM dimensions"),
+        None => crate::backend::gemm_nn_cpu_into(a, b, m, k, n, out)
+            .expect("validated model GEMM dimensions"),
     }
 }
 
-/// Device-aware row-major C(K,N) = A(M,K)^T * B(M,N).
+/// Device-aware row-major C(K,N) = A(M,K)^T * B(M,N), accumulated into an
+/// existing gradient so optimizer-group accumulation remains intact.
 #[inline]
-fn gemm_tn_dev(
+fn gemm_tn_dev_accumulate(
     gpu: Option<&crate::backend::GpuDispatch>,
     a: &[f32],
     b: &[f32],
     m: usize,
     k: usize,
     n: usize,
-) -> Vec<f32> {
+    out: &mut [f32],
+) {
     match gpu {
-        Some(ctx) => ctx.gemm_tn(a, b, m, k, n),
-        None => crate::backend::gemm_tn_cpu(a, b, m, k, n),
+        Some(ctx) => ctx
+            .gemm_tn_accumulate_into(a, b, m, k, n, out)
+            .expect("validated model GEMM dimensions"),
+        None => crate::backend::gemm_tn_cpu_accumulate_into(a, b, m, k, n, out)
+            .expect("validated model GEMM dimensions"),
     }
 }
 
@@ -327,17 +346,69 @@ pub fn stage_projections(m: &mut PSSALayerV2, seq_len: usize) {
     batched_matvec(&m.w_c.data, d_s, d_m, xn, l, &mut m.tape.c_proj[..l * d_s]);
 }
 
+/// The original ordered recurrence is the fast path for short chunks. It is
+/// deliberately separate from the scalar PSSA reference implementation: the
+/// staged path still computes the same tape fields, but avoids a tree, rayon
+/// jobs, and their per-dispatch bookkeeping when parallelism cannot pay back.
+#[inline]
+fn stage_ssm_scan_sequential(m: &mut PSSALayerV2, seq_len: usize) {
+    let m = &mut m.block;
+    m.refresh_ssm_rates();
+    let d_m = m.cfg.d_latent;
+    let d_s = m.cfg.d_state;
+    for t in 0..seq_len {
+        let del_off = t * d_m;
+        let b_off = t * d_s;
+        let c_off = t * d_s;
+        let h_prev_off = t * (d_m * d_s);
+        let h_next_off = (t + 1) * (d_m * d_s);
+        let ssm_off = t * (d_m * d_s);
+        let y_off = t * d_m;
+        let xn_off = t * d_m;
+
+        for i in 0..d_m {
+            let d_i = m.tape.delta[del_off + i];
+            let mut y_i = 0.0f32;
+            for j in 0..d_s {
+                let idx = i * d_s + j;
+                let bar_a = (d_i * m.ssm_rates[idx]).exp();
+                let bar_b = d_i * m.tape.b_proj[b_off + j];
+                m.tape.bar_a[ssm_off + idx] = bar_a;
+                m.tape.bar_b[ssm_off + idx] = bar_b;
+                let h_val = bar_a * m.tape.h_states[h_prev_off + idx]
+                    + bar_b * m.tape.x_norm[xn_off + i];
+                m.tape.h_states[h_next_off + idx] = h_val;
+                y_i += h_val * m.tape.c_proj[c_off + j];
+            }
+            m.tape.y_ssm[y_off + i] = y_i;
+        }
+    }
+}
+
 /// Stage 3: multi-channel SSM recurrent scan. Each channel is a diagonal
 /// affine recurrence, so its `(bar_a, bar_b*x)` maps compose associatively.
 /// The Blelloch tree parallelizes time while retaining the local maps in the
 /// tape for the unchanged backward oracle.
 #[inline]
 pub fn stage_ssm_scan(m: &mut PSSALayerV2, seq_len: usize) {
-    let m = &mut m.block;
-    m.refresh_ssm_rates();
     let d_m = m.cfg.d_latent;
     let d_s = m.cfg.d_state;
     let stride = d_m * d_s;
+    if !parallel_scan_enabled(seq_len, stride) {
+        stage_ssm_scan_sequential(m, seq_len);
+        return;
+    }
+    let executor = m.scan_executor.clone();
+    executor.run(|| stage_ssm_scan_parallel(m, seq_len));
+}
+
+#[inline]
+fn stage_ssm_scan_parallel(m: &mut PSSALayerV2, seq_len: usize) {
+    let d_m = m.cfg.d_latent;
+    let d_s = m.cfg.d_state;
+    let stride = d_m * d_s;
+    let m = &mut m.block;
+    m.refresh_ssm_rates();
 
     // Build the independent per-token affine maps in parallel. The scan is
     // below; keeping bar_a/bar_b local preserves the tape contract for
@@ -689,21 +760,26 @@ pub fn bwd_stage_logits_blocked(
     }
 
     // grad_z_final [L, d_m] = G [L, d_v] * W [d_v, d_m]
-    let g_zfinal = gemm_nn_dev(gpu, &g_logit, &unembed_w.data, seq_len, d_v, d_m);
-    m.bwd_g_zfinal[..seq_len * d_m].copy_from_slice(&g_zfinal);
+    gemm_nn_dev_into(
+        gpu,
+        &g_logit,
+        &unembed_w.data,
+        seq_len,
+        d_v,
+        d_m,
+        &mut m.bwd_g_zfinal[..seq_len * d_m],
+    );
 
     // unembed grad [d_v, d_m] += G^T [d_v, L] * Z [L, d_m]
-    let g_w = gemm_tn_dev(
+    gemm_tn_dev_accumulate(
         gpu,
         &g_logit,
         &m.tape.z_final[..seq_len * d_m],
         seq_len,
         d_v,
         d_m,
+        &mut unembed_w.grad,
     );
-    for (dst, src) in unembed_w.grad.iter_mut().zip(g_w.iter()) {
-        *dst += *src;
-    }
 }
 
 /// Fused per-token reference form, kept as the CPU path and the twin.
@@ -783,32 +859,58 @@ pub fn bwd_stage_mlp_blocked(
     }
 
     // g_mlp_act [L, d_mlp] = gz [L, d_m] * mlp_w2 [d_m, d_mlp]
-    let g_mlp_act = gemm_nn_dev(gpu, &gz, &m.mlp_w2.data, l, d_m, d_mlp);
+    gemm_nn_dev_into(
+        gpu,
+        &gz,
+        &m.mlp_w2.data,
+        l,
+        d_m,
+        d_mlp,
+        g_hidden,
+    );
 
     // mlp_w2 grad [d_m, d_mlp] += gz^T * mlp_act [L, d_mlp]
-    let gw2 = gemm_tn_dev(gpu, &gz, &m.tape.mlp_act[..l * d_mlp], l, d_m, d_mlp);
-    for (dst, src) in m.mlp_w2.grad.iter_mut().zip(gw2.iter()) {
-        *dst += *src;
-    }
+    gemm_tn_dev_accumulate(
+        gpu,
+        &gz,
+        &m.tape.mlp_act[..l * d_mlp],
+        l,
+        d_m,
+        d_mlp,
+        &mut m.mlp_w2.grad,
+    );
 
     // SiLU derivative, elementwise over the chunk.
     for i in 0..l * d_mlp {
         let h = m.tape.mlp_hidden[i];
         let sig_h = sigmoid(h);
-        g_hidden[i] = g_mlp_act[i] * (sig_h * (1.0 + h * (1.0 - sig_h)));
+        g_hidden[i] *= sig_h * (1.0 + h * (1.0 - sig_h));
     }
 
     // g_zraw_mlp [L, d_m] = g_hidden [L, d_mlp] * mlp_w1 [d_mlp, d_m]
-    let g_zraw_mlp = gemm_nn_dev(gpu, &g_hidden, &m.mlp_w1.data, l, d_mlp, d_m);
+    gemm_nn_dev_into(
+        gpu,
+        &g_hidden,
+        &m.mlp_w1.data,
+        l,
+        d_mlp,
+        d_m,
+        &mut m.bwd_g_zraw[..l * d_m],
+    );
 
     // mlp_w1 grad [d_mlp, d_m] += g_hidden^T * z_raw [L, d_m]
-    let gw1 = gemm_tn_dev(gpu, &g_hidden, &m.tape.z_raw[..l * d_m], l, d_mlp, d_m);
-    for (dst, src) in m.mlp_w1.grad.iter_mut().zip(gw1.iter()) {
-        *dst += *src;
-    }
+    gemm_tn_dev_accumulate(
+        gpu,
+        &g_hidden,
+        &m.tape.z_raw[..l * d_m],
+        l,
+        d_mlp,
+        d_m,
+        &mut m.mlp_w1.grad,
+    );
 
     for i in 0..l * d_m {
-        m.bwd_g_zraw[i] = m.bwd_g_zfinal[i] + g_zraw_mlp[i];
+        m.bwd_g_zraw[i] += m.bwd_g_zfinal[i];
     }
 }
 
@@ -1040,19 +1142,127 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
     }
 }
 
-/// Backward Stage 3: reverse affine scan for the SSM adjoint, followed by
-/// token-local derivatives and the projection/RMSNorm chains. The memory bank
-/// query adjoint has already been computed by `bwd_stage_memory`; it is not part
-/// of this associative recurrence.
+/// Ordered SSM adjoint for short chunks. This mirrors the old staged CPU
+/// recurrence and uses only model-owned scalar scratch, avoiding rayon's job
+/// setup on the path where a tree scan would be work-inefficient.
 #[inline]
-pub fn bwd_stage_ssm(m: &mut PSSALayerV2, seq_len: usize) {
+fn bwd_stage_ssm_sequential(m: &mut PSSALayerV2, seq_len: usize) {
     let pending_step = m.step_counter + 1;
     let (embed_w, embed_row_marks, m) =
         (&mut m.embed_w, &mut m.embed_row_marks, &mut m.block);
     m.refresh_ssm_rates();
     let d_m = m.cfg.d_latent;
     let d_s = m.cfg.d_state;
+    let l = seq_len;
+    let ssm_scale = 1.0 / (d_s as f32).sqrt();
+
+    m.grad_h_next.fill(0.0);
+    for t in 0..l {
+        embed_row_marks[m.tape.x_ids[t]] = pending_step;
+    }
+
+    for t in (0..l).rev() {
+        let x_id = m.tape.x_ids[t];
+        let del_off = t * d_m;
+        let m_off = t * d_m;
+        m.buf_g_delta.fill(0.0);
+        m.buf_g_b_proj.fill(0.0);
+        m.buf_g_c_proj.fill(0.0);
+        m.buf_g_h_prev.fill(0.0);
+
+        for i in 0..d_m {
+            let gz_i = m.bwd_g_zraw[m_off + i];
+            let g_y_i = gz_i * ssm_scale + m.bwd_g_ysm[m_off + i];
+            let d_i = m.tape.delta[del_off + i];
+            let xn_i = m.tape.x_norm[m_off + i];
+            for j in 0..d_s {
+                let idx = i * d_s + j;
+                let h_next = m.tape.h_states[(t + 1) * (d_m * d_s) + idx];
+                let c_val = m.tape.c_proj[t * d_s + j];
+                let bar_a = m.tape.bar_a[t * (d_m * d_s) + idx];
+                let a_physical = m.ssm_rates[idx];
+                let b_val = m.tape.b_proj[t * d_s + j];
+                let g_h_total = g_y_i * c_val + m.grad_h_next[idx];
+                m.buf_g_c_proj[j] += g_y_i * h_next;
+                m.buf_g_h_prev[idx] += g_h_total * bar_a;
+                m.a_mat.grad[idx] += g_h_total
+                    * (d_i * bar_a)
+                    * m.tape.h_states[t * (d_m * d_s) + idx]
+                    * m.ssm_rate_derivatives[idx];
+                m.buf_g_delta[i] += g_h_total
+                    * (a_physical * bar_a * m.tape.h_states[t * (d_m * d_s) + idx]
+                        + b_val * xn_i);
+                m.buf_g_b_proj[j] += g_h_total * (d_i * xn_i);
+                m.bwd_g_xnorm[m_off + i] +=
+                    g_h_total * m.tape.bar_b[t * (d_m * d_s) + idx];
+            }
+        }
+        m.grad_h_next.copy_from_slice(&m.buf_g_h_prev);
+
+        for i in 0..d_m {
+            let gd_i = m.buf_g_delta[i] * sigmoid(m.tape.delta_raw[del_off + i]);
+            let row_off = i * d_m;
+            for j in 0..d_m {
+                m.bwd_g_xnorm[m_off + j] += gd_i * m.w_delta.data[row_off + j];
+                m.w_delta.grad[row_off + j] += gd_i * m.tape.x_norm[m_off + j];
+            }
+        }
+        for j in 0..d_s {
+            let gb_j = m.buf_g_b_proj[j];
+            let gc_j = m.buf_g_c_proj[j];
+            let row_off = j * d_m;
+            for k in 0..d_m {
+                m.bwd_g_xnorm[m_off + k] +=
+                    gb_j * m.w_b.data[row_off + k] + gc_j * m.w_c.data[row_off + k];
+                m.w_b.grad[row_off + k] += gb_j * m.tape.x_norm[m_off + k];
+                m.w_c.grad[row_off + k] += gc_j * m.tape.x_norm[m_off + k];
+            }
+        }
+
+        let inv_rms = m.tape.inv_rms[t];
+        let e_t = &embed_w.data[x_id * d_m..(x_id + 1) * d_m];
+        let mut dot_gx_e = 0.0f32;
+        for i in 0..d_m {
+            let gx_i = m.bwd_g_xnorm[m_off + i];
+            m.norm_beta.grad[i] += gx_i;
+            m.norm_gamma.grad[i] += gx_i * (e_t[i] * inv_rms);
+            dot_gx_e += gx_i * m.norm_gamma.data[i] * e_t[i];
+        }
+        let emb_row_off = x_id * d_m;
+        for i in 0..d_m {
+            let g_unnorm = m.bwd_g_xnorm[m_off + i] * m.norm_gamma.data[i];
+            embed_w.grad[emb_row_off + i] += inv_rms
+                * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / d_m as f32));
+        }
+    }
+}
+
+/// Backward Stage 3: reverse affine scan for the SSM adjoint, followed by
+/// token-local derivatives and the projection/RMSNorm chains. The memory bank
+/// query adjoint has already been computed by `bwd_stage_memory`; it is not part
+/// of this associative recurrence.
+#[inline]
+pub fn bwd_stage_ssm(m: &mut PSSALayerV2, seq_len: usize) {
+    let d_m = m.cfg.d_latent;
+    let d_s = m.cfg.d_state;
     let stride = d_m * d_s;
+    if !parallel_scan_enabled(seq_len, stride) {
+        bwd_stage_ssm_sequential(m, seq_len);
+        return;
+    }
+    let executor = m.scan_executor.clone();
+    executor.run(|| bwd_stage_ssm_parallel(m, seq_len));
+}
+
+#[inline]
+fn bwd_stage_ssm_parallel(m: &mut PSSALayerV2, seq_len: usize) {
+    let d_m = m.cfg.d_latent;
+    let d_s = m.cfg.d_state;
+    let stride = d_m * d_s;
+    let pending_step = m.step_counter + 1;
+    let (embed_w, embed_row_marks, m) =
+        (&mut m.embed_w, &mut m.embed_row_marks, &mut m.block);
+    m.refresh_ssm_rates();
     let l = seq_len;
     let ssm_scale = 1.0 / (d_s as f32).sqrt();
 

@@ -760,6 +760,46 @@ pub fn gemm_cpu_into(
     Ok(())
 }
 
+/// Write row-major C(M,N) = A(M,K) * B(K,N) into caller-owned storage.
+pub fn gemm_nn_cpu_into(
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+) -> Result<(), String> {
+    let (_, _, c_len) = checked_gemm_sizes(m, n, k, 1, a.len(), b.len())
+        .map_err(|e| format!("CPU NN GEMM: {e}"))?;
+    if out.len() != c_len {
+        return Err("CPU NN GEMM output length mismatch".into());
+    }
+    out.fill(0.0);
+    let tile = |(i, dst): (usize, &mut [f32])| {
+        for kk in 0..k {
+            let b_row = &b[kk * n..(kk + 1) * n];
+            for (t, c_row) in dst.chunks_mut(n).enumerate() {
+                let av = a[(i * 4 + t) * k + kk];
+                if av == 0.0 {
+                    continue;
+                }
+                for (c, &b) in c_row.iter_mut().zip(b_row) {
+                    *c += av * b;
+                }
+            }
+        }
+    };
+    if c_len.saturating_mul(k) >= 1024 * 1024
+        && c_len / n >= 8
+        && rayon::current_num_threads() > 1
+    {
+        out.par_chunks_mut(4 * n).enumerate().for_each(tile);
+    } else {
+        out.chunks_mut(4 * n).enumerate().for_each(tile);
+    }
+    Ok(())
+}
+
 /// Row-major C(M,N) = A(M,K) * B(K,N). CPU twin for the backward-pass GEMMs.
 pub fn gemm_nn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     let Ok((_, _, c_len)) = checked_gemm_sizes(m, n, k, 1, a.len(), b.len()) else {
@@ -784,6 +824,45 @@ pub fn gemm_nn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f3
         c.chunks_mut(4 * n).enumerate().for_each(tile);
     }
     c
+}
+
+/// Accumulate row-major C(K,N) = A(M,K)^T * B(M,N) into caller-owned storage.
+pub fn gemm_tn_cpu_accumulate_into(
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+) -> Result<(), String> {
+    let (_, _, c_len) = checked_gemm_sizes(k, n, m, 1, a.len(), b.len())
+        .map_err(|e| format!("CPU TN GEMM: {e}"))?;
+    if out.len() != c_len {
+        return Err("CPU TN GEMM output length mismatch".into());
+    }
+    let tile = |(i, dst): (usize, &mut [f32])| {
+        for t in 0..m {
+            let b_row = &b[t * n..(t + 1) * n];
+            for (r, c_row) in dst.chunks_mut(n).enumerate() {
+                let av = a[t * k + i * 8 + r];
+                if av == 0.0 {
+                    continue;
+                }
+                for (c, &b) in c_row.iter_mut().zip(b_row) {
+                    *c += av * b;
+                }
+            }
+        }
+    };
+    if c_len.saturating_mul(m) >= 1024 * 1024
+        && c_len / n >= 8
+        && rayon::current_num_threads() > 1
+    {
+        out.par_chunks_mut(8 * n).enumerate().for_each(tile);
+    } else {
+        out.chunks_mut(8 * n).enumerate().for_each(tile);
+    }
+    Ok(())
 }
 
 /// Row-major C(K,N) = A(M,K)^T * B(M,N). CPU twin for the weight-gradient GEMMs.
@@ -936,6 +1015,40 @@ impl GpuDispatch {
             GpuDispatch::Wgpu(_) => gemm_tn_cpu(a, b, m, k, n),
             #[cfg(feature = "cuda")]
             GpuDispatch::Cuda(ctx) => ctx.gemm_tn(a, b, m, k, n),
+        }
+    }
+
+    /// Row-major C(M,N) = A(M,K) * B(K,N), reusing caller-owned output.
+    pub fn gemm_nn_into(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        match self {
+            GpuDispatch::Wgpu(_) => gemm_nn_cpu_into(a, b, m, k, n, out),
+            #[cfg(feature = "cuda")]
+            GpuDispatch::Cuda(ctx) => ctx.gemm_nn_into(a, b, m, k, n, out),
+        }
+    }
+
+    /// Accumulate row-major C(K,N) = A(M,K)^T * B(M,N) into caller-owned output.
+    pub fn gemm_tn_accumulate_into(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        match self {
+            GpuDispatch::Wgpu(_) => gemm_tn_cpu_accumulate_into(a, b, m, k, n, out),
+            #[cfg(feature = "cuda")]
+            GpuDispatch::Cuda(ctx) => ctx.gemm_tn_accumulate_into(a, b, m, k, n, out),
         }
     }
 
