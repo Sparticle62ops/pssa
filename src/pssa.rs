@@ -453,6 +453,17 @@ pub struct PSSAContinuousBlockV2 {
     pub bwd_g_logits: Vec<f32>,
     pub bwd_g_mlp: Vec<f32>,
 
+    // Runtime-only affine scan workspaces. The scan arrays are padded to the
+    // next power of two for the work-efficient Blelloch tree; they are not
+    // checkpoint state. The per-token adjoints remain separate so the
+    // reverse scan can be followed by parallel local derivative work.
+    pub ssm_scan_a: Vec<f32>,
+    pub ssm_scan_b: Vec<f32>,
+    pub bwd_ssm_delta: Vec<f32>,
+    pub bwd_ssm_b: Vec<f32>,
+    pub bwd_ssm_c: Vec<f32>,
+    pub bwd_ssm_a: Vec<f32>,
+
     // Inference Scratch Buffers
     pub inf_x_norm: Vec<f32>,
     pub inf_delta: Vec<f32>,
@@ -484,6 +495,8 @@ impl PSSAContinuousBlockV2 {
         let d_mlp = d_m * 2;
         let mem_cap = cfg.mem_capacity;
         let chunk_len = cfg.chunk_len;
+        let scan_len = chunk_len.next_power_of_two();
+        let state_width = d_m * d_s;
         let rank = 16;
 
         let norm_gamma = ParamVector::new(d_m, 1.0);
@@ -574,6 +587,12 @@ impl PSSAContinuousBlockV2 {
             bwd_g_ysm: vec![0.0; chunk_len * d_m],
             bwd_g_logits: vec![0.0; chunk_len * d_v],
             bwd_g_mlp: vec![0.0; chunk_len * d_mlp],
+            ssm_scan_a: vec![0.0; scan_len * state_width],
+            ssm_scan_b: vec![0.0; scan_len * state_width],
+            bwd_ssm_delta: vec![0.0; chunk_len * d_m],
+            bwd_ssm_b: vec![0.0; chunk_len * d_s],
+            bwd_ssm_c: vec![0.0; chunk_len * d_s],
+            bwd_ssm_a: vec![0.0; chunk_len * state_width],
             inf_x_norm: vec![0.0; d_m],
             inf_delta: vec![0.0; d_m],
             inf_b: vec![0.0; d_s],

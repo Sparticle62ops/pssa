@@ -302,6 +302,9 @@ pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
     let lv = checked_mul(l, v, "chunk * vocab")?;
     let lr = checked_mul(l, 16, "chunk * rank")?;
     let lms = checked_mul(l, ms, "chunk * latent * state")?;
+    let scan_len = l.checked_next_power_of_two()
+        .ok_or_else(|| invalid("affine scan padding overflow; reduce chunk length"))?;
+    let scan_ms = checked_mul(scan_len, ms, "padded scan * latent * state")?;
     let l_two_m = checked_mul(l, two_m, "chunk * MLP width")?;
     let mut f32_count = 0usize;
     let mut usize_count = 0usize;
@@ -392,6 +395,12 @@ pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
         ("bwd_g_xnorm", lm),
         ("bwd_g_ysm", lm),
         ("bwd_g_mlp", l_two_m),
+        ("ssm_scan_a", scan_ms),
+        ("ssm_scan_b", scan_ms),
+        ("bwd_ssm_delta", lm),
+        ("bwd_ssm_b", ls),
+        ("bwd_ssm_c", ls),
+        ("bwd_ssm_a", lms),
         ("inf_x_norm", m),
         ("inf_delta", m),
         ("inf_b", s),
