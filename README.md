@@ -24,7 +24,7 @@ around 2M tokens in.
 
 The two curves never cross, and they never touch:
 
-![Overlap region, links 43 to 64](docs/img/loss-curve-zoom.png)
+![Overlap region, second half of training](docs/img/loss-curve-zoom.png)
 
 ### It holds on text neither model has seen
 
@@ -177,14 +177,14 @@ End-of-link training cross-entropy:
 
 | Link | Tokens seen | PSSA | Transformer |
 | --- | --- | --- | --- |
-| ck01 | 200,000 | 5.733 | not recorded |
-| ck05 | 1,000,000 | 4.617 | not recorded |
-| ck10 | 2,000,000 | 4.447 | not recorded |
-| ck15 | 3,000,000 | 4.292 | not recorded |
-| ck20 | 4,000,000 | 4.185 | not recorded |
-| ck25 | 5,000,000 | 4.221 | not recorded |
-| ck30 | 6,000,000 | 4.070 | not recorded |
-| ck35 | 7,000,000 | 4.039 | not recorded |
+| ck01 | 200,000 | 5.733 | 6.461 |
+| ck05 | 1,000,000 | 4.617 | 5.467 |
+| ck10 | 2,000,000 | 4.447 | 5.082 |
+| ck15 | 3,000,000 | 4.292 | 4.858 |
+| ck20 | 4,000,000 | 4.185 | 4.704 |
+| ck25 | 5,000,000 | 4.221 | 4.704 |
+| ck30 | 6,000,000 | 4.070 | 4.561 |
+| ck35 | 7,000,000 | 4.039 | 4.523 |
 | ck37 | 7,400,000 | 3.960 | 4.465 |
 | ck44 | 8,800,000 | 4.004 | 4.480 |
 | ck48 | 9,600,000 | 3.937 | 4.415 |
@@ -194,9 +194,9 @@ End-of-link training cross-entropy:
 | ck64 | 12,800,000 | 3.982 | 4.428 |
 
 The baseline's first session was cut at link 43 by the notebook session limit
-and its loss CSV did not survive, so links 1 to 36 and 38 to 43 have no recorded
-value; link 37 comes from the live run log. The chain resumed from `ck43` in a
-second session and finished all 64 links.
+and its loss CSV did not survive, so links 1 to 43 are read back from that
+session's own run log instead. The chain resumed from `ck43` in a second session
+and finished all 64 links, and both curves above now cover the full run.
 
 ### Throughput is not hardware-matched
 
