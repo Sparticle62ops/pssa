@@ -32,7 +32,12 @@ Training loss only says a model fit the stream it was fed. So both checkpoints
 were scored on a 198,939-token slice cut from a part of the corpus neither run
 ever touched:
 
-![Held-out perplexity](docs/img/heldout.png)
+![Held-out loss per checkpoint on unseen text](docs/img/heldout.png)
+
+Every checkpoint of both runs, 64 PSSA links and 43 transformer links, scored on
+a bounded 9,934-token window of that unseen slice. The curves never cross: PSSA
+is ahead from the first link and finishes 0.51 nats lower. The table below is the
+final checkpoint of each run on the full slice.
 
 | Held-out slice, 198,939 unseen tokens | PSSA | Transformer |
 | --- | --- | --- |
