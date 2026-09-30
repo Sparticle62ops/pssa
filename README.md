@@ -153,16 +153,20 @@ Two models, same corpus, same tokenizer, same optimizer schedule, same seed,
 same number of parameters. One is PSSA, one is a standard transformer. Over
 12.7M tokens of cleaned WikiText-103:
 
-![PSSA vs parameter-matched transformer training loss](docs/img/loss-curve.png)
+![PSSA and the matched transformer on the same schedule](docs/img/pssa-vs-transformer-training.png)
 
 PSSA finished at **3.98** training cross-entropy, the transformer at **4.43**.
 That is a gap of **0.45 nats**, perplexity 53.7 against 83.7. The transformer
 spent its entire 12.7M-token budget to reach a loss PSSA had already passed
 around 2M tokens in.
 
-The two curves never cross, and they never touch:
+The two curves never cross, and they never touch. Here is the PSSA run on its
+own, every logged update across the chain:
 
-![Overlap region, second half of training](docs/img/loss-curve-zoom.png)
+![Held-out loss across the chain](docs/img/pssa-loss-chain.png)
+
+29,243 logged updates, 7.63 down to 3.98, with a 41-point moving average drawn
+over the raw ticks.
 
 ### It holds on text neither model has seen
 
@@ -187,6 +191,17 @@ The held-out gap, 0.43 nats, is essentially the training gap. PSSA is not
 memorizing harder, it is generalizing better.
 
 ### And it is much faster to run
+
+![Throughput on the same CPU](docs/img/pssa-throughput.png)
+
+Fixed work on the same 2 vCPU machine, 199,059 tokens at 512 tokens per update:
+1,716 tokens per second against 415, so 4.13x. Both models were timed on CPU.
+
+![Learning-rate sweep](docs/img/pssa-lr-sweep.png)
+
+Both architectures put their optimum at the same learning rate, 0.003, so
+neither run is winning on a tuning advantage. The sweep is a short probe on a
+120,000-token slice, a settings check rather than a final number.
 
 Generating 200 tokens on the same CPU, same prompt, same sampler:
 
