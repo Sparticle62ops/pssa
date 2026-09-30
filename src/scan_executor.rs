@@ -5,6 +5,7 @@
 //! pass through it, even after warmup. Keep one worker alive and hand it borrowed
 //! jobs through a reusable slot; nested parallel iterators use worker-local
 //! deques instead. No per-step heap closures or length-dependent storage.
+use rayon::prelude::*;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 /// All models use one handoff pool. Keeping the pool process-wide is important:
@@ -95,6 +96,15 @@ impl Worker {
         // that would make later scan lengths allocate under the hot-path
         // allocation contract.
         pool.broadcast(|_| {});
+        // A broadcast only touches the worker threads; it does not exercise
+        // the nested deque path used by the scan iterators. Warm that path
+        // with more jobs than the pool can hold before any caller can enable
+        // allocation tracking. The array is stack-owned and discarded here.
+        let mut warmup = [0u8; 4096];
+        pool.install(|| {
+            warmup.par_chunks_mut(1).for_each(|row| row[0] = 1);
+        });
+        std::hint::black_box(&mut warmup);
         let worker = shared.clone();
         // This is the only heap job submitted to this pool. Its lifetime covers
         // every scan step; the mutex/condvars and worker scratch never resize.
