@@ -3,7 +3,8 @@ use oxide_ai_pssa::dataset::{DatasetManager, Tokenizer};
 use oxide_ai_pssa::inference::{InferenceConfig, PSSAInferenceEngine};
 use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 use std::fs;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp(name: &str) -> std::path::PathBuf {
@@ -273,6 +274,39 @@ fn cli_errors_do_not_train_or_write_and_bad_numeric_exits_nonzero() {
     assert!(!excessive.status.success());
     assert!(String::from_utf8_lossy(&excessive.stderr).contains("at most"));
 }
+#[test]
+fn shipped_legacy_v5_chat_uses_checkpoint_vocabulary_with_or_without_data() {
+    let exe = env!("CARGO_BIN_EXE_oxide_ai_pssa");
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let model = manifest.join("data/model.pssa");
+    let data = manifest.join("data/downloaded.txt");
+    for with_data in [true, false] {
+        let mut command = Command::new(exe);
+        command
+            .args(["chat", "--model", model.to_str().unwrap(), "--temperature", "0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if with_data {
+            command.args(["--data", data.to_str().unwrap()]);
+        }
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"quantum mechanics\n/exit\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "with_data={with_data}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("interactive: /exit"));
+    }
+}
+
 #[test]
 fn process_train_save_then_generate_without_corpus() {
     let exe = env!("CARGO_BIN_EXE_oxide_ai_pssa");
