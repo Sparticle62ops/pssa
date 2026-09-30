@@ -10,3 +10,9 @@ data/downloaded.txt
 for.txt/.cargo/
 /.cargo/
 __agent__/
+
+# Agent working notes and internal handoffs
+AGENTS.md
+docs/HANDOFF-*
+docs/CONTINUATION-*
+docs/PROJECT-HANDOFF-*
