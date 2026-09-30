@@ -7,10 +7,13 @@
 //! deques instead. No per-step heap closures or length-dependent storage.
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-#[derive(Clone, Default)]
-pub struct ScanExecutor {
-    worker: Arc<OnceLock<Worker>>,
-}
+/// All models use one handoff pool. Keeping the pool process-wide is important:
+/// a model-local pool leaves each Rayon worker with its own lazily-created scan
+/// queue, so a second model can allocate again after allocation warmup.
+static GLOBAL_WORKER: OnceLock<Worker> = OnceLock::new();
+
+#[derive(Clone, Copy, Default)]
+pub struct ScanExecutor;
 
 impl ScanExecutor {
     pub(crate) fn run<F: FnOnce() + Send>(&self, f: F) {
@@ -20,7 +23,7 @@ impl ScanExecutor {
             f();
             return;
         }
-        let worker = self.worker.get_or_init(Worker::new);
+        let worker = GLOBAL_WORKER.get_or_init(Worker::new);
         // Only one caller may own the borrowed job slot until completion.
         let _caller = worker.caller.lock().unwrap();
         let mut job = (Some(f), None);
@@ -87,6 +90,11 @@ impl Worker {
             .num_threads(rayon::current_num_threads())
             .build()
             .expect("affine scan worker pool");
+        // Touch every worker before exposing the pool to scans. Rayon creates
+        // worker-local scheduler state lazily, and letting the first scan do
+        // that would make later scan lengths allocate under the hot-path
+        // allocation contract.
+        pool.broadcast(|_| {});
         let worker = shared.clone();
         // This is the only heap job submitted to this pool. Its lifetime covers
         // every scan step; the mutex/condvars and worker scratch never resize.
@@ -114,14 +122,5 @@ impl Worker {
             caller: Mutex::new(()),
             _pool: pool,
         }
-    }
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
-        // All run calls retain an executor handle, so no borrowed job remains.
-        let mut state = self.shared.state.lock().unwrap();
-        state.shutdown = true;
-        self.shared.wake.notify_one();
     }
 }
