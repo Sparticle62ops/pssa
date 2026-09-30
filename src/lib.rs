@@ -13,6 +13,7 @@ pub mod inference;
 pub mod linalg;
 pub mod gpu_batch;
 pub mod memory;
+pub mod feature_benchmark;
 pub mod pssa;
 pub mod sequence_batch;
 pub mod scan_executor;

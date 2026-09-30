@@ -235,4 +235,57 @@ impl HyperbolicEpisodicBankV2 {
         }
         min_dist
     }
+
+    /// Control read for feature benchmarks: cosine similarity in the stored
+    /// Euclidean coordinates. This is deliberately an opt-in helper; the
+    /// production PSSA path continues to use `retrieve_soft_into` above.
+    pub fn retrieve_soft_euclidean_into(
+        &self,
+        q: &[f32],
+        tau: f32,
+        out_val: &mut [f32],
+        out_weights: &mut [f32],
+    ) -> f32 {
+        assert_eq!(q.len(), self.dim_key);
+        assert_eq!(out_val.len(), self.dim_val);
+        assert!(out_weights.len() >= self.count);
+        assert!(tau.is_finite() && tau > 0.0);
+        if self.count == 0 {
+            out_val.fill(0.0);
+            out_weights.fill(0.0);
+            return 0.0;
+        }
+        let q_norm = q.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+        let mut max_distance = f32::NEG_INFINITY;
+        for idx in 0..self.count {
+            let off = idx * self.dim_key;
+            let (dot, k_norm_sq) = q.iter().enumerate().fold((0.0f64, 0.0f64), |(d, n), (j, x)| {
+                let k = self.keys[off + j] as f64;
+                (d + *x as f64 * k, n + k * k)
+            });
+            let cosine = if q_norm > 0.0 && k_norm_sq > 0.0 {
+                dot / (q_norm * k_norm_sq.sqrt())
+            } else {
+                0.0
+            };
+            let distance = (1.0 - cosine).clamp(0.0, 2.0) as f32;
+            out_weights[idx] = -distance;
+            max_distance = max_distance.max(-distance);
+        }
+        let mut sum = 0.0f32;
+        for weight in &mut out_weights[..self.count] {
+            *weight = ((*weight - max_distance) / tau).exp();
+            sum += *weight;
+        }
+        out_val.fill(0.0);
+        for idx in 0..self.count {
+            let weight = out_weights[idx] / sum;
+            out_weights[idx] = weight;
+            let off = idx * self.dim_val;
+            for j in 0..self.dim_val {
+                out_val[j] += weight * self.values[off + j];
+            }
+        }
+        -max_distance
+    }
 }
