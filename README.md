@@ -9,6 +9,17 @@ ML framework of any kind underneath it.
 At matched parameters and on the same corpus, it learns faster than a
 transformer and generates text about twelve times quicker on the same CPU.
 
+## Why Rust, and why that is not the point
+Not for speed points, and not because the language makes the architecture
+better. PSSA needed per-token weight updates, a memory bank written during the
+forward pass, and a scalar reference path that every batched kernel could be
+differentiated against. Expressing that inside an autograd framework meant
+fighting the framework at every step, so the linear algebra is written
+directly instead. That made the plastic parts straightforward and the
+gradients checkable against a reference to around 3e-8. The architecture is
+the claim here. The implementation language is a detail, and a Python port is
+welcome.
+
 ## How it differs from a transformer
 
 ![PSSA block compared with a transformer block, with the measured held-out results](docs/img/architecture.png)
@@ -18,6 +29,123 @@ grows with the square of the sequence length and the whole context is re-read at
 every step. PSSA carries one fixed-size state along the sequence in a single
 left-to-right pass, and looks things up in a memory bank instead of re-reading
 the context, so cost grows linearly with length.
+
+## The model
+
+![The PSSA layer, one token](docs/img/pssa-block.png)
+
+Every token goes through one PSSA layer: a selective state-space recurrence,
+a bounded read from an episodic memory bank in hyperbolic space, a learned gate
+that decides how much of that read reaches the residual stream, and a SiLU MLP.
+The defaults are `d_m = 256` channels, `d_s = 16` states per channel, and a
+rank-16 adapter.
+
+### The recurrence
+
+Write `x` for the layer-normalized token embedding. Three projections are read
+off the token itself, which is what makes the recurrence selective rather than
+fixed:
+
+```
+delta = softplus(W_delta x)      per-channel step size,  delta in R^d_m
+B     = W_B x                    input map,              B in R^d_s
+C     = W_C x                    output map,             C in R^d_s
+```
+
+The transition is diagonal, one rate per (channel, state) pair, kept negative by
+construction so the recurrence cannot blow up:
+
+```
+A = -softplus(A_raw)             A in R^(d_m x d_s)
+```
+
+Discretizing that continuous system with step `delta` gives the per-token update.
+`h` carries across tokens and across chunk boundaries during training:
+
+```
+Abar_ij = exp(delta_i * A_ij)
+Bbar_ij = delta_i * B_j
+
+h_ij <- Abar_ij * h_ij + Bbar_ij * x_i
+y_i   = sum_j C_j * h_ij
+```
+
+`A_raw` is initialized so each channel's 16 rates sit on log-spaced timescales
+`tau` from 1.5 to 200 tokens, in the spirit of the HiPPO initialization. A single
+channel therefore starts out holding the last two tokens and the last two hundred
+at the same time, and training moves those horizons rather than discovering them
+from scratch.
+
+![Initialized decay envelopes](docs/img/pssa-timescales.png)
+
+This half of the layer is a selective diagonal SSM and claims no novelty; it is
+the same family as S4 and Mamba, written out scalar-first so the backward pass
+can be checked term by term.
+
+### The memory read
+
+The part that is specific to PSSA is what happens to `y`. A query is formed from
+both the current token and the current state, so retrieval is conditioned on
+where the recurrence has got to and not only on the token in hand:
+
+```
+q  = W_qx x + W_qh y
+qh = proj(q)                     diffeomorphic map into the Poincare ball, |qh| < 1
+```
+
+The read is bounded at four slots, weighted by a softmax over hyperbolic distance
+at temperature `tau_mem`:
+
+```
+w = softmax(-d_H(qh, k_s) / tau_mem)   over the 4 nearest slots
+m = sum_k w_k * v_k
+```
+
+![Bounded hyperbolic read](docs/img/pssa-memory.png)
+
+Hyperbolic distance grows toward the boundary of the ball, so slots holding
+general context and slots holding one specific episode stay separable without
+widening the read. Four slots is a fixed cost per token regardless of how much
+the bank holds.
+
+### Gate, adapter, MLP
+
+The read does not join the stream unconditionally. A learned per-channel gate
+decides how much of it lands, alongside a low-rank SiLU adapter that carries
+targeted updates:
+
+```
+g     = sigmoid(W_gate x)
+z     = s * y + g (elementwise) W_proj m + adapter(x)
+u     = W_2 silu(W_1 z)
+z_out = z + u
+```
+
+### The write path
+
+Writes are the reason the architecture is called plastic. A slot is inserted when
+the incoming state is novel against what the bank already holds, each slot carries
+a refractory counter that rate-limits how often it can be overwritten, and fast
+plastic updates are folded back into the base transition matrix by a closed-form
+ridge regression rather than living in the external store forever:
+
+```
+A_base <- A_base + (H^T H + lambda I)^-1 H^T dH
+```
+
+The refractory counter is what keeps a stream of contradictory updates from
+erasing a slot that repeated evidence has already stabilized, and consolidation is
+what stops the bank from being the only place long-range structure is stored.
+
+### What is and is not new here
+
+The recurrence is standard selective-SSM machinery. The claims are the hyperbolic
+bounded read conditioned on the recurrent state, the novelty and refractory rules
+on writes, and the ridge consolidation step from fast weights into the transition
+matrix. Everything is implemented against a scalar reference path that the batched
+and parallel implementations are differentiated against on every commit, currently
+agreeing to a maximum gradient error around 3e-8 (`cargo run --release --example
+twin_check`).
 
 ## The result
 
@@ -168,7 +296,11 @@ Everything below is for running, training, and working on the project.
 
 Direct runtime dependencies are [`ureq`](https://crates.io/crates/ureq) for
 dataset downloads and [`tokenizers`](https://crates.io/crates/tokenizers) for
-byte-level BPE.
+byte-level BPE. A GPU is optional. Built with `--features cuda` the dense
+matrix work dispatches through cuBLAS with a device-resident weight cache; a
+WebGPU adapter is used for the same stages when CUDA is unavailable, and
+software adapters are refused because they are slower than the CPU path.
+Everything falls back to the CPU implementation with no feature flags.
 
 ## How the comparison was run
 
@@ -185,6 +317,14 @@ across the whole run instead of restarting per link.
   supervised target tokens per update, seed 42.
 - PSSA: latent 256, recurrent state 16, 512 memory slots, key width 32, vocab 2,048.
 - Baseline: 1,541,120 parameters, 1 layer, width 256, 4 heads, FFN 448, vocab 2,048.
+
+Matching the optimizer schedule cuts one way and not the other: neither model
+received tuning the other did not, but a schedule that suits PSSA is not
+guaranteed to be the transformer's best, so part of the gap could be an
+undertrained baseline rather than the architecture. A per-model learning-rate
+sweep is running now, both models swept over the same grid on the same token
+budget, and the best-against-best numbers will be posted here when it
+finishes, whichever way they come out.
 
 ### Per-token learning curve
 
@@ -215,12 +355,18 @@ and finished all 64 links, and both curves above now cover the full run.
 
 ### Throughput is not hardware-matched
 
-PSSA trained on a Kaggle T4 at roughly 900 tokens/second. The baseline is
-CPU-only, because `train-transformer` has no GPU path, and held 212
-tokens/second. Those two numbers say nothing about the architectures. On the
-same CPU-only Kaggle hardware the batched PSSA path measures 375 tokens/second
-against the baseline's 212, and the loss comparison above is unaffected either
-way, since it is matched on tokens and updates rather than on time.
+The headline training rates come from different machines and say nothing on
+their own: PSSA trained on a Kaggle T4 at roughly 900 tokens/second, while the
+baseline is CPU-only because `train-transformer` has no GPU path, and held 212
+tokens/second there.
+For a comparison that means something, both models were trained on the same
+CPU-only box, a 2-vCPU container with no GPU, over the same 199,059-token
+slice of the cleaned corpus with seed 42 and identical update counts. PSSA
+held 1,716 tokens/second against the baseline's 415, so 4.1x on matched
+hardware and matched work. An earlier measurement on Kaggle's CPU, before the
+scan parallelization, put the same pair at 375 against 212.
+The loss comparison above is unaffected either way, since it is matched on
+tokens and updates rather than on time.
 
 ### What these numbers are, and are not
 
