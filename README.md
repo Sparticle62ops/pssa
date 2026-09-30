@@ -9,6 +9,16 @@ ML framework of any kind underneath it.
 At matched parameters and on the same corpus, it learns faster than a
 transformer and generates text about twelve times quicker on the same CPU.
 
+## How it differs from a transformer
+
+![PSSA block compared with a transformer block, with the measured held-out results](docs/img/architecture.png)
+
+A transformer scores every pair of tokens in the context, so its cost per step
+grows with the square of the sequence length and the whole context is re-read at
+every step. PSSA carries one fixed-size state along the sequence in a single
+left-to-right pass, and looks things up in a memory bank instead of re-reading
+the context, so cost grows linearly with length.
+
 ## The result
 
 Two models, same corpus, same tokenizer, same optimizer schedule, same seed,
