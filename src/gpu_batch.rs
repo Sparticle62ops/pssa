@@ -42,7 +42,9 @@ pub(crate) fn parallel_scan_enabled(len: usize, _stride: usize) -> bool {
 
 /// Compose two diagonal affine maps. `first` is applied before `second`:
 ///
-///     x -> first_a*x + first_b -> second_a*x + second_b
+/// ```text
+/// x -> first_a*x + first_b -> second_a*x + second_b
+/// ```
 ///
 /// The SSM has one such scalar map for every latent/state channel, so maps at
 /// different channels are independent and the composition is associative.
@@ -175,6 +177,74 @@ pub(crate) fn dense_weight_adjoint(g: &[f32], x: &[f32], l: usize, rows: usize, 
         grad.par_chunks_mut(8 * cols).enumerate().for_each(|(i, dst)| tile(i, dst));
     } else {
         grad.chunks_mut(8 * cols).enumerate().for_each(|(i, dst)| tile(i, dst));
+    }
+}
+
+/// Weight adjoint with forward token order. Adapter gradients are accumulated
+/// in forward-token order by the scalar reference, so this variant preserves
+/// each output element's f32 reduction order while parallelizing independent
+/// weight rows for large packed batches.
+pub(crate) fn dense_weight_adjoint_forward(
+    g: &[f32],
+    x: &[f32],
+    l: usize,
+    rows: usize,
+    cols: usize,
+    grad: &mut [f32],
+) {
+    let tile = |tile_idx: usize, dst: &mut [f32]| {
+        let first_row = tile_idx * 8;
+        for t in 0..l {
+            let input = &x[t * cols..(t + 1) * cols];
+            for (r, output) in dst.chunks_mut(cols).enumerate() {
+                let scale = g[t * rows + first_row + r];
+                for (dst, &value) in output.iter_mut().zip(input) {
+                    *dst += scale * value;
+                }
+            }
+        }
+    };
+    if parallel_backward(l, rows, cols) {
+        grad.par_chunks_mut(8 * cols).enumerate().for_each(|(i, dst)| tile(i, dst));
+    } else {
+        grad.chunks_mut(8 * cols).enumerate().for_each(|(i, dst)| tile(i, dst));
+    }
+}
+
+/// Adapter up-projection input adjoint, including the consolidated slow copy.
+/// Each token owns one output row, and its channel reduction retains the same
+/// i-major order as `PlasticAdapterV2::total_up_matvec_transpose`.
+fn adapter_up_input_adjoint(
+    g: &[f32],
+    fast: &[f32],
+    slow: &[f32],
+    l: usize,
+    d_m: usize,
+    rank: usize,
+    out: &mut [f32],
+) {
+    let tile = |tile_idx: usize, dst: &mut [f32]| {
+        dst.fill(0.0);
+        let first_token = tile_idx * 4;
+        for i in 0..d_m {
+            let fast_row = &fast[i * rank..(i + 1) * rank];
+            let slow_row = &slow[i * rank..(i + 1) * rank];
+            for (local_t, row) in dst.chunks_mut(rank).enumerate() {
+                let t = first_token + local_t;
+                if t >= l {
+                    break;
+                }
+                let scale = g[t * d_m + i];
+                for r in 0..rank {
+                    row[r] += scale * (fast_row[r] + slow_row[r]);
+                }
+            }
+        }
+    };
+    if parallel_backward(l, d_m, rank) {
+        out.par_chunks_mut(4 * rank).enumerate().for_each(|(i, dst)| tile(i, dst));
+    } else {
+        out.chunks_mut(4 * rank).enumerate().for_each(|(i, dst)| tile(i, dst));
     }
 }
 
@@ -975,32 +1045,37 @@ pub fn bwd_stage_adapter(m: &mut PSSALayerV2, seq_len: usize) {
     let rank = m.adapters[0].rank;
     let l = seq_len;
 
+    // g_ad_act = U_total^T @ grad_z_raw[t]. Each token owns its complete
+    // adjoint row, so packed batches can use all CPU workers without atomics.
+    adapter_up_input_adjoint(
+        &m.bwd_g_zraw[..l * d_m],
+        &m.adapters[0].up_proj.data,
+        &m.adapters[0].consolidated_up,
+        l,
+        d_m,
+        rank,
+        &mut m.bwd_g_ad_down[..l * rank],
+    );
+
+    // up_proj grad: grad_z_raw[t,i] * adapter_act[t,r]. Preserve the scalar
+    // forward-token reduction order for every weight element.
+    dense_weight_adjoint_forward(
+        &m.bwd_g_zraw[..l * d_m],
+        &m.tape.adapter_act[..l * rank],
+        l,
+        d_m,
+        rank,
+        &mut m.adapters[0].up_proj.grad,
+    );
+
+    // SiLU derivative on adapter hidden, stored per token.
     for t in 0..l {
         let ad_off = t * rank;
-        let z_off = t * d_m;
-
-        // g_ad_act = U_total^T @ grad_z_raw[t]
-        m.adapters[0].total_up_matvec_transpose(
-            &m.bwd_g_zraw[z_off..z_off + d_m],
-            &mut m.buf_g_ad_act,
-        );
-
-        // up_proj grad: grad_z_raw[t,i] * adapter_act[t,r]
-        for i in 0..d_m {
-            let gz_i = m.bwd_g_zraw[z_off + i];
-            let row_off = i * rank;
-            for r in 0..rank {
-                m.adapters[0].up_proj.grad[row_off + r] +=
-                    gz_i * m.tape.adapter_act[ad_off + r];
-            }
-        }
-
-        // SiLU derivative on adapter hidden, stored per token
         for r in 0..rank {
             let h = m.tape.adapter_hidden[ad_off + r];
             let sig_h = sigmoid(h);
             let silu_prime = sig_h * (1.0 + h * (1.0 - sig_h));
-            m.bwd_g_ad_down[ad_off + r] = m.buf_g_ad_act[r] * silu_prime;
+            m.bwd_g_ad_down[ad_off + r] *= silu_prime;
         }
     }
 }
@@ -1016,18 +1091,25 @@ pub fn bwd_stage_adapter_down(m: &mut PSSALayerV2, seq_len: usize) {
     let l = seq_len;
     m.bwd_g_xnorm[..l * d_m].fill(0.0);
 
-    for t in 0..l {
-        let xn_off = t * d_m;
-        let ad_off = t * rank;
-        for r in 0..rank {
-            let gad_r = m.bwd_g_ad_down[ad_off + r];
-            let row_off = r * d_m;
-            for j in 0..d_m {
-                m.bwd_g_xnorm[xn_off + j] += gad_r * m.adapters[0].down_proj.data[row_off + j];
-                m.adapters[0].down_proj.grad[row_off + j] += gad_r * m.tape.x_norm[xn_off + j];
-            }
-        }
-    }
+    // Both VJPs are ordinary dense adjoints. The helper's forward-token
+    // reduction order matches the scalar adapter reference, while its row
+    // tiling parallelizes the independent packed-batch work.
+    dense_input_adjoint(
+        &m.bwd_g_ad_down[..l * rank],
+        &m.adapters[0].down_proj.data,
+        l,
+        rank,
+        d_m,
+        &mut m.bwd_g_xnorm[..l * d_m],
+    );
+    dense_weight_adjoint_forward(
+        &m.bwd_g_ad_down[..l * rank],
+        &m.tape.x_norm[..l * d_m],
+        l,
+        rank,
+        d_m,
+        &mut m.adapters[0].down_proj.grad,
+    );
 }
 
 /// Backward Stage 4: memory injection adjoint (gate, w_proj, memory query
@@ -1042,32 +1124,77 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
     let mem_cap = m.cfg.mem_capacity;
     let l = seq_len;
 
-    for t in 0..l {
-        let m_off = t * d_m;
+    // Keep the two token-local gate adjoints in model-owned storage. Their
+    // rows are independent, while the shared weight reductions below retain
+    // the scalar forward-token order for each parameter element.
+    let g_m_proj_out = &mut m.bwd_g_zfinal[..l * d_m];
+    let (g_gate_pre, gate_x) = m.bwd_g_mlp[..2 * l * d_m].split_at_mut(l * d_m);
 
+    let g_zraw = &m.bwd_g_zraw[..l * d_m];
+    let g_mem = &m.tape.g_mem[..l * d_m];
+    let m_proj = &m.tape.m_proj[..l * d_m];
+    let calculate_gate = |(t, (g_mp, g_gate)): (usize, (&mut [f32], &mut [f32]))| {
+        let off = t * d_m;
         for i in 0..d_m {
-            let gz_i = m.bwd_g_zraw[m_off + i];
-            let g_mem = m.tape.g_mem[m_off + i];
-            m.buf_g_m_proj_out[i] = gz_i * g_mem;
-
-            let d_sig = g_mem * (1.0 - g_mem);
-            let g_wgate_pre = gz_i * m.tape.m_proj[m_off + i] * d_sig;
-            let row_off = i * d_m;
-            for j in 0..d_m {
-                m.bwd_g_xnorm[m_off + j] += g_wgate_pre * m.w_gate.data[row_off + j];
-                m.w_gate.grad[row_off + j] += g_wgate_pre * m.tape.x_norm[m_off + j];
-            }
+            let gz_i = g_zraw[off + i];
+            let g_mem_i = g_mem[off + i];
+            g_mp[i] = gz_i * g_mem_i;
+            g_gate[i] = gz_i * m_proj[off + i] * g_mem_i * (1.0 - g_mem_i);
         }
-
-        // w_proj grad
-        for i in 0..d_m {
-            let g_mp_i = m.buf_g_m_proj_out[i];
-            let row_off = i * d_m;
-            for j in 0..d_m {
-                m.w_proj.grad[row_off + j] += g_mp_i * m.tape.m_val[m_off + j];
-            }
-        }
+    };
+    if parallel_backward(l, d_m, d_m) {
+        g_m_proj_out
+            .par_chunks_mut(d_m)
+            .zip(g_gate_pre.par_chunks_mut(d_m))
+            .enumerate()
+            .for_each(calculate_gate);
+    } else {
+        g_m_proj_out
+            .chunks_mut(d_m)
+            .zip(g_gate_pre.chunks_mut(d_m))
+            .enumerate()
+            .for_each(calculate_gate);
     }
+
+    // The input adjoint is first formed per token, then added in token order
+    // so its f32 accumulation order remains identical to the scalar path.
+    dense_input_adjoint(
+        g_gate_pre,
+        &m.w_gate.data,
+        l,
+        d_m,
+        d_m,
+        gate_x,
+    );
+    for (dst, src) in m.bwd_g_xnorm[..l * d_m].iter_mut().zip(gate_x.iter()) {
+        *dst += src;
+    }
+    // Reuse the second half of the same workspace for the projection input
+    // adjoint needed by every independent retrieval row.
+    dense_input_adjoint(
+        g_m_proj_out,
+        &m.w_proj.data,
+        l,
+        d_m,
+        d_m,
+        gate_x,
+    );
+    dense_weight_adjoint_forward(
+        g_gate_pre,
+        &m.tape.x_norm[..l * d_m],
+        l,
+        d_m,
+        d_m,
+        &mut m.w_gate.grad,
+    );
+    dense_weight_adjoint_forward(
+        g_m_proj_out,
+        &m.tape.m_val[..l * d_m],
+        l,
+        d_m,
+        d_m,
+        &mut m.w_proj.grad,
+    );
 
     // Hyperbolic retrieval adjoint, reverse time.
     for t in (0..l).rev() {
@@ -1077,15 +1204,9 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
         let q_sq = HyperbolicEpisodicBankV2::squared_norm(q) as f64;
 
         m.g_query_pnc.fill(0.0);
-        // Compute this token's projection adjoint only where it is consumed.
-        // A scratch value retained from the first pass would incorrectly apply
-        // the last token's memory gradient to every query in the chunk.
-        for i in 0..d_m {
-            let gz_i = m.bwd_g_zraw[m_off + i];
-            m.buf_g_m_proj_out[i] = gz_i * m.tape.g_mem[m_off + i];
-        }
-        m.w_proj
-            .matvec_transpose(&m.buf_g_m_proj_out, &mut m.buf_g_m_val);
+        // The projection adjoint was retained per token above; using one
+        // model-owned row here would accidentally reuse another token's value.
+        let g_m_val = &gate_x[m_off..m_off + d_m];
 
         for entry in 0..m.memory.count {
             let key_off = entry * d_k;
@@ -1094,7 +1215,7 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
             let mut dot_g_value_minus_mean = 0.0f64;
             let value_off = entry * d_m;
             for j in 0..d_m {
-                dot_g_value_minus_mean += m.buf_g_m_val[j] as f64
+                dot_g_value_minus_mean += g_m_val[j] as f64
                     * (m.memory.values[value_off + j] - m.tape.m_val[m_off + j]) as f64;
             }
             let g_score = m.tape.mem_weights[t * mem_cap + entry] as f64 * dot_g_value_minus_mean;
