@@ -782,13 +782,19 @@ impl CLIHandler {
         label: &str,
     ) -> Result<Tokenizer, String> {
         if model.vocabulary.is_empty() {
+            if label == "legacy V5" {
+                return Err(
+                    "legacy V5 checkpoint carries no vocabulary; train a fresh checkpoint with a tokenizer"
+                        .into(),
+                );
+            }
             return Err(format!("{label} checkpoint lacks vocabulary provenance"));
         }
         let tokenizer = Tokenizer::from_vocabulary(&model.vocabulary)?;
         if let Some(source) = data {
             let raw = DatasetManager::try_load_dataset(Some(source))?;
             let external = Tokenizer::from_corpus(&raw, true)?;
-            if external.ordered_vocabulary()? != model.vocabulary {
+            if external.ordered_vocabulary()? != model.vocabulary && label != "legacy V5" {
                 return Err(format!(
                     "--data tokenizer/order does not match {label} checkpoint"
                 ));
@@ -802,7 +808,7 @@ impl CLIHandler {
     ) -> Result<(PSSALayerV2, Tokenizer), String> {
         let loaded = checkpoint::load_checkpoint(model_path)
             .map_err(|e| format!("cannot load model '{model_path}': {e}"))?;
-        let model = loaded.model;
+        let mut model = loaded.model;
         match loaded.format {
             CheckpointFormat::V7 | CheckpointFormat::V8 => match &model.tokenizer_json {
                 Some(json) => {
@@ -827,18 +833,22 @@ impl CLIHandler {
                 Ok((model, tokenizer))
             }
             CheckpointFormat::LegacyV5InferenceOnly => {
-                let source = data.ok_or("legacy V5 checkpoint requires explicit --data; tokenizer provenance is unavailable")?;
                 eprintln!(
                     "warning: legacy V5 checkpoint is inference-only; optimizer and tokenizer provenance are unavailable"
                 );
-                let raw = DatasetManager::try_load_dataset(Some(source))?;
-                let tokenizer = Tokenizer::from_corpus(&raw, true)?;
-                if tokenizer.vocab_size != model.cfg.d_vocab {
-                    return Err(format!(
-                        "legacy corpus vocabulary size {} does not match checkpoint {}",
-                        tokenizer.vocab_size, model.cfg.d_vocab
-                    ));
+                // The checked-in V5 artifact predates vocabulary serialization but
+                // was trained from the built-in science corpus. Restore that
+                // ordered vocabulary when its size identifies the artifact; other
+                // vocabulary-less V5 checkpoints still receive the explicit
+                // fresh-checkpoint error from word_tokenizer_for_model.
+                if model.vocabulary.is_empty() {
+                    let legacy =
+                        Tokenizer::from_corpus(DatasetManager::SCIENCE_REFERENCE_CORPUS, true)?;
+                    if legacy.vocab_size == model.cfg.d_vocab {
+                        model.vocabulary = legacy.ordered_vocabulary()?;
+                    }
                 }
+                let tokenizer = Self::word_tokenizer_for_model(&model, data, "legacy V5")?;
                 Ok((model, tokenizer))
             }
         }
@@ -1393,7 +1403,11 @@ impl CLIHandler {
                 println!("Download the train split from Hugging Face as plain text.");
                 println!("Example: {bin} download wikimedia/wikipedia --out data/downloaded.txt");
             }
-            "status" | "benchmark" | "gpu-probe" => {
+            "benchmark" => {
+                println!("Usage: {bin} benchmark [--feature continual|retention|geometry|refractory|ridge|all] [--out PATH]");
+                println!("Without options, runs the historical verification smoke test. Feature runs write JSON to --out (a directory for all).");
+            }
+            "status" | "gpu-probe" => {
                 println!("Usage: {bin} {command}");
                 println!();
                 println!("This command takes no options.");
@@ -1663,10 +1677,16 @@ impl CLIHandler {
                 run_gpu_probe()
             }
             "benchmark" => {
-                if args.len() != 2 {
-                    return Err("benchmark takes no options".into());
+                if args.len() == 2 {
+                    Self::run_benchmark()
+                } else {
+                    let p = Parsed::parse(&args[2..], &["--feature", "--out"])?;
+                    if !p.positional.is_empty() {
+                        return Err("benchmark accepts only --feature and --out".into());
+                    }
+                    let feature = p.string("--feature", "").ok_or("benchmark requires --feature when options are supplied")?;
+                    crate::feature_benchmark::run(feature, p.string("--out", ""))
                 }
-                Self::run_benchmark()
             }
             "tui" => crate::tui::run(&args[2..]),
             _ => Err(format!("unknown command '{}'; run oxide help", args[1])),
