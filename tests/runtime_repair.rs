@@ -165,22 +165,30 @@ fn fixed_warmup_resume_matches_uninterrupted_training_before_and_after_warmup() 
     let (whole, _) = CLIHandler::train_corpus(raw, &opts).unwrap();
     let p = temp("warmup-segmented");
     let expected = temp("warmup-whole");
-    let (first, _) = CLIHandler::train_corpus(raw, &cli::TrainingOptions {
-        epochs: 1,
-        ..opts.clone()
-    }).unwrap();
+    let (first, _) = CLIHandler::train_corpus(
+        raw,
+        &cli::TrainingOptions {
+            epochs: 1,
+            ..opts.clone()
+        },
+    )
+    .unwrap();
     assert_eq!(first.step_counter, 4);
     assert_eq!(first.lr_schedule_warmup_steps, Some(5));
     CLIHandler::save_model_v2(&first, p.to_str().unwrap()).unwrap();
     for step in [8, 12] {
-        let (resumed, _) = CLIHandler::train_corpus(raw, &cli::TrainingOptions {
-            epochs: 1,
-            resume: Some(p.to_str().unwrap().into()),
-            // Omitted CLI flags must restore both parts of the stored schedule.
-            schedule_total_updates: None,
-            warmup_steps: 0,
-            ..opts.clone()
-        }).unwrap();
+        let (resumed, _) = CLIHandler::train_corpus(
+            raw,
+            &cli::TrainingOptions {
+                epochs: 1,
+                resume: Some(p.to_str().unwrap().into()),
+                // Omitted CLI flags must restore both parts of the stored schedule.
+                schedule_total_updates: None,
+                warmup_steps: 0,
+                ..opts.clone()
+            },
+        )
+        .unwrap();
         assert_eq!(resumed.step_counter, step);
         assert_eq!(resumed.lr_schedule_warmup_steps, Some(5));
         CLIHandler::save_model_v2(&resumed, p.to_str().unwrap()).unwrap();
@@ -283,7 +291,13 @@ fn shipped_legacy_v5_chat_uses_checkpoint_vocabulary_with_or_without_data() {
     for with_data in [true, false] {
         let mut command = Command::new(exe);
         command
-            .args(["chat", "--model", model.to_str().unwrap(), "--temperature", "0"])
+            .args([
+                "chat",
+                "--model",
+                model.to_str().unwrap(),
+                "--temperature",
+                "0",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

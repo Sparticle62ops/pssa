@@ -14,9 +14,11 @@ pub fn train_corpus(
     opts: &TrainingOptions,
     tokenizer_from: Option<&str>,
 ) -> Result<(TransformerModel, Tokenizer), String> {
+    let _plain_output = ui::plain_output(opts.no_tui);
     if opts.batch_size != 1 {
         return Err(
-            "--batch-size is supported by PSSA train only; use batch size 1 for the transformer".into(),
+            "--batch-size is supported by PSSA train only; use batch size 1 for the transformer"
+                .into(),
         );
     }
     if opts.chunk == 0 || opts.max_tokens == Some(0) || opts.epochs == 0 || opts.accumulate == 0 {
@@ -116,13 +118,35 @@ pub fn train_corpus(
         ),
     );
     println!();
-    let mut curve = opts.loss_csv.as_deref().map(|path| {
-        crate::loss_csv::LossCsv::open(path, opts.loss_every, model.step_counter, opts.tokens_seen)
-    }).transpose()?;
+    let mut curve = opts
+        .loss_csv
+        .as_deref()
+        .map(|path| {
+            crate::loss_csv::LossCsv::open(
+                path,
+                opts.loss_every,
+                model.step_counter,
+                opts.tokens_seen,
+            )
+        })
+        .transpose()?;
     let started = Instant::now();
     let mut update = 0;
     let mut tokens_seen = 0;
-    let mut progress = ui::Progress::new("training", schedule.updates);
+    let mut progress = ui::Progress::new_with_tui("training", schedule.updates, !opts.no_tui);
+    if let Some(path) = opts.checkpoint_path.as_deref() {
+        progress.set_checkpoint_path(path);
+    }
+    if let Some(path) = opts.resume.as_deref() {
+        progress.set_last_checkpoint(path);
+    }
+    progress.set_prior_updates(model.step_counter.saturating_sub(update));
+    println!(
+        "progress_schema=2 updates_total={} prior_updates={} checkpoint_target={}",
+        schedule.updates,
+        model.step_counter,
+        opts.checkpoint_path.as_deref().unwrap_or("-")
+    );
     for epoch in 0..opts.epochs {
         let mut loss_sum = 0.0f64;
         let mut token_sum = 0usize;
@@ -143,7 +167,8 @@ pub fn train_corpus(
                 token_sum += len;
             }
             update += 1;
-            model.apply_adamw(schedule.lr(update)?)?;
+            let learning_rate = schedule.lr(update)?;
+            model.apply_adamw(learning_rate)?;
             if !model.all_finite() {
                 return Err("non-finite parameters; training aborted without checkpoint".into());
             }
@@ -151,7 +176,14 @@ pub fn train_corpus(
             if let Some(curve) = &mut curve {
                 curve.record(total_tokens, model.step_counter, loss_sum - prior_loss)?;
             }
-            progress.update(update, total_tokens, loss_sum / token_sum.max(1) as f64);
+            let update_loss = (loss_sum - prior_loss) / total_tokens.max(1) as f64;
+            progress.update_with_metrics(
+                update,
+                total_tokens,
+                update_loss,
+                Some(learning_rate),
+                None,
+            );
         }
         progress.finish();
         println!(
@@ -198,10 +230,12 @@ pub fn run_training(
     tokenizer_from: Option<&str>,
 ) -> Result<(), String> {
     let raw = DatasetManager::try_load_dataset(Some(data))?;
-    let (model, _) = train_corpus(&raw, opts, tokenizer_from)?;
+    let mut run_options = opts.clone();
+    run_options.checkpoint_path = Some(out.to_string());
+    let (model, _) = train_corpus(&raw, &run_options, tokenizer_from)?;
     transformer_checkpoint::save_model(&model, out)
         .map_err(|e| format!("cannot save checkpoint '{out}': {e}"))?;
-    println!("saved_checkpoint={out}");
+    ui::checkpoint_saved(out);
     ui::success(&format!("checkpoint written to {}", ui::bold(out)));
     Ok(())
 }

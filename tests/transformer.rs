@@ -363,15 +363,36 @@ fn complete_fixed_schedule_restores_warmup_at_global_step_and_legacy_defaults() 
     };
     let whole = Schedule::new_with_warmup(100, 0, None, None, &opts).unwrap();
     for prior in [0, 1, 5, 10, 11, 99] {
-        let resumed = Schedule::new_with_warmup(100 - prior, prior, Some(100), Some(10),
-            &TrainingOptions { warmup_steps: 0, ..opts.clone() }).unwrap();
+        let resumed = Schedule::new_with_warmup(
+            100 - prior,
+            prior,
+            Some(100),
+            Some(10),
+            &TrainingOptions {
+                warmup_steps: 0,
+                ..opts.clone()
+            },
+        )
+        .unwrap();
         for update in 1..=100 - prior {
-            assert_eq!(whole.lr(prior + update).unwrap(), resumed.lr(update).unwrap());
+            assert_eq!(
+                whole.lr(prior + update).unwrap(),
+                resumed.lr(update).unwrap()
+            );
         }
     }
     for horizon in [None, Some(100)] {
-        let legacy = Schedule::new_with_warmup(5, 5, horizon, None,
-            &TrainingOptions { schedule_total_updates: None, ..opts.clone() }).unwrap();
+        let legacy = Schedule::new_with_warmup(
+            5,
+            5,
+            horizon,
+            None,
+            &TrainingOptions {
+                schedule_total_updates: None,
+                ..opts.clone()
+            },
+        )
+        .unwrap();
         assert_eq!(legacy.warmup, 0);
     }
     assert!(Schedule::new_with_warmup(1, 0, None, Some(1), &opts).is_err());
@@ -398,7 +419,10 @@ fn transformer_legacy_schedule_tails_load_and_invalid_warmup_is_rejected() {
             fs::write(&p, bytes).unwrap();
             let result = ck::load_checkpoint(&p);
             if horizon.is_some() && warmup < 100 {
-                assert_eq!(result.unwrap().lr_schedule_warmup_steps, Some(warmup as usize));
+                assert_eq!(
+                    result.unwrap().lr_schedule_warmup_steps,
+                    Some(warmup as usize)
+                );
             } else {
                 assert!(result.is_err());
             }

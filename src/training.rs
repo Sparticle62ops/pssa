@@ -76,7 +76,8 @@ pub fn sequence_plan(
 pub fn report_sequence_plan(plan: &[Vec<SequenceChunk>], batch_size: usize) {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for n in std::iter::once(batch_size).chain(plan.iter().flat_map(|batch| {
-        std::iter::once(batch.len()).chain(batch.iter().flat_map(|c| [c.lane, c.doc, c.start, c.len]))
+        std::iter::once(batch.len())
+            .chain(batch.iter().flat_map(|c| [c.lane, c.doc, c.start, c.len]))
     })) {
         for b in (n as u64).to_le_bytes() {
             hash = (hash ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
@@ -165,7 +166,11 @@ impl Schedule {
         // Evaluating it at the global step continues, rather than restarts, it.
         // With no stored definition, preserve legacy resume behavior.
         let warmup = stored_warmup.unwrap_or_else(|| {
-            if prior_steps > 0 { 0 } else { opts.warmup_steps }
+            if prior_steps > 0 {
+                0
+            } else {
+                opts.warmup_steps
+            }
         });
         if warmup >= total && warmup != 0 {
             return Err(format!(

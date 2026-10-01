@@ -7,15 +7,35 @@
 //! helpers here add presentation around those lines rather than replacing
 //! them.
 
+use std::cell::Cell;
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
 use std::sync::OnceLock;
 use std::time::Instant;
 
 static COLOR: OnceLock<bool> = OnceLock::new();
+thread_local! { static PLAIN: Cell<bool> = const { Cell::new(false) }; }
+
+/// Scoped presentation policy: no process-wide environment changes and no
+/// leakage between library calls or tests on different threads.
+pub struct PlainOutput(bool);
+pub fn plain_output(enabled: bool) -> PlainOutput {
+    PlainOutput(PLAIN.with(|plain| plain.replace(plain.get() || enabled)))
+}
+impl Drop for PlainOutput {
+    fn drop(&mut self) {
+        PLAIN.with(|plain| plain.set(self.0));
+    }
+}
 
 /// True when it is safe to emit ANSI escapes on stdout.
 pub fn color_enabled() -> bool {
-    *COLOR.get_or_init(|| io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none())
+    !PLAIN.with(Cell::get)
+        && *COLOR.get_or_init(|| {
+            io::stdout().is_terminal()
+                && std::env::var_os("NO_COLOR").is_none()
+                && std::env::var("TERM").is_ok_and(|term| term != "dumb")
+        })
 }
 
 fn paint(code: &str, text: &str) -> String {
@@ -276,42 +296,111 @@ impl Step {
     }
 }
 
-/// A progress display for a loop with a known number of steps.
-///
-/// On a terminal this repaints a single bar in place. Everywhere else it
-/// prints a plain checkpoint line at a fixed interval, so a six-hour headless
-/// run leaves a readable log instead of thousands of carriage returns.
+/// A bounded inline training dashboard. No raw mode, alternate screen or
+/// input interception: Ctrl+C keeps its usual meaning. Headless output emits
+/// a first, five-second and final sample, always as newline-delimited text.
 pub struct Progress {
     label: String,
     total: usize,
     started: Instant,
     last_draw: Instant,
     tokens: usize,
+    loss_history: VecDeque<(f64, usize)>,
+    learning_rate: Option<f32>,
+    checkpoint_path: Option<String>,
+    last_checkpoint: Option<String>,
+    prior_updates: usize,
+    memory_occupancy: Option<(usize, usize)>,
     interactive: bool,
-    drawn: bool,
+    emitted: bool,
+    drawn_rows: u16,
 }
 
 impl Progress {
     pub fn new(label: &str, total: usize) -> Self {
+        Self::new_with_tui(label, total, true)
+    }
+
+    /// Construct a progress display, optionally disabling cursor control even
+    /// when stdout is a terminal.  This is the implementation behind
+    /// `--no-tui`: the run still emits useful, rate-limited plain log lines.
+    pub fn new_with_tui(label: &str, total: usize, tui: bool) -> Self {
         Self {
             label: label.to_string(),
             total: total.max(1),
             started: Instant::now(),
             last_draw: Instant::now(),
             tokens: 0,
-            interactive: color_enabled(),
-            drawn: false,
+            loss_history: VecDeque::with_capacity(8),
+            learning_rate: None,
+            checkpoint_path: None,
+            last_checkpoint: None,
+            prior_updates: 0,
+            memory_occupancy: None,
+            interactive: tui && color_enabled(),
+            emitted: false,
+            drawn_rows: 0,
         }
+    }
+
+    /// Set the checkpoint destination shown by the live dashboard. This is a
+    /// pending target until `checkpoint_saved` is emitted after a successful
+    /// writer return.
+    pub fn set_checkpoint_path(&mut self, path: &str) {
+        self.checkpoint_path = Some(path.to_string());
+    }
+
+    pub fn set_prior_updates(&mut self, prior: usize) {
+        self.prior_updates = prior;
+    }
+
+    /// Show the checkpoint that this run resumed from until a newer save is
+    /// reported. This is intentionally presentation-only and is never stored
+    /// in a checkpoint.
+    pub fn set_last_checkpoint(&mut self, path: &str) {
+        if !path.trim().is_empty() {
+            self.last_checkpoint = Some(path.to_string());
+        }
+    }
+
+    /// Set the latest optimizer learning rate and optional memory-bank
+    /// occupancy shown on the next update.
+    pub fn set_metrics(&mut self, learning_rate: Option<f32>, memory: Option<(usize, usize)>) {
+        self.learning_rate = learning_rate.filter(|x| x.is_finite() && *x > 0.0);
+        self.memory_occupancy =
+            memory.filter(|(used, capacity)| *used <= *capacity && *capacity > 0);
     }
 
     /// Record `token_delta` freshly processed tokens at step `done`.
     pub fn update(&mut self, done: usize, token_delta: usize, loss: f64) {
+        self.update_with_metrics(done, token_delta, loss, None, None);
+    }
+
+    /// Record progress and the metrics that are useful when a run is left
+    /// unattended.  The last eight finite losses form the short moving
+    /// average, while the raw loss remains available for machine parsers.
+    pub fn update_with_metrics(
+        &mut self,
+        done: usize,
+        token_delta: usize,
+        loss: f64,
+        learning_rate: Option<f32>,
+        memory: Option<(usize, usize)>,
+    ) {
         self.tokens += token_delta;
-        let min_gap = if self.interactive { 0.08 } else { 30.0 };
-        if self.last_draw.elapsed().as_secs_f64() < min_gap && done < self.total {
+        self.set_metrics(learning_rate, memory);
+        if loss.is_finite() {
+            if self.loss_history.len() == 8 {
+                self.loss_history.pop_front();
+            }
+            self.loss_history.push_back((loss, token_delta));
+        }
+        let min_gap = if self.interactive { 0.2 } else { 5.0 };
+        if self.emitted && self.last_draw.elapsed().as_secs_f64() < min_gap && done < self.total {
             return;
         }
         self.last_draw = Instant::now();
+        self.emitted = true;
 
         let elapsed = self.started.elapsed().as_secs_f64();
         let fraction = (done as f64 / self.total as f64).clamp(0.0, 1.0);
@@ -325,43 +414,149 @@ impl Progress {
         } else {
             f64::NAN
         };
+        let average = self.loss_average().unwrap_or(loss);
+        let remaining_updates = self.total.saturating_sub(done);
+        let lr = self
+            .learning_rate
+            .map(|x| format!("{x:.6e}"))
+            .unwrap_or_else(|| "-".into());
+        let memory = self
+            .memory_occupancy
+            .map(|(used, capacity)| format!("{used}/{capacity}"))
+            .unwrap_or_else(|| "-".into());
+        let checkpoint = self.checkpoint_path.clone().unwrap_or_else(|| "-".into());
+        let number = self
+            .checkpoint_path
+            .as_deref()
+            .and_then(checkpoint_number)
+            .map(|number| number.to_string())
+            .unwrap_or_else(|| "-".into());
+        let last_checkpoint = self
+            .last_checkpoint
+            .clone()
+            .unwrap_or_else(|| "none".into());
+        let global = self.prior_updates.saturating_add(done);
 
         if self.interactive {
-            let bar_width = (width() as i64 - 52).clamp(16, 40) as usize;
-            let filled = (fraction * bar_width as f64).round() as usize;
-            let bar = format!(
-                "{}{}",
-                cyan(&"█".repeat(filled)),
-                dim(&"░".repeat(bar_width - filled))
-            );
-            print!(
-                "\r  {} {bar} {:>3.0}%  loss {:.4}  {:.0} tok/s  eta {}   ",
-                dim(&self.label),
-                fraction * 100.0,
-                loss,
-                rate,
-                duration(remaining)
-            );
+            self.clear();
+            let rows = [
+                format!(
+                    "{} {:>3.0}% | updates {done}/{} | {remaining_updates} remaining (global {global})",
+                    self.label,
+                    fraction * 100.0,
+                    self.total
+                ),
+                format!("loss {loss:.6} | avg(8, token-weighted) {average:.6}"),
+                format!(
+                    "{rate:.0} tokens/s | ETA {} | elapsed {}",
+                    duration(remaining),
+                    duration(elapsed)
+                ),
+                format!("learning rate {lr} | memory bank {memory}"),
+                format!("checkpoint #{number} pending: {checkpoint}"),
+                format!("last checkpoint: {last_checkpoint}"),
+            ];
+            let (columns, height) = crossterm::terminal::size().unwrap_or((80, 24));
+            // Never wrap a row; leave the final column free. ratatui truncates
+            // by display width (including wide Unicode paths), not bytes.
+            let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(
+                0,
+                0,
+                columns.saturating_sub(1),
+                1,
+            ));
+            for row in rows.iter().take(usize::from(height.saturating_sub(1))) {
+                buffer.reset();
+                buffer.set_string(0, 0, row, ratatui::style::Style::default());
+                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                println!("\r{text}");
+                self.drawn_rows += 1;
+            }
             let _ = io::stdout().flush();
-            self.drawn = true;
         } else {
             println!(
-                "  {} {}/{} ({:.0}%) loss={loss:.6} tokens_per_second={rate:.0} eta={}",
+                "  {} {}/{} ({:.0}%) loss={loss:.6} loss_average={average:.6} tokens_per_second={rate:.0} optimizer_updates={done} updates_total={} updates_remaining={remaining_updates} global_update={global} learning_rate={lr} memory_occupancy={memory} checkpoint_number={number} elapsed_seconds={elapsed:.3} eta={}",
                 self.label,
                 done,
                 self.total,
                 fraction * 100.0,
-                duration(remaining)
+                self.total,
+                duration(remaining),
             );
+            let _ = io::stdout().flush();
         }
     }
 
-    /// Clear the in-place bar so the next line starts clean.
-    pub fn finish(&mut self) {
-        if self.interactive && self.drawn {
-            print!("\r{}\r", " ".repeat(width() + 20));
-            let _ = io::stdout().flush();
+    fn loss_average(&self) -> Option<f64> {
+        let tokens: usize = self.loss_history.iter().map(|(_, n)| n).sum();
+        (tokens > 0).then(|| {
+            self.loss_history
+                .iter()
+                .map(|(l, n)| l * *n as f64)
+                .sum::<f64>()
+                / tokens as f64
+        })
+    }
+
+    fn clear(&mut self) {
+        if self.drawn_rows > 0 {
+            let _ = crossterm::execute!(
+                io::stdout(),
+                crossterm::cursor::MoveUp(self.drawn_rows),
+                crossterm::cursor::MoveToColumn(0),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
+            );
         }
-        self.drawn = false;
+        self.drawn_rows = 0;
+    }
+
+    /// Leave the final frame in scrollback and allow epoch/summary lines below.
+    pub fn finish(&mut self) {
+        self.drawn_rows = 0;
+    }
+}
+
+/// Kaggle chain convention; no assumption about arbitrary checkpoint names.
+pub(crate) fn checkpoint_number(path: &str) -> Option<u64> {
+    std::path::Path::new(path)
+        .file_stem()?
+        .to_str()?
+        .strip_prefix("ck")?
+        .parse()
+        .ok()
+}
+
+pub(crate) fn checkpoint_saved(path: &str) {
+    println!("saved_checkpoint={path}");
+    let number = checkpoint_number(path)
+        .map(|number| number.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    println!("checkpoint_number={number} checkpoint_status=saved");
+    println!("last_checkpoint={path}");
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn average_uses_only_last_eight_updates_and_weights_targets() {
+        let mut progress = Progress::new_with_tui("test", 100, false);
+        progress.emitted = true;
+        for _ in 0..8 {
+            progress.update(1, 1, 2.0);
+        }
+        progress.update(2, 7, 4.0);
+        assert_eq!(progress.loss_history.len(), 8);
+        assert_eq!(progress.loss_average(), Some(3.0));
+        progress.update(3, 1, f64::NAN);
+        assert_eq!(progress.loss_average(), Some(3.0));
+    }
+
+    #[test]
+    fn chain_number_handles_both_checkpoint_types_and_spaces() {
+        assert_eq!(checkpoint_number("/tmp/chain dir/ck32.pssa"), Some(32));
+        assert_eq!(checkpoint_number("ck02.trfm"), Some(2));
+        assert_eq!(checkpoint_number("model.pssa"), None);
     }
 }

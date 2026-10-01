@@ -195,9 +195,9 @@ for i in $(seq "$START" "$TOTAL"); do
   SKIP=$(( (i - 1) * WINDOW ))
   echo "--- ck$(printf '%02d' "$i") (corpus offset $SKIP) ---"
   if [ -z "$PREV" ]; then
-    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --batch-size "$BATCH" --accumulate "$ACC" --total-updates "$TOTAL_UPDATES"
+    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --batch-size "$BATCH" --accumulate "$ACC" --total-updates "$TOTAL_UPDATES" --no-tui
   else
-    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --batch-size "$BATCH" --accumulate "$ACC" --resume "$PREV" --total-updates "$TOTAL_UPDATES"
+    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --batch-size "$BATCH" --accumulate "$ACC" --resume "$PREV" --total-updates "$TOTAL_UPDATES" --no-tui
   fi
   PREV="$OUT"
 done

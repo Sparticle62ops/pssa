@@ -107,7 +107,10 @@ impl<'a> PSSAInferenceEngine<'a> {
         // not let its (irrelevant) logit become the numerical reference for
         // the softmax: a very large <unk> logit would otherwise underflow all
         // valid candidates to zero and report a spurious sampling failure.
-        let max = logits[1..].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let max = logits[1..]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0;
         probs[0] = 0.0;
         for i in 1..d_v {

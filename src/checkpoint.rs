@@ -302,7 +302,8 @@ pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
     let lv = checked_mul(l, v, "chunk * vocab")?;
     let lr = checked_mul(l, 16, "chunk * rank")?;
     let lms = checked_mul(l, ms, "chunk * latent * state")?;
-    let scan_len = l.checked_next_power_of_two()
+    let scan_len = l
+        .checked_next_power_of_two()
         .ok_or_else(|| invalid("affine scan padding overflow; reduce chunk length"))?;
     let scan_ms = checked_mul(scan_len, ms, "padded scan * latent * state")?;
     let l_two_m = checked_mul(l, two_m, "chunk * MLP width")?;

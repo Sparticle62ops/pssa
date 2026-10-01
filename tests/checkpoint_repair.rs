@@ -50,10 +50,7 @@ fn model() -> PSSALayerV2 {
         "delta".into(),
     ];
     for i in 0..12 {
-        pm(
-            persistent_matrix_mut(&mut x, i),
-            i as f32 + 0.1,
-        );
+        pm(persistent_matrix_mut(&mut x, i), i as f32 + 0.1);
     }
     pv(&mut x.norm_gamma, 20.);
     pv(&mut x.norm_beta, 30.);
@@ -530,7 +527,11 @@ fn legacy_inside_ball_keys_survive_norm_rounding_and_all_checkpoint_versions() {
     let mut m = PSSALayerV2::new(cfg, 7);
     // Produced by the old f32 projection; its true squared norm is below 1,
     // but converting that f64 norm back to f32 rounds it to exactly 1.
-    let key = [-0.5546702146530151f32, 0.7364687323570251, 0.38723990321159363];
+    let key = [
+        -0.5546702146530151f32,
+        0.7364687323570251,
+        0.38723990321159363,
+    ];
     let norm: f64 = key.iter().map(|&x| (x as f64).powi(2)).sum();
     assert!(norm < 1.0);
     assert_eq!(norm as f32, 1.0);
@@ -548,7 +549,9 @@ fn legacy_inside_ball_keys_survive_norm_rounding_and_all_checkpoint_versions() {
         assert_eq!(&loaded.memory.keys[..3], &key);
         assert!(loaded.memory.norm_sq[0] < 1.0);
         let mut out = [0.0; 4];
-        loaded.memory.retrieve_soft_into(&key, 0.7, &mut out, &mut [0.0; 3]);
+        loaded
+            .memory
+            .retrieve_soft_into(&key, 0.7, &mut out, &mut [0.0; 3]);
         assert_eq!(out, [2.0; 4]);
     }
     fs::remove_file(p).unwrap();
@@ -783,12 +786,29 @@ fn actual_numeric_storage(m: &PSSALayerV2) -> usize {
         inf_features,
         inf_block_out,
     } = m;
-    matrix_bytes(embed_w) + matrix_bytes(unembed_w) + vector_bytes(embed_row_marks)
-        + actual_block_storage(block) + extra_blocks.iter().map(actual_block_storage).sum::<usize>()
-        + [residual_scales, continuous_inputs, output_adjoints, input_adjoints,
-            residual_block_adjoints, residual_input_adjoints, inf_features, inf_block_out]
-            .into_iter().map(vector_bytes).sum::<usize>()
-        + boundary_adjoints.iter().chain(layer_activations).map(vector_bytes).sum::<usize>()
+    matrix_bytes(embed_w)
+        + matrix_bytes(unembed_w)
+        + vector_bytes(embed_row_marks)
+        + actual_block_storage(block)
+        + extra_blocks.iter().map(actual_block_storage).sum::<usize>()
+        + [
+            residual_scales,
+            continuous_inputs,
+            output_adjoints,
+            input_adjoints,
+            residual_block_adjoints,
+            residual_input_adjoints,
+            inf_features,
+            inf_block_out,
+        ]
+        .into_iter()
+        .map(vector_bytes)
+        .sum::<usize>()
+        + boundary_adjoints
+            .iter()
+            .chain(layer_activations)
+            .map(vector_bytes)
+            .sum::<usize>()
 }
 
 fn actual_block_storage(b: &oxide_ai_pssa::pssa::PSSAContinuousBlockV2) -> usize {
@@ -1029,22 +1049,25 @@ fn actual_block_storage(b: &oxide_ai_pssa::pssa::PSSAContinuousBlockV2) -> usize
     .sum::<usize>()
         + vector_bytes(x_ids)
         + vector_bytes(target_ids);
-    params
-        + norms
-        + adapter_bytes
-        + float_bytes
-        + memory_bytes
-        + tape_bytes
+    params + norms + adapter_bytes + float_bytes + memory_bytes + tape_bytes
 }
 
 #[test]
 fn large_projected_memory_keys_use_the_banks_norm_policy_on_save_and_load() {
     use oxide_ai_pssa::memory::HyperbolicEpisodicBankV2;
     let p = path("high-dimensional-memory");
-    let mut m = PSSALayerV2::new(PSSAConfigV2 {
-        d_vocab: 2, d_latent: 1, d_state: 1, d_mem_key: 10_000,
-        mem_capacity: 1, chunk_len: 1, ..Default::default()
-    }, 42);
+    let mut m = PSSALayerV2::new(
+        PSSAConfigV2 {
+            d_vocab: 2,
+            d_latent: 1,
+            d_state: 1,
+            d_mem_key: 10_000,
+            mem_capacity: 1,
+            chunk_len: 1,
+            ..Default::default()
+        },
+        42,
+    );
     let mut key = vec![0.0; m.cfg.d_mem_key];
     HyperbolicEpisodicBankV2::diffeomorphic_project(&vec![1e20; m.cfg.d_mem_key], &mut key);
     assert!(HyperbolicEpisodicBankV2::squared_norm(&key) < 1.0);
@@ -1072,7 +1095,10 @@ fn checked_allocation_accounting_matches_actual_model_vectors() {
             ..Default::default()
         };
         for depth in [1, 4] {
-            let cfg = PSSAConfigV2 { depth, ..cfg.clone() };
+            let cfg = PSSAConfigV2 {
+                depth,
+                ..cfg.clone()
+            };
             let expected = checkpoint::allocation_bytes(&cfg).unwrap();
             let actual = PSSALayerV2::new(cfg, 42);
             assert_eq!(

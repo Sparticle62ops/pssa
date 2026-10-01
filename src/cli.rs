@@ -44,6 +44,10 @@ pub struct TrainingOptions {
     pub loss_every: usize,
     /// Explicit target-token offset when starting a new CSV from a checkpoint.
     pub tokens_seen: Option<usize>,
+    /// Disable cursor control while retaining rate-limited plain progress logs.
+    pub no_tui: bool,
+    /// Runtime-only destination shown by the progress display; never checkpointed.
+    pub checkpoint_path: Option<String>,
 }
 impl Default for TrainingOptions {
     fn default() -> Self {
@@ -69,6 +73,8 @@ impl Default for TrainingOptions {
             loss_csv: None,
             loss_every: 10_000,
             tokens_seen: None,
+            no_tui: false,
+            checkpoint_path: None,
         }
     }
 }
@@ -114,6 +120,16 @@ impl Parsed {
                 if !allowed.contains(arg.as_str()) {
                     return Err(format!("unknown option '{arg}'"));
                 }
+                // Boolean switches are deliberately explicit rather than
+                // accepting arbitrary valueless options.  Keep the existing
+                // value-taking parser for every other flag.
+                if arg == "--no-tui" {
+                    if flags.insert(arg.clone(), "true".into()).is_some() {
+                        return Err(format!("option '{arg}' was specified more than once"));
+                    }
+                    i += 1;
+                    continue;
+                }
                 if i + 1 >= args.len()
                     || (args[i + 1].starts_with('-') && allowed.contains(args[i + 1].as_str()))
                 {
@@ -142,9 +158,14 @@ impl Parsed {
             .find_map(|name| self.flags.get(*name).map(String::as_str))
     }
     fn reject_duplicate_aliases(&self, names: &[&str], label: &str) -> Result<(), String> {
-        let count = names.iter().filter(|name| self.flags.contains_key(**name)).count();
+        let count = names
+            .iter()
+            .filter(|name| self.flags.contains_key(**name))
+            .count();
         if count > 1 {
-            Err(format!("{label} was specified more than once (use one spelling)"))
+            Err(format!(
+                "{label} was specified more than once (use one spelling)"
+            ))
         } else {
             Ok(())
         }
@@ -201,13 +222,15 @@ impl CLIHandler {
                 format!("cannot create output '{output_path}': {e}; use --out with a new file in an existing writable directory")
             })?;
         let mut writer = BufWriter::new(output);
-        let result = clean_wikitext(BufReader::new(input), &mut writer)
-            .and_then(|()| writer.flush());
+        let result =
+            clean_wikitext(BufReader::new(input), &mut writer).and_then(|()| writer.flush());
         drop(writer);
         if let Err(e) = result {
             let cleanup = match std::fs::remove_file(output_path) {
                 Ok(()) => String::new(),
-                Err(error) => format!("; cannot remove partial output: {error}; remove '{output_path}' before retrying"),
+                Err(error) => format!(
+                    "; cannot remove partial output: {error}; remove '{output_path}' before retrying"
+                ),
             };
             return Err(format!(
                 "cannot clean '{input_path}' into '{output_path}': {e}; check input UTF-8 and output disk space/permissions{cleanup}"
@@ -268,9 +291,15 @@ impl CLIHandler {
             skip_tokens: parsed.required_usize("--skip-tokens", "", 0)?,
             loss_csv: parsed.string("--loss-csv", "").map(str::to_string),
             loss_every: parsed.usize_nonzero("--loss-every", "", 10_000)?,
-            tokens_seen: parsed.string("--tokens-seen", "").map(|s| {
-                s.parse().map_err(|_| "--tokens-seen must be an unsigned integer".to_string())
-            }).transpose()?,
+            tokens_seen: parsed
+                .string("--tokens-seen", "")
+                .map(|s| {
+                    s.parse()
+                        .map_err(|_| "--tokens-seen must be an unsigned integer".to_string())
+                })
+                .transpose()?,
+            no_tui: parsed.flags.contains_key("--no-tui"),
+            checkpoint_path: None,
         };
         if x.loss_csv.is_none()
             && (parsed.flags.contains_key("--loss-every") || x.tokens_seen.is_some())
@@ -317,7 +346,12 @@ impl CLIHandler {
                 ("--depth", "--depth", x.depth, loaded.model.depth()),
                 ("--state", "--state", x.state, loaded.model.cfg.d_state),
                 ("--key", "--key", x.key, loaded.model.cfg.d_mem_key),
-                ("--memory", "--memory", x.memory, loaded.model.cfg.mem_capacity),
+                (
+                    "--memory",
+                    "--memory",
+                    x.memory,
+                    loaded.model.cfg.mem_capacity,
+                ),
                 ("--chunk", "--chunk", x.chunk, loaded.model.cfg.chunk_len),
             ];
             for (label, flag, requested, actual) in checks {
@@ -406,6 +440,17 @@ impl CLIHandler {
             Ok(docs)
         }
     }
+    fn memory_occupancy(model: &PSSALayerV2) -> Option<(usize, usize)> {
+        let banks = std::iter::once(&model.block).chain(model.extra_blocks.iter());
+        let mut used = 0usize;
+        let mut capacity = 0usize;
+        for block in banks {
+            used = used.checked_add(block.memory.count)?;
+            capacity = capacity.checked_add(block.memory.capacity)?;
+        }
+        (capacity > 0).then_some((used, capacity))
+    }
+
     fn finite(model: &PSSALayerV2) -> bool {
         fn matrix_finite(p: &crate::pssa::ParamMatrix) -> bool {
             p.data
@@ -425,30 +470,43 @@ impl CLIHandler {
         }
         matrix_finite(&model.embed_w)
             && matrix_finite(&model.unembed_w)
-            && std::iter::once(&model.block).chain(&model.extra_blocks).all(|block| {
-                [
-                    &block.a_mat, &block.w_delta, &block.w_b, &block.w_c,
-                    &block.w_qx, &block.w_qh, &block.w_gate, &block.w_proj,
-                    &block.mlp_w1, &block.mlp_w2,
-                ].iter().all(|p| matrix_finite(p))
-                    && vector_finite(&block.norm_gamma)
-                    && vector_finite(&block.norm_beta)
-                    && block.adapters.iter().all(|ad| {
-                        matrix_finite(&ad.down_proj) && matrix_finite(&ad.up_proj)
-                            && ad.consolidated_up.iter().all(|v| v.is_finite())
-                    })
-                    && block.h_persistent.iter().all(|v| v.is_finite())
-                    && block.memory.keys.iter().all(|v| v.is_finite())
-                    && block.memory.values.iter().all(|v| v.is_finite())
-                    && block.memory.norm_sq.iter().all(|v| v.is_finite())
-                    && block.memory.confidence.iter().all(|v| v.is_finite())
-            })
+            && std::iter::once(&model.block)
+                .chain(&model.extra_blocks)
+                .all(|block| {
+                    [
+                        &block.a_mat,
+                        &block.w_delta,
+                        &block.w_b,
+                        &block.w_c,
+                        &block.w_qx,
+                        &block.w_qh,
+                        &block.w_gate,
+                        &block.w_proj,
+                        &block.mlp_w1,
+                        &block.mlp_w2,
+                    ]
+                    .iter()
+                    .all(|p| matrix_finite(p))
+                        && vector_finite(&block.norm_gamma)
+                        && vector_finite(&block.norm_beta)
+                        && block.adapters.iter().all(|ad| {
+                            matrix_finite(&ad.down_proj)
+                                && matrix_finite(&ad.up_proj)
+                                && ad.consolidated_up.iter().all(|v| v.is_finite())
+                        })
+                        && block.h_persistent.iter().all(|v| v.is_finite())
+                        && block.memory.keys.iter().all(|v| v.is_finite())
+                        && block.memory.values.iter().all(|v| v.is_finite())
+                        && block.memory.norm_sq.iter().all(|v| v.is_finite())
+                        && block.memory.confidence.iter().all(|v| v.is_finite())
+                })
     }
 
     pub fn train_corpus(
         raw: &str,
         options: &TrainingOptions,
     ) -> Result<(PSSALayerV2, Tokenizer), String> {
+        let _plain_output = ui::plain_output(options.no_tui);
         if options.epochs == 0
             || options.latent == 0
             || options.state == 0
@@ -464,7 +522,9 @@ impl CLIHandler {
             );
         }
         if !(1..=32).contains(&options.depth) {
-            return Err("--depth must be between 1 and 32; use --depth 1 for the original model".into());
+            return Err(
+                "--depth must be between 1 and 32; use --depth 1 for the original model".into(),
+            );
         }
         if options.batch_size > 65_536 {
             return Err("--batch-size must be at most 65536; use fewer document lanes".into());
@@ -483,7 +543,8 @@ impl CLIHandler {
                 if options.depth != model.depth() {
                     return Err(format!(
                         "--depth={} does not match resume checkpoint value {}; use the checkpoint depth or start a fresh run",
-                        options.depth, model.depth()
+                        options.depth,
+                        model.depth()
                     ));
                 }
                 if model.vocabulary.is_empty() {
@@ -500,7 +561,10 @@ impl CLIHandler {
                 }
                 println!(
                     "resumed_from={path} vocab={} d_latent={} depth={} prior_steps={}",
-                    model.cfg.d_vocab, model.cfg.d_latent, model.depth(), model.step_counter
+                    model.cfg.d_vocab,
+                    model.cfg.d_latent,
+                    model.depth(),
+                    model.step_counter
                 );
                 ui::success(&format!(
                     "resumed {} at {} prior optimizer steps",
@@ -539,9 +603,14 @@ impl CLIHandler {
         // report GPU execution while actually running the scalar stack.
         if model.depth() > 1 {
             model.device = Device::Cpu;
-            println!("backend=cpu (stacked depth {}; GPU execution unsupported)", model.depth());
+            println!(
+                "backend=cpu (stacked depth {}; GPU execution unsupported)",
+                model.depth()
+            );
             if options.batch_size > 1 {
-                println!("batch_backend=cpu-replay (independent stacked lanes; no packed GEMM acceleration)");
+                println!(
+                    "batch_backend=cpu-replay (independent stacked lanes; no packed GEMM acceleration)"
+                );
             }
         } else {
             // Retain the accelerated depth-one stages and their CPU fallback.
@@ -590,7 +659,9 @@ impl CLIHandler {
         let last_lr = schedule.lr(total_updates)?;
         println!(
             "model=pssa parameters={} vocab={} depth={}",
-            model.parameter_count(), model.cfg.d_vocab, model.depth()
+            model.parameter_count(),
+            model.cfg.d_vocab,
+            model.depth()
         );
         crate::training::report_stream(&docs, chunk_len, options.accumulate);
         if options.batch_size > 1 {
@@ -606,7 +677,9 @@ impl CLIHandler {
             "width",
             &format!(
                 "latent {} / state {} / depth {}",
-                model.cfg.d_latent, model.cfg.d_state, model.depth()
+                model.cfg.d_latent,
+                model.cfg.d_state,
+                model.depth()
             ),
         );
         ui::field(
@@ -630,16 +703,38 @@ impl CLIHandler {
         );
         println!();
 
-        let mut curve = options.loss_csv.as_deref().map(|path| {
-            crate::loss_csv::LossCsv::open(path, options.loss_every, model.step_counter, options.tokens_seen)
-        }).transpose()?;
+        let mut curve = options
+            .loss_csv
+            .as_deref()
+            .map(|path| {
+                crate::loss_csv::LossCsv::open(
+                    path,
+                    options.loss_every,
+                    model.step_counter,
+                    options.tokens_seen,
+                )
+            })
+            .transpose()?;
         // Sequence values are borrowed views into `docs`; reuse the descriptor
         // vector so packed training does not allocate once per microbatch.
         let mut sequence_views = Vec::with_capacity(options.batch_size);
         let started = Instant::now();
         let mut update = 0;
         let mut tokens_seen = 0usize;
-        let mut progress = ui::Progress::new("training", total_updates);
+        let mut progress = ui::Progress::new_with_tui("training", total_updates, !options.no_tui);
+        if let Some(path) = options.checkpoint_path.as_deref() {
+            progress.set_checkpoint_path(path);
+        }
+        if let Some(path) = options.resume.as_deref() {
+            progress.set_last_checkpoint(path);
+        }
+        progress.set_prior_updates(model.step_counter.saturating_sub(update));
+        println!(
+            "progress_schema=2 updates_total={} prior_updates={} checkpoint_target={}",
+            total_updates,
+            model.step_counter,
+            options.checkpoint_path.as_deref().unwrap_or("-")
+        );
         for epoch in 0..options.epochs {
             model.reset_recurrent_state();
             if let Some(batch) = &mut sequence_batch {
@@ -690,15 +785,12 @@ impl CLIHandler {
                             .any(|c| batch.state(c.lane).iter().any(|x| !x.is_finite()))
                         {
                             return Err(
-                                "non-finite batch carry; training aborted without checkpoint".into(),
+                                "non-finite batch carry; training aborted without checkpoint"
+                                    .into(),
                             );
                         }
                     } else {
-                        crate::gpu_batch::backward_chunk_batched(
-                            &mut model,
-                            batch_tokens,
-                            scale,
-                        );
+                        crate::gpu_batch::backward_chunk_batched(&mut model, batch_tokens, scale);
                     }
                     // All retrieval adjoints see the same bank as forward. Writes
                     // happen only now, in deterministic lane order, using each
@@ -716,7 +808,8 @@ impl CLIHandler {
                     }
                 }
                 update += 1;
-                model.apply_adamw(schedule.lr(update)?);
+                let learning_rate = schedule.lr(update)?;
+                model.apply_adamw(learning_rate);
                 if !Self::finite(&model) {
                     return Err("non-finite parameters; training aborted without checkpoint".into());
                 }
@@ -724,7 +817,14 @@ impl CLIHandler {
                 if let Some(curve) = &mut curve {
                     curve.record(total_tokens, model.step_counter, loss_sum - prior_loss)?;
                 }
-                progress.update(update, total_tokens, loss_sum / token_sum.max(1) as f64);
+                let update_loss = (loss_sum - prior_loss) / total_tokens.max(1) as f64;
+                progress.update_with_metrics(
+                    update,
+                    total_tokens,
+                    update_loss,
+                    Some(learning_rate),
+                    Self::memory_occupancy(&model),
+                );
             }
             progress.finish();
             model.ema_consolidate_plasticity();
@@ -766,11 +866,14 @@ impl CLIHandler {
     }
 
     pub fn run_training(data: &str, options: &TrainingOptions, out: &str) -> Result<(), String> {
+        let _plain_output = ui::plain_output(options.no_tui);
         let raw = DatasetManager::try_load_dataset(Some(data))?;
-        let (model, _) = Self::train_corpus(&raw, options)?;
+        let mut run_options = options.clone();
+        run_options.checkpoint_path = Some(out.to_string());
+        let (model, _) = Self::train_corpus(&raw, &run_options)?;
         Self::save_model_v2(&model, out)
             .map_err(|e| format!("cannot save checkpoint '{out}': {e}"))?;
-        println!("saved_checkpoint={out}");
+        ui::checkpoint_saved(out);
         ui::success(&format!("checkpoint written to {}", ui::bold(out)));
         println!();
         Ok(())
@@ -819,7 +922,9 @@ impl CLIHandler {
                     if tokenizer.ordered_vocabulary()? != model.vocabulary
                         || tokenizer.vocab_size != model.cfg.d_vocab
                     {
-                        return Err("checkpoint tokenizer metadata/model vocabulary mismatch".into());
+                        return Err(
+                            "checkpoint tokenizer metadata/model vocabulary mismatch".into()
+                        );
                     }
                     Ok((model, tokenizer))
                 }
@@ -887,12 +992,17 @@ impl CLIHandler {
         raw: &str,
     ) -> Result<(f64, usize, usize, usize), String> {
         let metrics = crate::evaluation::evaluate_pssa(
-            model, tokenizer, raw, crate::evaluation::EvaluationSlice::default(),
+            model,
+            tokenizer,
+            raw,
+            crate::evaluation::EvaluationSlice::default(),
         )?;
         Ok((metrics.loss, metrics.tokens, metrics.correct, metrics.oov))
     }
     fn run_evaluate(
-        model_path: &str, data: &str, slice: crate::evaluation::EvaluationSlice,
+        model_path: &str,
+        data: &str,
+        slice: crate::evaluation::EvaluationSlice,
     ) -> Result<(), String> {
         // V5 checkpoints contain no tokenizer provenance, so the evaluation
         // corpus also has to seed their legacy word tokenizer.  Newer formats
@@ -989,6 +1099,42 @@ impl CLIHandler {
         println!("benchmark_pass ce={ce:.6} completion={out}");
         Ok(())
     }
+    fn run_throughput(
+        model_path: &str,
+        data: &str,
+        slice: crate::evaluation::EvaluationSlice,
+    ) -> Result<(), String> {
+        let raw = DatasetManager::try_load_dataset(Some(data))?;
+        let started = Instant::now();
+        let (tokens, elapsed) = if model_path.ends_with(".trfm") {
+            let model = crate::transformer_checkpoint::load_checkpoint(model_path)
+                .map_err(|e| format!("cannot load transformer model '{model_path}': {e}"))?;
+            let tokenizer = model.tokenizer()?;
+            let mut model = model;
+            let metrics =
+                crate::evaluation::evaluate_transformer(&mut model, &tokenizer, &raw, slice)?;
+            (metrics.tokens, started.elapsed().as_secs_f64())
+        } else {
+            let format = checkpoint::load_checkpoint(model_path)
+                .map_err(|e| format!("cannot inspect model '{model_path}': {e}"))?
+                .format;
+            let provenance = (format == CheckpointFormat::LegacyV5InferenceOnly).then_some(data);
+            let (mut model, tokenizer) = Self::load_for_inference(model_path, provenance)?;
+            let metrics = crate::evaluation::evaluate_pssa(&mut model, &tokenizer, &raw, slice)?;
+            (metrics.tokens, started.elapsed().as_secs_f64())
+        };
+        let rate = if elapsed > 0.0 {
+            tokens as f64 / elapsed
+        } else {
+            0.0
+        };
+        println!(
+            "throughput_tokens={} elapsed_seconds={elapsed:.6} tokens_per_second={rate:.3} model={model_path}",
+            tokens
+        );
+        Ok(())
+    }
+
     /// Everything the project can do, on one screen, with the state of the
     /// working directory next to it. This is what `oxide` alone prints.
     pub fn print_home() {
@@ -1003,15 +1149,31 @@ impl CLIHandler {
 
         ui::panel_top("commands");
         for (name, blurb) in [
-            ("train", "fit a checkpoint on a text corpus"),
+            ("train", "fit a PSSA checkpoint on a text corpus"),
+            ("train-transformer", "fit the CPU decoder-only baseline"),
             ("generate", "continue a prompt with a trained checkpoint"),
+            (
+                "generate-transformer",
+                "continue a prompt with the baseline",
+            ),
             ("chat", "interactive prompt loop against a checkpoint"),
-            ("evaluate", "cross entropy, perplexity and accuracy as JSON"),
+            ("score", "score a checkpoint on held-out text (JSON)"),
+            (
+                "score-transformer",
+                "score the baseline on held-out text (JSON)",
+            ),
             ("status", "checkpoints and corpora in this directory"),
             ("download", "pull a Hugging Face dataset to a local file"),
-            ("clean-wikitext", "stream-clean raw WikiText into a new file"),
+            (
+                "clean-wikitext",
+                "stream-clean raw WikiText into a new file",
+            ),
             ("benchmark", "end-to-end smoke test on the built-in corpus"),
-            ("tui", "live dashboard for a piped training run (train ... | oxide tui)"),
+            ("throughput", "measure frozen-model tokens/sec on a corpus"),
+            (
+                "tui",
+                "live dashboard for a piped training run (train ... | oxide tui)",
+            ),
             (
                 "gpu-probe",
                 "check whether a WebGPU compute device is usable",
@@ -1026,7 +1188,6 @@ impl CLIHandler {
         ui::panel_bottom();
         println!();
 
-        println!("  train-transformer: same-size decoder-only baseline (help train-transformer)");
         Self::workspace_panel();
         println!();
         println!(
@@ -1056,7 +1217,7 @@ impl CLIHandler {
                 let Some(name) = path.to_str() else { continue };
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 let label = name.trim_start_matches("./").to_string();
-                if name.ends_with(".pssa") {
+                if name.ends_with(".pssa") || name.ends_with(".trfm") {
                     checkpoints.push((label, size));
                 } else if name.ends_with(".txt") && size > 4096 {
                     corpora.push((label, size));
@@ -1111,7 +1272,7 @@ impl CLIHandler {
             let mut paths: Vec<String> = entries
                 .flatten()
                 .filter_map(|e| e.path().to_str().map(|s| s.to_string()))
-                .filter(|s| s.ends_with(".pssa"))
+                .filter(|s| s.ends_with(".pssa") || s.ends_with(".trfm"))
                 .collect();
             paths.sort();
             for path in paths {
@@ -1128,27 +1289,45 @@ impl CLIHandler {
                     break;
                 }
                 described += 1;
-                match checkpoint::load_checkpoint(&path) {
-                    Ok(loaded) => {
-                        let m = loaded.model;
-                        ui::panel_row(&ui::bold(path.trim_start_matches("./")));
-                        ui::panel_field(
-                            "  shape",
-                            &format!(
-                                "vocab {} / latent {} / state {}",
-                                ui::thousands(m.cfg.d_vocab),
-                                m.cfg.d_latent,
-                                m.cfg.d_state
-                            ),
-                        );
-                        ui::panel_field(
-                            "  trained",
-                            &format!("{} optimizer steps", ui::thousands(m.step_counter as usize)),
-                        );
+                ui::panel_row(&ui::bold(path.trim_start_matches("./")));
+                if path.ends_with(".trfm") {
+                    match crate::transformer_checkpoint::load_checkpoint(&path) {
+                        Ok(m) => {
+                            ui::panel_field(
+                                "  shape",
+                                &format!(
+                                    "vocab {} / width {} / feed-forward {}",
+                                    ui::thousands(m.cfg.d_vocab),
+                                    m.cfg.d_model,
+                                    m.cfg.d_ff
+                                ),
+                            );
+                            ui::panel_field(
+                                "  trained",
+                                &format!("{} optimizer steps", ui::thousands(m.step_counter)),
+                            );
+                        }
+                        Err(e) => ui::panel_field("  unreadable", &ui::dim(&e.to_string())),
                     }
-                    Err(e) => {
-                        ui::panel_row(&ui::bold(path.trim_start_matches("./")));
-                        ui::panel_field("  unreadable", &ui::dim(&e.to_string()));
+                } else {
+                    match checkpoint::load_checkpoint(&path) {
+                        Ok(loaded) => {
+                            let m = loaded.model;
+                            ui::panel_field(
+                                "  shape",
+                                &format!(
+                                    "vocab {} / latent {} / state {}",
+                                    ui::thousands(m.cfg.d_vocab),
+                                    m.cfg.d_latent,
+                                    m.cfg.d_state
+                                ),
+                            );
+                            ui::panel_field(
+                                "  trained",
+                                &format!("{} optimizer steps", ui::thousands(m.step_counter)),
+                            );
+                        }
+                        Err(e) => ui::panel_field("  unreadable", &ui::dim(&e.to_string())),
                     }
                 }
             }
@@ -1176,13 +1355,30 @@ impl CLIHandler {
         println!("  {}", ui::bold("COMMANDS"));
         for (name, blurb) in [
             ("train", "fit a checkpoint on a text corpus"),
+            ("train-transformer", "fit the CPU decoder-only baseline"),
             ("generate", "continue a prompt with a trained checkpoint"),
-            ("evaluate", "cross entropy, perplexity and accuracy as JSON"),
+            (
+                "generate-transformer",
+                "continue a prompt with the baseline",
+            ),
+            ("score", "score a checkpoint on held-out text (JSON)"),
+            (
+                "score-transformer",
+                "score the baseline on held-out text (JSON)",
+            ),
             ("chat", "interactive prompt loop against a checkpoint"),
+            ("status", "checkpoints and corpora in this directory"),
             ("download", "pull a Hugging Face dataset to a local file"),
-            ("clean-wikitext", "stream-clean raw WikiText into a new file"),
+            (
+                "clean-wikitext",
+                "stream-clean raw WikiText into a new file",
+            ),
             ("benchmark", "end-to-end smoke test on the built-in corpus"),
-            ("tui", "live dashboard for a piped training run (train ... | oxide tui)"),
+            ("throughput", "measure frozen-model tokens/sec on a corpus"),
+            (
+                "tui",
+                "live dashboard for a piped training run (train ... | oxide tui)",
+            ),
             (
                 "gpu-probe",
                 "check whether a WebGPU compute device is usable",
@@ -1192,8 +1388,7 @@ impl CLIHandler {
             println!("    {:<16}{}", ui::cyan(name), ui::dim(blurb));
         }
         println!();
-        println!("    train-transformer  same-size decoder-only baseline (help train-transformer)");
-        println!("    generate-transformer / evaluate-transformer  sample / score the baseline");
+        println!("    evaluate / evaluate-transformer / repl  hidden compatibility aliases");
         println!("  {}", ui::bold("TRAIN"));
         println!("    {bin} train [source] [-d|--data source] [-o|--out path]");
         println!(
@@ -1257,8 +1452,11 @@ impl CLIHandler {
             ui::dim("continue from an existing checkpoint")
         );
         println!();
-        println!("    --loss-csv PATH --loss-every N  append training curves every N target tokens");
+        println!(
+            "    --loss-csv PATH --loss-every N  append training curves every N target tokens"
+        );
         println!("    --tokens-seen N  offset for a new CSV on resume (existing CSV restores it)");
+        println!("    --no-tui         disable cursor updates; keep plain progress logs");
         println!();
         println!("  {}", ui::bold("GENERATE"));
         println!(
@@ -1301,76 +1499,144 @@ impl CLIHandler {
         );
         println!();
     }
+    fn canonical_command(command: &str) -> &str {
+        match command {
+            // Canonical developer-facing names. Historical spellings remain
+            // accepted as hidden aliases for scripts and notebooks.
+            "repl" => "chat",
+            "evaluate" => "score",
+            "evaluate-transformer" => "score-transformer",
+            other => other,
+        }
+    }
+
     fn print_command_help(command: &str) -> Result<(), String> {
         let bin = "oxide_ai_pssa";
+        let command = Self::canonical_command(command);
         match command {
             "train-transformer" => {
                 println!("Usage: {bin} train-transformer [SOURCE] [OPTIONS]");
                 println!("Decoder-only baseline: 1 layer, width 256, 4 heads, FFN 448; CPU only.");
-                println!("Same data/tokenizer/window/update schedule as train; context resets each chunk.");
+                println!(
+                    "Same data/tokenizer/window/update schedule as train; context resets each chunk."
+                );
                 println!("  -d, --data SOURCE   -o, --out PATH (default: data/model.trfm)");
                 println!("  -e, --epochs N (4)  --chunk N (64)  --accumulate N (8)");
                 println!("  --tokenizer bpe|word (bpe)  --vocab-size N (2048 ceiling)");
-                println!("  --tokenizer-from PSSA_CHECKPOINT  import EXACT tokenizer for comparisons");
+                println!(
+                    "  --tokenizer-from PSSA_CHECKPOINT  import EXACT tokenizer for comparisons"
+                );
                 println!("  --max-tokens N  --skip-tokens N (wraps at EOF)");
-                println!("  --lr F (0.001)  --warmup-steps N (0)  --total-updates N  --seed N (42)");
-                println!("  --resume PATH  restore transformer weights, moments, tokenizer and horizon");
-                println!("  --loss-csv PATH --loss-every N (10000)  append target-token loss curve");
+                println!(
+                    "  --lr F (0.001)  --warmup-steps N (0)  --total-updates N  --seed N (42)"
+                );
+                println!(
+                    "  --resume PATH  restore transformer weights, moments, tokenizer and horizon"
+                );
+                println!(
+                    "  --loss-csv PATH --loss-every N (10000)  append target-token loss curve"
+                );
                 println!("  --tokens-seen N  required when starting a new curve on resume");
-                println!("Omit --tokenizer-from on resume; identical chunk/accumulation flags give identical updates.");
+                println!("  --no-tui         disable cursor updates; keep plain progress logs");
+                println!(
+                    "Omit --tokenizer-from on resume; identical chunk/accumulation flags give identical updates."
+                );
+                println!();
+                println!(
+                    "Example: {bin} train-transformer data/downloaded.txt -o data/model.trfm --max-tokens 200000 -e 1"
+                );
             }
             "train" => {
                 println!("Usage: {bin} train [SOURCE] [OPTIONS]");
                 println!();
-                println!("Fit a checkpoint on a text corpus. SOURCE may be a local file, directory, URL, hf:REPO, or science.");
+                println!(
+                    "Fit a checkpoint on a text corpus. SOURCE may be a local file, directory, URL, hf:REPO, or science."
+                );
                 println!();
                 println!("Options:");
-                println!("  -d, --data <SOURCE>           dataset source (also accepted as SOURCE)");
-                println!("  -o, --out <PATH>              checkpoint output (default: data/model.pssa)");
+                println!(
+                    "  -d, --data <SOURCE>           dataset source (also accepted as SOURCE)"
+                );
+                println!(
+                    "  -o, --out <PATH>              checkpoint output (default: data/model.pssa)"
+                );
                 println!("  -e, --epochs <N>              positive number of passes (default: 4)");
                 println!("      --tokenizer <bpe|word>    tokenizer family (default: bpe)");
                 println!("      --vocab-size <N>          BPE vocabulary ceiling (default: 2048)");
                 println!("      --latent <N>              latent width (default: 256)");
-                println!("      --depth <N>               continuous blocks, 1..32 (default: 1; stacks CPU-only)");
+                println!(
+                    "      --depth <N>               continuous blocks, 1..32 (default: 1; stacks CPU-only)"
+                );
                 println!("      --state <N>               recurrent state width (default: 16)");
                 println!("      --key <N>                 memory key width (default: 32)");
                 println!("      --memory <N>              memory capacity (default: 512)");
                 println!("      --chunk <N>               training chunk length (default: 64)");
                 println!("      --batch-size <N>          independent document lanes (default: 1)");
-                println!("      --accumulate <N>          microbatches per optimizer update (default: 8)");
+                println!(
+                    "      --accumulate <N>          microbatches per optimizer update (default: 8)"
+                );
                 println!("      --lr <F>                  base learning rate (default: 0.001)");
                 println!("      --warmup-steps <N>        linear warm-up updates (default: 0)");
-                println!("      --total-updates <N>       fixed whole-run schedule horizon (fresh run)");
+                println!(
+                    "      --total-updates <N>       fixed whole-run schedule horizon (fresh run)"
+                );
                 println!("      --seed <N>                initialization seed (default: 42)");
                 println!("      --max-tokens <N>          global token cap");
                 println!("      --skip-tokens <N>         offset into the corpus; wraps at EOF");
-                println!("      --resume <PATH>            continue optimizer/model state from a checkpoint");
-                println!("      --loss-csv <PATH>          append target-token training loss curve");
-                println!("      --loss-every <N>           token cadence (default: 10000), at update boundaries");
-                println!("      --tokens-seen <N>          offset for a new CSV on resume; otherwise restored");
+                println!(
+                    "      --resume <PATH>            continue optimizer/model state from a checkpoint"
+                );
+                println!(
+                    "      --loss-csv <PATH>          append target-token training loss curve"
+                );
+                println!(
+                    "      --loss-every <N>           token cadence (default: 10000), at update boundaries"
+                );
+                println!(
+                    "      --tokens-seen <N>          offset for a new CSV on resume; otherwise restored"
+                );
+                println!(
+                    "      --no-tui                   disable cursor updates; keep plain progress logs"
+                );
                 println!();
-                println!("Examples:");
-                println!("  {bin} train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1");
-                println!("  {bin} train data/downloaded.txt -o data/ck02.pssa --resume data/ck01.pssa --skip-tokens 200000 --max-tokens 200000 -e 1");
+                println!("Example:");
+                println!(
+                    "  {bin} train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1"
+                );
+                println!(
+                    "  {bin} train data/downloaded.txt -o data/ck02.pssa --resume data/ck01.pssa --skip-tokens 200000 --max-tokens 200000 -e 1"
+                );
             }
             "generate" | "generate-transformer" => {
-                let model = if command == "generate" { "data/model.pssa" } else { "data/model.trfm" };
+                let model = if command == "generate" {
+                    "data/model.pssa"
+                } else {
+                    "data/model.trfm"
+                };
                 println!("Usage: {bin} {command} [PROMPT] [OPTIONS]");
                 println!();
                 println!("Options:");
                 println!("  -p, --prompt <TEXT>           prompt (also accepted as PROMPT)");
                 println!("  -m, --model <PATH>            checkpoint (default: {model})");
-                println!("  -t, --temp, --temperature <F> sampling temperature; 0 is greedy (default: 0.70)");
-                println!("      --max-new-tokens <N>      generation cap (default: 64, max: {MAX_GENERATION_TOKENS})");
+                println!(
+                    "  -t, --temp, --temperature <F> sampling temperature; 0 is greedy (default: 0.70)"
+                );
+                println!(
+                    "      --max-new-tokens <N>      generation cap (default: 64, max: {MAX_GENERATION_TOKENS})"
+                );
                 println!();
-                println!("Examples:");
+                println!("Example:");
                 println!("  {bin} {command} -m {model} -p \"The sun is\"");
-                println!("  {bin} {command} \"quantum mechanics\" --temperature 0 --max-new-tokens 32");
+                println!(
+                    "  {bin} {command} \"quantum mechanics\" --temperature 0 --max-new-tokens 32"
+                );
             }
             "chat" | "repl" => {
                 println!("Usage: {bin} chat [DATA] [OPTIONS]");
                 println!();
-                println!("Start an interactive prompt loop. DATA is an optional legacy word-tokenizer provenance source.");
+                println!(
+                    "Start an interactive prompt loop. DATA is an optional legacy word-tokenizer provenance source."
+                );
                 println!("Options:");
                 println!("  -m, --model <PATH>            checkpoint (default: data/model.pssa)");
                 println!("  -d, --data <SOURCE>           legacy tokenizer provenance source");
@@ -1378,24 +1644,40 @@ impl CLIHandler {
                 println!();
                 println!("Example: {bin} chat -m data/model.pssa --temperature 0.7");
             }
-            "evaluate" | "evaluate-transformer" => {
+            "score" | "score-transformer" => {
                 println!("Usage: {bin} {command} [DATA] [-m|--model PATH] [-d|--data SOURCE]");
                 println!();
                 println!("Evaluate a checkpoint and print one JSON metrics object.");
-                println!("  --skip-tokens N --max-tokens N  strict held-out slice, never wraps at EOF");
+                println!(
+                    "  --skip-tokens N --max-tokens N  strict held-out slice, never wraps at EOF"
+                );
                 println!("Use the embedded tokenizer; no training or checkpoint writes.");
-                let model = if command == "evaluate" { "data/model.pssa" } else { "data/model.trfm" };
+                let model = if command == "score" {
+                    "data/model.pssa"
+                } else {
+                    "data/model.trfm"
+                };
                 println!("Example: {bin} {command} data/heldout.txt --model {model}");
             }
             "clean-wikitext" => {
                 println!("Usage: {bin} clean-wikitext INPUT -o OUTPUT");
                 println!();
                 println!("Stream-clean a local UTF-8 WikiText raw dump, one line at a time.");
-                println!("  -o, --out <PATH>  required new output file; existing files are never overwritten");
-                println!("Removes headings and <unk>, joins @-@ / @.@ / @,@, normalizes punctuation spacing,");
-                println!("and collapses blank lines. Output uses LF endings. Input is never modified.");
-                println!("Run once before a fresh training chain; do not switch corpora mid-resume.");
-                println!("Example: {bin} clean-wikitext wiki.train.raw --out data/wikitext-clean.txt");
+                println!(
+                    "  -o, --out <PATH>  required new output file; existing files are never overwritten"
+                );
+                println!(
+                    "Removes headings and <unk>, joins @-@ / @.@ / @,@, normalizes punctuation spacing,"
+                );
+                println!(
+                    "and collapses blank lines. Output uses LF endings. Input is never modified."
+                );
+                println!(
+                    "Run once before a fresh training chain; do not switch corpora mid-resume."
+                );
+                println!(
+                    "Example: {bin} clean-wikitext wiki.train.raw --out data/wikitext-clean.txt"
+                );
             }
             "download" => {
                 println!("Usage: {bin} download REPOSITORY [-o|--out PATH]");
@@ -1404,18 +1686,54 @@ impl CLIHandler {
                 println!("Example: {bin} download wikimedia/wikipedia --out data/downloaded.txt");
             }
             "benchmark" => {
-                println!("Usage: {bin} benchmark [--feature continual|retention|geometry|refractory|ridge|all] [--out PATH]");
-                println!("Without options, runs the historical verification smoke test. Feature runs write JSON to --out (a directory for all).");
+                println!("Usage: {bin} benchmark [-f|--feature NAME] [-o|--out PATH]");
+                println!("Features: continual, retention, geometry, refractory, ridge, or all.");
+                println!("Without options, runs the historical verification smoke test.");
+                println!(
+                    "Example: {bin} benchmark --feature geometry --out __agent__/feature_results"
+                );
             }
-            "status" | "gpu-probe" => {
-                println!("Usage: {bin} {command}");
+            "status" => {
+                println!("Usage: {bin} status");
                 println!();
-                println!("This command takes no options.");
+                println!(
+                    "List nearby corpora and checkpoints, including model shapes and optimizer steps."
+                );
+                println!("Example: {bin} status");
+            }
+            "gpu-probe" => {
+                println!("Usage: {bin} gpu-probe");
+                println!();
+                println!(
+                    "Probe the available GPU backend and compare one GEMM against the CPU reference."
+                );
+                println!("Example: {bin} gpu-probe");
+            }
+            "throughput" => {
+                println!(
+                    "Usage: {bin} throughput [DATA] [--model PATH] [--skip-tokens N] [--max-tokens N]"
+                );
+                println!();
+                println!(
+                    "Measure frozen-model scoring throughput. DATA defaults to the normal training source."
+                );
+                println!(
+                    "Example: {bin} throughput data/heldout.txt --model data/model.pssa --max-tokens 10000"
+                );
+            }
+            "help" => {
+                println!("Usage: {bin} help [COMMAND]");
+                println!();
+                println!("Show the complete command list or one command's options and example.");
+                println!("Example: {bin} help train");
             }
             "tui" => {
-                println!("Usage: {bin} tui");
+                println!("Usage: {bin} tui [--chain DIR]");
                 println!();
-                println!("Render a dashboard for a piped training run: train ... | {bin} tui");
+                println!(
+                    "Render a live dashboard for a piped training run; piped output is passed through plainly."
+                );
+                println!("Example: {bin} train data/downloaded.txt --no-tui | {bin} tui");
             }
             _ => return Err(format!("unknown command '{command}'; run {bin} help")),
         }
@@ -1427,9 +1745,9 @@ impl CLIHandler {
             Self::print_home();
             return Ok(());
         }
-        let command = args[1].as_str();
+        let command = Self::canonical_command(args[1].as_str());
         if command == "help" {
-            if args.len() == 2 {
+            if args.len() == 2 || (args.len() == 3 && matches!(args[2].as_str(), "--help" | "-h")) {
                 Self::print_help();
                 return Ok(());
             }
@@ -1442,7 +1760,10 @@ impl CLIHandler {
             Self::print_help();
             return Ok(());
         }
-        if args[2..].iter().any(|arg| matches!(arg.as_str(), "--help" | "-h")) {
+        if args[2..]
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+        {
             return Self::print_command_help(command);
         }
         match command {
@@ -1453,11 +1774,31 @@ impl CLIHandler {
             "train" | "train-transformer" => {
                 let baseline = command == "train-transformer";
                 let mut allowed = vec![
-                    "--data", "-d", "--out", "-o", "--epochs", "-e",
-                    "--latent", "--state", "--key", "--memory", "--chunk", "--lr",
-                    "--accumulate", "--warmup-steps", "--total-updates", "--seed",
-                    "--max-tokens", "--tokenizer", "--vocab-size", "--resume", "--skip-tokens",
-                    "--loss-csv", "--loss-every", "--tokens-seen",
+                    "--data",
+                    "-d",
+                    "--out",
+                    "-o",
+                    "--epochs",
+                    "-e",
+                    "--latent",
+                    "--state",
+                    "--key",
+                    "--memory",
+                    "--chunk",
+                    "--lr",
+                    "--accumulate",
+                    "--warmup-steps",
+                    "--total-updates",
+                    "--seed",
+                    "--max-tokens",
+                    "--tokenizer",
+                    "--vocab-size",
+                    "--resume",
+                    "--skip-tokens",
+                    "--loss-csv",
+                    "--loss-every",
+                    "--tokens-seen",
+                    "--no-tui",
                 ];
                 if baseline {
                     allowed.retain(|x| !["--latent", "--state", "--key", "--memory"].contains(x));
@@ -1477,23 +1818,33 @@ impl CLIHandler {
                     return Err("train accepts at most one positional source".into());
                 }
                 if p.positional.len() == 1 && p.string("--data", "-d").is_some() {
-                    return Err("train source was specified both positionally and with --data".into());
+                    return Err(
+                        "train source was specified both positionally and with --data".into(),
+                    );
                 }
                 let data = p
                     .string("--data", "-d")
                     .map(str::to_string)
                     .or_else(|| p.positional.first().cloned())
                     .unwrap_or_else(Self::default_data);
-                let default_out = if baseline { "data/model.trfm" } else { "data/model.pssa" };
+                let default_out = if baseline {
+                    "data/model.trfm"
+                } else {
+                    "data/model.pssa"
+                };
                 let out = p.string("--out", "-o").unwrap_or(default_out);
                 if baseline {
                     let mut opts = Self::common_options(&p)?;
                     if let Some(path) = &opts.resume {
                         if p.string("--tokenizer-from", "").is_some() {
-                            return Err("--resume restores its own tokenizer; omit --tokenizer-from".into());
+                            return Err(
+                                "--resume restores its own tokenizer; omit --tokenizer-from".into(),
+                            );
                         }
-                        let model = crate::transformer_checkpoint::load_checkpoint(path)
-                            .map_err(|e| format!("cannot inspect resume checkpoint '{path}': {e}"))?;
+                        let model =
+                            crate::transformer_checkpoint::load_checkpoint(path).map_err(|e| {
+                                format!("cannot inspect resume checkpoint '{path}': {e}")
+                            })?;
                         if p.flags.contains_key("--chunk") && opts.chunk != model.cfg.chunk_len {
                             return Err(format!(
                                 "--chunk={} does not match resume checkpoint value {}",
@@ -1503,14 +1854,20 @@ impl CLIHandler {
                         if !p.flags.contains_key("--lr") {
                             opts.lr = model.cfg.lr;
                         }
-                        if let (Some(requested), Some(stored)) = (
-                            opts.schedule_total_updates, model.lr_schedule_total_updates,
-                        ) && requested != stored {
-                            return Err(format!("--total-updates={requested} does not match resume checkpoint horizon {stored}"));
+                        if let (Some(requested), Some(stored)) =
+                            (opts.schedule_total_updates, model.lr_schedule_total_updates)
+                            && requested != stored
+                        {
+                            return Err(format!(
+                                "--total-updates={requested} does not match resume checkpoint horizon {stored}"
+                            ));
                         }
                     }
                     crate::transformer_training::run_training(
-                        &data, &opts, out, p.string("--tokenizer-from", ""),
+                        &data,
+                        &opts,
+                        out,
+                        p.string("--tokenizer-from", ""),
                     )
                 } else {
                     Self::run_training(&data, &Self::options(&p)?, out)
@@ -1544,13 +1901,16 @@ impl CLIHandler {
                     return Err("generate accepts one positional prompt".into());
                 }
                 if p.positional.len() == 1 && p.string("--prompt", "-p").is_some() {
-                    return Err("generate prompt was specified both positionally and with --prompt".into());
+                    return Err(
+                        "generate prompt was specified both positionally and with --prompt".into(),
+                    );
                 }
                 let prompt = p
                     .string("--prompt", "-p")
                     .or_else(|| p.positional.first().map(String::as_str))
                     .ok_or("generate requires a prompt")?;
-                let temp = p.f32_first(&["--temp", "--temperature", "-t"], "--temperature", 0.70)?;
+                let temp =
+                    p.f32_first(&["--temp", "--temperature", "-t"], "--temperature", 0.70)?;
                 if temp < 0.0 {
                     return Err("--temp must be >= 0".into());
                 }
@@ -1562,7 +1922,9 @@ impl CLIHandler {
                 }
                 let text = if command == "generate-transformer" {
                     if p.string("--data", "-d").is_some() {
-                        return Err("transformer checkpoints embed their tokenizer; omit --data".into());
+                        return Err(
+                            "transformer checkpoints embed their tokenizer; omit --data".into()
+                        );
                     }
                     crate::transformer_inference::generate(
                         p.string("--model", "-m").unwrap_or("data/model.trfm"),
@@ -1577,53 +1939,78 @@ impl CLIHandler {
                     )?
                 } else {
                     Self::run_generate(
-                        prompt, p.string("--model", "-m").unwrap_or("data/model.pssa"),
-                        p.string("--data", "-d"), temp, max,
+                        prompt,
+                        p.string("--model", "-m").unwrap_or("data/model.pssa"),
+                        p.string("--data", "-d"),
+                        temp,
+                        max,
                     )?
                 };
                 println!("{text}");
                 Ok(())
             }
-            "evaluate" | "evaluate-transformer" => {
-                let p = Parsed::parse(&args[2..], &["--model", "-m", "--data", "-d", "--skip-tokens", "--max-tokens"])?;
+            "score" | "score-transformer" => {
+                let p = Parsed::parse(
+                    &args[2..],
+                    &[
+                        "--model",
+                        "-m",
+                        "--data",
+                        "-d",
+                        "--skip-tokens",
+                        "--max-tokens",
+                    ],
+                )?;
                 p.reject_duplicate_aliases(&["--model", "-m"], "--model")?;
                 p.reject_duplicate_aliases(&["--data", "-d"], "--data")?;
                 if p.positional.len() > 1 {
-                    return Err("evaluate accepts one positional data source".into());
+                    return Err("score accepts one positional data source".into());
                 }
                 if p.positional.len() == 1 && p.string("--data", "-d").is_some() {
-                    return Err("evaluate data was specified both positionally and with --data".into());
+                    return Err("score data was specified both positionally and with --data".into());
                 }
                 let data = p
                     .string("--data", "-d")
-                    .or_else(|| p.positional.first().map(String::as_str))
-                    .ok_or("evaluate requires a data source (use DATA or --data DATA)")?;
+                    .map(str::to_owned)
+                    .or_else(|| p.positional.first().cloned())
+                    .unwrap_or_else(Self::default_data);
                 let slice = crate::evaluation::EvaluationSlice {
                     skip_tokens: p.required_usize("--skip-tokens", "", 0)?,
-                    max_tokens: p.string("--max-tokens", "")
-                        .map(|_| p.usize_nonzero("--max-tokens", "", 1)).transpose()?,
+                    max_tokens: p
+                        .string("--max-tokens", "")
+                        .map(|_| p.usize_nonzero("--max-tokens", "", 1))
+                        .transpose()?,
                 };
-                if command == "evaluate-transformer" {
+                if command == "score-transformer" {
                     crate::transformer_inference::evaluate_slice(
-                        p.string("--model", "-m").unwrap_or("data/model.trfm"), data, slice,
+                        p.string("--model", "-m").unwrap_or("data/model.trfm"),
+                        &data,
+                        slice,
                     )
                 } else {
                     Self::run_evaluate(
-                        p.string("--model", "-m").unwrap_or("data/model.pssa"), data, slice,
+                        p.string("--model", "-m").unwrap_or("data/model.pssa"),
+                        &data,
+                        slice,
                     )
                 }
             }
             "chat" | "repl" => {
                 let p = Parsed::parse(
                     &args[2..],
-                    &["--model", "-m", "--data", "-d", "--temp", "--temperature", "-t"],
+                    &[
+                        "--model",
+                        "-m",
+                        "--data",
+                        "-d",
+                        "--temp",
+                        "--temperature",
+                        "-t",
+                    ],
                 )?;
                 p.reject_duplicate_aliases(&["--model", "-m"], "--model")?;
                 p.reject_duplicate_aliases(&["--data", "-d"], "--data")?;
-                p.reject_duplicate_aliases(
-                    &["--temp", "--temperature", "-t"],
-                    "--temperature",
-                )?;
+                p.reject_duplicate_aliases(&["--temp", "--temperature", "-t"], "--temperature")?;
                 if p.positional.len() > 1 {
                     return Err("chat accepts one positional data source".into());
                 }
@@ -1647,8 +2034,9 @@ impl CLIHandler {
                 if p.positional.len() != 1 {
                     return Err("clean-wikitext requires one input file; use clean-wikitext INPUT -o OUTPUT".into());
                 }
-                let output = p.string("--out", "-o")
-                    .ok_or("clean-wikitext requires --out OUTPUT (or -o OUTPUT); choose a new output file")?;
+                let output = p.string("--out", "-o").ok_or(
+                    "clean-wikitext requires --out OUTPUT (or -o OUTPUT); choose a new output file",
+                )?;
                 Self::run_clean_wikitext(&p.positional[0], output)
             }
             "download" => {
@@ -1680,13 +2068,57 @@ impl CLIHandler {
                 if args.len() == 2 {
                     Self::run_benchmark()
                 } else {
-                    let p = Parsed::parse(&args[2..], &["--feature", "--out"])?;
+                    let p = Parsed::parse(&args[2..], &["--feature", "-f", "--out", "-o"])?;
+                    p.reject_duplicate_aliases(&["--feature", "-f"], "--feature")?;
+                    p.reject_duplicate_aliases(&["--out", "-o"], "--out")?;
                     if !p.positional.is_empty() {
                         return Err("benchmark accepts only --feature and --out".into());
                     }
-                    let feature = p.string("--feature", "").ok_or("benchmark requires --feature when options are supplied")?;
-                    crate::feature_benchmark::run(feature, p.string("--out", ""))
+                    let feature = p
+                        .string("--feature", "-f")
+                        .ok_or("benchmark requires --feature when options are supplied")?;
+                    crate::feature_benchmark::run(feature, p.string("--out", "-o"))
                 }
+            }
+            "throughput" => {
+                let p = Parsed::parse(
+                    &args[2..],
+                    &[
+                        "--model",
+                        "-m",
+                        "--data",
+                        "-d",
+                        "--skip-tokens",
+                        "--max-tokens",
+                    ],
+                )?;
+                p.reject_duplicate_aliases(&["--model", "-m"], "--model")?;
+                p.reject_duplicate_aliases(&["--data", "-d"], "--data")?;
+                if p.positional.len() > 1 {
+                    return Err("throughput accepts one positional data source".into());
+                }
+                if p.positional.len() == 1 && p.string("--data", "-d").is_some() {
+                    return Err(
+                        "throughput data was specified both positionally and with --data".into(),
+                    );
+                }
+                let data = p
+                    .string("--data", "-d")
+                    .map(str::to_owned)
+                    .or_else(|| p.positional.first().cloned())
+                    .unwrap_or_else(Self::default_data);
+                let slice = crate::evaluation::EvaluationSlice {
+                    skip_tokens: p.required_usize("--skip-tokens", "", 0)?,
+                    max_tokens: p
+                        .string("--max-tokens", "")
+                        .map(|_| p.usize_nonzero("--max-tokens", "", 1))
+                        .transpose()?,
+                };
+                Self::run_throughput(
+                    p.string("--model", "-m").unwrap_or("data/model.pssa"),
+                    &data,
+                    slice,
+                )
             }
             "tui" => crate::tui::run(&args[2..]),
             _ => Err(format!("unknown command '{}'; run oxide help", args[1])),
@@ -1695,12 +2127,20 @@ impl CLIHandler {
 }
 fn probe_max_abs_diff(actual: &[f32], expected: &[f32]) -> Result<f32, String> {
     if actual.len() != expected.len() {
-        return Err(format!("GPU probe output length {}, expected {}", actual.len(), expected.len()));
+        return Err(format!(
+            "GPU probe output length {}, expected {}",
+            actual.len(),
+            expected.len()
+        ));
     }
     if actual.iter().chain(expected).any(|x| !x.is_finite()) {
         return Err("GPU probe comparison contains nonfinite values".into());
     }
-    Ok(actual.iter().zip(expected).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max))
+    Ok(actual
+        .iter()
+        .zip(expected)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max))
 }
 
 #[cfg(test)]
@@ -1714,7 +2154,10 @@ mod probe_tests {
             assert!(probe_max_abs_diff(&[bad], &[0.0]).is_err());
             assert!(probe_max_abs_diff(&[0.0], &[bad]).is_err());
         }
-        assert_eq!(probe_max_abs_diff(&[1.0, -2.0], &[1.25, -2.0]).unwrap(), 0.25);
+        assert_eq!(
+            probe_max_abs_diff(&[1.0, -2.0], &[1.25, -2.0]).unwrap(),
+            0.25
+        );
     }
 }
 
@@ -1757,7 +2200,8 @@ pub fn run_gpu_probe() -> Result<(), String> {
     let w: Vec<f32> = (0..n * k).map(|_| next()).collect();
 
     let t_gpu = Instant::now();
-    let y_gpu = ctx.try_dispatch_gemm(&x, &w, m, n, k, batch)
+    let y_gpu = ctx
+        .try_dispatch_gemm(&x, &w, m, n, k, batch)
         .map_err(|e| format!("GPU probe dispatch failed (no CPU fallback): {e}"))?;
     let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1000.0;
 
@@ -1775,7 +2219,9 @@ pub fn run_gpu_probe() -> Result<(), String> {
         println!("result: PASS, GPU kernel matches CPU reference");
     } else {
         println!("result: FAIL, GPU kernel diverges from CPU reference");
-        return Err(format!("GPU GEMM differs from CPU reference by {max_abs:.3e}"));
+        return Err(format!(
+            "GPU GEMM differs from CPU reference by {max_abs:.3e}"
+        ));
     }
     println!("note: this verifies GPU GEMM, not end-to-end training or hardware backward parity");
     Ok(())

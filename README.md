@@ -417,42 +417,63 @@ Commands:
 
 | Command | Purpose |
 | --- | --- |
-| `train [source]` | Fit a checkpoint on a text corpus and write a `.pssa` file. |
-| `generate <prompt>` | Continue a prompt with a trained checkpoint. |
-| `chat [source]` or `repl [source]` | Interactive prompt loop against a checkpoint. |
-| `evaluate [source]` | Cross entropy, perplexity and accuracy as JSON. |
+| `train [source]` | Fit a PSSA checkpoint on a text corpus and write a `.pssa` file. |
+| `train-transformer [source]` | Fit the CPU decoder-only baseline and write a `.trfm` file. |
+| `generate <prompt>` / `generate-transformer` | Continue a prompt with a trained checkpoint. |
+| `chat [source]` | Interactive prompt loop against a checkpoint. `repl` remains a hidden alias. |
+| `score [source]` / `score-transformer` | Score a checkpoint on held-out text as JSON. `evaluate` remains a hidden alias. |
+| `throughput [source]` | Measure frozen-model scoring tokens/sec. |
 | `status` | Checkpoints and corpora in the working directory. Takes no options. |
 | `download <repo>` | Pull a Hugging Face dataset to a local file. |
 | `clean-wikitext INPUT -o OUTPUT` | Stream-clean a raw WikiText file into a new UTF-8 corpus. |
-| `benchmark` | End-to-end smoke test on the built-in corpus. |
+| `benchmark` | End-to-end smoke test or feature benchmark. |
+| `tui` | Render a live dashboard for piped training output. |
 | `gpu-probe` | Check whether a WebGPU compute device is usable. |
-| `help` | Print command and option help. |
+| `help` | Print command and option help, including examples. |
+
+The training display uses cursor updates only on a real terminal. For a plain,
+parseable log (recommended for Kaggle or a pipe), pass `--no-tui`; the output
+still includes loss, a short moving average, speed, ETA, update counts, learning
+rate, memory occupancy, and checkpoint events. To view a piped log interactively:
+
+```bash
+oxide_ai_pssa train data/downloaded.txt -o chain/ck01.pssa --max-tokens 200000 -e 1 --no-tui \\
+  | oxide_ai_pssa tui --chain chain
+```
 
 Options:
 
 | Option | Default | Applies to | Description |
 | --- | --- | --- | --- |
-| `-d, --data <source>` | `data/downloaded.txt` when present, otherwise `science` | `train`, `chat`, `evaluate` | Dataset source, or a comma-separated list. |
-| `-m, --model <path>` | `data/model.pssa` | `chat`, `generate`, `evaluate` | Checkpoint to load. |
-| `-o, --out <path>` | Command-specific; required for `clean-wikitext` | `train`, `download`, `clean-wikitext` | Output checkpoint or dataset path. Cleaning requires a new file. |
-| `-p, --prompt <text>` | empty | `generate` | Prompt text. Required for generation. |
-| `-e, --epochs <n>` | `4` | `train` | Training epochs. |
-| `-t, --temp, --temperature <float>` | `0.70` | `chat`, `generate` | Sampling temperature. |
-| `--max-new-tokens <n>` | `64` (maximum 100,000) | `generate` | Generation length cap. |
-| `--latent <n>` | `256` | `train` | Latent dimension. |
-| `--state <n>` | `16` | `train` | Recurrent state dimension. |
-| `--key <n>` | `32` | `train` | Memory-key dimension. |
-| `--memory <n>` | `512` | `train` | Memory bank capacity. |
-| `--chunk <n>` | `64` | `train` | Sequence chunk length. |
-| `--lr <float>` | `1e-3` | `train` | Base learning rate. |
-| `--accumulate <n>` | `8` | `train` | Chunks per optimizer update. |
-| `--warmup-steps <n>` | `0` | `train` | Linear warm-up before cosine decay. |
-| `--seed <n>` | `42` | `train` | Initialization seed. |
-| `--tokenizer <bpe\|word>` | `bpe` | `train` | Tokenizer family. |
-| `--vocab-size <n>` | `2048` | `train` | BPE vocabulary maximum. |
-| `--max-tokens <n>` | unset | `train` | Global cap across input documents, not per document. |
-| `--skip-tokens <n>` | `0` | `train` | Skip this many tokens before training starts. |
-| `--resume <path>` | unset | `train` | Continue from an existing checkpoint. |
+| `-d, --data <source>` | `data/downloaded.txt` when present, otherwise `science` | `train`, `train-transformer`, `chat`, `score`, `score-transformer`, `throughput` | Dataset source, or a comma-separated list. |
+| `-m, --model <path>` | `data/model.pssa` (or `.trfm` for baseline commands) | `chat`, `generate`, `generate-transformer`, `score`, `score-transformer`, `throughput` | Checkpoint to load. |
+| `-o, --out <path>` | Command-specific; required for `clean-wikitext` | `train`, `train-transformer`, `download`, `clean-wikitext`, `benchmark` | Output checkpoint, dataset, or benchmark path. Cleaning requires a new file. |
+| `-p, --prompt <text>` | empty | `generate`, `generate-transformer` | Prompt text. Required for generation. |
+| `-e, --epochs <n>` | `4` | `train`, `train-transformer` | Training epochs. |
+| `-t, --temp, --temperature <float>` | `0.70` | `chat`, `generate`, `generate-transformer` | Sampling temperature. |
+| `--max-new-tokens <n>` | `64` (maximum 100,000) | `generate`, `generate-transformer` | Generation length cap. |
+| `--latent <n>` | `256` | `train` | PSSA latent dimension. |
+| `--depth <n>` | `1` | `train` | Continuous PSSA blocks; stacked models run on CPU. |
+| `--state <n>` | `16` | `train` | PSSA recurrent state dimension. |
+| `--key <n>` | `32` | `train` | PSSA memory-key dimension. |
+| `--memory <n>` | `512` | `train` | PSSA memory-bank capacity. |
+| `--batch-size <n>` | `1` | `train` | Independent PSSA document lanes. |
+| `--chunk <n>` | `64` | `train`, `train-transformer` | Sequence chunk length. |
+| `--lr <float>` | `1e-3` | `train`, `train-transformer` | Base learning rate. |
+| `--accumulate <n>` | `8` | `train`, `train-transformer` | Chunks per optimizer update. |
+| `--warmup-steps <n>` | `0` | `train`, `train-transformer` | Linear warm-up before cosine decay. |
+| `--total-updates <n>` | unset | `train`, `train-transformer` | Fixed whole-run schedule horizon. |
+| `--seed <n>` | `42` | `train`, `train-transformer` | Initialization seed. |
+| `--tokenizer <bpe\|word>` | `bpe` | `train`, `train-transformer` | Tokenizer family. |
+| `--vocab-size <n>` | `2048` | `train`, `train-transformer` | BPE vocabulary maximum. |
+| `--tokenizer-from <path>` | unset | `train-transformer` | Import the exact tokenizer from a PSSA checkpoint. |
+| `--max-tokens <n>` | unset | `train`, `train-transformer` | Global cap across input documents, not per document; scoring commands use it for a held-out slice. |
+| `--skip-tokens <n>` | `0` | `train`, `train-transformer` | Skip this many tokens before training starts; scoring commands use it for a held-out slice. |
+| `--resume <path>` | unset | `train`, `train-transformer` | Continue from an existing checkpoint. |
+| `--loss-csv <path>` / `--loss-every <n>` | unset / `10000` | `train`, `train-transformer` | Append target-token training curves at update boundaries. |
+| `--tokens-seen <n>` | unset | `train`, `train-transformer` | Offset for a new loss CSV on resume. |
+| `--no-tui` | off | `train`, `train-transformer` | Disable cursor updates and emit rate-limited plain progress lines. |
+| `--skip-tokens <n>` / `--max-tokens <n>` | `0` / unset | `score`, `score-transformer`, `throughput` | Select a strict held-out slice; scoring never wraps at EOF. |
 
 Positional arguments and long/short options can be mixed:
 
