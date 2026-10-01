@@ -708,7 +708,13 @@ impl DatasetManager {
     /// corpus fields at any depth.
     fn extract_json_text(raw: &str) -> Option<String> {
         const TEXT_FIELDS: &[&str] = &[
-            "text", "content", "article", "story", "instruction", "output", "sentence",
+            "text",
+            "content",
+            "article",
+            "story",
+            "instruction",
+            "output",
+            "sentence",
             "summary",
         ];
         let value: serde_json::Value = serde_json::from_str(raw).ok()?;
@@ -724,11 +730,7 @@ impl DatasetManager {
                 _ => {}
             }
         }
-        fn collect_text(
-            value: &serde_json::Value,
-            fields: &[&str],
-            out: &mut Vec<String>,
-        ) {
+        fn collect_text(value: &serde_json::Value, fields: &[&str], out: &mut Vec<String>) {
             match value {
                 serde_json::Value::Object(object) => {
                     for (key, value) in object {
@@ -785,20 +787,29 @@ mod wikitext_tests {
     #[test]
     fn restores_hyphenated_words() {
         assert_eq!(
-            clean(" Robert Boulter is an English film , television and theatre actor . He had a guest @-@ starring role on the television series The Bill in 2000 . \n"),
+            clean(
+                " Robert Boulter is an English film , television and theatre actor . He had a guest @-@ starring role on the television series The Bill in 2000 . \n"
+            ),
             "Robert Boulter is an English film, television and theatre actor. He had a guest-starring role on the television series The Bill in 2000.\n"
         );
-        assert_eq!(clean("guest\t@-@  starring co@-@stars\n"), "guest-starring co-stars\n");
+        assert_eq!(
+            clean("guest\t@-@  starring co@-@stars\n"),
+            "guest-starring co-stars\n"
+        );
     }
 
     #[test]
     fn restores_decimal_points_and_thousands_separators() {
         assert_eq!(
-            clean("It caused enormous disruption to Chinese society : the census of 754 recorded 52 @.@ 9 million people , but ten years later , the census counted just 16 @.@ 9 million , the remainder having been displaced or killed ."),
+            clean(
+                "It caused enormous disruption to Chinese society : the census of 754 recorded 52 @.@ 9 million people , but ten years later , the census counted just 16 @.@ 9 million , the remainder having been displaced or killed ."
+            ),
             "It caused enormous disruption to Chinese society : the census of 754 recorded 52.9 million people, but ten years later, the census counted just 16.9 million, the remainder having been displaced or killed.\n"
         );
         assert_eq!(
-            clean("The single peaked at number 46 on the US Billboard Hot 100 and has been certified gold by the Recording Industry Association of America ( RIAA ) for shipments of 500 @,@ 000 copies ."),
+            clean(
+                "The single peaked at number 46 on the US Billboard Hot 100 and has been certified gold by the Recording Industry Association of America ( RIAA ) for shipments of 500 @,@ 000 copies ."
+            ),
             "The single peaked at number 46 on the US Billboard Hot 100 and has been certified gold by the Recording Industry Association of America (RIAA) for shipments of 500,000 copies.\n"
         );
         assert_eq!(clean("1\t@,@  234@.@5\n"), "1,234.5\n");
@@ -807,17 +818,24 @@ mod wikitext_tests {
     #[test]
     fn drops_heading_lines_without_inserting_blanks() {
         assert_eq!(
-            clean(" = Robert Boulter = \n = = Career = = \n = = = 2000 – 2005 = = = \n== Career ==\nRobert Boulter .\n= Filmography =\nThe Bill .\n"),
+            clean(
+                " = Robert Boulter = \n = = Career = = \n = = = 2000 – 2005 = = = \n== Career ==\nRobert Boulter .\n= Filmography =\nThe Bill .\n"
+            ),
             "Robert Boulter.\nThe Bill.\n"
         );
         assert_eq!(clean(" = Title = \n"), "");
-        assert_eq!(clean("An equation: x = y .\n= not a heading\n"), "An equation: x = y.\n= not a heading\n");
+        assert_eq!(
+            clean("An equation: x = y .\n= not a heading\n"),
+            "An equation: x = y.\n= not a heading\n"
+        );
     }
 
     #[test]
     fn collapses_blank_lines_even_across_removed_headings() {
         assert_eq!(
-            clean(" \t\r\n\nRobert Boulter .\r\n \t\n= = Career = =\n\n\u{2003}\nThe Bill .\n\n \t\n"),
+            clean(
+                " \t\r\n\nRobert Boulter .\r\n \t\n= = Career = =\n\n\u{2003}\nThe Bill .\n\n \t\n"
+            ),
             "\nRobert Boulter.\n\nThe Bill.\n\n"
         );
         assert_eq!(clean(""), "");
@@ -827,7 +845,9 @@ mod wikitext_tests {
     #[test]
     fn restores_punctuation_spacing_without_corrupting_unicode() {
         assert_eq!(
-            clean(" Du Fu ( Wade – Giles : Tu Fu ; Chinese : 杜甫 ; 712 – 770 ) was a prominent Chinese poet of the Tang dynasty .\n"),
+            clean(
+                " Du Fu ( Wade – Giles : Tu Fu ; Chinese : 杜甫 ; 712 – 770 ) was a prominent Chinese poet of the Tang dynasty .\n"
+            ),
             "Du Fu (Wade – Giles : Tu Fu ; Chinese : 杜甫 ; 712 – 770) was a prominent Chinese poet of the Tang dynasty.\n"
         );
         assert_eq!(clean("( ( 杜甫 ) ) , poetry .\n"), "((杜甫)), poetry.\n");
@@ -837,10 +857,15 @@ mod wikitext_tests {
     fn removes_unknown_tokens_and_their_extra_spacing() {
         // Inject unknown-token artifacts into the Robert Boulter excerpt.
         assert_eq!(
-            clean(" <unk> Robert Boulter is an English <unk> <unk> film , television and theatre actor <unk> . <unk> \n"),
+            clean(
+                " <unk> Robert Boulter is an English <unk> <unk> film , television and theatre actor <unk> . <unk> \n"
+            ),
             "Robert Boulter is an English film, television and theatre actor.\n"
         );
-        assert_eq!(clean("<unk>\n \n <unk> <unk> \nThe Bill ."), "\nThe Bill.\n");
+        assert_eq!(
+            clean("<unk>\n \n <unk> <unk> \nThe Bill ."),
+            "\nThe Bill.\n"
+        );
         assert_eq!(clean("( <unk> Du Fu <unk> )\n"), "(Du Fu)\n");
     }
 

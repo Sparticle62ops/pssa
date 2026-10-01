@@ -25,8 +25,18 @@ struct RunState {
     // monitor tab
     progress_pct: Option<f64>,
     live_loss: Option<f64>,
+    loss_average: Option<f64>,
     tok_s: Option<f64>,
     eta: Option<String>,
+    updates_done: Option<u64>,
+    updates_total: Option<u64>,
+    updates_remaining: Option<u64>,
+    learning_rate: Option<f64>,
+    memory_used: Option<u64>,
+    memory_capacity: Option<u64>,
+    checkpoint_number: Option<u64>,
+    checkpoint_target: Option<String>,
+    last_checkpoint: Option<String>,
     // losses over time (for the sparkline)
     loss_series: Vec<f64>,
     // last finished epoch line
@@ -93,9 +103,17 @@ impl RunState {
                     self.progress_pct = Some(p);
                 }
                 self.tok_s = parse_kv::<f64>(line, "tokens_per_second=")
-                    .or_else(|| line.split_once("tok/s")?.0.split_whitespace().last()?.parse().ok())
+                    .or_else(|| {
+                        line.split_once("tok/s")?
+                            .0
+                            .split_whitespace()
+                            .last()?
+                            .parse()
+                            .ok()
+                    })
                     .filter(|v| v.is_finite());
-                if let Some((_, eta)) = line.split_once("eta=").or_else(|| line.split_once("eta ")) {
+                if let Some((_, eta)) = line.split_once("eta=").or_else(|| line.split_once("eta "))
+                {
                     // ui::duration can contain spaces, e.g. `2h 14m 09s`.
                     self.eta = Some(eta.trim().to_string());
                 }
@@ -109,6 +127,58 @@ impl RunState {
         }
         if let Some(u) = parse_kv(line, "optimizer_updates=") {
             self.optimizer_updates = Some(u);
+            self.updates_done = Some(u);
+        }
+        if let Some(prior) = parse_kv(line, "prior_updates=") {
+            self.prior_steps = Some(prior);
+        }
+        if let Some(v) = parse_kv::<f64>(line, "loss_average=")
+            && v.is_finite()
+        {
+            self.loss_average = Some(v);
+        }
+        if let Some((done, total)) = parse_fraction(line, "optimizer_updates=") {
+            self.updates_done = Some(done);
+            self.updates_total = Some(total);
+            self.updates_remaining = Some(total.saturating_sub(done));
+        }
+        if let Some(total) = parse_kv(line, "updates_total=") {
+            self.updates_total = Some(total);
+            if let Some(done) = self.updates_done {
+                self.updates_remaining = Some(total.saturating_sub(done));
+            }
+        }
+        if let Some(remaining) = parse_kv(line, "updates_remaining=") {
+            self.updates_remaining = Some(remaining);
+        }
+        if let Some(done) = parse_kv(line, "global_update=") {
+            self.optimizer_updates = Some(done);
+        }
+        if let Some(lr) = parse_kv::<f64>(line, "learning_rate=")
+            && lr.is_finite()
+        {
+            self.learning_rate = Some(lr);
+        }
+        if let Some(number) = parse_kv(line, "checkpoint_number=") {
+            self.checkpoint_number = Some(number);
+        }
+        if let Some((used, capacity)) = parse_fraction(line, "memory_occupancy=") {
+            self.memory_used = Some(used);
+            self.memory_capacity = Some(capacity);
+        }
+        if let Some(path) = line.split("checkpoint_target=").nth(1).map(str::trim)
+            && !path.is_empty()
+            && path != "-"
+        {
+            self.checkpoint_target = Some(path.to_string());
+            self.checkpoint_number = checkpoint_number(path);
+        }
+        if let Some(path) = line.split("last_checkpoint=").nth(1).map(str::trim)
+            && !path.is_empty()
+            && path != "-"
+        {
+            self.last_checkpoint = Some(path.to_string());
+            self.checkpoint_number = checkpoint_number(path);
         }
         if line.contains("resumed_from=") {
             let value = line.split("resumed_from=").nth(1).unwrap_or("").trim();
@@ -134,15 +204,23 @@ impl RunState {
     }
 
     fn note_checkpoint(&mut self, path: &str) {
+        let path = path.trim();
+        if path.is_empty() || path == "-" {
+            return;
+        }
+        self.last_checkpoint = Some(path.to_string());
+        self.checkpoint_number = checkpoint_number(path);
         let name = PathBuf::from(path)
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string());
-        if !name.ends_with(".pssa") {
+        if !(name.ends_with(".pssa") || name.ends_with(".trfm")) {
             return;
         }
         if !self.checkpoints.iter().any(|(n, _)| *n == name) {
             self.checkpoints.push((name, None));
+            self.checkpoints
+                .sort_by_key(|(name, _)| checkpoint_sort_key(name));
         }
     }
 
@@ -155,21 +233,25 @@ impl RunState {
         let mut names: Vec<(String, Option<f64>)> = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".pssa") {
-                let loss = std::fs::read_to_string(
-                    entry.path().with_extension("loss"),
-                )
-                .ok()
-                .and_then(|s| s.trim().parse::<f64>().ok());
+            if name.ends_with(".pssa") || name.ends_with(".trfm") {
+                let loss = std::fs::read_to_string(entry.path().with_extension("loss"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<f64>().ok());
                 names.push((name, loss));
             }
         }
-        names.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, _) in names {
-            if !self.checkpoints.iter().any(|(n, _)| *n == name) {
-                self.checkpoints.push((name, None));
+        names.sort_by_key(|(name, _)| checkpoint_sort_key(name));
+        for (name, loss) in names {
+            if let Some(existing) = self.checkpoints.iter_mut().find(|(n, _)| *n == name) {
+                if loss.is_some() {
+                    existing.1 = loss;
+                }
+            } else {
+                self.checkpoints.push((name, loss));
             }
         }
+        self.checkpoints
+            .sort_by_key(|(name, _)| checkpoint_sort_key(name));
     }
 }
 
@@ -192,7 +274,11 @@ fn parse_field(line: &str, label: &str) -> Option<String> {
 /// Pull `key=value` (or `key value`) numeric pairs out of a line.
 fn parse_kv<T: std::str::FromStr>(line: &str, key: &str) -> Option<T> {
     let rest = line.split(key).nth(1)?;
-    let token = rest.trim_start().split_whitespace().next()?.trim_end_matches(['%', ',', 's']);
+    let token = rest
+        .trim_start()
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(['%', ',', 's']);
     token.parse().ok()
 }
 
@@ -201,6 +287,31 @@ fn parse_pct(line: &str) -> Option<f64> {
         let value = token.trim_matches(['(', ')']).strip_suffix('%')?;
         value.parse::<f64>().ok().filter(|v| v.is_finite())
     })
+}
+
+fn parse_fraction(line: &str, key: &str) -> Option<(u64, u64)> {
+    let rest = line.split(key).nth(1)?.trim_start();
+    let value = rest.split_whitespace().next()?;
+    let (done, total) = value.split_once('/')?;
+    let done = done.parse().ok()?;
+    let total = total.parse().ok()?;
+    (total > 0 && done <= total).then_some((done, total))
+}
+
+fn checkpoint_sort_key(name: &str) -> (u8, u64, String) {
+    let number = checkpoint_number(name).unwrap_or(u64::MAX);
+    (u8::from(number == u64::MAX), number, name.to_string())
+}
+
+fn checkpoint_number(path: &str) -> Option<u64> {
+    let name = PathBuf::from(path)
+        .file_name()?
+        .to_string_lossy()
+        .into_owned();
+    let stem = name
+        .strip_suffix(".pssa")
+        .or_else(|| name.strip_suffix(".trfm"))?;
+    stem.strip_prefix("ck")?.parse().ok()
 }
 
 fn parse_field_exact(line: &str, label: &str) -> Option<String> {
@@ -242,11 +353,20 @@ fn run_app(rx: mpsc::Receiver<String>, chain_dir: PathBuf) -> io::Result<()> {
     };
     let mut tab = 0usize;
     let mut last_chain_scan = std::time::Instant::now() - Duration::from_secs(60);
+    let mut input_closed = false;
 
     loop {
-        // drain stdin
-        while let Ok(line) = rx.try_recv() {
-            state.ingest(&line);
+        // Drain stdin. A completed producer should leave the final dashboard
+        // frame visible once, then let the wrapper restore the terminal.
+        loop {
+            match rx.try_recv() {
+                Ok(line) => state.ingest(&line),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    input_closed = true;
+                    break;
+                }
+            }
         }
         if last_chain_scan.elapsed() > Duration::from_secs(5) {
             state.refresh_chain();
@@ -254,13 +374,18 @@ fn run_app(rx: mpsc::Receiver<String>, chain_dir: PathBuf) -> io::Result<()> {
         }
 
         terminal.draw(|f| draw(f, &state, tab))?;
+        if input_closed {
+            break;
+        }
 
         // poll events for up to 200ms, then loop back to stdin
         if crossterm::event::poll(Duration::from_millis(200))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 if key.kind == crossterm::event::KeyEventKind::Press {
                     match key.code {
-                        crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => break,
+                        crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
+                            break;
+                        }
                         crossterm::event::KeyCode::Tab | crossterm::event::KeyCode::Right => {
                             tab = (tab + 1) % TABS.len();
                         }
@@ -281,14 +406,26 @@ fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
     let area = f.area();
     let tabs = ratatui::widgets::Tabs::new(TABS)
         .select(tab)
-        .highlight_style(ratatui::style::Style::new().fg(ratatui::style::Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD))
+        .highlight_style(
+            ratatui::style::Style::new()
+                .fg(ratatui::style::Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )
         .padding("", "");
     let title = format!("oxide tui  |  q quit  tab switch");
     f.render_widget(
-        ratatui::widgets::Paragraph::new(ratatui::text::Line::styled(title, ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::DIM))),
+        ratatui::widgets::Paragraph::new(ratatui::text::Line::styled(
+            title,
+            ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::DIM),
+        )),
         area,
     );
-    let tabs_area = ratatui::layout::Rect { x: area.x, y: area.y, width: area.width, height: 1 };
+    let tabs_area = ratatui::layout::Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
     f.render_widget(tabs, tabs_area);
 
     let body = ratatui::layout::Rect {
@@ -308,76 +445,116 @@ fn draw_monitor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Run
     let chunks = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
-            ratatui::layout::Constraint::Length(7),
-            ratatui::layout::Constraint::Min(5),
-            ratatui::layout::Constraint::Length(6),
+            ratatui::layout::Constraint::Length(5),
+            ratatui::layout::Constraint::Min(6),
+            ratatui::layout::Constraint::Length(9),
         ])
         .split(area);
 
-    // progress + gauges
     let pct = state.progress_pct.unwrap_or(0.0);
     let loss = state.live_loss.or(state.epoch_loss).unwrap_or(0.0);
+    let average = state.loss_average.or(state.live_loss).unwrap_or(loss);
+    let done = state
+        .updates_done
+        .or(state.optimizer_updates)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "-".into());
+    let total = state
+        .updates_total
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "-".into());
     let gauge = ratatui::widgets::Gauge::default()
         .label(format!(
-            "loss {:.4}  |  {:.0}%  |  {:.0} tok/s  |  eta {}",
-            loss,
-            pct,
-            state.tok_s.unwrap_or(0.0),
-            state.eta.as_deref().unwrap_or("-")
+            "{pct:.0}%  |  updates {done}/{total}  |  loss {loss:.4}  avg {average:.4}"
         ))
         .ratio((pct / 100.0).clamp(0.0, 1.0))
         .gauge_style(
             ratatui::style::Style::new()
                 .fg(loss_color(loss))
                 .bg(ratatui::style::Color::Black),
+        )
+        .block(
+            ratatui::widgets::Block::default()
+                .title(" monitor ")
+                .borders(ratatui::widgets::Borders::ALL),
         );
-    f.render_widget(
-        ratatui::widgets::Block::default().title(" monitor ").borders(ratatui::widgets::Borders::ALL),
-        chunks[0],
-    );
-    let inner = ratatui::layout::Rect {
-        x: chunks[0].x + 1,
-        y: chunks[0].y + 1,
-        width: chunks[0].width.saturating_sub(2),
-        height: 3,
-    };
-    f.render_widget(gauge, inner);
+    f.render_widget(gauge, chunks[0]);
 
-    // loss sparkline
     let data: Vec<u64> = state
         .loss_series
         .iter()
-        .map(|l| (*l * 1000.0) as u64)
+        .map(|l| (l.max(0.0) * 1000.0) as u64)
         .collect();
     let spark = ratatui::widgets::Sparkline::default()
-        .block(ratatui::widgets::Block::default().title(" loss ").borders(ratatui::widgets::Borders::ALL))
+        .block(
+            ratatui::widgets::Block::default()
+                .title(" loss history (raw updates) ")
+                .borders(ratatui::widgets::Borders::ALL),
+        )
         .data(&data)
         .style(ratatui::style::Style::new().fg(loss_color(loss)));
     f.render_widget(spark, chunks[1]);
 
-    // latest epoch + run stats
+    let memory = match (state.memory_used, state.memory_capacity) {
+        (Some(used), Some(capacity)) if capacity > 0 => {
+            format!(
+                "{used}/{capacity} ({:.0}%)",
+                used as f64 * 100.0 / capacity as f64
+            )
+        }
+        _ => "not reported".into(),
+    };
+    let checkpoint = match (state.checkpoint_number, state.checkpoint_target.as_deref()) {
+        (Some(number), Some(path)) => format!("#{number}  {path}"),
+        (_, Some(path)) => path.to_string(),
+        _ => "not configured".into(),
+    };
+    let last_checkpoint = state
+        .last_checkpoint
+        .as_deref()
+        .unwrap_or("not written yet");
     let lines = vec![
         ratatui::text::Line::from(format!(
-            "last epoch   loss {:.4}   tokens {}   updates {}",
+            "speed       {:>7.0} tokens/s    ETA {}",
+            state.tok_s.unwrap_or(0.0),
+            state.eta.as_deref().unwrap_or("-")
+        )),
+        ratatui::text::Line::from(format!(
+            "optimizer   {done}/{total} updates    {} remaining    lr {}",
+            state
+                .updates_remaining
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into()),
+            state
+                .learning_rate
+                .map(|lr| format!("{lr:.6e}"))
+                .unwrap_or_else(|| "-".into())
+        )),
+        ratatui::text::Line::from(format!("memory bank {memory}")),
+        ratatui::text::Line::from(format!("checkpoint  {checkpoint}")),
+        ratatui::text::Line::from(format!("last saved  {last_checkpoint}")),
+        ratatui::text::Line::from(format!(
+            "last epoch  loss {:.4}   tokens {}   updates {}",
             state.epoch_loss.unwrap_or(0.0),
             state.epoch_tokens.unwrap_or(0),
             state.epoch_updates.unwrap_or(0)
         )),
         ratatui::text::Line::from(format!(
-            "this run     wall {}   training_seconds={:.1}   optimizer_updates={}",
+            "run         wall {}   resumed from {}   prior steps {}",
             state.wall.as_deref().unwrap_or("-"),
-            state.training_seconds.unwrap_or(0.0),
-            state.optimizer_updates.unwrap_or(0)
-        )),
-        ratatui::text::Line::from(format!(
-            "chain        resumed from {} at {} prior steps",
             state.resumed_from.as_deref().unwrap_or("-"),
-            state.prior_steps.map(|s| s.to_string()).unwrap_or_else(|| "-".into())
+            state
+                .prior_steps
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".into())
         )),
     ];
     f.render_widget(
-        ratatui::widgets::Paragraph::new(lines)
-            .block(ratatui::widgets::Block::default().title(" run ").borders(ratatui::widgets::Borders::ALL)),
+        ratatui::widgets::Paragraph::new(lines).block(
+            ratatui::widgets::Block::default()
+                .title(" run metrics ")
+                .borders(ratatui::widgets::Borders::ALL),
+        ),
         chunks[2],
     );
 }
@@ -385,7 +562,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Run
 fn draw_chain(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &RunState) {
     let rows: Vec<ratatui::text::Line> = if state.checkpoints.is_empty() {
         vec![ratatui::text::Line::from(format!(
-            "no .pssa files found in {}",
+            "no checkpoint files found in {}",
             state.chain_dir.display()
         ))]
     } else {
@@ -395,10 +572,8 @@ fn draw_chain(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &RunSt
             .iter()
             .enumerate()
             .map(|(i, (name, loss))| {
-                let marker = if i == last { "●" } else { "●" };
-                let style = loss
-                    .map(loss_color)
-                    .unwrap_or(ratatui::style::Color::Green);
+                let marker = if i == last { "●" } else { "○" };
+                let style = loss.map(loss_color).unwrap_or(ratatui::style::Color::Green);
                 let loss_text = loss
                     .map(|l| format!("{l:.4}"))
                     .unwrap_or_else(|| "—".into());
@@ -410,12 +585,11 @@ fn draw_chain(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &RunSt
             })
             .collect()
     };
-    let block = ratatui::widgets::Paragraph::new(rows)
-        .block(
-            ratatui::widgets::Block::default()
-                .title(format!(" chain ({}) ", state.chain_dir.display()))
-                .borders(ratatui::widgets::Borders::ALL),
-        );
+    let block = ratatui::widgets::Paragraph::new(rows).block(
+        ratatui::widgets::Block::default()
+            .title(format!(" chain ({}) ", state.chain_dir.display()))
+            .borders(ratatui::widgets::Borders::ALL),
+    );
     f.render_widget(block, area);
 }
 
@@ -435,14 +609,19 @@ fn draw_model(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &RunSt
         })
         .collect();
     f.render_widget(
-        ratatui::widgets::Paragraph::new(lines)
-            .block(ratatui::widgets::Block::default().title(" model ").borders(ratatui::widgets::Borders::ALL)),
+        ratatui::widgets::Paragraph::new(lines).block(
+            ratatui::widgets::Block::default()
+                .title(" model ")
+                .borders(ratatui::widgets::Borders::ALL),
+        ),
         area,
     );
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
-    let mut chain_dir = PathBuf::from("/kaggle/working/chain");
+    // Keep the default useful on a local checkout; Kaggle callers can pass
+    // their mounted chain explicitly (the training scripts already do).
+    let mut chain_dir = PathBuf::from("chain");
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -450,20 +629,29 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 chain_dir = PathBuf::from(&args[i + 1]);
                 i += 1;
             }
-            other => return Err(format!("unknown tui flag '{other}'; usage: oxide tui [--chain DIR]")),
+            other => {
+                return Err(format!(
+                    "unknown tui flag '{other}'; usage: oxide tui [--chain DIR]"
+                ));
+            }
         }
         i += 1;
     }
 
     if io::stdin().is_terminal() {
-        return Err(
-            "oxide tui reads a training run from stdin; pipe it: oxide train ... | oxide tui".into(),
+        println!("Usage: oxide_ai_pssa train ... --no-tui | oxide_ai_pssa tui [--chain DIR]");
+        println!(
+            "Example: oxide_ai_pssa train data/corpus.txt -o chain/ck01.pssa --no-tui | oxide_ai_pssa tui --chain chain"
         );
+        return Ok(());
     }
     if !io::stdout().is_terminal() {
-        return Err(
-            "oxide tui needs a real terminal to draw in; run it interactively, e.g. inside tmux or ssh".into(),
-        );
+        // A dashboard cannot repaint a pipe.  Preserve the producer's plain
+        // structured log instead of failing halfway through a headless run.
+        for line in io::stdin().lock().lines() {
+            println!("{}", strip_ansi(&line.map_err(|e| e.to_string())?));
+        }
+        return Ok(());
     }
 
     let (tx, rx) = mpsc::channel::<String>();
@@ -490,7 +678,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
 #[allow(dead_code)]
 fn unused_helpers() {
-    let _ = parse_field_exact("  schedule        1 epoch(s), 446 updates, lr 0.001", "schedule");
+    let _ = parse_field_exact(
+        "  schedule        1 epoch(s), 446 updates, lr 0.001",
+        "schedule",
+    );
     let _ = ui::bold("");
 }
 
@@ -515,7 +706,8 @@ mod tests {
     #[test]
     fn parses_interactive_progress_without_confusing_epoch_summary() {
         let mut state = RunState::default();
-        state.ingest("\r  \x1b[2mtraining\x1b[0m ███░  97%  loss 4.0778  146 tok/s  eta 14m 09s   ");
+        state
+            .ingest("\r  \x1b[2mtraining\x1b[0m ███░  97%  loss 4.0778  146 tok/s  eta 14m 09s   ");
         assert_eq!(state.progress_pct, Some(97.0));
         assert_eq!(state.live_loss, Some(4.0778));
         assert_eq!(state.tok_s, Some(146.0));
@@ -526,6 +718,32 @@ mod tests {
         assert_eq!(state.epoch_updates, Some(10));
         assert_eq!(state.live_loss, Some(4.0778));
         assert_eq!(state.loss_series, [4.0778, 4.0123]);
+    }
+
+    #[test]
+    fn parses_structured_training_metrics_and_checkpoint_events() {
+        let mut state = RunState::default();
+        state.ingest(
+            "progress_schema=2 updates_total=42 prior_updates=7 checkpoint_target=/tmp/ck08.pssa",
+        );
+        state.ingest(
+            "training 3/42 (7%) loss=4.125000 loss_average=4.250000 tokens_per_second=321 optimizer_updates=3 updates_total=42 updates_remaining=39 global_update=10 learning_rate=2.5e-4 memory_occupancy=12/512 eta=4m 2s",
+        );
+        assert_eq!(state.updates_done, Some(3));
+        assert_eq!(state.updates_total, Some(42));
+        assert_eq!(state.updates_remaining, Some(39));
+        assert_eq!(state.learning_rate, Some(2.5e-4));
+        assert_eq!(state.memory_used, Some(12));
+        assert_eq!(state.memory_capacity, Some(512));
+        assert_eq!(state.prior_steps, Some(7));
+        assert_eq!(state.checkpoint_number, Some(8));
+        assert_eq!(state.checkpoint_target.as_deref(), Some("/tmp/ck08.pssa"));
+        assert_eq!(state.last_checkpoint, None);
+        assert_eq!(state.eta.as_deref(), Some("4m 2s"));
+        state.ingest("checkpoint_number=9 checkpoint_status=saved");
+        assert_eq!(state.checkpoint_number, Some(9));
+        state.ingest("last_checkpoint=/tmp/ck09.pssa");
+        assert_eq!(state.last_checkpoint.as_deref(), Some("/tmp/ck09.pssa"));
     }
 
     #[test]
@@ -542,10 +760,18 @@ mod tests {
         assert_eq!(state.vocab.as_deref(), Some("2048 BPE tokens"));
         assert_eq!(state.width.as_deref(), Some("256"));
         assert_eq!(state.memory.as_deref(), Some("512 slots"));
-        assert_eq!(state.schedule.as_deref(), Some("1 epoch(s), 446 updates, lr 0.001"));
+        assert_eq!(
+            state.schedule.as_deref(),
+            Some("1 epoch(s), 446 updates, lr 0.001")
+        );
         assert_eq!(state.wall.as_deref(), Some("2h 14m 09s"));
         assert_eq!(state.throughput.as_deref(), Some("146 tokens/s"));
-        for line in ["corpus=other", "corpus_path other", "corpuses other", "corpus   "] {
+        for line in [
+            "corpus=other",
+            "corpus_path other",
+            "corpuses other",
+            "corpus   ",
+        ] {
             assert_eq!(parse_field(line, "corpus"), None, "{line}");
         }
     }
@@ -557,8 +783,13 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "tui::tests::ui_producer_fixture", "--nocapture"])
             .env("OXIDE_TUI_PRODUCER_FIXTURE", "1")
-            .output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let mut state = RunState::default();
         for line in String::from_utf8(output.stdout).unwrap().lines() {
             state.ingest(line);

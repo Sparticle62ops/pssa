@@ -167,12 +167,12 @@ for i in $(seq "$START" "$TOTAL"); do
     ./target/release/oxide_ai_pssa train-transformer "$DATA" -o "$OUT" \
       --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 \
       --chunk "$CHUNK" --accumulate "$ACC" --total-updates "$TOTAL_UPDATES" \
-      --loss-csv "$LOSS_CSV" --loss-every "$LOSS_EVERY" --tokens-seen 0 $EXTRA
+      --loss-csv "$LOSS_CSV" --loss-every "$LOSS_EVERY" --tokens-seen 0 --no-tui $EXTRA
   else
     ./target/release/oxide_ai_pssa train-transformer "$DATA" -o "$OUT" \
       --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 \
       --chunk "$CHUNK" --accumulate "$ACC" --resume "$PREV" \
-      --loss-csv "$LOSS_CSV" --loss-every "$LOSS_EVERY"
+      --loss-csv "$LOSS_CSV" --loss-every "$LOSS_EVERY" --no-tui
   fi
   PREV="$OUT"
 done

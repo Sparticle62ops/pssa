@@ -10,8 +10,13 @@ use std::path::Path;
 
 fn validate_warmup(model: &TransformerModel) -> wire::Result<()> {
     if let Some(warmup) = model.lr_schedule_warmup_steps {
-        if !model.lr_schedule_total_updates.is_some_and(|horizon| warmup < horizon) {
-            return Err(invalid("transformer schedule warmup requires a larger fixed horizon"));
+        if !model
+            .lr_schedule_total_updates
+            .is_some_and(|horizon| warmup < horizon)
+        {
+            return Err(invalid(
+                "transformer schedule warmup requires a larger fixed horizon",
+            ));
         }
     }
     Ok(())

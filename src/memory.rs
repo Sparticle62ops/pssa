@@ -255,14 +255,21 @@ impl HyperbolicEpisodicBankV2 {
             out_weights.fill(0.0);
             return 0.0;
         }
-        let q_norm = q.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+        let q_norm = q
+            .iter()
+            .map(|x| (*x as f64) * (*x as f64))
+            .sum::<f64>()
+            .sqrt();
         let mut max_distance = f32::NEG_INFINITY;
         for idx in 0..self.count {
             let off = idx * self.dim_key;
-            let (dot, k_norm_sq) = q.iter().enumerate().fold((0.0f64, 0.0f64), |(d, n), (j, x)| {
-                let k = self.keys[off + j] as f64;
-                (d + *x as f64 * k, n + k * k)
-            });
+            let (dot, k_norm_sq) = q
+                .iter()
+                .enumerate()
+                .fold((0.0f64, 0.0f64), |(d, n), (j, x)| {
+                    let k = self.keys[off + j] as f64;
+                    (d + *x as f64 * k, n + k * k)
+                });
             let cosine = if q_norm > 0.0 && k_norm_sq > 0.0 {
                 dot / (q_norm * k_norm_sq.sqrt())
             } else {

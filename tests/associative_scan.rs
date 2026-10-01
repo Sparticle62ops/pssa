@@ -308,12 +308,33 @@ fn protected_memory_writes_remain_ordered_between_scanned_chunks() {
         assert_eq!(scanned.memory.write_head, scalar.memory.write_head);
         assert_eq!(scanned.memory.last_seen_step, scalar.memory.last_seen_step);
         assert_eq!(scanned.memory.confidence, scalar.memory.confidence);
-        close(&scalar.memory.keys, &scanned.memory.keys, FORWARD_TOL, &context, "bank keys");
-        close(&scalar.memory.values, &scanned.memory.values, FORWARD_TOL, &context, "bank values");
-        close(&scalar.memory.norm_sq, &scanned.memory.norm_sq, FORWARD_TOL, &context, "bank norms");
+        close(
+            &scalar.memory.keys,
+            &scanned.memory.keys,
+            FORWARD_TOL,
+            &context,
+            "bank keys",
+        );
+        close(
+            &scalar.memory.values,
+            &scanned.memory.values,
+            FORWARD_TOL,
+            &context,
+            "bank values",
+        );
+        close(
+            &scalar.memory.norm_sq,
+            &scanned.memory.norm_sq,
+            FORWARD_TOL,
+            &context,
+            "bank norms",
+        );
         assert_eq!(scanned.memory.last_seen_step[slot], scanned.step_counter);
         if overwrite {
-            assert_eq!(scanned.memory.write_head, (slot + 1) % scanned.cfg.mem_capacity);
+            assert_eq!(
+                scanned.memory.write_head,
+                (slot + 1) % scanned.cfg.mem_capacity
+            );
             assert_ne!(scanned.memory.values, before.values);
         } else {
             assert_eq!(scanned.memory.write_head, slot);

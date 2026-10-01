@@ -146,10 +146,14 @@ impl Vector {
 /// inverse RMS for backward; affine gamma/beta are applied by the model.
 pub fn rms_norm_slice(input: &[f32], out: &mut [f32]) -> f32 {
     assert_eq!(input.len(), out.len());
-    if input.is_empty() { return 0.0; }
+    if input.is_empty() {
+        return 0.0;
+    }
     let sum_sq: f32 = input.iter().map(|&x| x * x).sum();
     let inv = 1.0 / (sum_sq / input.len() as f32 + 1e-5).sqrt();
-    for (y, x) in out.iter_mut().zip(input) { *y = x * inv; }
+    for (y, x) in out.iter_mut().zip(input) {
+        *y = x * inv;
+    }
     inv
 }
 
@@ -372,11 +376,25 @@ impl Matrix {
     /// reading any row. Shape violations panic, as for the other numeric APIs.
     #[inline(always)]
     pub fn matvec_into(&self, v: &[f32], out: &mut [f32]) {
-        let len = self.rows.checked_mul(self.cols)
+        let len = self
+            .rows
+            .checked_mul(self.cols)
             .expect("matrix dimensions overflow usize");
-        assert_eq!(self.data.len(), len, "matrix storage must match its dimensions");
-        assert_eq!(self.cols, v.len(), "matrix input length must match its columns");
-        assert_eq!(self.rows, out.len(), "matrix output length must match its rows");
+        assert_eq!(
+            self.data.len(),
+            len,
+            "matrix storage must match its dimensions"
+        );
+        assert_eq!(
+            self.cols,
+            v.len(),
+            "matrix input length must match its columns"
+        );
+        assert_eq!(
+            self.rows,
+            out.len(),
+            "matrix output length must match its rows"
+        );
         if self.cols == 0 {
             out.fill(0.0);
             return;
@@ -454,7 +472,8 @@ impl Matrix {
             return Err("Cannot invert non-square matrix".to_string());
         }
         let n = self.rows;
-        let len = n.checked_mul(n)
+        let len = n
+            .checked_mul(n)
             .ok_or_else(|| "Matrix dimensions overflow usize".to_string())?;
         if self.data.len() != len {
             return Err("Matrix storage must match its dimensions".to_string());
@@ -462,12 +481,15 @@ impl Matrix {
         if self.data.iter().any(|x| !x.is_finite()) {
             return Err("Cannot invert a matrix containing nonfinite values".to_string());
         }
-        let stride = n.checked_mul(2)
+        let stride = n
+            .checked_mul(2)
             .ok_or_else(|| "Augmented matrix dimensions overflow usize".to_string())?;
-        let augmented_len = len.checked_mul(2)
+        let augmented_len = len
+            .checked_mul(2)
             .ok_or_else(|| "Augmented matrix dimensions overflow usize".to_string())?;
         let mut augmented = Vec::new();
-        augmented.try_reserve_exact(augmented_len)
+        augmented
+            .try_reserve_exact(augmented_len)
             .map_err(|e| format!("Cannot allocate augmented matrix: {e}"))?;
         augmented.resize(augmented_len, 0.0f64);
         let mut row_scales = vec![0.0f64; n];
@@ -539,7 +561,9 @@ impl Matrix {
             for j in 0..n {
                 let value = augmented[i * stride + n + j] as f32;
                 if !value.is_finite() {
-                    return Err("Matrix inverse is not representable as finite f32 values".to_string());
+                    return Err(
+                        "Matrix inverse is not representable as finite f32 values".to_string()
+                    );
                 }
                 inv.data[i * n + j] = value;
             }
@@ -580,14 +604,20 @@ mod tests {
     #[test]
     fn portable_and_runtime_kernels_match_f64_for_unaligned_slices_and_every_tail() {
         for len in (0..=97).chain([127, 128, 129, 255, 256, 257, 1023, 1024, 1025]) {
-            let a: Vec<f32> = (0..len + 3).map(|i| ((i * 37 % 127) as f32 - 63.0) * 0.03125).collect();
-            let b: Vec<f32> = (0..len + 5).map(|i| ((i * 53 % 113) as f32 - 56.0) * -0.0234375).collect();
+            let a: Vec<f32> = (0..len + 3)
+                .map(|i| ((i * 37 % 127) as f32 - 63.0) * 0.03125)
+                .collect();
+            let b: Vec<f32> = (0..len + 5)
+                .map(|i| ((i * 53 % 113) as f32 - 56.0) * -0.0234375)
+                .collect();
             let (a, b) = (&a[1..len + 1], &b[3..len + 3]);
             let expected: f64 = a.iter().zip(b).map(|(&a, &b)| a as f64 * b as f64).sum();
             let check = |actual: f32| {
                 assert!(actual.is_finite());
-                assert!((actual as f64 - expected).abs() <= 2.0e-6 + 2.0e-5 * expected.abs(),
-                    "length={len}, actual={actual}, expected={expected}");
+                assert!(
+                    (actual as f64 - expected).abs() <= 2.0e-6 + 2.0e-5 * expected.abs(),
+                    "length={len}, actual={actual}, expected={expected}"
+                );
             };
             check(dot_slice_portable(a, b));
             check(dot_slice(a, b));
@@ -602,7 +632,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn cached_detection_matches_host_and_dispatches_the_selected_kernel() {
-        let expected = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
+        let expected =
+            std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
         assert_eq!(avx2_fma_available(), expected);
         assert_eq!(avx2_fma_available(), expected);
         // Non-dyadic values exercise the distinct FMA rounding/reduction path.
@@ -629,14 +660,22 @@ mod tests {
         // assertion: it lets LLVM eliminate the portable loop's bounds checks.
         #[inline(always)]
         fn portable(a: &[f32], b: &[f32]) -> f32 {
-            assert_eq!(a.len(), b.len(), "dot product operands must have equal lengths");
+            assert_eq!(
+                a.len(),
+                b.len(),
+                "dot product operands must have equal lengths"
+            );
             dot_slice_portable(a, b)
         }
 
         fn time(mut kernel: impl FnMut() -> f32, iterations: usize) -> f64 {
-            for _ in 0..1000 { black_box(kernel()); }
+            for _ in 0..1000 {
+                black_box(kernel());
+            }
             let start = Instant::now();
-            for _ in 0..iterations { black_box(kernel()); }
+            for _ in 0..iterations {
+                black_box(kernel());
+            }
             start.elapsed().as_secs_f64() * 1.0e9 / iterations as f64
         }
         #[cfg(target_arch = "x86_64")]
@@ -659,8 +698,12 @@ mod tests {
             }
             baseline.sort_by(f64::total_cmp);
             runtime.sort_by(f64::total_cmp);
-            println!("length={len} portable_median_ns={:.2} runtime_median_ns={:.2} speedup={:.2}x",
-                baseline[3], runtime[3], baseline[3] / runtime[3]);
+            println!(
+                "length={len} portable_median_ns={:.2} runtime_median_ns={:.2} speedup={:.2}x",
+                baseline[3],
+                runtime[3],
+                baseline[3] / runtime[3]
+            );
         }
     }
 }

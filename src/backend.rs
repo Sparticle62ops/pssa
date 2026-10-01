@@ -789,9 +789,7 @@ pub fn gemm_nn_cpu_into(
             }
         }
     };
-    if c_len.saturating_mul(k) >= 1024 * 1024
-        && c_len / n >= 8
-        && rayon::current_num_threads() > 1
+    if c_len.saturating_mul(k) >= 1024 * 1024 && c_len / n >= 8 && rayon::current_num_threads() > 1
     {
         out.par_chunks_mut(4 * n).enumerate().for_each(tile);
     } else {
@@ -813,8 +811,12 @@ pub fn gemm_nn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f3
             let b_row = &b[kk * n..(kk + 1) * n];
             for (t, c_row) in dst.chunks_mut(n).enumerate() {
                 let av = a[(i * 4 + t) * k + kk];
-                if av == 0.0 { continue; }
-                for (c, &b) in c_row.iter_mut().zip(b_row) { *c += av * b; }
+                if av == 0.0 {
+                    continue;
+                }
+                for (c, &b) in c_row.iter_mut().zip(b_row) {
+                    *c += av * b;
+                }
             }
         }
     };
@@ -854,9 +856,7 @@ pub fn gemm_tn_cpu_accumulate_into(
             }
         }
     };
-    if c_len.saturating_mul(m) >= 1024 * 1024
-        && c_len / n >= 8
-        && rayon::current_num_threads() > 1
+    if c_len.saturating_mul(m) >= 1024 * 1024 && c_len / n >= 8 && rayon::current_num_threads() > 1
     {
         out.par_chunks_mut(8 * n).enumerate().for_each(tile);
     } else {
@@ -878,8 +878,12 @@ pub fn gemm_tn_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f3
             let b_row = &b[t * n..(t + 1) * n];
             for (r, c_row) in dst.chunks_mut(n).enumerate() {
                 let av = a[t * k + i * 8 + r];
-                if av == 0.0 { continue; }
-                for (c, &b) in c_row.iter_mut().zip(b_row) { *c += av * b; }
+                if av == 0.0 {
+                    continue;
+                }
+                for (c, &b) in c_row.iter_mut().zip(b_row) {
+                    *c += av * b;
+                }
             }
         }
     };
@@ -1131,8 +1135,11 @@ mod backend_tests {
         // Even legacy M=1 callers now use full 16-row tiles, not dispatch Z.
         assert!(checked_wgpu_sizes(&limits, 1, 1, 1, 65536, 65536, 1).is_ok());
         let too_many_rows = 65535 * 16 + 1;
-        assert!(checked_wgpu_sizes(&limits, 1, 1, 1, too_many_rows, too_many_rows, 1)
-            .unwrap_err().contains("workgroup"));
+        assert!(
+            checked_wgpu_sizes(&limits, 1, 1, 1, too_many_rows, too_many_rows, 1)
+                .unwrap_err()
+                .contains("workgroup")
+        );
         // The same contiguous chunk can be represented as M=L, batch=1.
         assert!(checked_wgpu_sizes(&limits, 65536, 1, 1, 1, 65536, 1).is_ok());
         let mut small = limits.clone();
@@ -1187,7 +1194,8 @@ mod backend_tests {
         );
         let large = vec![1.0; 65536];
         assert_eq!(
-            gpu.try_dispatch_gemm(&large, &[2.0], 1, 1, 1, 65536).unwrap(),
+            gpu.try_dispatch_gemm(&large, &[2.0], 1, 1, 1, 65536)
+                .unwrap(),
             vec![2.0; 65536]
         );
         gpu.dispatch_gemm_into(&large, &[2.0], 1, 1, 1, 65536, &mut vec![0.0; 65536])

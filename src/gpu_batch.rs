@@ -49,12 +49,7 @@ pub(crate) fn parallel_scan_enabled(len: usize, _stride: usize) -> bool {
 /// The SSM has one such scalar map for every latent/state channel, so maps at
 /// different channels are independent and the composition is associative.
 #[inline(always)]
-fn compose_affine(
-    first_a: f32,
-    first_b: f32,
-    second_a: f32,
-    second_b: f32,
-) -> (f32, f32) {
+fn compose_affine(first_a: f32, first_b: f32, second_a: f32, second_b: f32) -> (f32, f32) {
     (second_a * first_a, second_a * first_b + second_b)
 }
 
@@ -79,7 +74,9 @@ pub(crate) fn affine_scan_in_place(
     assert!(scan_a.len() >= width * stride && scan_b.len() >= width * stride);
     let a = &mut scan_a[..width * stride];
     let b = &mut scan_b[..width * stride];
-    a[len * stride..].par_chunks_mut(stride).for_each(|row| row.fill(1.0));
+    a[len * stride..]
+        .par_chunks_mut(stride)
+        .for_each(|row| row.fill(1.0));
     b[len * stride..].fill(0.0);
 
     // Up-sweep: reduce each subtree to its right-hand endpoint.
@@ -125,8 +122,7 @@ pub(crate) fn affine_scan_in_place(
                     let left_b = b_chunk[left + j];
                     a_chunk[left + j] = parent_a;
                     b_chunk[left + j] = parent_b;
-                    let (next_a, next_b) =
-                        compose_affine(parent_a, parent_b, left_a, left_b);
+                    let (next_a, next_b) = compose_affine(parent_a, parent_b, left_a, left_b);
                     a_chunk[right + j] = next_a;
                     b_chunk[right + j] = next_b;
                 }
@@ -136,7 +132,14 @@ pub(crate) fn affine_scan_in_place(
 }
 
 /// G[L,R] * W[R,C], owning complete output rows with contiguous weight reads.
-pub(crate) fn dense_input_adjoint(g: &[f32], w: &[f32], l: usize, rows: usize, cols: usize, out: &mut [f32]) {
+pub(crate) fn dense_input_adjoint(
+    g: &[f32],
+    w: &[f32],
+    l: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
     // Reuse each contiguous weight row across four tokens before advancing.
     // Per-element summation order is unchanged; tasks own complete output tiles.
     let tile = |tile_idx: usize, dst: &mut [f32]| {
@@ -152,15 +155,26 @@ pub(crate) fn dense_input_adjoint(g: &[f32], w: &[f32], l: usize, rows: usize, c
         }
     };
     if parallel_backward(l, rows, cols) {
-        out.par_chunks_mut(4 * cols).enumerate().for_each(|(i, dst)| tile(i, dst));
+        out.par_chunks_mut(4 * cols)
+            .enumerate()
+            .for_each(|(i, dst)| tile(i, dst));
     } else {
-        out.chunks_mut(4 * cols).enumerate().for_each(|(i, dst)| tile(i, dst));
+        out.chunks_mut(4 * cols)
+            .enumerate()
+            .for_each(|(i, dst)| tile(i, dst));
     }
 }
 
 /// dW[R,C] += G[L,R]^T * X[L,C]. Each task owns rows, accumulating tokens
 /// in reverse order just like the reference TBPTT path (including existing grads).
-pub(crate) fn dense_weight_adjoint(g: &[f32], x: &[f32], l: usize, rows: usize, cols: usize, grad: &mut [f32]) {
+pub(crate) fn dense_weight_adjoint(
+    g: &[f32],
+    x: &[f32],
+    l: usize,
+    rows: usize,
+    cols: usize,
+    grad: &mut [f32],
+) {
     let tile = |tile_idx: usize, dst: &mut [f32]| {
         let first_row = tile_idx * 8;
         for t in (0..l).rev() {
@@ -174,9 +188,13 @@ pub(crate) fn dense_weight_adjoint(g: &[f32], x: &[f32], l: usize, rows: usize, 
         }
     };
     if parallel_backward(l, rows, cols) {
-        grad.par_chunks_mut(8 * cols).enumerate().for_each(|(i, dst)| tile(i, dst));
+        grad.par_chunks_mut(8 * cols)
+            .enumerate()
+            .for_each(|(i, dst)| tile(i, dst));
     } else {
-        grad.chunks_mut(8 * cols).enumerate().for_each(|(i, dst)| tile(i, dst));
+        grad.chunks_mut(8 * cols)
+            .enumerate()
+            .for_each(|(i, dst)| tile(i, dst));
     }
 }
 
@@ -205,9 +223,13 @@ pub(crate) fn dense_weight_adjoint_forward(
         }
     };
     if parallel_backward(l, rows, cols) {
-        grad.par_chunks_mut(8 * cols).enumerate().for_each(|(i, dst)| tile(i, dst));
+        grad.par_chunks_mut(8 * cols)
+            .enumerate()
+            .for_each(|(i, dst)| tile(i, dst));
     } else {
-        grad.chunks_mut(8 * cols).enumerate().for_each(|(i, dst)| tile(i, dst));
+        grad.chunks_mut(8 * cols)
+            .enumerate()
+            .for_each(|(i, dst)| tile(i, dst));
     }
 }
 
@@ -242,9 +264,13 @@ fn adapter_up_input_adjoint(
         }
     };
     if parallel_backward(l, d_m, rank) {
-        out.par_chunks_mut(4 * rank).enumerate().for_each(|(i, dst)| tile(i, dst));
+        out.par_chunks_mut(4 * rank)
+            .enumerate()
+            .for_each(|(i, dst)| tile(i, dst));
     } else {
-        out.chunks_mut(4 * rank).enumerate().for_each(|(i, dst)| tile(i, dst));
+        out.chunks_mut(4 * rank)
+            .enumerate()
+            .for_each(|(i, dst)| tile(i, dst));
     }
 }
 
@@ -269,7 +295,15 @@ fn gpu_ctx(m: &PSSALayerV2) -> Option<crate::backend::GpuDispatch> {
 /// M=1, batch=L: that wastes 15/16 of WebGPU's row tile and gives CUDA GEMVs.
 /// The backends also fold legacy shared-weight batches at their boundary.
 #[inline]
-fn batched_matvec_dev(gpu: Option<&crate::backend::GpuDispatch>, w: &[f32], rows: usize, cols: usize, x: &[f32], l: usize, out: &mut [f32]) {
+fn batched_matvec_dev(
+    gpu: Option<&crate::backend::GpuDispatch>,
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    l: usize,
+    out: &mut [f32],
+) {
     if let Some(ctx) = gpu {
         ctx.dispatch_gemm_into(&x[..l * cols], w, l, rows, cols, 1, out)
             .expect("validated model GEMM dimensions");
@@ -359,8 +393,7 @@ pub(crate) fn materialize_ssm_scan(
                 let mut y_i = 0.0f32;
                 for j in 0..d_s {
                     let idx = i * d_s + j;
-                    let h_before = scan_a[state_off + idx] * initial[idx]
-                        + scan_b[state_off + idx];
+                    let h_before = scan_a[state_off + idx] * initial[idx] + scan_b[state_off + idx];
                     let h = local_a[state_off + idx] * h_before
                         + local_b[state_off + idx] * x_norm[t * d_m + i];
                     state_row[idx] = h;
@@ -406,7 +439,15 @@ pub fn stage_projections(m: &mut PSSALayerV2, seq_len: usize) {
     let l = seq_len;
     let xn = &m.tape.x_norm[..l * d_m];
 
-    batched_matvec_dev(gpu.as_ref(), &m.w_delta.data, d_m, d_m, xn, l, &mut m.tape.delta_raw[..l * d_m]);
+    batched_matvec_dev(
+        gpu.as_ref(),
+        &m.w_delta.data,
+        d_m,
+        d_m,
+        xn,
+        l,
+        &mut m.tape.delta_raw[..l * d_m],
+    );
     // Reference keeps the raw projection in `delta_raw` and the softplus in
     // `delta`; the backward pass takes sigmoid(delta_raw), so both are needed.
     for i in 0..l * d_m {
@@ -445,8 +486,8 @@ fn stage_ssm_scan_sequential(m: &mut PSSALayerV2, seq_len: usize) {
                 let bar_b = d_i * m.tape.b_proj[b_off + j];
                 m.tape.bar_a[ssm_off + idx] = bar_a;
                 m.tape.bar_b[ssm_off + idx] = bar_b;
-                let h_val = bar_a * m.tape.h_states[h_prev_off + idx]
-                    + bar_b * m.tape.x_norm[xn_off + i];
+                let h_val =
+                    bar_a * m.tape.h_states[h_prev_off + idx] + bar_b * m.tape.x_norm[xn_off + i];
                 m.tape.h_states[h_next_off + idx] = h_val;
                 y_i += h_val * m.tape.c_proj[c_off + j];
             }
@@ -574,11 +615,27 @@ pub fn stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
     }
 
     // Gate, memory projection and injection as batched GEMMs over the chunk.
-    batched_matvec_dev(gpu.as_ref(), &m.w_gate.data, d_m, d_m, &m.tape.x_norm[..seq_len * d_m], seq_len, &mut m.tape.g_mem[..seq_len * d_m]);
+    batched_matvec_dev(
+        gpu.as_ref(),
+        &m.w_gate.data,
+        d_m,
+        d_m,
+        &m.tape.x_norm[..seq_len * d_m],
+        seq_len,
+        &mut m.tape.g_mem[..seq_len * d_m],
+    );
     for v in &mut m.tape.g_mem[..seq_len * d_m] {
         *v = sigmoid(*v);
     }
-    batched_matvec_dev(gpu.as_ref(), &m.w_proj.data, d_m, d_m, &m.tape.m_val[..seq_len * d_m], seq_len, &mut m.tape.m_proj[..seq_len * d_m]);
+    batched_matvec_dev(
+        gpu.as_ref(),
+        &m.w_proj.data,
+        d_m,
+        d_m,
+        &m.tape.m_val[..seq_len * d_m],
+        seq_len,
+        &mut m.tape.m_proj[..seq_len * d_m],
+    );
     for t in 0..seq_len {
         let m_off = t * d_m;
         for i in 0..d_m {
@@ -649,26 +706,36 @@ pub fn stage_mlp(m: &mut PSSALayerV2, seq_len: usize) {
             m.tape.adapter_act[ad_off + r] = h * sigmoid(h);
         }
         let act = &m.tape.adapter_act[ad_off..ad_off + m.adapters[0].rank];
-        adapter_up_into(
-            &m.adapters[0],
-            d_m,
-            act,
-            &mut m.buf_ad_out[..d_m],
-        );
+        adapter_up_into(&m.adapters[0], d_m, act, &mut m.buf_ad_out[..d_m]);
 
         for i in 0..d_m {
-            m.tape.z_raw[z_off + i] = (m.tape.y_ssm[y_off + i] * ssm_scale)
-                + m.tape.m_inj[m_off + i]
-                + m.buf_ad_out[i];
+            m.tape.z_raw[z_off + i] =
+                (m.tape.y_ssm[y_off + i] * ssm_scale) + m.tape.m_inj[m_off + i] + m.buf_ad_out[i];
         }
     }
 
-    batched_matvec_dev(gpu.as_ref(), &m.mlp_w1.data, d_mlp, d_m, &m.tape.z_raw[..seq_len * d_m], seq_len, &mut m.tape.mlp_hidden[..seq_len * d_mlp]);
+    batched_matvec_dev(
+        gpu.as_ref(),
+        &m.mlp_w1.data,
+        d_mlp,
+        d_m,
+        &m.tape.z_raw[..seq_len * d_m],
+        seq_len,
+        &mut m.tape.mlp_hidden[..seq_len * d_mlp],
+    );
     for t_i in 0..seq_len * d_mlp {
         let h = m.tape.mlp_hidden[t_i];
         m.tape.mlp_act[t_i] = h * sigmoid(h);
     }
-    batched_matvec_dev(gpu.as_ref(), &m.mlp_w2.data, d_m, d_mlp, &m.tape.mlp_act[..seq_len * d_mlp], seq_len, &mut m.tape.z_final[..seq_len * d_m]);
+    batched_matvec_dev(
+        gpu.as_ref(),
+        &m.mlp_w2.data,
+        d_m,
+        d_mlp,
+        &m.tape.mlp_act[..seq_len * d_mlp],
+        seq_len,
+        &mut m.tape.z_final[..seq_len * d_m],
+    );
     for t in 0..seq_len {
         let z_off = t * d_m;
         for i in 0..d_m {
@@ -735,13 +802,24 @@ pub fn stage_logits_loss(m: &mut PSSALayerV2, seq_len: usize) -> f32 {
 /// f32 roundoff. Dense stages batch token rows; the diagonal SSM recurrence uses
 /// a host-side parallel Blelloch scan for both CPU and GPU dense backends.
 /// Stacked models retain their existing scalar CPU fallback.
-pub fn forward_train_chunk_batched(m: &mut PSSALayerV2, token_ids: &[usize], target_ids: &[usize]) -> f32 {
+pub fn forward_train_chunk_batched(
+    m: &mut PSSALayerV2,
+    token_ids: &[usize],
+    target_ids: &[usize],
+) -> f32 {
     if m.depth() > 1 {
-        assert!(!m.device.is_gpu(), "stacked training is CPU-only; use Device::Cpu");
+        assert!(
+            !m.device.is_gpu(),
+            "stacked training is CPU-only; use Device::Cpu"
+        );
         return m.forward_train_chunk(token_ids, target_ids);
     }
     assert!(!token_ids.is_empty(), "training chunk must be nonempty");
-    assert_eq!(token_ids.len(), target_ids.len(), "token and target counts must match");
+    assert_eq!(
+        token_ids.len(),
+        target_ids.len(),
+        "token and target counts must match"
+    );
     assert!(
         token_ids.len() <= m.cfg.chunk_len,
         "training chunk length exceeds configured tape capacity"
@@ -756,8 +834,7 @@ pub fn forward_train_chunk_batched(m: &mut PSSALayerV2, token_ids: &[usize], tar
 
     m.tape.x_ids[..seq_len].copy_from_slice(&token_ids[..seq_len]);
     m.tape.target_ids[..seq_len].copy_from_slice(&target_ids[..seq_len]);
-    m.block.tape.h_states[..m.cfg.d_latent * m.cfg.d_state]
-        .copy_from_slice(&m.block.h_persistent);
+    m.block.tape.h_states[..m.cfg.d_latent * m.cfg.d_state].copy_from_slice(&m.block.h_persistent);
 
     stage_embed_norm(m, seq_len);
     stage_projections(m, seq_len);
@@ -768,13 +845,12 @@ pub fn forward_train_chunk_batched(m: &mut PSSALayerV2, token_ids: &[usize], tar
     let loss = stage_logits_loss(m, seq_len);
 
     let last_h_off = seq_len * (m.cfg.d_latent * m.cfg.d_state);
-    m.block.h_persistent
-        .copy_from_slice(&m.block.tape.h_states[last_h_off..last_h_off + m.cfg.d_latent * m.cfg.d_state]);
+    m.block.h_persistent.copy_from_slice(
+        &m.block.tape.h_states[last_h_off..last_h_off + m.cfg.d_latent * m.cfg.d_state],
+    );
 
     loss
 }
-
-
 
 // =============================================================================
 // BACKWARD STAGES (REVERSE TIME, BATCHED)
@@ -817,15 +893,28 @@ pub fn bwd_stage_logits_blocked(
         let tgt_id = m.tape.target_ids[t];
         for i in 0..d_v {
             let indicator = if i == tgt_id { 1.0 } else { 0.0 };
-            g_logit[log_off + i] = (m.tape.probs[log_off + i] - indicator) * scale_loss * logit_scale;
+            g_logit[log_off + i] =
+                (m.tape.probs[log_off + i] - indicator) * scale_loss * logit_scale;
         }
     }
 
     if gpu.is_none() {
-        dense_input_adjoint(g_logit, &unembed_w.data, seq_len, d_v, d_m,
-            &mut m.bwd_g_zfinal[..seq_len * d_m]);
-        dense_weight_adjoint(g_logit, &m.tape.z_final[..seq_len * d_m], seq_len, d_v, d_m,
-            &mut unembed_w.grad);
+        dense_input_adjoint(
+            g_logit,
+            &unembed_w.data,
+            seq_len,
+            d_v,
+            d_m,
+            &mut m.bwd_g_zfinal[..seq_len * d_m],
+        );
+        dense_weight_adjoint(
+            g_logit,
+            &m.tape.z_final[..seq_len * d_m],
+            seq_len,
+            d_v,
+            d_m,
+            &mut unembed_w.grad,
+        );
         return;
     }
 
@@ -911,17 +1000,35 @@ pub fn bwd_stage_mlp_blocked(
     let g_hidden = &mut m.bwd_g_mlp[..l * d_mlp];
     if gpu.is_none() {
         dense_input_adjoint(gz, &m.mlp_w2.data, l, d_m, d_mlp, g_hidden);
-        dense_weight_adjoint(gz, &m.tape.mlp_act[..l * d_mlp], l, d_m, d_mlp,
-            &mut m.mlp_w2.grad);
+        dense_weight_adjoint(
+            gz,
+            &m.tape.mlp_act[..l * d_mlp],
+            l,
+            d_m,
+            d_mlp,
+            &mut m.mlp_w2.grad,
+        );
         for (i, grad) in g_hidden.iter_mut().enumerate() {
             let h = m.tape.mlp_hidden[i];
             let sig_h = sigmoid(h);
             *grad *= sig_h * (1.0 + h * (1.0 - sig_h));
         }
-        dense_input_adjoint(g_hidden, &m.mlp_w1.data, l, d_mlp, d_m,
-            &mut m.bwd_g_zraw[..l * d_m]);
-        dense_weight_adjoint(g_hidden, &m.tape.z_raw[..l * d_m], l, d_mlp, d_m,
-            &mut m.mlp_w1.grad);
+        dense_input_adjoint(
+            g_hidden,
+            &m.mlp_w1.data,
+            l,
+            d_mlp,
+            d_m,
+            &mut m.bwd_g_zraw[..l * d_m],
+        );
+        dense_weight_adjoint(
+            g_hidden,
+            &m.tape.z_raw[..l * d_m],
+            l,
+            d_mlp,
+            d_m,
+            &mut m.mlp_w1.grad,
+        );
         for (dst, &residual) in m.bwd_g_zraw[..l * d_m].iter_mut().zip(gz) {
             *dst += residual;
         }
@@ -929,15 +1036,7 @@ pub fn bwd_stage_mlp_blocked(
     }
 
     // g_mlp_act [L, d_mlp] = gz [L, d_m] * mlp_w2 [d_m, d_mlp]
-    gemm_nn_dev_into(
-        gpu,
-        &gz,
-        &m.mlp_w2.data,
-        l,
-        d_m,
-        d_mlp,
-        g_hidden,
-    );
+    gemm_nn_dev_into(gpu, &gz, &m.mlp_w2.data, l, d_m, d_mlp, g_hidden);
 
     // mlp_w2 grad [d_m, d_mlp] += gz^T * mlp_act [L, d_mlp]
     gemm_tn_dev_accumulate(
@@ -996,10 +1095,8 @@ pub fn bwd_stage_mlp_scalar(m: &mut PSSALayerV2, seq_len: usize) {
         let z_off = t * d_m;
 
         // g_mlp_act = mlp_w2^T @ grad_z_final[t]
-        m.mlp_w2.matvec_transpose(
-            &m.bwd_g_zfinal[z_off..z_off + d_m],
-            &mut m.buf_g_mlp_act,
-        );
+        m.mlp_w2
+            .matvec_transpose(&m.bwd_g_zfinal[z_off..z_off + d_m], &mut m.buf_g_mlp_act);
 
         // mlp_w2 grad: grad_z_final[t,i] * mlp_act[t,j]
         for i in 0..d_m {
@@ -1019,7 +1116,8 @@ pub fn bwd_stage_mlp_scalar(m: &mut PSSALayerV2, seq_len: usize) {
         }
 
         // g_zraw_mlp = mlp_w1^T @ g_mlp_hidden
-        m.mlp_w1.matvec_transpose(&m.buf_g_mlp_hidden, &mut m.buf_g_zraw_mlp);
+        m.mlp_w1
+            .matvec_transpose(&m.buf_g_mlp_hidden, &mut m.buf_g_zraw_mlp);
 
         // mlp_w1 grad: g_mlp_hidden[t,i] * z_raw[t,j]
         for i in 0..d_mlp {
@@ -1158,27 +1256,13 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
 
     // The input adjoint is first formed per token, then added in token order
     // so its f32 accumulation order remains identical to the scalar path.
-    dense_input_adjoint(
-        g_gate_pre,
-        &m.w_gate.data,
-        l,
-        d_m,
-        d_m,
-        gate_x,
-    );
+    dense_input_adjoint(g_gate_pre, &m.w_gate.data, l, d_m, d_m, gate_x);
     for (dst, src) in m.bwd_g_xnorm[..l * d_m].iter_mut().zip(gate_x.iter()) {
         *dst += src;
     }
     // Reuse the second half of the same workspace for the projection input
     // adjoint needed by every independent retrieval row.
-    dense_input_adjoint(
-        g_m_proj_out,
-        &m.w_proj.data,
-        l,
-        d_m,
-        d_m,
-        gate_x,
-    );
+    dense_input_adjoint(g_m_proj_out, &m.w_proj.data, l, d_m, d_m, gate_x);
     dense_weight_adjoint_forward(
         g_gate_pre,
         &m.tape.x_norm[..l * d_m],
@@ -1269,8 +1353,7 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
 #[inline]
 fn bwd_stage_ssm_sequential(m: &mut PSSALayerV2, seq_len: usize) {
     let pending_step = m.step_counter + 1;
-    let (embed_w, embed_row_marks, m) =
-        (&mut m.embed_w, &mut m.embed_row_marks, &mut m.block);
+    let (embed_w, embed_row_marks, m) = (&mut m.embed_w, &mut m.embed_row_marks, &mut m.block);
     m.refresh_ssm_rates();
     let d_m = m.cfg.d_latent;
     let d_s = m.cfg.d_state;
@@ -1311,11 +1394,9 @@ fn bwd_stage_ssm_sequential(m: &mut PSSALayerV2, seq_len: usize) {
                     * m.tape.h_states[t * (d_m * d_s) + idx]
                     * m.ssm_rate_derivatives[idx];
                 m.buf_g_delta[i] += g_h_total
-                    * (a_physical * bar_a * m.tape.h_states[t * (d_m * d_s) + idx]
-                        + b_val * xn_i);
+                    * (a_physical * bar_a * m.tape.h_states[t * (d_m * d_s) + idx] + b_val * xn_i);
                 m.buf_g_b_proj[j] += g_h_total * (d_i * xn_i);
-                m.bwd_g_xnorm[m_off + i] +=
-                    g_h_total * m.tape.bar_b[t * (d_m * d_s) + idx];
+                m.bwd_g_xnorm[m_off + i] += g_h_total * m.tape.bar_b[t * (d_m * d_s) + idx];
             }
         }
         m.grad_h_next.copy_from_slice(&m.buf_g_h_prev);
@@ -1352,8 +1433,8 @@ fn bwd_stage_ssm_sequential(m: &mut PSSALayerV2, seq_len: usize) {
         let emb_row_off = x_id * d_m;
         for i in 0..d_m {
             let g_unnorm = m.bwd_g_xnorm[m_off + i] * m.norm_gamma.data[i];
-            embed_w.grad[emb_row_off + i] += inv_rms
-                * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / d_m as f32));
+            embed_w.grad[emb_row_off + i] +=
+                inv_rms * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / d_m as f32));
         }
     }
 }
@@ -1381,8 +1462,7 @@ fn bwd_stage_ssm_parallel(m: &mut PSSALayerV2, seq_len: usize) {
     let d_s = m.cfg.d_state;
     let stride = d_m * d_s;
     let pending_step = m.step_counter + 1;
-    let (embed_w, embed_row_marks, m) =
-        (&mut m.embed_w, &mut m.embed_row_marks, &mut m.block);
+    let (embed_w, embed_row_marks, m) = (&mut m.embed_w, &mut m.embed_row_marks, &mut m.block);
     m.refresh_ssm_rates();
     let l = seq_len;
     let ssm_scale = 1.0 / (d_s as f32).sqrt();
@@ -1464,10 +1544,7 @@ fn bwd_stage_ssm_parallel(m: &mut PSSALayerV2, seq_len: usize) {
                     let rate = m.ssm_rates[idx];
 
                     c_row[j] += gy * h_next;
-                    a_row[idx] = q
-                        * (d_i * a)
-                        * h_prev
-                        * m.ssm_rate_derivatives[idx];
+                    a_row[idx] = q * (d_i * a) * h_prev * m.ssm_rate_derivatives[idx];
                     delta_row[i] += q * (rate * a * h_prev + b * x_i);
                     b_row[j] += q * (d_i * x_i);
                     x_row[i] += q * m.tape.bar_b[state_off + idx];
@@ -1487,14 +1564,7 @@ fn bwd_stage_ssm_parallel(m: &mut PSSALayerV2, seq_len: usize) {
         (&m.bwd_ssm_b[..l * d_s], &mut m.w_b, d_s),
         (&m.bwd_ssm_c[..l * d_s], &mut m.w_c, d_s),
     ] {
-        dense_input_adjoint(
-            g,
-            &w.data,
-            l,
-            rows,
-            d_m,
-            &mut m.bwd_g_mlp[..l * d_m],
-        );
+        dense_input_adjoint(g, &w.data, l, rows, d_m, &mut m.bwd_g_mlp[..l * d_m]);
         for (dst, src) in m.bwd_g_xnorm[..l * d_m]
             .iter_mut()
             .zip(&m.bwd_g_mlp[..l * d_m])
@@ -1527,8 +1597,8 @@ fn bwd_stage_ssm_parallel(m: &mut PSSALayerV2, seq_len: usize) {
         let emb_row_off = x_id * d_m;
         for i in 0..d_m {
             let g_unnorm = m.bwd_g_xnorm[d_off + i] * m.norm_gamma.data[i];
-            embed_w.grad[emb_row_off + i] += inv_rms
-                * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / d_m as f32));
+            embed_w.grad[emb_row_off + i] +=
+                inv_rms * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / d_m as f32));
         }
     }
 }
@@ -1538,7 +1608,10 @@ fn bwd_stage_ssm_parallel(m: &mut PSSALayerV2, seq_len: usize) {
 /// the scalar `backward_chunk` to f32 roundoff.
 pub fn backward_chunk_batched(m: &mut PSSALayerV2, seq_len: usize, accumulation_scale: f32) {
     if m.depth() > 1 {
-        assert!(!m.device.is_gpu(), "stacked training is CPU-only; use Device::Cpu");
+        assert!(
+            !m.device.is_gpu(),
+            "stacked training is CPU-only; use Device::Cpu"
+        );
         m.backward_chunk(seq_len, accumulation_scale);
         return;
     }
