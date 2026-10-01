@@ -91,20 +91,29 @@ fn staged_and_packed_scans_reuse_storage_on_all_threads() {
     for len in [257, 256, 64] {
         step(&mut staged, &mut packed, &mut batch, len);
     }
+    let mut step_counts = [[(0usize, 0usize); 3]; 8];
     ALLOCS.store(0, Ordering::Relaxed);
     REALLOCS.store(0, Ordering::Relaxed);
     ACTIVE.store(true, Ordering::SeqCst);
     for round in 0..8 {
-        for len in [257, 256, 64] {
+        for (index, len) in [257, 256, 64].into_iter().enumerate() {
             step(&mut staged, &mut packed, &mut batch, len);
-            eprintln!(
-                "round={round} len={len} alloc={} realloc={}",
+            step_counts[round][index] = (
                 ALLOCS.load(Ordering::Relaxed),
-                REALLOCS.load(Ordering::Relaxed)
+                REALLOCS.load(Ordering::Relaxed),
             );
         }
     }
     ACTIVE.store(false, Ordering::SeqCst);
+    for round in 0..8 {
+        for (index, len) in [257, 256, 64].into_iter().enumerate() {
+            eprintln!(
+                "round={round} len={len} alloc={} realloc={}",
+                step_counts[round][index].0,
+                step_counts[round][index].1
+            );
+        }
+    }
     assert_eq!(
         ALLOCS.load(Ordering::Relaxed),
         0,
