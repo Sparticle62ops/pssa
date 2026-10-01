@@ -735,6 +735,10 @@ impl CLIHandler {
             model.step_counter,
             options.checkpoint_path.as_deref().unwrap_or("-")
         );
+        println!(
+            "last_checkpoint={}",
+            options.resume.as_deref().unwrap_or("-")
+        );
         for epoch in 0..options.epochs {
             model.reset_recurrent_state();
             if let Some(batch) = &mut sequence_batch {
@@ -1385,69 +1389,69 @@ impl CLIHandler {
             ),
             ("help", "show this message"),
         ] {
-            println!("    {:<16}{}", ui::cyan(name), ui::dim(blurb));
+            println!("    {:<22}{}", ui::cyan(name), ui::dim(blurb));
         }
         println!();
         println!("    evaluate / evaluate-transformer / repl  hidden compatibility aliases");
         println!("  {}", ui::bold("TRAIN"));
         println!("    {bin} train [source] [-d|--data source] [-o|--out path]");
         println!(
-            "    {:<30}{}",
+            "    {:<48}{}",
             "  --tokenizer bpe|word",
             ui::dim("default bpe")
         );
         println!(
-            "    {:<30}{}",
+            "    {:<48}{}",
             "  --vocab-size n",
             ui::dim("byte-level BPE ceiling, default 2048")
         );
         println!(
-            "    {:<30}{}",
+            "    {:<48}{}",
             "  -e|--epochs n",
             ui::dim("passes over the selected slice")
         );
         println!(
-            "    {:<30}{}",
+            "    {:<48}{}",
             "  --latent n --state n --depth n",
             ui::dim("width, recurrent state size, blocks (depth 1..32; default 1)")
         );
         println!(
-            "    {:<30}{}",
+            "    {:<48}{}",
             "  --key n --memory n",
             ui::dim("episodic key width and bank capacity")
         );
         println!(
-            "    {:<30}{}",
+            "    {:<48}{}",
             "  --chunk n --accumulate n",
             ui::dim("chunk length and microbatches per update")
         );
         println!(
-            "    {:<30}{}",
+            "    {:<48}{}",
             "  --batch-size n",
             ui::dim("independent document lanes (default 1)")
         );
         println!(
-            "    {:<30}{}",
+            "    {:<48}{}",
             "  --lr f --warmup-steps n --total-updates n",
             ui::dim("optimizer schedule; fixed whole-run horizon for fresh chains")
         );
         println!(
-            "    {:<30}{}",
+            "    {:<48}{}",
             "  --seed n",
             ui::dim("deterministic initialisation")
         );
         println!(
-            "    {:<30}{}",
+            "    {:<48}{}",
             "  --max-tokens n",
             ui::dim("global cap on training tokens")
         );
         println!(
-            "    {:<30}{}",
+            "    {:<48}{}",
             "  --skip-tokens n",
             ui::dim("drop this many tokens from the front first")
         );
         println!(
-            "    {:<30}{}",
+            "    {:<48}{}",
             "  --resume path",
             ui::dim("continue from an existing checkpoint")
         );
@@ -1468,7 +1472,9 @@ impl CLIHandler {
             "    {}",
             ui::dim("# train a fresh checkpoint on the first 200k tokens")
         );
-        println!("    {bin} train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1");
+        println!(
+            "    Example: {bin} train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1"
+        );
         println!();
         println!(
             "    {}",
@@ -1619,6 +1625,9 @@ impl CLIHandler {
                 println!("  -p, --prompt <TEXT>           prompt (also accepted as PROMPT)");
                 println!("  -m, --model <PATH>            checkpoint (default: {model})");
                 println!(
+                    "  -d, --data <SOURCE>           legacy PSSA word-tokenizer provenance; transformer checkpoints reject it"
+                );
+                println!(
                     "  -t, --temp, --temperature <F> sampling temperature; 0 is greedy (default: 0.70)"
                 );
                 println!(
@@ -1689,6 +1698,7 @@ impl CLIHandler {
                 println!("Usage: {bin} benchmark [-f|--feature NAME] [-o|--out PATH]");
                 println!("Features: continual, retention, geometry, refractory, ridge, or all.");
                 println!("Without options, runs the historical verification smoke test.");
+                println!("Feature runs require --feature; --out selects their output directory.");
                 println!(
                     "Example: {bin} benchmark --feature geometry --out __agent__/feature_results"
                 );
@@ -1711,11 +1721,14 @@ impl CLIHandler {
             }
             "throughput" => {
                 println!(
-                    "Usage: {bin} throughput [DATA] [--model PATH] [--skip-tokens N] [--max-tokens N]"
+                    "Usage: {bin} throughput [DATA] [-d|--data SOURCE] [-m|--model PATH] [--skip-tokens N] [--max-tokens N]"
                 );
                 println!();
                 println!(
                     "Measure frozen-model scoring throughput. DATA defaults to the normal training source."
+                );
+                println!(
+                    "Options: -d, --data SOURCE; -m, --model PATH; --skip-tokens N; --max-tokens N"
                 );
                 println!(
                     "Example: {bin} throughput data/heldout.txt --model data/model.pssa --max-tokens 10000"
@@ -1728,7 +1741,7 @@ impl CLIHandler {
                 println!("Example: {bin} help train");
             }
             "tui" => {
-                println!("Usage: {bin} tui [--chain DIR]");
+                println!("Usage: {bin} tui [-c|--chain DIR]");
                 println!();
                 println!(
                     "Render a live dashboard for a piped training run; piped output is passed through plainly."
@@ -1747,14 +1760,20 @@ impl CLIHandler {
         }
         let command = Self::canonical_command(args[1].as_str());
         if command == "help" {
-            if args.len() == 2 || (args.len() == 3 && matches!(args[2].as_str(), "--help" | "-h")) {
+            if args.len() == 2 {
                 Self::print_help();
                 return Ok(());
             }
             if args.len() == 3 {
+                if matches!(args[2].as_str(), "--help" | "-h") {
+                    return Self::print_command_help("help");
+                }
                 return Self::print_command_help(&args[2]);
             }
-            return Err("help accepts at most one command name".into());
+            if args.len() == 4 && matches!(args[3].as_str(), "--help" | "-h") {
+                return Self::print_command_help(&args[2]);
+            }
+            return Err("help accepts one command name, optionally followed by --help".into());
         }
         if matches!(command, "--help" | "-h") {
             Self::print_help();

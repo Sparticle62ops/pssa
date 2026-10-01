@@ -631,7 +631,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown tui flag '{other}'; usage: oxide tui [--chain DIR]"
+                    "unknown tui flag '{other}'; usage: oxide tui [-c|--chain DIR]"
                 ));
             }
         }
@@ -639,7 +639,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
 
     if io::stdin().is_terminal() {
-        println!("Usage: oxide_ai_pssa train ... --no-tui | oxide_ai_pssa tui [--chain DIR]");
+        println!("Usage: oxide_ai_pssa train ... --no-tui | oxide_ai_pssa tui [-c|--chain DIR]");
         println!(
             "Example: oxide_ai_pssa train data/corpus.txt -o chain/ck01.pssa --no-tui | oxide_ai_pssa tui --chain chain"
         );

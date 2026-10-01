@@ -147,6 +147,7 @@ pub fn train_corpus(
         model.step_counter,
         opts.checkpoint_path.as_deref().unwrap_or("-")
     );
+    println!("last_checkpoint={}", opts.resume.as_deref().unwrap_or("-"));
     for epoch in 0..opts.epochs {
         let mut loss_sum = 0.0f64;
         let mut token_sum = 0usize;
