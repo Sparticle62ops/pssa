@@ -347,6 +347,27 @@ impl Tokenizer {
         }
     }
 
+    /// Returns distinct word-level tokens that map to `<unk>`, in prompt order.
+    /// BPE tokenization has byte fallback and therefore has no unknown words.
+    pub fn unknown_words(&self, text: &str, lower: bool) -> Vec<String> {
+        if self.kind != TokenizerKind::Word {
+            return Vec::new();
+        }
+        let mut unknown = Vec::new();
+        for token in Self::clean_and_tokenize(text, lower) {
+            if self.token_to_id.contains_key(&token)
+                || unknown.iter().any(|known: &String| known == &token)
+            {
+                continue;
+            }
+            unknown.push(token);
+            if unknown.len() == 8 {
+                break;
+            }
+        }
+        unknown
+    }
+
     pub fn try_encode(&self, text: &str, lower: bool) -> Result<Vec<usize>, String> {
         match &self.backend {
             TokenizerBackend::Word => Ok(Self::clean_and_tokenize(text, lower)

@@ -1083,6 +1083,7 @@ impl CLIHandler {
     }
     fn run_chat(model_path: &str, data: Option<&str>, temp: f32) -> Result<(), String> {
         let (mut model, tokenizer) = Self::load_for_inference(model_path, data)?;
+        let mut engine = PSSAInferenceEngine::try_new(&mut model, &tokenizer)?;
         println!("interactive: /exit");
         loop {
             print!("user> ");
@@ -1106,14 +1107,10 @@ impl CLIHandler {
                 temperature: temp,
                 ..Default::default()
             };
-            println!(
-                "{}",
-                PSSAInferenceEngine::try_new(&mut model, &tokenizer)?.try_generate_chat_turn(
-                    p,
-                    &cfg,
-                    |_| {}
-                )?
-            );
+            match engine.try_generate_chat_turn(p, &cfg, |_| {}) {
+                Ok(output) => println!("{output}"),
+                Err(error) => eprintln!("error: {error}"),
+            }
         }
         Ok(())
     }

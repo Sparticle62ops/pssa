@@ -2,6 +2,19 @@ use crate::dataset::{Tokenizer, TokenizerKind};
 use crate::linalg::SimpleRng;
 use crate::pssa::PSSALayerV2;
 
+pub(crate) fn unknown_prompt_error(tokenizer: &Tokenizer, prompt: &str) -> String {
+    let unknown = tokenizer.unknown_words(prompt, true);
+    let listed = if unknown.is_empty() {
+        "the entered words".to_string()
+    } else {
+        unknown.join(", ")
+    };
+    format!(
+        "none of these words are in this model's vocabulary (word-level tokenizer, {} words learned from the training text): {listed}. try words from the training data, or use a BPE-tokenized checkpoint",
+        tokenizer.vocab_size.saturating_sub(1)
+    )
+}
+
 pub struct InferenceConfig {
     pub temperature: f32,
     pub top_p: f32,
@@ -174,7 +187,7 @@ impl<'a> PSSAInferenceEngine<'a> {
             return Err("prompt is empty after tokenization".into());
         }
         if prompt_ids.iter().all(|&id| id == 0) {
-            return Err("prompt contains no known vocabulary tokens".into());
+            return Err(unknown_prompt_error(self.tokenizer, prompt));
         }
         let d_v = self.model.cfg.d_vocab;
         let mut logits = vec![0.0f32; d_v];
@@ -319,5 +332,25 @@ impl<'a> PSSAInferenceEngine<'a> {
     {
         self.try_generate_chat_turn(prompt, cfg, callback)
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unknown_prompt_error;
+    use crate::dataset::Tokenizer;
+
+    #[test]
+    fn unknown_prompt_error_explains_word_vocabulary() {
+        let tokenizer = Tokenizer::from_vocabulary(&[
+            "<unk>".into(),
+            "alpha".into(),
+            "beta".into(),
+        ])
+        .unwrap();
+        let error = unknown_prompt_error(&tokenizer, "hello saturn hello");
+        assert!(error.contains("word-level tokenizer, 2 words learned from the training text"));
+        assert!(error.contains(": hello, saturn."));
+        assert!(error.contains("try words from the training data"));
     }
 }
