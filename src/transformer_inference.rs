@@ -1,7 +1,7 @@
 //! Baseline generation uses the same seeded sampler and decoding policy as PSSA.
 use crate::dataset::{DatasetManager, TokenizerKind};
 use crate::evaluation::{self, EvaluationSlice};
-use crate::inference::{InferenceConfig, PSSAInferenceEngine};
+use crate::inference::{InferenceConfig, PSSAInferenceEngine, unknown_prompt_error};
 use crate::linalg::SimpleRng;
 use crate::transformer_checkpoint;
 
@@ -17,7 +17,7 @@ pub fn generate(path: &str, prompt: &str, cfg: &InferenceConfig) -> Result<Strin
         return Err("prompt is empty after tokenization".into());
     }
     if ids.iter().all(|&id| id == 0) {
-        return Err("prompt contains no known vocabulary tokens".into());
+        return Err(unknown_prompt_error(&tok, prompt));
     }
     let prompt_len = ids.len();
     let mut logits = vec![0.0; tok.vocab_size];
