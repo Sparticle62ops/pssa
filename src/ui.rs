@@ -358,7 +358,8 @@ impl Progress {
     /// reported. This is intentionally presentation-only and is never stored
     /// in a checkpoint.
     pub fn set_last_checkpoint(&mut self, path: &str) {
-        if !path.trim().is_empty() {
+        let path = path.trim();
+        if !path.is_empty() && path != "-" {
             self.last_checkpoint = Some(path.to_string());
         }
     }
@@ -431,10 +432,12 @@ impl Progress {
             .and_then(checkpoint_number)
             .map(|number| number.to_string())
             .unwrap_or_else(|| "-".into());
-        let last_checkpoint = self
+        let last_checkpoint = self.last_checkpoint.clone().unwrap_or_else(|| "-".into());
+        let last_checkpoint_field = self
             .last_checkpoint
-            .clone()
-            .unwrap_or_else(|| "none".into());
+            .as_deref()
+            .map(|path| format!(" last_checkpoint={path}"))
+            .unwrap_or_default();
         let global = self.prior_updates.saturating_add(done);
 
         if self.interactive {
@@ -475,7 +478,7 @@ impl Progress {
             let _ = io::stdout().flush();
         } else {
             println!(
-                "  {} {}/{} ({:.0}%) loss={loss:.6} loss_average={average:.6} tokens_per_second={rate:.0} optimizer_updates={done} updates_total={} updates_remaining={remaining_updates} global_update={global} learning_rate={lr} memory_occupancy={memory} checkpoint_number={number} elapsed_seconds={elapsed:.3} eta={}",
+                "  {} {}/{} ({:.0}%) loss={loss:.6} loss_average={average:.6} tokens_per_second={rate:.0} optimizer_updates={done} updates_total={} updates_remaining={remaining_updates} global_update={global} learning_rate={lr} memory_occupancy={memory} checkpoint_number={number} elapsed_seconds={elapsed:.3} eta={}{last_checkpoint_field}",
                 self.label,
                 done,
                 self.total,
