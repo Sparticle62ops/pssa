@@ -324,39 +324,70 @@ impl ChunkActivationTape {
         mem_cap: usize,
         rank: usize,
     ) -> Self {
+        Self::new_with_loops(max_l, d_vocab, d_latent, d_state, d_key, mem_cap, rank, 1)
+    }
+
+    /// Allocate one contiguous activation tape per Ouro iteration. The public
+    /// tape shape remains unchanged for the historical one-loop path: token
+    /// IDs, logits, probabilities, and losses are final-output storage, while
+    /// the intermediate activation arrays are laid out as
+    /// `[loop][token][feature]`.
+    pub fn new_with_loops(
+        max_l: usize,
+        d_vocab: usize,
+        d_latent: usize,
+        d_state: usize,
+        d_key: usize,
+        mem_cap: usize,
+        rank: usize,
+        loops: usize,
+    ) -> Self {
+        assert!((1..=32).contains(&loops));
+        let loop_l = max_l * loops;
         Self {
             max_l,
             x_ids: vec![0; max_l],
             target_ids: vec![0; max_l],
-            x_raw: vec![0.0; max_l * d_latent],
-            x_norm: vec![0.0; max_l * d_latent],
-            inv_rms: vec![0.0; max_l],
-            delta_raw: vec![0.0; max_l * d_latent],
-            delta: vec![0.0; max_l * d_latent],
-            b_proj: vec![0.0; max_l * d_state],
-            c_proj: vec![0.0; max_l * d_state],
-            bar_a: vec![0.0; max_l * d_latent * d_state],
-            bar_b: vec![0.0; max_l * d_latent * d_state],
-            h_states: vec![0.0; (max_l + 1) * d_latent * d_state],
-            y_ssm: vec![0.0; max_l * d_latent],
-            q_euc: vec![0.0; max_l * d_key],
-            q_norm: vec![0.0; max_l],
-            q_poincare: vec![0.0; max_l * d_key],
-            mem_weights: vec![0.0; max_l * mem_cap],
-            m_val: vec![0.0; max_l * d_latent],
-            g_mem: vec![0.0; max_l * d_latent],
-            m_inj: vec![0.0; max_l * d_latent],
-            m_proj: vec![0.0; max_l * d_latent],
-            adapter_hidden: vec![0.0; max_l * rank],
-            adapter_act: vec![0.0; max_l * rank],
-            z_raw: vec![0.0; max_l * d_latent],
-            mlp_hidden: vec![0.0; max_l * 2 * d_latent],
-            mlp_act: vec![0.0; max_l * 2 * d_latent],
-            z_final: vec![0.0; max_l * d_latent],
+            x_raw: vec![0.0; loop_l * d_latent],
+            x_norm: vec![0.0; loop_l * d_latent],
+            inv_rms: vec![0.0; loop_l],
+            delta_raw: vec![0.0; loop_l * d_latent],
+            delta: vec![0.0; loop_l * d_latent],
+            b_proj: vec![0.0; loop_l * d_state],
+            c_proj: vec![0.0; loop_l * d_state],
+            bar_a: vec![0.0; loop_l * d_latent * d_state],
+            bar_b: vec![0.0; loop_l * d_latent * d_state],
+            // Extra loop carries are runtime-only, after the activation slots.
+            h_states: vec![0.0; (loops * (max_l + 1) + loops - 1) * d_latent * d_state],
+            y_ssm: vec![0.0; loop_l * d_latent],
+            q_euc: vec![0.0; loop_l * d_key],
+            q_norm: vec![0.0; loop_l],
+            q_poincare: vec![0.0; loop_l * d_key],
+            mem_weights: vec![0.0; loop_l * mem_cap],
+            m_val: vec![0.0; loop_l * d_latent],
+            g_mem: vec![0.0; loop_l * d_latent],
+            m_inj: vec![0.0; loop_l * d_latent],
+            m_proj: vec![0.0; loop_l * d_latent],
+            adapter_hidden: vec![0.0; loop_l * rank],
+            adapter_act: vec![0.0; loop_l * rank],
+            z_raw: vec![0.0; loop_l * d_latent],
+            mlp_hidden: vec![0.0; loop_l * 2 * d_latent],
+            mlp_act: vec![0.0; loop_l * 2 * d_latent],
+            z_final: vec![0.0; loop_l * d_latent],
             logits: vec![0.0; max_l * d_vocab],
             probs: vec![0.0; max_l * d_vocab],
             losses: vec![0.0; max_l],
         }
+    }
+
+    #[inline]
+    pub fn loop_offset(&self, loop_index: usize, token: usize, width: usize) -> usize {
+        loop_index * self.max_l * width + token * width
+    }
+
+    #[inline]
+    pub fn loop_state_offset(&self, loop_index: usize, token: usize, width: usize) -> usize {
+        loop_index * (self.max_l + 1) * width + token * width
     }
 }
 
@@ -489,6 +520,15 @@ impl PSSAContinuousBlockV2 {
         rng: &mut SimpleRng,
         d_v: usize,
     ) -> Self {
+        Self::new_with_rng_and_loops(cfg, rng, d_v, 1)
+    }
+
+    pub(crate) fn new_with_rng_and_loops(
+        cfg: PSSAContinuousConfigV2,
+        rng: &mut SimpleRng,
+        d_v: usize,
+        loops: usize,
+    ) -> Self {
         let d_m = cfg.d_latent;
         let d_s = cfg.d_state;
         let d_k = cfg.d_mem_key;
@@ -537,8 +577,9 @@ impl PSSAContinuousBlockV2 {
         let mlp_w1 = ParamMatrix::random_xavier(d_mlp, d_m, rng);
         let mlp_w2 = ParamMatrix::zeros(d_m, d_mlp);
 
-        let tape = ChunkActivationTape::new(chunk_len, d_v, d_m, d_s, d_k, mem_cap, rank);
-
+        let tape = ChunkActivationTape::new_with_loops(
+            chunk_len, d_v, d_m, d_s, d_k, mem_cap, rank, loops,
+        );
         Self {
             cfg,
             norm_gamma,
@@ -628,6 +669,32 @@ impl PSSAContinuousBlockV2 {
 
     pub fn reset_recurrent_state(&mut self) {
         self.h_persistent.fill(0.0);
+        let start = self.loop_carry_start();
+        self.tape.h_states[start..].fill(0.0);
+    }
+
+    /// Each virtual pass has its own causal temporal carry, but shares every
+    /// weight, optimizer moment and memory bank. Keeping these extra carries
+    /// in runtime tape storage leaves the historical checkpoint state intact.
+    pub(crate) fn loop_carry_start(&self) -> usize {
+        let loops = self.tape.x_raw.len() / (self.tape.max_l * self.cfg.d_latent);
+        loops * (self.tape.max_l + 1) * self.h_persistent.len()
+    }
+
+    fn swap_loop_carry(&mut self, loop_index: usize) {
+        if loop_index != 0 {
+            let start = self.loop_carry_start() + (loop_index - 1) * self.h_persistent.len();
+            for (state, stored) in self.h_persistent.iter_mut()
+                .zip(&mut self.tape.h_states[start..]) {
+                std::mem::swap(state, stored);
+            }
+        }
+    }
+
+    fn forward_inference_loop(&mut self, input: &[f32], output: &mut [f32], loop_index: usize) {
+        self.swap_loop_carry(loop_index);
+        self.forward_continuous_inference(input, output);
+        self.swap_loop_carry(loop_index);
     }
 
     #[inline(always)]
@@ -738,9 +805,18 @@ impl PSSAContinuousBlockV2 {
 
     /// Process raw continuous rows, detaching incoming carry at the chunk edge.
     pub fn forward_train_chunk(&mut self, inputs: &[f32], seq_len: usize) {
+        self.forward_train_chunk_loop(inputs, seq_len, 0);
+    }
+
+    /// Forward one Ouro iteration into its preallocated activation slot.
+    pub fn forward_train_chunk_loop(&mut self, inputs: &[f32], seq_len: usize, loop_index: usize) {
         assert!(seq_len > 0 && seq_len <= self.tape.max_l);
         assert_eq!(inputs.len(), seq_len * self.cfg.d_latent);
-        self.tape.x_raw[..inputs.len()].copy_from_slice(inputs);
+        let loop_l = loop_index * self.tape.max_l;
+        let loop_state = loop_index * (self.tape.max_l + 1);
+        assert!(loop_index < self.tape.x_raw.len() / (self.tape.max_l * self.cfg.d_latent));
+        let x_raw_off = loop_l * self.cfg.d_latent;
+        self.tape.x_raw[x_raw_off..x_raw_off + inputs.len()].copy_from_slice(inputs);
         let d_m = self.cfg.d_latent;
         let d_s = self.cfg.d_state;
         let d_k = self.cfg.d_mem_key;
@@ -749,18 +825,20 @@ impl PSSAContinuousBlockV2 {
         let rank = self.adapters[0].rank;
         let ssm_scale = 1.0 / (d_s as f32).sqrt();
 
-        self.tape.h_states[..d_m * d_s].copy_from_slice(&self.h_persistent);
+        self.swap_loop_carry(loop_index);
+        self.tape.h_states[loop_state * d_m * d_s..(loop_state + 1) * d_m * d_s]
+            .copy_from_slice(&self.h_persistent);
 
         self.refresh_ssm_rates();
 
         for t in 0..seq_len {
             // 1. Raw continuous input & affine RMSNorm
-            let e_t = &self.tape.x_raw[t * d_m..(t + 1) * d_m];
+            let e_t = &self.tape.x_raw[(loop_l + t) * d_m..(loop_l + t + 1) * d_m];
             let sum_sq: f32 = e_t.iter().map(|&x| x * x).sum();
             let inv_rms = 1.0 / (sum_sq / (d_m as f32) + 1e-5).sqrt();
-            self.tape.inv_rms[t] = inv_rms;
+            self.tape.inv_rms[loop_l + t] = inv_rms;
 
-            let xn_off = t * d_m;
+            let xn_off = (loop_l + t) * d_m;
             for i in 0..d_m {
                 self.tape.x_norm[xn_off + i] =
                     self.norm_gamma.data[i] * (e_t[i] * inv_rms) + self.norm_beta.data[i];
@@ -768,7 +846,7 @@ impl PSSAContinuousBlockV2 {
             let x_n = &self.tape.x_norm[xn_off..xn_off + d_m];
 
             // 2. Data-Dependent Projections
-            let del_off = t * d_m;
+            let del_off = (loop_l + t) * d_m;
             self.w_delta
                 .matvec(x_n, &mut self.tape.delta_raw[del_off..del_off + d_m]);
             for i in 0..d_m {
@@ -776,21 +854,21 @@ impl PSSAContinuousBlockV2 {
             }
             let delta = &self.tape.delta[del_off..del_off + d_m];
 
-            let b_off = t * d_s;
+            let b_off = (loop_l + t) * d_s;
             self.w_b
                 .matvec(x_n, &mut self.tape.b_proj[b_off..b_off + d_s]);
             let b_p = &self.tape.b_proj[b_off..b_off + d_s];
 
-            let c_off = t * d_s;
+            let c_off = (loop_l + t) * d_s;
             self.w_c
                 .matvec(x_n, &mut self.tape.c_proj[c_off..c_off + d_s]);
             let c_p = &self.tape.c_proj[c_off..c_off + d_s];
 
             // 3. Multi-Channel SSM Recurrent Scan
-            let h_prev_off = t * (d_m * d_s);
-            let h_next_off = (t + 1) * (d_m * d_s);
-            let ssm_off = t * (d_m * d_s);
-            let y_off = t * d_m;
+            let h_prev_off = (loop_state + t) * (d_m * d_s);
+            let h_next_off = (loop_state + t + 1) * (d_m * d_s);
+            let ssm_off = (loop_l + t) * (d_m * d_s);
+            let y_off = (loop_l + t) * d_m;
 
             for i in 0..d_m {
                 let d_i = delta[i];
@@ -813,20 +891,20 @@ impl PSSAContinuousBlockV2 {
             let y_ssm = &self.tape.y_ssm[y_off..y_off + d_m];
 
             // 4. Diffeomorphic Poincaré Memory Retrieval
-            let q_off = t * d_k;
+            let q_off = (loop_l + t) * d_k;
             for r in 0..d_k {
                 let row_x = &self.w_qx.data[r * d_m..(r + 1) * d_m];
                 let row_h = &self.w_qh.data[r * d_m..(r + 1) * d_m];
                 self.tape.q_euc[q_off + r] = dot_slice(row_x, x_n) + dot_slice(row_h, y_ssm);
             }
 
-            self.tape.q_norm[t] = HyperbolicEpisodicBankV2::diffeomorphic_project(
+            self.tape.q_norm[loop_l + t] = HyperbolicEpisodicBankV2::diffeomorphic_project(
                 &self.tape.q_euc[q_off..q_off + d_k],
                 &mut self.tape.q_poincare[q_off..q_off + d_k],
             );
 
-            let m_off = t * d_m;
-            let mw_off = t * mem_cap;
+            let m_off = (loop_l + t) * d_m;
+            let mw_off = (loop_l + t) * mem_cap;
             self.memory.retrieve_soft_into(
                 &self.tape.q_poincare[q_off..q_off + d_k],
                 self.cfg.tau_mem,
@@ -848,7 +926,7 @@ impl PSSAContinuousBlockV2 {
             }
 
             // 5. Zero-Init Plastic Adapter
-            let ad_off = t * rank;
+            let ad_off = (loop_l + t) * rank;
             self.adapters[0]
                 .down_proj
                 .matvec(x_n, &mut self.tape.adapter_hidden[ad_off..ad_off + rank]);
@@ -862,14 +940,14 @@ impl PSSAContinuousBlockV2 {
             );
 
             // 6. Latent Aggregation & SiLU MLP Expansion
-            let z_off = t * d_m;
+            let z_off = (loop_l + t) * d_m;
             for i in 0..d_m {
                 self.tape.z_raw[z_off + i] =
                     (y_ssm[i] * ssm_scale) + self.tape.m_inj[m_off + i] + self.buf_ad_out[i];
             }
             let z_raw = &self.tape.z_raw[z_off..z_off + d_m];
 
-            let mlp_off = t * d_mlp;
+            let mlp_off = (loop_l + t) * d_mlp;
             self.mlp_w1
                 .matvec(z_raw, &mut self.tape.mlp_hidden[mlp_off..mlp_off + d_mlp]);
             for i in 0..d_mlp {
@@ -885,9 +963,10 @@ impl PSSAContinuousBlockV2 {
             }
         }
 
-        let last_h_off = seq_len * (d_m * d_s);
+        let last_h_off = (loop_state + seq_len) * (d_m * d_s);
         self.h_persistent
             .copy_from_slice(&self.tape.h_states[last_h_off..last_h_off + d_m * d_s]);
+        self.swap_loop_carry(loop_index);
     }
 
     pub fn zero_gradients(&mut self) {
@@ -914,6 +993,19 @@ impl PSSAContinuousBlockV2 {
         seq_len: usize,
         input_adjoints: &mut [f32],
     ) {
+        self.backward_chunk_loop(output_adjoints, seq_len, input_adjoints, 0);
+    }
+
+    /// Backward one Ouro iteration into the shared parameter gradients.
+    /// Temporal carry is detached at the chunk edge for each virtual pass;
+    /// inter-pass feature adjoints are propagated by the outer residual loop.
+    pub fn backward_chunk_loop(
+        &mut self,
+        output_adjoints: &[f32],
+        seq_len: usize,
+        input_adjoints: &mut [f32],
+        loop_index: usize,
+    ) {
         assert!(
             seq_len > 0 && seq_len <= self.cfg.chunk_len,
             "backward sequence length must be within tape capacity"
@@ -929,16 +1021,19 @@ impl PSSAContinuousBlockV2 {
 
         self.refresh_ssm_rates();
         self.grad_h_next.fill(0.0);
+        let loop_l = loop_index * self.tape.max_l;
+        let loop_state = loop_index * (self.tape.max_l + 1);
+        assert!(loop_index < self.tape.x_raw.len() / (self.tape.max_l * d_m));
 
         // Reverse Time Loop across sequence chunk L
         for t in (0..seq_len).rev() {
-            let z_off = t * d_m;
+            let z_off = (loop_l + t) * d_m;
 
             self.grad_z_final
-                .copy_from_slice(&output_adjoints[z_off..z_off + d_m]);
+                .copy_from_slice(&output_adjoints[t * d_m..(t + 1) * d_m]);
 
             // 2. SiLU MLP Backward
-            let mlp_off = t * d_mlp;
+            let mlp_off = (loop_l + t) * d_mlp;
             self.mlp_w2
                 .matvec_transpose(&self.grad_z_final, &mut self.buf_g_mlp_act);
 
@@ -973,7 +1068,7 @@ impl PSSAContinuousBlockV2 {
             }
 
             // 3. Adapter Backward
-            let ad_off = t * rank;
+            let ad_off = (loop_l + t) * rank;
             self.adapters[0].total_up_matvec_transpose(&self.grad_z_raw, &mut self.buf_g_ad_act);
 
             for i in 0..d_m {
@@ -999,12 +1094,12 @@ impl PSSAContinuousBlockV2 {
                 for j in 0..d_m {
                     self.grad_x_norm[j] += gad_r * self.adapters[0].down_proj.data[row_off + j];
                     self.adapters[0].down_proj.grad[row_off + j] +=
-                        gad_r * self.tape.x_norm[t * d_m + j];
+                        gad_r * self.tape.x_norm[(loop_l + t) * d_m + j];
                 }
             }
 
             // 4. Memory Injection Backward
-            let m_off = t * d_m;
+            let m_off = (loop_l + t) * d_m;
             for i in 0..d_m {
                 let gz_i = self.grad_z_raw[i];
                 let g_mem = self.tape.g_mem[m_off + i];
@@ -1015,7 +1110,8 @@ impl PSSAContinuousBlockV2 {
                 let row_off = i * d_m;
                 for j in 0..d_m {
                     self.grad_x_norm[j] += g_wgate_pre * self.w_gate.data[row_off + j];
-                    self.w_gate.grad[row_off + j] += g_wgate_pre * self.tape.x_norm[t * d_m + j];
+                    self.w_gate.grad[row_off + j] +=
+                        g_wgate_pre * self.tape.x_norm[(loop_l + t) * d_m + j];
                 }
             }
 
@@ -1032,7 +1128,7 @@ impl PSSAContinuousBlockV2 {
             // Retrieval is a full-bank softmax over -hyperbolic_distance/tau.
             // Bank keys/values are detached stored state; only the query path learns.
             self.g_query_pnc.fill(0.0);
-            let q_off = t * d_k;
+            let q_off = (loop_l + t) * d_k;
             let q = &self.tape.q_poincare[q_off..q_off + d_k];
             let q_sq = HyperbolicEpisodicBankV2::squared_norm(q) as f64;
             for entry in 0..self.memory.count {
@@ -1045,7 +1141,8 @@ impl PSSAContinuousBlockV2 {
                     dot_g_value_minus_mean += self.buf_g_m_val[j] as f64
                         * (self.memory.values[value_off + j] - self.tape.m_val[m_off + j]) as f64;
                 }
-                let g_score = self.tape.mem_weights[t * self.cfg.mem_capacity + entry] as f64
+                let g_score = self.tape.mem_weights[(loop_l + t) * self.cfg.mem_capacity + entry]
+                    as f64
                     * dot_g_value_minus_mean;
                 let mut sq = 0.0f64;
                 for k in 0..d_k {
@@ -1074,8 +1171,8 @@ impl PSSAContinuousBlockV2 {
                 &mut self.g_query_euc,
             );
             self.g_y_ssm.fill(0.0);
-            let xn = &self.tape.x_norm[t * d_m..(t + 1) * d_m];
-            let y = &self.tape.y_ssm[t * d_m..(t + 1) * d_m];
+            let xn = &self.tape.x_norm[(loop_l + t) * d_m..(loop_l + t + 1) * d_m];
+            let y = &self.tape.y_ssm[(loop_l + t) * d_m..(loop_l + t + 1) * d_m];
             for r_i in 0..d_k {
                 let gq = self.g_query_euc[r_i];
                 let row = r_i * d_m;
@@ -1088,11 +1185,11 @@ impl PSSAContinuousBlockV2 {
             }
 
             // 5. Multi-Channel SSM Recurrence Backward & Temporal State Flow
-            let ssm_off = t * (d_m * d_s);
-            let h_prev_off = t * (d_m * d_s);
-            let c_off = t * d_s;
-            let b_off = t * d_s;
-            let del_off = t * d_m;
+            let ssm_off = (loop_l + t) * (d_m * d_s);
+            let h_prev_off = (loop_state + t) * (d_m * d_s);
+            let c_off = (loop_l + t) * d_s;
+            let b_off = (loop_l + t) * d_s;
+            let del_off = (loop_l + t) * d_m;
 
             self.buf_g_delta.fill(0.0);
             self.buf_g_b_proj.fill(0.0);
@@ -1103,11 +1200,11 @@ impl PSSAContinuousBlockV2 {
                 let gz_i = self.grad_z_raw[i];
                 let g_y_i = gz_i * ssm_scale + self.g_y_ssm[i];
                 let d_i = self.tape.delta[del_off + i];
-                let xn_i = self.tape.x_norm[t * d_m + i];
+                let xn_i = self.tape.x_norm[(loop_l + t) * d_m + i];
 
                 for j in 0..d_s {
                     let idx = i * d_s + j;
-                    let h_next = self.tape.h_states[(t + 1) * (d_m * d_s) + idx];
+                    let h_next = self.tape.h_states[(loop_state + t + 1) * (d_m * d_s) + idx];
                     let c_val = self.tape.c_proj[c_off + j];
                     let bar_a = self.tape.bar_a[ssm_off + idx];
                     let a_physical = self.ssm_rates[idx];
@@ -1139,7 +1236,8 @@ impl PSSAContinuousBlockV2 {
                 let row_off = i * d_m;
                 for j in 0..d_m {
                     self.grad_x_norm[j] += gd_i * self.w_delta.data[row_off + j];
-                    self.w_delta.grad[row_off + j] += gd_i * self.tape.x_norm[t * d_m + j];
+                    self.w_delta.grad[row_off + j] +=
+                        gd_i * self.tape.x_norm[(loop_l + t) * d_m + j];
                 }
             }
 
@@ -1150,14 +1248,14 @@ impl PSSAContinuousBlockV2 {
                 for k in 0..d_m {
                     self.grad_x_norm[k] +=
                         gb_j * self.w_b.data[row_off + k] + gc_j * self.w_c.data[row_off + k];
-                    self.w_b.grad[row_off + k] += gb_j * self.tape.x_norm[t * d_m + k];
-                    self.w_c.grad[row_off + k] += gc_j * self.tape.x_norm[t * d_m + k];
+                    self.w_b.grad[row_off + k] += gb_j * self.tape.x_norm[(loop_l + t) * d_m + k];
+                    self.w_c.grad[row_off + k] += gc_j * self.tape.x_norm[(loop_l + t) * d_m + k];
                 }
             }
 
             // 6. Affine RMSNorm backward to gamma, beta, and raw input rows
-            let inv_rms = self.tape.inv_rms[t];
-            let e_t = &self.tape.x_raw[t * d_m..(t + 1) * d_m];
+            let inv_rms = self.tape.inv_rms[loop_l + t];
+            let e_t = &self.tape.x_raw[(loop_l + t) * d_m..(loop_l + t + 1) * d_m];
 
             let mut dot_gx_e = 0.0f32;
             for i in 0..d_m {
@@ -1285,17 +1383,36 @@ impl PSSAConfigV2 {
 
 impl PSSALayerV2 {
     pub const MAX_DEPTH: usize = 32;
+    pub const MAX_LOOPS: usize = 32;
 
     pub fn new(cfg: PSSAConfigV2, seed: u64) -> Self {
-        Self::new_with_device(cfg, seed, Device::Cpu)
+        Self::new_with_device_and_loops(cfg, seed, Device::Cpu, 1)
     }
     pub fn new_with_depth(mut cfg: PSSAConfigV2, seed: u64, depth: usize) -> Self {
         cfg.depth = depth;
         Self::new(cfg, seed)
     }
+    pub fn new_with_depth_and_loops(
+        mut cfg: PSSAConfigV2,
+        seed: u64,
+        depth: usize,
+        loops: usize,
+    ) -> Self {
+        cfg.depth = depth;
+        Self::new_with_device_and_loops(cfg, seed, Device::Cpu, loops)
+    }
     pub fn new_with_device(cfg: PSSAConfigV2, seed: u64, device: Device) -> Self {
+        Self::new_with_device_and_loops(cfg, seed, device, 1)
+    }
+    fn new_with_device_and_loops(
+        cfg: PSSAConfigV2,
+        seed: u64,
+        device: Device,
+        loops: usize,
+    ) -> Self {
+        assert!((1..=Self::MAX_LOOPS).contains(&loops));
         cfg.validate();
-        crate::checkpoint::validate_model_config(&cfg).expect("invalid model allocation");
+        Self::validate_loops_config(&cfg, loops).expect("invalid model allocation");
         assert!(
             cfg.depth == 1 || !device.is_gpu(),
             "stacked depth currently requires Device::Cpu"
@@ -1305,16 +1422,22 @@ impl PSSALayerV2 {
         // Preserve main's exact original embedding/block/head random draw order.
         // Extra blocks are initialized only after both shared endpoints.
         let embed_w = ParamMatrix::random_xavier(v, d, &mut rng);
-        let block = PSSAContinuousBlockV2::new_with_rng((&cfg).into(), &mut rng, v);
+        let block = if loops == 1 {
+            PSSAContinuousBlockV2::new_with_rng((&cfg).into(), &mut rng, v)
+        } else {
+            PSSAContinuousBlockV2::new_with_rng_and_loops((&cfg).into(), &mut rng, v, loops)
+        };
         let unembed_w = ParamMatrix::random_xavier(v, d, &mut rng);
         let extra_blocks = (1..depth)
-            .map(|_| PSSAContinuousBlockV2::new_with_rng((&cfg).into(), &mut rng, 0))
+            .map(|_| {
+                PSSAContinuousBlockV2::new_with_rng_and_loops((&cfg).into(), &mut rng, 0, loops)
+            })
             .collect();
         Self {
             cfg,
             step_counter: 0,
             device,
-            scan_executor: crate::scan_executor::ScanExecutor::default(),
+            scan_executor: crate::scan_executor::ScanExecutor::with_loops(loops),
             rng,
             vocabulary: Vec::new(),
             tokenizer_json: None,
@@ -1341,6 +1464,64 @@ impl PSSALayerV2 {
         self.extra_blocks.len() + 1
     }
 
+    /// Runtime-only Ouro count; it is deliberately absent from checkpoints.
+    pub fn loops(&self) -> usize {
+        self.scan_executor.loops
+    }
+
+    /// Check the extra runtime activation/carry storage against the existing
+    /// allocation cap without adding anything to serialized configuration.
+    pub fn validate_loops_config(cfg: &PSSAConfigV2, loops: usize) -> Result<(), String> {
+        if !(1..=Self::MAX_LOOPS).contains(&loops) {
+            return Err("--loops must be between 1 and 32; use --loops 1 for the original model".into());
+        }
+        crate::checkpoint::validate_model_config(cfg)?;
+        let base = crate::checkpoint::allocation_bytes(cfg).map_err(|e| e.to_string())? as u128;
+        let (d, s, k, l, mem) = (cfg.d_latent as u128, cfg.d_state as u128,
+            cfg.d_mem_key as u128, cfg.chunk_len as u128, cfg.mem_capacity as u128);
+        // All float activation arrays except the one shared vocabulary head.
+        // Each extra pass also has an initial state row and a persistent carry.
+        let per_pass = l * (15 * d + 2 * s + 2 * k + mem + 34 + 3 * d * s) + 2 * d * s;
+        let bytes = base + 4 * cfg.depth as u128 * (loops - 1) as u128 * per_pass;
+        if bytes > crate::checkpoint::MAX_LOAD_ALLOCATION_BYTES as u128 {
+            return Err(format!("Ouro runtime needs {bytes} bytes, over the model byte cap; reduce --loops, --chunk, or model dimensions"));
+        }
+        Ok(())
+    }
+
+    fn resize_loop_tape(&mut self, loops: usize) {
+        assert!((1..=Self::MAX_LOOPS).contains(&loops));
+        let l = self.block.tape.max_l;
+        let d = self.cfg.d_latent;
+        let s = self.cfg.d_state;
+        let k = self.cfg.d_mem_key;
+        let mem = self.cfg.mem_capacity;
+        let rank = self.block.adapters[0].rank;
+        self.block.tape =
+            ChunkActivationTape::new_with_loops(l, self.cfg.d_vocab, d, s, k, mem, rank, loops);
+        for block in &mut self.extra_blocks {
+            block.tape = ChunkActivationTape::new_with_loops(l, 0, d, s, k, mem, rank, loops);
+        }
+        self.scan_executor = crate::scan_executor::ScanExecutor::with_loops(loops);
+    }
+
+    /// Apply a runtime loop count after checkpoint loading without altering
+    /// persistent model metadata or serialized bytes.
+    pub fn set_loops(&mut self, loops: usize) -> Result<(), String> {
+        if !(1..=Self::MAX_LOOPS).contains(&loops) {
+            return Err(
+                "--loops must be between 1 and 32; use --loops 1 for the original model".into(),
+            );
+        }
+        if self.loops() != loops {
+            let mut cfg = self.cfg.clone();
+            cfg.chunk_len = self.block.tape.max_l;
+            Self::validate_loops_config(&cfg, loops)?;
+            self.resize_loop_tape(loops);
+        }
+        Ok(())
+    }
+
     pub fn reset_recurrent_state(&mut self) {
         self.block.reset_recurrent_state();
         for b in &mut self.extra_blocks {
@@ -1348,18 +1529,97 @@ impl PSSALayerV2 {
         }
     }
 
+    /// Number of detached recurrent carry scalars retained between chunks.
+    /// Ouro passes have independent temporal carries even though their weights
+    /// are shared, so packed sequence replay must preserve every pass.
+    pub(crate) fn recurrent_state_len(&self) -> usize {
+        self.depth() * self.loops() * self.cfg.d_latent * self.cfg.d_state
+    }
+
+    pub(crate) fn copy_recurrent_state_to(&self, out: &mut [f32]) {
+        let hs = self.cfg.d_latent * self.cfg.d_state;
+        assert_eq!(out.len(), self.recurrent_state_len());
+        for (block, dst) in std::iter::once(&self.block)
+            .chain(&self.extra_blocks)
+            .zip(out.chunks_exact_mut(self.loops() * hs))
+        {
+            dst[..hs].copy_from_slice(&block.h_persistent);
+            if self.loops() > 1 {
+                let start = block.loop_carry_start();
+                dst[hs..].copy_from_slice(
+                    &block.tape.h_states[start..start + (self.loops() - 1) * hs],
+                );
+            }
+        }
+    }
+
+    pub(crate) fn copy_recurrent_state_from(&mut self, state: &[f32]) {
+        let hs = self.cfg.d_latent * self.cfg.d_state;
+        assert_eq!(state.len(), self.recurrent_state_len());
+        let loops = self.loops();
+        for (block, src) in std::iter::once(&mut self.block)
+            .chain(&mut self.extra_blocks)
+            .zip(state.chunks_exact(loops * hs))
+        {
+            block.h_persistent.copy_from_slice(&src[..hs]);
+            if loops > 1 {
+                let start = block.loop_carry_start();
+                block.tape.h_states[start..start + (loops - 1) * hs]
+                    .copy_from_slice(&src[hs..]);
+            }
+        }
+    }
+
     pub fn forward_inference(&mut self, x_id: usize, logits_out: &mut [f32]) {
         assert!(x_id < self.cfg.d_vocab, "token ID must be in vocabulary");
         assert_eq!(logits_out.len(), self.cfg.d_vocab);
         let d = self.cfg.d_latent;
-        self.block.forward_continuous_inference(
-            &self.embed_w.data[x_id * d..(x_id + 1) * d],
-            &mut self.inf_features,
-        );
-        for (b, &scale) in self.extra_blocks.iter_mut().zip(&self.residual_scales) {
-            b.forward_continuous_inference(&self.inf_features, &mut self.inf_block_out);
-            for i in 0..d {
-                self.inf_features[i] += scale * self.inf_block_out[i];
+        let loops = self.loops();
+        if loops == 1 {
+            self.block.forward_continuous_inference(
+                &self.embed_w.data[x_id * d..(x_id + 1) * d],
+                &mut self.inf_features,
+            );
+            for (b, &scale) in self.extra_blocks.iter_mut().zip(&self.residual_scales) {
+                b.forward_continuous_inference(&self.inf_features, &mut self.inf_block_out);
+                for i in 0..d {
+                    self.inf_features[i] += scale * self.inf_block_out[i];
+                }
+            }
+        } else {
+            self.inf_features.copy_from_slice(&self.embed_w.data[x_id * d..(x_id + 1) * d]);
+            let loop_scale = 1.0 / (loops as f32).sqrt();
+            for loop_index in 0..loops {
+                self.block.forward_inference_loop(
+                    &self.inf_features, &mut self.inf_block_out, loop_index,
+                );
+                for i in 0..d {
+                    self.inf_features[i] += loop_scale * self.inf_block_out[i];
+                }
+            }
+            // Destructure the independent runtime buffers before borrowing a
+            // block mutably; this keeps inference allocation-free while the
+            // depth residual input remains in the unused prefix of the
+            // training workspace.
+            let PSSALayerV2 {
+                extra_blocks,
+                residual_scales,
+                continuous_inputs,
+                inf_features,
+                inf_block_out,
+                ..
+            } = self;
+            for (b, &scale) in extra_blocks.iter_mut().zip(residual_scales.iter()) {
+                continuous_inputs[..d].copy_from_slice(inf_features);
+                for loop_index in 0..loops {
+                    b.forward_inference_loop(inf_features, inf_block_out, loop_index);
+                    for i in 0..d {
+                        inf_features[i] += loop_scale * inf_block_out[i];
+                    }
+                }
+                for i in 0..d {
+                    inf_features[i] = continuous_inputs[i] + scale * inf_features[i];
+                }
             }
         }
         self.unembed_w.matvec(&self.inf_features, logits_out);
@@ -1390,30 +1650,71 @@ impl PSSALayerV2 {
         let seq_len = token_ids.len();
         let (d, v) = (self.cfg.d_latent, self.cfg.d_vocab);
         let n = seq_len * d;
+        let loops = self.loops();
         self.block.tape.x_ids[..seq_len].copy_from_slice(token_ids);
         self.block.tape.target_ids[..seq_len].copy_from_slice(target_ids);
         for (t, &id) in token_ids.iter().enumerate() {
             self.continuous_inputs[t * d..(t + 1) * d]
                 .copy_from_slice(&self.embed_w.data[id * d..(id + 1) * d]);
         }
-        self.block
-            .forward_train_chunk(&self.continuous_inputs[..n], seq_len);
-        for layer in 0..self.extra_blocks.len() {
-            let (prior, after) = self.layer_activations.split_at_mut(layer);
-            let previous = if layer == 0 {
-                &self.block.tape.z_final[..n]
-            } else {
-                &prior[layer - 1][..n]
-            };
-            let b = &mut self.extra_blocks[layer];
-            b.forward_train_chunk(previous, seq_len);
-            let scale = self.residual_scales[layer];
-            for i in 0..n {
-                after[0][i] = previous[i] + scale * b.tape.z_final[i];
+        if loops == 1 {
+            self.block
+                .forward_train_chunk(&self.continuous_inputs[..n], seq_len);
+            for layer in 0..self.extra_blocks.len() {
+                let (prior, after) = self.layer_activations.split_at_mut(layer);
+                let previous = if layer == 0 {
+                    &self.block.tape.z_final[..n]
+                } else {
+                    &prior[layer - 1][..n]
+                };
+                let b = &mut self.extra_blocks[layer];
+                b.forward_train_chunk(previous, seq_len);
+                let scale = self.residual_scales[layer];
+                for i in 0..n {
+                    after[0][i] = previous[i] + scale * b.tape.z_final[i];
+                }
+            }
+        } else {
+            let loop_scale = 1.0 / (loops as f32).sqrt();
+            for loop_index in 0..loops {
+                self.block.forward_train_chunk_loop(
+                    &self.continuous_inputs[..n],
+                    seq_len,
+                    loop_index,
+                );
+                let off = loop_index * self.block.tape.max_l * d;
+                for i in 0..n {
+                    self.continuous_inputs[i] += loop_scale * self.block.tape.z_final[off + i];
+                }
+            }
+            for layer in 0..self.extra_blocks.len() {
+                // Preserve the input to this independently weighted depth block
+                // while the shared loop reuses `continuous_inputs` as its work row.
+                self.residual_input_adjoints[..n].copy_from_slice(&self.continuous_inputs[..n]);
+                for loop_index in 0..loops {
+                    let b = &mut self.extra_blocks[layer];
+                    b.forward_train_chunk_loop(&self.continuous_inputs[..n], seq_len, loop_index);
+                    let off = loop_index * b.tape.max_l * d;
+                    for i in 0..n {
+                        self.continuous_inputs[i] += loop_scale * b.tape.z_final[off + i];
+                    }
+                }
+                let scale = self.residual_scales[layer];
+                for i in 0..n {
+                    self.continuous_inputs[i] =
+                        self.residual_input_adjoints[i] + scale * self.continuous_inputs[i];
+                }
+                self.layer_activations[layer][..n].copy_from_slice(&self.continuous_inputs[..n]);
             }
         }
         let tape = &mut self.block.tape;
-        let final_z = self.layer_activations.last().unwrap_or(&tape.z_final);
+        let final_z: &[f32] = if loops == 1 {
+            self.layer_activations.last().unwrap_or(&tape.z_final)
+        } else if let Some(last) = self.layer_activations.last() {
+            &last[..n]
+        } else {
+            &self.continuous_inputs[..n]
+        };
         let logit_scale = 1.0 / (d as f32).sqrt();
         let mut total_loss = 0.0f32;
         for t in 0..seq_len {
@@ -1463,6 +1764,7 @@ impl PSSALayerV2 {
         assert!(accumulation_scale.is_finite());
         let (d, v) = (self.cfg.d_latent, self.cfg.d_vocab);
         let n = seq_len * d;
+        let loops = self.loops();
         let scale_loss = accumulation_scale / seq_len as f32;
         let logit_scale = 1.0 / (d as f32).sqrt();
         let pending = self
@@ -1473,10 +1775,15 @@ impl PSSALayerV2 {
             self.embed_row_marks[self.block.tape.x_ids[t]] = pending;
         }
         self.output_adjoints[..n].fill(0.0);
-        let final_z = self
-            .layer_activations
-            .last()
-            .unwrap_or(&self.block.tape.z_final);
+        let final_z: &[f32] = if loops == 1 {
+            self.layer_activations
+                .last()
+                .map_or(&self.block.tape.z_final[..], Vec::as_slice)
+        } else if let Some(last) = self.layer_activations.last() {
+            &last[..n]
+        } else {
+            &self.continuous_inputs[..n]
+        };
         // Keep the old reverse-time accumulation order for bit-exact depth one.
         for t in (0..seq_len).rev() {
             for i in 0..v {
@@ -1494,26 +1801,70 @@ impl PSSALayerV2 {
         }
         let depth = self.depth();
         self.boundary_adjoints[depth][..n].copy_from_slice(&self.output_adjoints[..n]);
-        for layer in (0..self.extra_blocks.len()).rev() {
-            let scale = self.residual_scales[layer];
-            for i in 0..n {
-                self.residual_block_adjoints[i] = scale * self.output_adjoints[i];
+        if loops == 1 {
+            for layer in (0..self.extra_blocks.len()).rev() {
+                let scale = self.residual_scales[layer];
+                for i in 0..n {
+                    self.residual_block_adjoints[i] = scale * self.output_adjoints[i];
+                }
+                self.extra_blocks[layer].backward_chunk(
+                    &self.residual_block_adjoints[..n],
+                    seq_len,
+                    &mut self.residual_input_adjoints[..n],
+                );
+                for i in 0..n {
+                    self.output_adjoints[i] += self.residual_input_adjoints[i];
+                }
+                self.boundary_adjoints[layer + 1][..n].copy_from_slice(&self.output_adjoints[..n]);
             }
-            self.extra_blocks[layer].backward_chunk(
-                &self.residual_block_adjoints[..n],
+            self.block.backward_chunk(
+                &self.output_adjoints[..n],
                 seq_len,
-                &mut self.residual_input_adjoints[..n],
+                &mut self.input_adjoints[..n],
             );
-            for i in 0..n {
-                self.output_adjoints[i] += self.residual_input_adjoints[i];
+        } else {
+            let loop_scale = 1.0 / (loops as f32).sqrt();
+            for layer in (0..self.extra_blocks.len()).rev() {
+                let depth_scale = self.residual_scales[layer];
+                for i in 0..n {
+                    self.residual_block_adjoints[i] = depth_scale * self.output_adjoints[i];
+                }
+                for loop_index in (0..loops).rev() {
+                    for i in 0..n {
+                        self.input_adjoints[i] = loop_scale * self.residual_block_adjoints[i];
+                    }
+                    self.extra_blocks[layer].backward_chunk_loop(
+                        &self.input_adjoints[..n],
+                        seq_len,
+                        &mut self.residual_input_adjoints[..n],
+                        loop_index,
+                    );
+                    for i in 0..n {
+                        self.residual_block_adjoints[i] += self.residual_input_adjoints[i];
+                    }
+                }
+                for i in 0..n {
+                    self.output_adjoints[i] += self.residual_block_adjoints[i];
+                }
+                self.boundary_adjoints[layer + 1][..n].copy_from_slice(&self.output_adjoints[..n]);
             }
-            self.boundary_adjoints[layer + 1][..n].copy_from_slice(&self.output_adjoints[..n]);
+            self.residual_block_adjoints[..n].copy_from_slice(&self.output_adjoints[..n]);
+            for loop_index in (0..loops).rev() {
+                for i in 0..n {
+                    self.input_adjoints[i] = loop_scale * self.residual_block_adjoints[i];
+                }
+                self.block.backward_chunk_loop(
+                    &self.input_adjoints[..n],
+                    seq_len,
+                    &mut self.residual_input_adjoints[..n],
+                    loop_index,
+                );
+                for i in 0..n {
+                    self.residual_block_adjoints[i] += self.residual_input_adjoints[i];
+                }
+            }
+            self.input_adjoints[..n].copy_from_slice(&self.residual_block_adjoints[..n]);
         }
-        self.block.backward_chunk(
-            &self.output_adjoints[..n],
-            seq_len,
-            &mut self.input_adjoints[..n],
-        );
         self.boundary_adjoints[0][..n].copy_from_slice(&self.input_adjoints[..n]);
         for t in (0..seq_len).rev() {
             let row = self.block.tape.x_ids[t] * d;
@@ -1558,11 +1909,17 @@ impl PSSALayerV2 {
         if !(loss > 3.5) {
             return;
         }
+        let loops = self.loops();
         for b in std::iter::once(&mut self.block).chain(&mut self.extra_blocks) {
             let (k, d) = (b.cfg.d_mem_key, b.cfg.d_latent);
+            let loop_l = if loops == 1 {
+                0
+            } else {
+                (loops - 1) * b.tape.max_l
+            };
             b.memory.insert_protected(
-                &b.tape.q_poincare[last * k..(last + 1) * k],
-                &b.tape.z_final[last * d..(last + 1) * d],
+                &b.tape.q_poincare[(loop_l + last) * k..(loop_l + last + 1) * k],
+                &b.tape.z_final[(loop_l + last) * d..(loop_l + last + 1) * d],
                 loss,
                 self.step_counter,
             );

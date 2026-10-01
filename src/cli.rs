@@ -18,6 +18,8 @@ pub struct TrainingOptions {
     pub latent: usize,
     /// Continuous PSSA blocks, sharing one embedding and output head.
     pub depth: usize,
+    /// Runtime-only repeated passes through each shared continuous block.
+    pub loops: usize,
     pub state: usize,
     pub key: usize,
     pub memory: usize,
@@ -55,6 +57,7 @@ impl Default for TrainingOptions {
             epochs: 4,
             latent: 256,
             depth: 1,
+            loops: 1,
             state: 16,
             key: 32,
             memory: 512,
@@ -184,6 +187,15 @@ impl Parsed {
             Ok(n)
         }
     }
+    fn loops(&self) -> Result<usize, String> {
+        let loops = self.string("--loops", "").map_or(Ok(1), |value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| "--loops must be an integer between 1 and 32".to_string())
+        })?;
+        CLIHandler::validate_loops(loops)?;
+        Ok(loops)
+    }
     fn f32(&self, long: &str, short: &str, default: f32) -> Result<f32, String> {
         self.f32_first(&[long, short], long, default)
     }
@@ -201,6 +213,15 @@ impl Parsed {
 
 pub struct CLIHandler;
 impl CLIHandler {
+    fn validate_loops(loops: usize) -> Result<(), String> {
+        if !(1..=PSSALayerV2::MAX_LOOPS).contains(&loops) {
+            return Err(
+                "--loops must be between 1 and 32; use --loops 1 for the original model".into(),
+            );
+        }
+        Ok(())
+    }
+
     fn default_data() -> String {
         if std::path::Path::new("data/downloaded.txt").exists() {
             "data/downloaded.txt".into()
@@ -259,6 +280,7 @@ impl CLIHandler {
             epochs: parsed.usize_nonzero("--epochs", "-e", 4)?,
             latent: parsed.usize_nonzero("--latent", "", 256)?,
             depth: parsed.usize_nonzero("--depth", "", 1)?,
+            loops: parsed.loops()?,
             state: parsed.usize_nonzero("--state", "", 16)?,
             key: parsed.usize_nonzero("--key", "", 32)?,
             memory: parsed.usize_nonzero("--memory", "", 512)?,
@@ -526,6 +548,7 @@ impl CLIHandler {
                 "--depth must be between 1 and 32; use --depth 1 for the original model".into(),
             );
         }
+        Self::validate_loops(options.loops)?;
         if options.batch_size > 65_536 {
             return Err("--batch-size must be at most 65536; use fewer document lanes".into());
         }
@@ -590,22 +613,35 @@ impl CLIHandler {
                     ..Default::default()
                 };
                 checkpoint::validate_model_config(&cfg)?;
-                let mut model = PSSALayerV2::new(cfg, options.seed);
+                PSSALayerV2::validate_loops_config(&cfg, options.loops)?;
+                let mut model = PSSALayerV2::new_with_depth_and_loops(
+                    cfg,
+                    options.seed,
+                    options.depth,
+                    options.loops,
+                );
                 model.vocabulary = tokenizer.ordered_vocabulary()?;
                 model.tokenizer_json = tokenizer.serialized_metadata();
                 (model, tokenizer)
             }
         };
+        if options.resume.is_some() {
+            model.set_loops(options.loops)?;
+        }
         // Keep an explicit resume override in the checkpoint's persisted
         // configuration so a later link does not silently revert to the old LR.
         model.cfg.lr = options.lr;
-        // Stacked kernels are CPU-only. Do not attach a device and misleadingly
-        // report GPU execution while actually running the scalar stack.
-        if model.depth() > 1 {
+        // Stacks and repeated shared-block passes are CPU-only. Do not attach
+        // a device and misleadingly report GPU execution for these paths.
+        if model.depth() > 1 || model.loops() > 1 {
             model.device = Device::Cpu;
             println!(
-                "backend=cpu (stacked depth {}; GPU execution unsupported)",
-                model.depth()
+                "backend=cpu ({}; GPU execution unsupported)",
+                if model.depth() > 1 {
+                    format!("stacked depth {}", model.depth())
+                } else {
+                    format!("Ouro loops {}", model.loops())
+                }
             );
             if options.batch_size > 1 {
                 println!(
@@ -767,16 +803,21 @@ impl CLIHandler {
                         }
                         batch.forward(&mut model, &sequence_views)?
                     } else {
-                        // Preserve the historical single-lane math and write order.
                         let c = microbatch[0];
                         if c.start == 0 {
                             model.reset_recurrent_state();
                         }
-                        crate::gpu_batch::forward_train_chunk_batched(
-                            &mut model,
-                            &docs[c.doc][c.start..c.start + c.len],
-                            &docs[c.doc][c.start + 1..c.start + 1 + c.len],
-                        )
+                        let inputs = &docs[c.doc][c.start..c.start + c.len];
+                        let targets = &docs[c.doc][c.start + 1..c.start + 1 + c.len];
+                        if model.loops() > 1 {
+                            // gpu_batch only implements one pass through each block.
+                            model.forward_train_chunk(inputs, targets)
+                        } else {
+                            // Preserve the historical single-lane math and write order.
+                            crate::gpu_batch::forward_train_chunk_batched(
+                                &mut model, inputs, targets,
+                            )
+                        }
                     };
                     if !loss.is_finite() {
                         return Err("non-finite loss; training aborted without checkpoint".into());
@@ -793,6 +834,8 @@ impl CLIHandler {
                                     .into(),
                             );
                         }
+                    } else if model.loops() > 1 {
+                        model.backward_chunk(batch_tokens, scale);
                     } else {
                         crate::gpu_batch::backward_chunk_batched(&mut model, batch_tokens, scale);
                     }
@@ -970,12 +1013,26 @@ impl CLIHandler {
         temperature: f32,
         max_new: usize,
     ) -> Result<String, String> {
+        Self::run_generate_with_loops(prompt, model_path, data, temperature, max_new, 1)
+    }
+
+    /// Generate with a runtime-only Ouro override; checkpoints do not store it.
+    pub fn run_generate_with_loops(
+        prompt: &str,
+        model_path: &str,
+        data: Option<&str>,
+        temperature: f32,
+        max_new: usize,
+        loops: usize,
+    ) -> Result<String, String> {
+        Self::validate_loops(loops)?;
         if max_new > MAX_GENERATION_TOKENS {
             return Err(format!(
                 "max_new_tokens must be at most {MAX_GENERATION_TOKENS}"
             ));
         }
         let (mut model, tokenizer) = Self::load_for_inference(model_path, data)?;
+        model.set_loops(loops)?;
         let cfg = InferenceConfig {
             temperature,
             max_new_tokens: max_new,
@@ -1007,7 +1064,9 @@ impl CLIHandler {
         model_path: &str,
         data: &str,
         slice: crate::evaluation::EvaluationSlice,
+        loops: usize,
     ) -> Result<(), String> {
+        Self::validate_loops(loops)?;
         // V5 checkpoints contain no tokenizer provenance, so the evaluation
         // corpus also has to seed their legacy word tokenizer.  Newer formats
         // restore their tokenizer independently of the held-out corpus.
@@ -1016,6 +1075,7 @@ impl CLIHandler {
             .format;
         let provenance = (format == CheckpointFormat::LegacyV5InferenceOnly).then_some(data);
         let (mut model, tokenizer) = Self::load_for_inference(model_path, provenance)?;
+        model.set_loops(loops)?;
         let raw = DatasetManager::try_load_dataset(Some(data))?;
         let metrics = crate::evaluation::evaluate_pssa(&mut model, &tokenizer, &raw, slice)?;
         println!("{}", metrics.json());
@@ -1412,8 +1472,8 @@ impl CLIHandler {
         );
         println!(
             "    {:<48}{}",
-            "  --latent n --state n --depth n",
-            ui::dim("width, recurrent state size, blocks (depth 1..32; default 1)")
+            "  --latent n --state n --depth n --loops n",
+            ui::dim("width, recurrent state size, blocks, shared Ouro passes (1..32; default 1; repeat on resume; not checkpointed)")
         );
         println!(
             "    {:<48}{}",
@@ -1464,7 +1524,7 @@ impl CLIHandler {
         println!();
         println!("  {}", ui::bold("GENERATE"));
         println!(
-            "    {bin} generate <prompt> [-m|--model path] [-t|--temp|--temperature f] [--max-new-tokens n]"
+            "    {bin} generate <prompt> [-m|--model path] [-t|--temp|--temperature f] [--max-new-tokens n] [--loops n]"
         );
         println!();
         println!("  {}", ui::bold("EXAMPLES"));
@@ -1573,6 +1633,7 @@ impl CLIHandler {
                 println!(
                     "      --depth <N>               continuous blocks, 1..32 (default: 1; stacks CPU-only)"
                 );
+                println!("      --loops <N>               shared Ouro passes, 1..32 (default: 1; repeat on resume; not checkpointed)");
                 println!("      --state <N>               recurrent state width (default: 16)");
                 println!("      --key <N>                 memory key width (default: 32)");
                 println!("      --memory <N>              memory capacity (default: 512)");
@@ -1633,6 +1694,9 @@ impl CLIHandler {
                 println!(
                     "      --max-new-tokens <N>      generation cap (default: 64, max: {MAX_GENERATION_TOKENS})"
                 );
+                if command == "generate" {
+                    println!("      --loops <N>               shared Ouro passes, 1..32 (repeat; not checkpointed)");
+                }
                 println!();
                 println!("Example:");
                 println!("  {bin} {command} -m {model} -p \"The sun is\"");
@@ -1660,6 +1724,9 @@ impl CLIHandler {
                 println!(
                     "  --skip-tokens N --max-tokens N  strict held-out slice, never wraps at EOF"
                 );
+                if command == "score" {
+                    println!("  --loops N                      shared Ouro passes, 1..32 (repeat; not checkpointed)");
+                }
                 println!("Use the embedded tokenizer; no training or checkpoint writes.");
                 let model = if command == "score" {
                     "data/model.pssa"
@@ -1823,7 +1890,7 @@ impl CLIHandler {
                     allowed.retain(|x| !["--latent", "--state", "--key", "--memory"].contains(x));
                     allowed.push("--tokenizer-from");
                 } else {
-                    allowed.extend(["--batch-size", "--depth"]);
+                    allowed.extend(["--batch-size", "--depth", "--loops"]);
                 }
                 let p = Parsed::parse(&args[2..], &allowed)?;
                 for (names, label) in [
@@ -1893,21 +1960,23 @@ impl CLIHandler {
                 }
             }
             "generate" | "generate-transformer" => {
-                let p = Parsed::parse(
-                    &args[2..],
-                    &[
-                        "--prompt",
-                        "-p",
-                        "--model",
-                        "-m",
-                        "--data",
-                        "-d",
-                        "--temp",
-                        "--temperature",
-                        "-t",
-                        "--max-new-tokens",
-                    ],
-                )?;
+                let mut allowed = vec![
+                    "--prompt",
+                    "-p",
+                    "--model",
+                    "-m",
+                    "--data",
+                    "-d",
+                    "--temp",
+                    "--temperature",
+                    "-t",
+                    "--max-new-tokens",
+                ];
+                if command == "generate" {
+                    allowed.push("--loops");
+                }
+                let p = Parsed::parse(&args[2..], &allowed)?;
+                let loops = p.loops()?;
                 for (names, label) in [
                     (&["--prompt", "-p"][..], "--prompt"),
                     (&["--model", "-m"][..], "--model"),
@@ -1957,29 +2026,32 @@ impl CLIHandler {
                         },
                     )?
                 } else {
-                    Self::run_generate(
+                    Self::run_generate_with_loops(
                         prompt,
                         p.string("--model", "-m").unwrap_or("data/model.pssa"),
                         p.string("--data", "-d"),
                         temp,
                         max,
+                        loops,
                     )?
                 };
                 println!("{text}");
                 Ok(())
             }
             "score" | "score-transformer" => {
-                let p = Parsed::parse(
-                    &args[2..],
-                    &[
-                        "--model",
-                        "-m",
-                        "--data",
-                        "-d",
-                        "--skip-tokens",
-                        "--max-tokens",
-                    ],
-                )?;
+                let mut allowed = vec![
+                    "--model",
+                    "-m",
+                    "--data",
+                    "-d",
+                    "--skip-tokens",
+                    "--max-tokens",
+                ];
+                if command == "score" {
+                    allowed.push("--loops");
+                }
+                let p = Parsed::parse(&args[2..], &allowed)?;
+                let loops = p.loops()?;
                 p.reject_duplicate_aliases(&["--model", "-m"], "--model")?;
                 p.reject_duplicate_aliases(&["--data", "-d"], "--data")?;
                 if p.positional.len() > 1 {
@@ -2011,6 +2083,7 @@ impl CLIHandler {
                         p.string("--model", "-m").unwrap_or("data/model.pssa"),
                         &data,
                         slice,
+                        loops,
                     )
                 }
             }

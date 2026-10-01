@@ -6,8 +6,9 @@
 //! or cross-sequence adjoints. Dense stages use the same CPU/GPU dispatch as L=1
 //! chunk training, but see the sum of the active sequence lengths as GEMM rows.
 //!
-//! Stacked models use a CPU-only serial replay fallback: each lane retains every
-//! layer's carry and its chunk inputs, then recomputes its tape for backward.
+//! Stacked and looped models use a CPU-only serial replay fallback: each lane
+//! retains every layer/pass carry and its chunk inputs, then recomputes its tape
+//! for backward.
 //! This preserves independent lanes and token weighting, not packed-GEMM speed.
 //! Parameters and memory must remain unchanged between forward and backward.
 use crate::{
@@ -110,11 +111,12 @@ impl SequenceBatch {
             .ok_or("batch allocation overflow; reduce --batch-size")?;
         crate::checkpoint::validate_model_config(&budget)
             .map_err(|e| format!("batch workspace: {e}; reduce --batch-size or --chunk"))?;
-        m.block.tape = ChunkActivationTape::new(rows, v, d, s, k, mem, rank);
+        let loops = m.loops();
+        m.block.tape = ChunkActivationTape::new_with_loops(rows, v, d, s, k, mem, rank, loops);
         // Packed terminal rows let the trainer defer per-layer memory writes
         // until ALL replayed backwards complete, using the usual insertion API.
         for block in &mut m.extra_blocks {
-            block.tape = ChunkActivationTape::new(rows, 0, d, s, k, mem, rank);
+            block.tape = ChunkActivationTape::new_with_loops(rows, 0, d, s, k, mem, rank, loops);
         }
         m.bwd_g_zfinal.resize(rows * d, 0.0);
         m.bwd_g_zraw.resize(rows * d, 0.0);
@@ -125,8 +127,8 @@ impl SequenceBatch {
         m.bwd_g_mlp.resize(rows * 2 * d, 0.0);
         let lanes = (0..batch_size)
             .map(|_| Lane {
-                replay: (depth > 1).then(|| ReplayLane {
-                    initial_carry: vec![0.0; depth * d * s],
+                replay: (depth > 1 || loops > 1).then(|| ReplayLane {
+                    initial_carry: vec![0.0; depth * loops * d * s],
                     inputs: Vec::with_capacity(l),
                     targets: Vec::with_capacity(l),
                     terminal_keys: vec![0.0; depth * k],
@@ -134,7 +136,7 @@ impl SequenceBatch {
                 }),
                 offset: 0,
                 len: 0,
-                carry: vec![0.0; depth * d * s],
+                carry: vec![0.0; depth * loops * d * s],
                 h: vec![0.0; (l + 1) * d * s],
                 bar_a: vec![0.0; l * d * s],
                 bar_b: vec![0.0; l * d * s],
@@ -153,7 +155,7 @@ impl SequenceBatch {
         Ok(Self {
             lanes,
             shape: shape(m),
-            model_carry: vec![0.0; depth * d * s],
+            model_carry: vec![0.0; depth * loops * d * s],
             losses: vec![0.0; rows],
             active_lanes: Vec::with_capacity(batch_size),
             tokens: 0,
@@ -244,7 +246,7 @@ impl SequenceBatch {
                 return Err("batch token ID is outside the model vocabulary".into());
             }
         }
-        if m.depth() > 1 {
+        if m.depth() > 1 || m.loops() > 1 {
             return Ok(self.forward_stacked(m, sequences));
         }
         self.tokens = 0;
@@ -302,7 +304,7 @@ impl SequenceBatch {
                 "batch backward needs a pending forward and a finite accumulation scale".into(),
             );
         }
-        if m.depth() > 1 {
+        if m.depth() > 1 || m.loops() > 1 {
             self.backward_stacked(m, accumulation_scale);
             return Ok(());
         }
@@ -405,11 +407,19 @@ impl SequenceBatch {
             self.losses[self.tokens..self.tokens + lane.len]
                 .copy_from_slice(&m.block.tape.losses[..lane.len]);
             let last = lane.len - 1;
+            let loops = m.loops();
             for (i, block) in std::iter::once(&m.block).chain(&m.extra_blocks).enumerate() {
-                replay.terminal_keys[i * k..(i + 1) * k]
-                    .copy_from_slice(&block.tape.q_poincare[last * k..(last + 1) * k]);
-                replay.terminal_values[i * d..(i + 1) * d]
-                    .copy_from_slice(&block.tape.z_final[last * d..(last + 1) * d]);
+                let loop_l = if loops == 1 {
+                    0
+                } else {
+                    (loops - 1) * block.tape.max_l
+                };
+                replay.terminal_keys[i * k..(i + 1) * k].copy_from_slice(
+                    &block.tape.q_poincare[(loop_l + last) * k..(loop_l + last + 1) * k],
+                );
+                replay.terminal_values[i * d..(i + 1) * d].copy_from_slice(
+                    &block.tape.z_final[(loop_l + last) * d..(loop_l + last + 1) * d],
+                );
             }
             self.tokens += lane.len;
         }
@@ -441,6 +451,7 @@ impl SequenceBatch {
     fn publish_stacked_terminals(&self, m: &mut PSSALayerV2) {
         let d = m.cfg.d_latent;
         let k = m.cfg.d_mem_key;
+        let loops = m.loops();
         m.block.tape.losses[..self.tokens].copy_from_slice(&self.losses[..self.tokens]);
         for &index in &self.active_lanes {
             let lane = &self.lanes[index];
@@ -450,9 +461,14 @@ impl SequenceBatch {
                 .chain(&mut m.extra_blocks)
                 .enumerate()
             {
-                block.tape.q_poincare[last * k..(last + 1) * k]
+                let loop_l = if loops == 1 {
+                    0
+                } else {
+                    (loops - 1) * block.tape.max_l
+                };
+                block.tape.q_poincare[(loop_l + last) * k..(loop_l + last + 1) * k]
                     .copy_from_slice(&replay.terminal_keys[i * k..(i + 1) * k]);
-                block.tape.z_final[last * d..(last + 1) * d]
+                block.tape.z_final[(loop_l + last) * d..(loop_l + last + 1) * d]
                     .copy_from_slice(&replay.terminal_values[i * d..(i + 1) * d]);
             }
         }
@@ -460,23 +476,11 @@ impl SequenceBatch {
 }
 
 fn copy_carry_from_model(m: &PSSALayerV2, out: &mut [f32]) {
-    let hs = m.cfg.d_latent * m.cfg.d_state;
-    for (block, dst) in std::iter::once(&m.block)
-        .chain(&m.extra_blocks)
-        .zip(out.chunks_exact_mut(hs))
-    {
-        dst.copy_from_slice(&block.h_persistent);
-    }
+    m.copy_recurrent_state_to(out);
 }
 
 fn copy_carry_to_model(carry: &[f32], m: &mut PSSALayerV2) {
-    let hs = m.cfg.d_latent * m.cfg.d_state;
-    for (block, src) in std::iter::once(&mut m.block)
-        .chain(&mut m.extra_blocks)
-        .zip(carry.chunks_exact(hs))
-    {
-        block.h_persistent.copy_from_slice(src);
-    }
+    m.copy_recurrent_state_from(carry);
 }
 
 impl Lane {

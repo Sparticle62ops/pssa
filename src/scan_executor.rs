@@ -13,10 +13,25 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 /// queue, so a second model can allocate again after allocation warmup.
 static GLOBAL_WORKER: OnceLock<Worker> = OnceLock::new();
 
-#[derive(Clone, Copy, Default)]
-pub struct ScanExecutor;
+#[derive(Clone, Copy)]
+pub struct ScanExecutor {
+    /// Runtime-only Ouro loop count. Keeping it beside the scheduler avoids
+    /// changing the checkpointed/configuration structs and preserves the
+    /// historical public layer layout used by allocation audits.
+    pub(crate) loops: usize,
+}
+
+impl Default for ScanExecutor {
+    fn default() -> Self {
+        Self { loops: 1 }
+    }
+}
 
 impl ScanExecutor {
+    pub(crate) fn with_loops(loops: usize) -> Self {
+        Self { loops }
+    }
+
     pub(crate) fn run<F: FnOnce() + Send>(&self, f: F) {
         // Nested lane scans already run on a worker. Reentering the handoff
         // would deadlock; their parallel iterators need no external injection.
