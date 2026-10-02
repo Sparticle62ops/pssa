@@ -625,8 +625,18 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--chain" | "-c" if i + 1 < args.len() => {
-                chain_dir = PathBuf::from(&args[i + 1]);
+            "--chain" | "-c" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "option '--chain' requires a directory; usage: oxide tui [-c|--chain DIR]"
+                        .to_string()
+                })?;
+                if value.starts_with('-') {
+                    return Err(format!(
+                        "option '{}' requires a directory; usage: oxide tui [-c|--chain DIR]",
+                        args[i]
+                    ));
+                }
+                chain_dir = PathBuf::from(value);
                 i += 1;
             }
             other => {
