@@ -18,7 +18,7 @@
 
 use crate::linalg::{dot_slice, sigmoid, softplus};
 use crate::memory::HyperbolicEpisodicBankV2;
-use crate::pssa::PSSALayerV2;
+use crate::pssa::{PSSAContinuousBlockV2, PSSALayerV2};
 use rayon::prelude::*;
 
 // Parallelize large, independent dense adjoints without shared atomics.
@@ -408,7 +408,7 @@ pub(crate) fn materialize_ssm_scan(
 // FORWARD STAGES
 // =============================================================================
 
-/// Stage 1: embedding gather + affine RMSNorm for every token in the chunk.
+/// Stage 1: embedding gather for every token, followed by affine RMSNorm.
 #[inline]
 pub fn stage_embed_norm(m: &mut PSSALayerV2, seq_len: usize) {
     let (embed_w, m) = (&m.embed_w, &mut m.block);
@@ -416,13 +416,29 @@ pub fn stage_embed_norm(m: &mut PSSALayerV2, seq_len: usize) {
     for t in 0..seq_len {
         let x_id = m.tape.x_ids[t];
         let e_t = &embed_w.data[x_id * d_m..(x_id + 1) * d_m];
+        m.tape.x_raw[t * d_m..(t + 1) * d_m].copy_from_slice(e_t);
+    }
+    stage_input_norm_block(m, seq_len);
+}
+
+/// Stage 1 for a continuous residual input already materialized in `x_raw`.
+/// Weight-shared Ouro passes use this instead of gathering the embedding again.
+#[inline]
+pub(crate) fn stage_input_norm(m: &mut PSSALayerV2, seq_len: usize) {
+    stage_input_norm_block(&mut m.block, seq_len);
+}
+
+#[inline]
+pub(crate) fn stage_input_norm_block(m: &mut PSSAContinuousBlockV2, seq_len: usize) {
+    let d_m = m.cfg.d_latent;
+    for t in 0..seq_len {
+        let raw_off = t * d_m;
+        let e_t = &m.tape.x_raw[raw_off..raw_off + d_m];
         let sum_sq: f32 = e_t.iter().map(|&x| x * x).sum();
         let inv_rms = 1.0 / (sum_sq / (d_m as f32) + 1e-5).sqrt();
         m.tape.inv_rms[t] = inv_rms;
-        let xn_off = t * d_m;
         for i in 0..d_m {
-            m.tape.x_raw[xn_off + i] = e_t[i];
-            m.tape.x_norm[xn_off + i] =
+            m.tape.x_norm[raw_off + i] =
                 m.norm_gamma.data[i] * (e_t[i] * inv_rms) + m.norm_beta.data[i];
         }
     }
@@ -1351,7 +1367,7 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
 /// recurrence and uses only model-owned scalar scratch, avoiding rayon's job
 /// setup on the path where a tree scan would be work-inefficient.
 #[inline]
-fn bwd_stage_ssm_sequential(m: &mut PSSALayerV2, seq_len: usize) {
+fn bwd_stage_ssm_sequential(m: &mut PSSALayerV2, seq_len: usize, input_is_embedding: bool) {
     let pending_step = m.step_counter + 1;
     let (embed_w, embed_row_marks, m) = (&mut m.embed_w, &mut m.embed_row_marks, &mut m.block);
     m.refresh_ssm_rates();
@@ -1361,8 +1377,10 @@ fn bwd_stage_ssm_sequential(m: &mut PSSALayerV2, seq_len: usize) {
     let ssm_scale = 1.0 / (d_s as f32).sqrt();
 
     m.grad_h_next.fill(0.0);
-    for t in 0..l {
-        embed_row_marks[m.tape.x_ids[t]] = pending_step;
+    if input_is_embedding {
+        for t in 0..l {
+            embed_row_marks[m.tape.x_ids[t]] = pending_step;
+        }
     }
 
     for t in (0..l).rev() {
@@ -1422,7 +1440,7 @@ fn bwd_stage_ssm_sequential(m: &mut PSSALayerV2, seq_len: usize) {
         }
 
         let inv_rms = m.tape.inv_rms[t];
-        let e_t = &embed_w.data[x_id * d_m..(x_id + 1) * d_m];
+        let e_t = &m.tape.x_raw[m_off..m_off + d_m];
         let mut dot_gx_e = 0.0f32;
         for i in 0..d_m {
             let gx_i = m.bwd_g_xnorm[m_off + i];
@@ -1430,11 +1448,13 @@ fn bwd_stage_ssm_sequential(m: &mut PSSALayerV2, seq_len: usize) {
             m.norm_gamma.grad[i] += gx_i * (e_t[i] * inv_rms);
             dot_gx_e += gx_i * m.norm_gamma.data[i] * e_t[i];
         }
-        let emb_row_off = x_id * d_m;
-        for i in 0..d_m {
-            let g_unnorm = m.bwd_g_xnorm[m_off + i] * m.norm_gamma.data[i];
-            embed_w.grad[emb_row_off + i] +=
-                inv_rms * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / d_m as f32));
+        if input_is_embedding {
+            let emb_row_off = x_id * d_m;
+            for i in 0..d_m {
+                let g_unnorm = m.bwd_g_xnorm[m_off + i] * m.norm_gamma.data[i];
+                embed_w.grad[emb_row_off + i] +=
+                    inv_rms * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / d_m as f32));
+            }
         }
     }
 }
@@ -1445,19 +1465,30 @@ fn bwd_stage_ssm_sequential(m: &mut PSSALayerV2, seq_len: usize) {
 /// of this associative recurrence.
 #[inline]
 pub fn bwd_stage_ssm(m: &mut PSSALayerV2, seq_len: usize) {
+    bwd_stage_ssm_with_input(m, seq_len, true);
+}
+
+/// SSM backward with an explicit input kind. The normal batched path starts
+/// at the embedding, while an Ouro pass starts at a continuous residual and
+/// must return that residual adjoint instead of writing another embedding row.
+pub(crate) fn bwd_stage_ssm_with_input(
+    m: &mut PSSALayerV2,
+    seq_len: usize,
+    input_is_embedding: bool,
+) {
     let d_m = m.cfg.d_latent;
     let d_s = m.cfg.d_state;
     let stride = d_m * d_s;
     if !parallel_scan_enabled(seq_len, stride) {
-        bwd_stage_ssm_sequential(m, seq_len);
+        bwd_stage_ssm_sequential(m, seq_len, input_is_embedding);
         return;
     }
     let executor = m.scan_executor.clone();
-    executor.run(|| bwd_stage_ssm_parallel(m, seq_len));
+    executor.run(|| bwd_stage_ssm_parallel(m, seq_len, input_is_embedding));
 }
 
 #[inline]
-fn bwd_stage_ssm_parallel(m: &mut PSSALayerV2, seq_len: usize) {
+fn bwd_stage_ssm_parallel(m: &mut PSSALayerV2, seq_len: usize, input_is_embedding: bool) {
     let d_m = m.cfg.d_latent;
     let d_s = m.cfg.d_state;
     let stride = d_m * d_s;
@@ -1467,8 +1498,10 @@ fn bwd_stage_ssm_parallel(m: &mut PSSALayerV2, seq_len: usize) {
     let l = seq_len;
     let ssm_scale = 1.0 / (d_s as f32).sqrt();
 
-    for t in 0..l {
-        embed_row_marks[m.tape.x_ids[t]] = pending_step;
+    if input_is_embedding {
+        for t in 0..l {
+            embed_row_marks[m.tape.x_ids[t]] = pending_step;
+        }
     }
 
     // Let p_t be the adjoint propagated through the transition at t:
@@ -1586,7 +1619,7 @@ fn bwd_stage_ssm_parallel(m: &mut PSSALayerV2, seq_len: usize) {
         let x_id = m.tape.x_ids[t];
         let d_off = t * d_m;
         let inv_rms = m.tape.inv_rms[t];
-        let e_t = &embed_w.data[x_id * d_m..(x_id + 1) * d_m];
+        let e_t = &m.tape.x_raw[d_off..d_off + d_m];
         let mut dot_gx_e = 0.0f32;
         for i in 0..d_m {
             let gx_i = m.bwd_g_xnorm[d_off + i];
@@ -1594,10 +1627,38 @@ fn bwd_stage_ssm_parallel(m: &mut PSSALayerV2, seq_len: usize) {
             m.norm_gamma.grad[i] += gx_i * (e_t[i] * inv_rms);
             dot_gx_e += gx_i * m.norm_gamma.data[i] * e_t[i];
         }
-        let emb_row_off = x_id * d_m;
+        if input_is_embedding {
+            let emb_row_off = x_id * d_m;
+            for i in 0..d_m {
+                let g_unnorm = m.bwd_g_xnorm[d_off + i] * m.norm_gamma.data[i];
+                embed_w.grad[emb_row_off + i] +=
+                    inv_rms * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / d_m as f32));
+            }
+        }
+    }
+}
+
+/// Return the adjoint through the affine RMSNorm into the raw continuous
+/// input. This is separate from the embedding write in `bwd_stage_ssm` so a
+/// later shared loop can feed its residual derivative to the previous pass.
+pub(crate) fn bwd_stage_input_norm(
+    b: &PSSAContinuousBlockV2,
+    seq_len: usize,
+    input_adjoints: &mut [f32],
+) {
+    let d_m = b.cfg.d_latent;
+    assert_eq!(input_adjoints.len(), seq_len * d_m);
+    for t in 0..seq_len {
+        let off = t * d_m;
+        let inv_rms = b.tape.inv_rms[t];
+        let e_t = &b.tape.x_raw[off..off + d_m];
+        let mut dot_gx_e = 0.0f32;
         for i in 0..d_m {
-            let g_unnorm = m.bwd_g_xnorm[d_off + i] * m.norm_gamma.data[i];
-            embed_w.grad[emb_row_off + i] +=
+            dot_gx_e += b.bwd_g_xnorm[off + i] * b.norm_gamma.data[i] * e_t[i];
+        }
+        for i in 0..d_m {
+            let g_unnorm = b.bwd_g_xnorm[off + i] * b.norm_gamma.data[i];
+            input_adjoints[off + i] =
                 inv_rms * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / d_m as f32));
         }
     }
