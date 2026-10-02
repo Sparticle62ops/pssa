@@ -1,24 +1,41 @@
 [package]
 name = "oxide_ai_pssa"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Sparticle62ops"]
-description = "Plastic State-Space Architecture (PSSA) V2 with CPU SIMD & WebGPU Compute Backends"
+description = "Plastic state-space language model in Rust with CPU, CUDA (cuBLAS), and WebGPU backends, stacked depth, shared loops, and a terminal UI"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Sparticle62ops/pssa"
+readme = "README.md"
+keywords = ["language-model", "state-space", "machine-learning", "cuda", "webgpu"]
+categories = ["science", "command-line-utilities"]
 
 [dependencies]
-# HTTP/HTTPS streaming for corpus downloads
+# HTTP/HTTPS streaming for corpus downloads. Held at ureq 2.x for now.
 ureq = { version = "2.9", features = ["tls"] }
 
-# WebGPU compute runtime & buffer casting
+# WebGPU compute runtime & buffer casting. Held at wgpu 0.19 for now.
 wgpu = { version = "0.19", features = ["wgsl"] }
-pollster = "0.3"
-bytemuck = { version = "1.16", features = ["derive"] }
+pollster = "1.0.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
 
 # Multi-threaded CPU fallback acceleration
-rayon = "1.10"
-tokenizers = { version = "0.22.1", default-features = false, features = ["fancy-regex"] }
+rayon = "1.12.0"
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
 # Explicit direct use validates persisted tokenizer policy before model allocation.
-serde_json = "1.0"
+serde_json = "1.0.151"
+
+# Ratatui 0.29 and Crossterm 0.28 are the newest matching pair compatible
+# with the Rust 1.85 MSRV; keep them together until the MSRV can move.
+[dependencies.ratatui]
+version = "0.29"
+default-features = true
+
+[dependencies.crossterm]
+version = "0.28"
+default-features = false
+features = ["events", "event-stream"]
 
 # Optional native CUDA backend (cuBLAS). Enabled with --features cuda.
 # dynamic-loading means the binary still builds and runs on machines with no
@@ -38,11 +55,3 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-[dependencies.ratatui]
-version = "0.29"
-default-features = true
-
-[dependencies.crossterm]
-version = "0.28"
-default-features = false
-features = ["events", "event-stream"]
