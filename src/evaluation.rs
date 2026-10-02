@@ -84,16 +84,19 @@ pub struct Metrics {
     pub oov: usize,
     /// Selected encoded tokens, including fragments without a transition.
     pub encoded_tokens: usize,
+    /// Effective runtime pass count used by the evaluator.
+    pub loops: usize,
 }
 
 impl Metrics {
-    fn for_documents(docs: &[Vec<usize>]) -> Self {
+    fn for_documents(docs: &[Vec<usize>], loops: usize) -> Self {
         Self {
             loss: 0.0,
             tokens: 0,
             correct: 0,
             oov: docs.iter().flatten().filter(|&&id| id == 0).count(),
             encoded_tokens: docs.iter().map(Vec::len).sum(),
+            loops,
         }
     }
 
@@ -139,10 +142,11 @@ impl Metrics {
             format!("{ppl:.8}")
         };
         format!(
-            "{{\"cross_entropy\":{ce},\"perplexity\":{ppl_json},\"perplexity_overflow\":{overflow},\"oov_rate\":{:.8},\"token_count\":{},\"next_token_accuracy\":{:.8}}}",
+            "{{\"cross_entropy\":{ce},\"perplexity\":{ppl_json},\"perplexity_overflow\":{overflow},\"oov_rate\":{:.8},\"token_count\":{},\"next_token_accuracy\":{:.8},\"loops\":{}}}",
             self.oov as f64 / self.encoded_tokens.max(1) as f64,
             self.tokens,
             self.correct as f64 / self.tokens.max(1) as f64,
+            self.loops,
         )
     }
 }
@@ -178,7 +182,7 @@ pub fn evaluate_pssa(
     let docs = documents(raw, tokenizer, slice)?;
     let vocab = model.cfg.d_vocab;
     validate_model_input(tokenizer, &docs, vocab, model.cfg.chunk_len)?;
-    let mut metrics = Metrics::for_documents(&docs);
+    let mut metrics = Metrics::for_documents(&docs, model.loops());
     let incoming_carries: Vec<_> = std::iter::once(&model.block)
         .chain(&model.extra_blocks)
         .map(|block| block.h_persistent.clone())
@@ -221,7 +225,7 @@ pub fn evaluate_transformer(
     let docs = documents(raw, tokenizer, slice)?;
     let vocab = model.cfg.d_vocab;
     validate_model_input(tokenizer, &docs, vocab, model.cfg.chunk_len)?;
-    let mut metrics = Metrics::for_documents(&docs);
+    let mut metrics = Metrics::for_documents(&docs, 1);
     for doc in &docs {
         for (input, targets) in TokenChunkIterator::new(doc, model.cfg.chunk_len) {
             let loss = model.forward_train_chunk(input, targets);
@@ -564,7 +568,8 @@ mod tests {
                 (3, 2, 1, 1)
             );
             let json: serde_json::Value = serde_json::from_str(&metrics.json()).unwrap();
-            assert_eq!(json.as_object().unwrap().len(), 6);
+            assert_eq!(json.as_object().unwrap().len(), 7);
+            assert_eq!(json["loops"], 1);
             assert!((json["cross_entropy"].as_f64().unwrap() - 7f64.ln()).abs() < 1e-6);
             assert!((json["perplexity"].as_f64().unwrap() - 7.0).abs() < 1e-5);
             assert_eq!(json["perplexity_overflow"], false);
@@ -582,6 +587,20 @@ mod tests {
     }
 
     #[test]
+    fn json_contains_effective_loop_count() {
+        let metrics = Metrics {
+            loss: 0.0,
+            tokens: 0,
+            correct: 0,
+            oov: 0,
+            encoded_tokens: 0,
+            loops: 3,
+        };
+        let json: serde_json::Value = serde_json::from_str(&metrics.json()).unwrap();
+        assert_eq!(json["loops"], 3);
+    }
+
+    #[test]
     fn json_encodes_perplexity_overflow_as_null_not_infinity() {
         let mut metrics = Metrics {
             loss: 1000.0,
@@ -589,6 +608,7 @@ mod tests {
             correct: 1,
             oov: 1,
             encoded_tokens: 3,
+            loops: 1,
         };
         let json: serde_json::Value = serde_json::from_str(&metrics.json()).unwrap();
         assert_eq!(json["cross_entropy"], 1000.0);

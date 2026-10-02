@@ -20,6 +20,8 @@ pub struct TrainingOptions {
     pub depth: usize,
     /// Runtime-only repeated passes through each shared continuous block.
     pub loops: usize,
+    /// Whether the runtime loop count was explicitly supplied by the CLI.
+    pub loops_explicit: bool,
     pub state: usize,
     pub key: usize,
     pub memory: usize,
@@ -58,6 +60,7 @@ impl Default for TrainingOptions {
             latent: 256,
             depth: 1,
             loops: 1,
+            loops_explicit: false,
             state: 16,
             key: 32,
             memory: 512,
@@ -281,6 +284,7 @@ impl CLIHandler {
             latent: parsed.usize_nonzero("--latent", "", 256)?,
             depth: parsed.usize_nonzero("--depth", "", 1)?,
             loops: parsed.loops()?,
+            loops_explicit: parsed.flags.contains_key("--loops"),
             state: parsed.usize_nonzero("--state", "", 16)?,
             key: parsed.usize_nonzero("--key", "", 32)?,
             memory: parsed.usize_nonzero("--memory", "", 512)?,
@@ -583,12 +587,18 @@ impl CLIHandler {
                     return Err("resume checkpoint tokenizer/vocabulary mismatch".into());
                 }
                 println!(
-                    "resumed_from={path} vocab={} d_latent={} depth={} prior_steps={}",
+                    "resumed_from={path} vocab={} d_latent={} depth={} loops={} prior_steps={}",
                     model.cfg.d_vocab,
                     model.cfg.d_latent,
                     model.depth(),
+                    options.loops,
                     model.step_counter
                 );
+                if options.loops == 1 && !options.loops_explicit {
+                    println!(
+                        "note: --loops not given, running 1 pass (loops are not checkpointed)"
+                    );
+                }
                 ui::success(&format!(
                     "resumed {} at {} prior optimizer steps",
                     ui::bold(path),
@@ -695,10 +705,11 @@ impl CLIHandler {
         let first_lr = schedule.lr(1)?;
         let last_lr = schedule.lr(total_updates)?;
         println!(
-            "model=pssa parameters={} vocab={} depth={}",
+            "model=pssa parameters={} vocab={} depth={} loops={}",
             model.parameter_count(),
             model.cfg.d_vocab,
-            model.depth()
+            model.depth(),
+            model.loops()
         );
         crate::training::report_stream(&docs, chunk_len, options.accumulate);
         if options.batch_size > 1 {
@@ -1082,8 +1093,15 @@ impl CLIHandler {
         println!("{}", metrics.json());
         Ok(())
     }
-    fn run_chat(model_path: &str, data: Option<&str>, temp: f32) -> Result<(), String> {
+    fn run_chat(
+        model_path: &str,
+        data: Option<&str>,
+        temp: f32,
+        loops: usize,
+    ) -> Result<(), String> {
+        Self::validate_loops(loops)?;
         let (mut model, tokenizer) = Self::load_for_inference(model_path, data)?;
+        model.set_loops(loops)?;
         let mut engine = PSSAInferenceEngine::try_new(&mut model, &tokenizer)?;
         println!("interactive: /exit");
         loop {
@@ -1712,6 +1730,7 @@ impl CLIHandler {
                 println!("  -m, --model <PATH>            checkpoint (default: data/model.pssa)");
                 println!("  -d, --data <SOURCE>           legacy tokenizer provenance source");
                 println!("  -t, --temp, --temperature <F> sampling temperature (default: 0.70)");
+                println!("      --loops <N>               shared Ouro passes, 1..32 (repeat; not checkpointed)");
                 println!();
                 println!("Example: {bin} chat -m data/model.pssa --temperature 0.7");
             }
@@ -2096,8 +2115,10 @@ impl CLIHandler {
                         "--temp",
                         "--temperature",
                         "-t",
+                        "--loops",
                     ],
                 )?;
+                let loops = p.loops()?;
                 p.reject_duplicate_aliases(&["--model", "-m"], "--model")?;
                 p.reject_duplicate_aliases(&["--data", "-d"], "--data")?;
                 p.reject_duplicate_aliases(&["--temp", "--temperature", "-t"], "--temperature")?;
@@ -2116,6 +2137,7 @@ impl CLIHandler {
                     p.string("--data", "-d")
                         .or_else(|| p.positional.first().map(String::as_str)),
                     t,
+                    loops,
                 )
             }
             "clean-wikitext" => {
