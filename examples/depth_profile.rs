@@ -80,8 +80,8 @@ fn run(depth: usize, staged: bool) {
 }
 
 fn main() {
-    run(1, false);
-    run(1, true);
-    run(2, false);
-    run(4, false);
+    for depth in [1, 2, 4] {
+        run(depth, false);
+        run(depth, true);
+    }
 }
