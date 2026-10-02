@@ -421,13 +421,6 @@ pub fn stage_embed_norm(m: &mut PSSALayerV2, seq_len: usize) {
     stage_input_norm_block(m, seq_len);
 }
 
-/// Stage 1 for a continuous residual input already materialized in `x_raw`.
-/// Weight-shared Ouro passes use this instead of gathering the embedding again.
-#[inline]
-pub(crate) fn stage_input_norm(m: &mut PSSALayerV2, seq_len: usize) {
-    stage_input_norm_block(&mut m.block, seq_len);
-}
-
 #[inline]
 pub(crate) fn stage_input_norm_block(m: &mut PSSAContinuousBlockV2, seq_len: usize) {
     let d_m = m.cfg.d_latent;

@@ -364,7 +364,7 @@ impl ChunkActivationTape {
             bar_b: vec![0.0; loop_l * d_latent * d_state],
             // Extra loop carries are runtime-only, after the activation slots.
             h_states: vec![
-                (0.0f32);
+                0.0f32;
                 (saved_slots * (max_l + 1) + loops.saturating_sub(1))
                     * d_latent
                     * d_state
