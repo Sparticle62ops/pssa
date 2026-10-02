@@ -57,6 +57,13 @@ fn cuda_init_is_fallible_and_strict_shapes_are_checked_if_available() {
             &ctx.try_gemm_tn(&x, &b, 15, 7, 11).unwrap(),
             &oxide_ai_pssa::backend::gemm_tn_cpu(&x, &b, 15, 7, 11),
         );
+        let mut accumulated = vec![0.25; 7 * 11];
+        ctx.try_gemm_tn_accumulate_into(&x, &b, 15, 7, 11, &mut accumulated)
+            .unwrap();
+        let expected = oxide_ai_pssa::backend::gemm_tn_cpu(&x, &b, 15, 7, 11);
+        for (actual, product) in accumulated.iter().zip(expected) {
+            assert!((actual - (0.25 + product)).abs() < 1e-4);
+        }
         // nn's second operand is cached; host storage can be reused next loop.
         ctx.invalidate_weights();
     }
