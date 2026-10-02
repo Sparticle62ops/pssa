@@ -107,6 +107,7 @@ pub fn learning_rate_for_update(
     Ok(min + 0.5 * (base - min) * (1.0 + (std::f32::consts::PI * progress).cos()))
 }
 
+#[derive(Debug)]
 struct Parsed {
     flags: HashMap<String, String>,
     positional: Vec<String>,
@@ -133,9 +134,16 @@ impl Parsed {
                     i += 1;
                     continue;
                 }
-                if i + 1 >= args.len()
-                    || (args[i + 1].starts_with('-') && allowed.contains(args[i + 1].as_str()))
-                {
+                let missing_value = match args.get(i + 1) {
+                    None => true,
+                    Some(value) if !value.starts_with('-') => false,
+                    Some(value) if allowed.contains(value.as_str()) => true,
+                    // Negative numeric values are legitimate values for
+                    // flags such as --temperature; leave their eventual
+                    // domain validation to the typed option parser.
+                    Some(value) => value.parse::<f64>().is_err(),
+                };
+                if missing_value {
                     return Err(format!("option '{arg}' requires a value"));
                 }
                 if flags.insert(arg.clone(), args[i + 1].clone()).is_some() {
