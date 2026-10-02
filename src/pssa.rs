@@ -491,6 +491,8 @@ pub struct PSSAContinuousBlockV2 {
     pub bwd_g_ad_down: Vec<f32>,
     pub bwd_g_xnorm: Vec<f32>,
     pub bwd_g_ysm: Vec<f32>,
+    /// Packed per-token query adjoints used by the CUDA backward GEMMs.
+    pub bwd_g_query_euc: Vec<f32>,
     pub bwd_g_logits: Vec<f32>,
     pub bwd_g_mlp: Vec<f32>,
 
@@ -636,6 +638,7 @@ impl PSSAContinuousBlockV2 {
             bwd_g_ad_down: vec![0.0; chunk_len * rank],
             bwd_g_xnorm: vec![0.0; chunk_len * d_m],
             bwd_g_ysm: vec![0.0; chunk_len * d_m],
+            bwd_g_query_euc: vec![0.0; chunk_len * d_k],
             bwd_g_logits: vec![0.0; chunk_len * d_v],
             bwd_g_mlp: vec![0.0; chunk_len * d_mlp],
             ssm_scan_a: vec![0.0; scan_len * state_width],
@@ -1540,10 +1543,6 @@ impl PSSALayerV2 {
         assert!((1..=Self::MAX_LOOPS).contains(&loops));
         cfg.validate();
         Self::validate_loops_config(&cfg, loops).expect("invalid model allocation");
-        assert!(
-            cfg.depth == 1 || !device.is_gpu(),
-            "stacked depth currently requires Device::Cpu"
-        );
         let mut rng = SimpleRng::new(seed);
         let (v, d, l, depth) = (cfg.d_vocab, cfg.d_latent, cfg.chunk_len, cfg.depth);
         // Preserve main's exact original embedding/block/head random draw order.
@@ -1845,6 +1844,7 @@ impl PSSALayerV2 {
         let (d, v) = (self.cfg.d_latent, self.cfg.d_vocab);
         let n = seq_len * d;
         let loops = self.loops();
+        let gpu = self.device.gpu();
         self.block.tape.x_ids[..seq_len].copy_from_slice(token_ids);
         self.block.tape.target_ids[..seq_len].copy_from_slice(target_ids);
         for (t, &id) in token_ids.iter().enumerate() {
@@ -1883,7 +1883,25 @@ impl PSSALayerV2 {
                 self.residual_input_adjoints[..n].copy_from_slice(&self.continuous_inputs[..n]);
                 for loop_index in 0..loops {
                     let b = &mut self.extra_blocks[layer];
-                    b.forward_train_chunk_loop(&self.continuous_inputs[..n], seq_len, loop_index);
+                    if let Some(gpu) = gpu.as_ref() {
+                        b.swap_loop_carry(loop_index);
+                        b.tape.x_raw[..n].copy_from_slice(&self.continuous_inputs[..n]);
+                        let state_width = d * self.cfg.d_state;
+                        b.tape.h_states[..state_width].copy_from_slice(&b.h_persistent);
+                        crate::gpu_batch::forward_continuous_block_batched(b, seq_len, gpu);
+                        let last_h_off = seq_len * state_width;
+                        b.h_persistent.copy_from_slice(
+                            &b.tape.h_states[last_h_off..last_h_off + state_width],
+                        );
+                        b.copy_base_tape_to_loop(loop_index);
+                        b.swap_loop_carry(loop_index);
+                    } else {
+                        b.forward_train_chunk_loop(
+                            &self.continuous_inputs[..n],
+                            seq_len,
+                            loop_index,
+                        );
+                    }
                     let off = loop_index * b.tape.max_l * d;
                     for i in 0..n {
                         self.continuous_inputs[i] += loop_scale * b.tape.z_final[off + i];
@@ -1905,12 +1923,26 @@ impl PSSALayerV2 {
         } else {
             &self.continuous_inputs[..n]
         };
+        if let Some(gpu) = gpu.as_ref() {
+            gpu.dispatch_gemm_into(
+                final_z,
+                &self.unembed_w.data,
+                seq_len,
+                v,
+                d,
+                1,
+                &mut tape.logits[..seq_len * v],
+            )
+            .expect("validated model GEMM dimensions");
+        }
         let logit_scale = 1.0 / (d as f32).sqrt();
         let mut total_loss = 0.0f32;
         for t in 0..seq_len {
             let off = t * v;
-            self.unembed_w
-                .matvec(&final_z[t * d..(t + 1) * d], &mut tape.logits[off..off + v]);
+            if gpu.is_none() {
+                self.unembed_w
+                    .matvec(&final_z[t * d..(t + 1) * d], &mut tape.logits[off..off + v]);
+            }
             for i in 0..v {
                 tape.logits[off + i] *= logit_scale;
             }
@@ -1955,6 +1987,7 @@ impl PSSALayerV2 {
         let (d, v) = (self.cfg.d_latent, self.cfg.d_vocab);
         let n = seq_len * d;
         let loops = self.loops();
+        let gpu = if loops > 1 { self.device.gpu() } else { None };
         let scale_loss = accumulation_scale / seq_len as f32;
         let logit_scale = 1.0 / (d as f32).sqrt();
         let pending = self
@@ -1974,18 +2007,29 @@ impl PSSALayerV2 {
         } else {
             &self.continuous_inputs[..n]
         };
-        // Keep the old reverse-time accumulation order for bit-exact depth one.
-        for t in (0..seq_len).rev() {
-            for i in 0..v {
-                let indicator = if i == self.block.tape.target_ids[t] {
-                    1.0
-                } else {
-                    0.0
-                };
-                let g = (self.block.tape.probs[t * v + i] - indicator) * scale_loss * logit_scale;
-                for j in 0..d {
-                    self.output_adjoints[t * d + j] += g * self.unembed_w.data[i * d + j];
-                    self.unembed_w.grad[i * d + j] += g * final_z[t * d + j];
+        if let Some(gpu) = gpu.as_ref() {
+            crate::gpu_batch::stacked_backward_logits(
+                self,
+                seq_len,
+                scale_loss,
+                Some(gpu),
+            );
+            self.output_adjoints[..n].copy_from_slice(&self.block.bwd_g_zfinal[..n]);
+        } else {
+            // Keep the old reverse-time accumulation order for bit-exact depth one.
+            for t in (0..seq_len).rev() {
+                for i in 0..v {
+                    let indicator = if i == self.block.tape.target_ids[t] {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    let g =
+                        (self.block.tape.probs[t * v + i] - indicator) * scale_loss * logit_scale;
+                    for j in 0..d {
+                        self.output_adjoints[t * d + j] += g * self.unembed_w.data[i * d + j];
+                        self.unembed_w.grad[i * d + j] += g * final_z[t * d + j];
+                    }
                 }
             }
         }
@@ -2023,12 +2067,24 @@ impl PSSALayerV2 {
                     for i in 0..n {
                         self.input_adjoints[i] = loop_scale * self.residual_block_adjoints[i];
                     }
-                    self.extra_blocks[layer].backward_chunk_loop(
-                        &self.input_adjoints[..n],
-                        seq_len,
-                        &mut self.residual_input_adjoints[..n],
-                        loop_index,
-                    );
+                    let b = &mut self.extra_blocks[layer];
+                    if let Some(gpu) = gpu.as_ref() {
+                        b.copy_loop_tape_to_base(loop_index);
+                        crate::gpu_batch::backward_continuous_block_batched(
+                            b,
+                            &self.input_adjoints[..n],
+                            seq_len,
+                            &mut self.residual_input_adjoints[..n],
+                            gpu,
+                        );
+                    } else {
+                        b.backward_chunk_loop(
+                            &self.input_adjoints[..n],
+                            seq_len,
+                            &mut self.residual_input_adjoints[..n],
+                            loop_index,
+                        );
+                    }
                     for i in 0..n {
                         self.residual_block_adjoints[i] += self.residual_input_adjoints[i];
                     }

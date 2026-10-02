@@ -622,6 +622,7 @@ fn block_storage(b: &PSSAContinuousBlockV2) -> usize {
         &b.bwd_g_ad_down,
         &b.bwd_g_xnorm,
         &b.bwd_g_ysm,
+        &b.bwd_g_query_euc,
         &b.bwd_g_logits,
         &b.bwd_g_mlp,
         &b.ssm_scan_a,
