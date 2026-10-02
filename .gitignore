@@ -16,3 +16,7 @@ AGENTS.md
 docs/HANDOFF-*
 docs/CONTINUATION-*
 docs/PROJECT-HANDOFF-*
+
+# Agent run scratch (never commit)
+.loops-fix/
+*_findings.md
