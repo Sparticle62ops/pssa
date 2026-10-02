@@ -830,6 +830,7 @@ fn actual_block_storage(b: &oxide_ai_pssa::pssa::PSSAContinuousBlockV2) -> usize
         w_proj,
         memory,
         adapters,
+        adapter_up_effective,
         mlp_w1,
         mlp_w2,
         tape,
@@ -908,6 +909,7 @@ fn actual_block_storage(b: &oxide_ai_pssa::pssa::PSSAContinuousBlockV2) -> usize
         .sum();
     let float_bytes: usize = [
         h_persistent,
+        adapter_up_effective,
         ssm_raw_snapshot,
         ssm_rates,
         ssm_rate_derivatives,
