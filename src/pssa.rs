@@ -1859,6 +1859,12 @@ impl PSSALayerV2 {
                 .all(|&id| id < self.cfg.d_vocab),
             "token IDs must be in vocabulary"
         );
+        // SequenceBatch replays through this reference entry point. On a GPU,
+        // use the same staged path as the single-lane trainer; the CPU path
+        // remains the historical scalar implementation.
+        if self.loops() == 1 && self.device.is_gpu() {
+            return crate::gpu_batch::forward_train_chunk_batched(self, token_ids, target_ids);
+        }
         let seq_len = token_ids.len();
         let (d, v) = (self.cfg.d_latent, self.cfg.d_vocab);
         let n = seq_len * d;
@@ -2006,6 +2012,9 @@ impl PSSALayerV2 {
         let (d, v) = (self.cfg.d_latent, self.cfg.d_vocab);
         let n = seq_len * d;
         let loops = self.loops();
+        if loops == 1 && self.device.is_gpu() {
+            return crate::gpu_batch::backward_chunk_batched(self, seq_len, accumulation_scale);
+        }
         let gpu = if loops > 1 { self.device.gpu() } else { None };
         let scale_loss = accumulation_scale / seq_len as f32;
         let logit_scale = 1.0 / (d as f32).sqrt();
