@@ -182,9 +182,14 @@ impl RunState {
         }
         if line.contains("resumed_from=") {
             let value = line.split("resumed_from=").nth(1).unwrap_or("").trim();
-            let head = value.split_whitespace().next().unwrap_or("");
-            if !head.is_empty() {
-                self.resumed_from = Some(head.to_string());
+            // The checkpoint path is followed by structured metadata, but the
+            // path itself may contain spaces.
+            let path = value
+                .split_once(" vocab=")
+                .map_or(value, |(path, _)| path)
+                .trim();
+            if !path.is_empty() {
+                self.resumed_from = Some(path.to_string());
             }
         }
         if let Some(s) = parse_kv(line, "prior_steps=") {
@@ -625,8 +630,18 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--chain" | "-c" if i + 1 < args.len() => {
-                chain_dir = PathBuf::from(&args[i + 1]);
+            "--chain" | "-c" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "option '--chain' requires a directory; usage: oxide tui [-c|--chain DIR]"
+                        .to_string()
+                })?;
+                if value.starts_with('-') {
+                    return Err(format!(
+                        "option '{}' requires a directory; usage: oxide tui [-c|--chain DIR]",
+                        args[i]
+                    ));
+                }
+                chain_dir = PathBuf::from(value);
                 i += 1;
             }
             other => {
@@ -814,6 +829,18 @@ mod tests {
         let mut progress = ui::Progress::new("training", 4);
         progress.update(4, 512, 4.123456);
         progress.finish();
+    }
+
+    #[test]
+    fn preserves_resume_paths_containing_spaces() {
+        let mut state = RunState::default();
+        state.ingest(
+            "resumed_from=/tmp/run with spaces/ck01.pssa vocab=2048 d_latent=256 depth=1 prior_steps=42",
+        );
+        assert_eq!(
+            state.resumed_from.as_deref(),
+            Some("/tmp/run with spaces/ck01.pssa")
+        );
     }
 
     #[test]
