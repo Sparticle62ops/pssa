@@ -798,21 +798,340 @@ pub fn stage_logits_loss(m: &mut PSSALayerV2, seq_len: usize) -> f32 {
     total_loss / (seq_len as f32)
 }
 
+/// Run the dense staged schedule for one continuous block whose raw inputs are
+/// already in the block tape. Stacked depth uses this CPU schedule for every
+/// block instead of falling back to the scalar token-at-a-time implementation.
+#[inline]
+fn stacked_prepare_block(block: &mut crate::pssa::PSSAContinuousBlockV2, seq_len: usize) {
+    let state_width = block.cfg.d_latent * block.cfg.d_state;
+    block.tape.h_states[..state_width].copy_from_slice(&block.h_persistent);
+    assert!(seq_len <= block.tape.max_l);
+}
+
+#[inline]
+fn stacked_finish_block(block: &mut crate::pssa::PSSAContinuousBlockV2, seq_len: usize) {
+    let state_width = block.cfg.d_latent * block.cfg.d_state;
+    let last = seq_len * state_width;
+    block
+        .h_persistent
+        .copy_from_slice(&block.tape.h_states[last..last + state_width]);
+}
+
+#[inline]
+fn stacked_input_norm(
+    block: &mut crate::pssa::PSSAContinuousBlockV2,
+    inputs: &[f32],
+    seq_len: usize,
+) {
+    let d = block.cfg.d_latent;
+    assert_eq!(inputs.len(), seq_len * d);
+    block.tape.x_raw[..inputs.len()].copy_from_slice(inputs);
+    for t in 0..seq_len {
+        let off = t * d;
+        let raw = &block.tape.x_raw[off..off + d];
+        let sum_sq: f32 = raw.iter().map(|&x| x * x).sum();
+        let inv_rms = 1.0 / (sum_sq / d as f32 + 1e-5).sqrt();
+        block.tape.inv_rms[t] = inv_rms;
+        for i in 0..d {
+            block.tape.x_norm[off + i] = block.norm_gamma.data[i]
+                * (block.tape.x_raw[off + i] * inv_rms)
+                + block.norm_beta.data[i];
+        }
+    }
+}
+
+#[inline]
+fn stacked_projections(block: &mut crate::pssa::PSSAContinuousBlockV2, seq_len: usize) {
+    let d = block.cfg.d_latent;
+    let s = block.cfg.d_state;
+    let xn = &block.tape.x_norm[..seq_len * d];
+    batched_matvec(
+        &block.w_delta.data,
+        d,
+        d,
+        xn,
+        seq_len,
+        &mut block.tape.delta_raw[..seq_len * d],
+    );
+    for i in 0..seq_len * d {
+        block.tape.delta[i] = softplus(block.tape.delta_raw[i]);
+    }
+    batched_matvec(
+        &block.w_b.data,
+        s,
+        d,
+        xn,
+        seq_len,
+        &mut block.tape.b_proj[..seq_len * s],
+    );
+    batched_matvec(
+        &block.w_c.data,
+        s,
+        d,
+        xn,
+        seq_len,
+        &mut block.tape.c_proj[..seq_len * s],
+    );
+}
+
+/// The stacked path keeps the short-chunk ordered recurrence. Its expensive
+/// dense projections and adjoints are still whole-chunk GEMMs; retaining the
+/// ordered recurrence also preserves the scalar depth math for every layer.
+#[inline]
+fn stacked_ssm(block: &mut crate::pssa::PSSAContinuousBlockV2, seq_len: usize) {
+    block.refresh_ssm_rates();
+    let d = block.cfg.d_latent;
+    let s = block.cfg.d_state;
+    let stride = d * s;
+    for t in 0..seq_len {
+        let d_off = t * d;
+        let b_off = t * s;
+        let c_off = t * s;
+        let h_prev = t * stride;
+        let h_next = (t + 1) * stride;
+        let xn = t * d;
+        for i in 0..d {
+            let delta = block.tape.delta[d_off + i];
+            let mut y = 0.0f32;
+            for j in 0..s {
+                let idx = i * s + j;
+                let a = (delta * block.ssm_rates[idx]).exp();
+                let b = delta * block.tape.b_proj[b_off + j];
+                block.tape.bar_a[t * stride + idx] = a;
+                block.tape.bar_b[t * stride + idx] = b;
+                let h = a * block.tape.h_states[h_prev + idx] + b * block.tape.x_norm[xn + i];
+                block.tape.h_states[h_next + idx] = h;
+                y += h * block.tape.c_proj[c_off + j];
+            }
+            block.tape.y_ssm[t * d + i] = y;
+        }
+    }
+}
+
+#[inline]
+fn stacked_memory(block: &mut crate::pssa::PSSAContinuousBlockV2, seq_len: usize) {
+    let d = block.cfg.d_latent;
+    let k = block.cfg.d_mem_key;
+    let cap = block.cfg.mem_capacity;
+    for t in 0..seq_len {
+        let x = t * d;
+        let q = t * k;
+        for r in 0..k {
+            let row = r * d;
+            block.tape.q_euc[q + r] =
+                dot_slice(&block.w_qx.data[row..row + d], &block.tape.x_norm[x..x + d])
+                    + dot_slice(&block.w_qh.data[row..row + d], &block.tape.y_ssm[x..x + d]);
+        }
+        block.tape.q_norm[t] = crate::memory::HyperbolicEpisodicBankV2::diffeomorphic_project(
+            &block.tape.q_euc[q..q + k],
+            &mut block.tape.q_poincare[q..q + k],
+        );
+        block.memory.retrieve_soft_into(
+            &block.tape.q_poincare[q..q + k],
+            block.cfg.tau_mem,
+            &mut block.tape.m_val[x..x + d],
+            &mut block.tape.mem_weights[t * cap..(t + 1) * cap],
+        );
+    }
+    batched_matvec(
+        &block.w_gate.data,
+        d,
+        d,
+        &block.tape.x_norm[..seq_len * d],
+        seq_len,
+        &mut block.tape.g_mem[..seq_len * d],
+    );
+    for x in &mut block.tape.g_mem[..seq_len * d] {
+        *x = sigmoid(*x);
+    }
+    batched_matvec(
+        &block.w_proj.data,
+        d,
+        d,
+        &block.tape.m_val[..seq_len * d],
+        seq_len,
+        &mut block.tape.m_proj[..seq_len * d],
+    );
+    for i in 0..seq_len * d {
+        block.tape.m_inj[i] = block.tape.g_mem[i] * block.tape.m_proj[i];
+    }
+}
+
+#[inline]
+fn stacked_adapter(block: &mut crate::pssa::PSSAContinuousBlockV2, seq_len: usize) {
+    let d = block.cfg.d_latent;
+    let rank = block.adapters[0].rank;
+    for t in 0..seq_len {
+        let x = t * d;
+        let a = t * rank;
+        for r in 0..rank {
+            block.tape.adapter_hidden[a + r] = dot_slice(
+                &block.adapters[0].down_proj.data[r * d..(r + 1) * d],
+                &block.tape.x_norm[x..x + d],
+            );
+            let h = block.tape.adapter_hidden[a + r];
+            block.tape.adapter_act[a + r] = h * sigmoid(h);
+        }
+        for i in 0..d {
+            let row = i * rank;
+            let mut value = 0.0f32;
+            for r in 0..rank {
+                value += (block.adapters[0].up_proj.data[row + r]
+                    + block.adapters[0].consolidated_up[row + r])
+                    * block.tape.adapter_act[a + r];
+            }
+            block.buf_ad_out[i] = value;
+            block.tape.z_raw[t * d + i] = block.tape.y_ssm[t * d + i]
+                / (block.cfg.d_state as f32).sqrt()
+                + block.tape.m_inj[t * d + i]
+                + value;
+        }
+    }
+}
+
+#[inline]
+fn stacked_mlp(block: &mut crate::pssa::PSSAContinuousBlockV2, seq_len: usize) {
+    let d = block.cfg.d_latent;
+    let mlp = 2 * d;
+    batched_matvec(
+        &block.mlp_w1.data,
+        mlp,
+        d,
+        &block.tape.z_raw[..seq_len * d],
+        seq_len,
+        &mut block.tape.mlp_hidden[..seq_len * mlp],
+    );
+    for i in 0..seq_len * mlp {
+        let h = block.tape.mlp_hidden[i];
+        block.tape.mlp_act[i] = h * sigmoid(h);
+    }
+    batched_matvec(
+        &block.mlp_w2.data,
+        d,
+        mlp,
+        &block.tape.mlp_act[..seq_len * mlp],
+        seq_len,
+        &mut block.tape.z_final[..seq_len * d],
+    );
+    for i in 0..seq_len * d {
+        block.tape.z_final[i] += block.tape.z_raw[i];
+    }
+}
+
+#[inline]
+fn stacked_forward_block(
+    block: &mut crate::pssa::PSSAContinuousBlockV2,
+    inputs: &[f32],
+    seq_len: usize,
+) {
+    stacked_input_norm(block, inputs, seq_len);
+    stacked_prepare_block(block, seq_len);
+    stacked_projections(block, seq_len);
+    stacked_ssm(block, seq_len);
+    stacked_memory(block, seq_len);
+    stacked_adapter(block, seq_len);
+    stacked_mlp(block, seq_len);
+    stacked_finish_block(block, seq_len);
+}
+
+#[inline]
+fn stacked_logits_loss(m: &mut PSSALayerV2, seq_len: usize) -> f32 {
+    let d = m.cfg.d_latent;
+    let v = m.cfg.d_vocab;
+    let final_z = &m.continuous_inputs[..seq_len * d];
+    let (unembed, block) = (&m.unembed_w.data, &mut m.block);
+    batched_matvec(
+        unembed,
+        v,
+        d,
+        final_z,
+        seq_len,
+        &mut block.tape.logits[..seq_len * v],
+    );
+    let scale = 1.0 / (d as f32).sqrt();
+    for x in &mut block.tape.logits[..seq_len * v] {
+        *x *= scale;
+    }
+    let mut total = 0.0f32;
+    for t in 0..seq_len {
+        let off = t * v;
+        let target = block.tape.target_ids[t];
+        let mut max_l = f32::NEG_INFINITY;
+        for i in 0..v {
+            max_l = max_l.max(block.tape.logits[off + i]);
+        }
+        let mut sum = 0.0f32;
+        for i in 0..v {
+            let e = (block.tape.logits[off + i] - max_l).exp();
+            block.tape.probs[off + i] = e;
+            sum += e;
+        }
+        let inv = 1.0 / sum.max(1e-8);
+        for i in 0..v {
+            block.tape.probs[off + i] *= inv;
+        }
+        let loss = (max_l - block.tape.logits[off + target]) + sum.ln();
+        block.tape.losses[t] = loss;
+        total += loss;
+    }
+    total / seq_len as f32
+}
+
+fn forward_train_chunk_stacked_batched(
+    m: &mut PSSALayerV2,
+    token_ids: &[usize],
+    target_ids: &[usize],
+) -> f32 {
+    assert!(
+        !m.device.is_gpu(),
+        "stacked training is CPU-only; use Device::Cpu"
+    );
+    assert!(!token_ids.is_empty());
+    assert_eq!(token_ids.len(), target_ids.len());
+    assert!(token_ids.len() <= m.cfg.chunk_len);
+    assert!(
+        token_ids
+            .iter()
+            .chain(target_ids)
+            .all(|&id| id < m.cfg.d_vocab)
+    );
+    let seq_len = token_ids.len();
+    let d = m.cfg.d_latent;
+    let n = seq_len * d;
+    m.block.tape.x_ids[..seq_len].copy_from_slice(token_ids);
+    m.block.tape.target_ids[..seq_len].copy_from_slice(target_ids);
+    stage_embed_norm(m, seq_len);
+    stacked_prepare_block(&mut m.block, seq_len);
+    stacked_projections(&mut m.block, seq_len);
+    stacked_ssm(&mut m.block, seq_len);
+    stacked_memory(&mut m.block, seq_len);
+    stacked_adapter(&mut m.block, seq_len);
+    stacked_mlp(&mut m.block, seq_len);
+    stacked_finish_block(&mut m.block, seq_len);
+    m.continuous_inputs[..n].copy_from_slice(&m.block.tape.z_final[..n]);
+    for layer in 0..m.extra_blocks.len() {
+        let input = &m.continuous_inputs[..n];
+        stacked_forward_block(&mut m.extra_blocks[layer], input, seq_len);
+        let scale = m.residual_scales[layer];
+        for i in 0..n {
+            m.layer_activations[layer][i] =
+                input[i] + scale * m.extra_blocks[layer].tape.z_final[i];
+        }
+        m.continuous_inputs[..n].copy_from_slice(&m.layer_activations[layer][..n]);
+    }
+    stacked_logits_loss(m, seq_len)
+}
+
 /// Full batched forward pass over a chunk, matching `forward_train_chunk` to
 /// f32 roundoff. Dense stages batch token rows; the diagonal SSM recurrence uses
 /// a host-side parallel Blelloch scan for both CPU and GPU dense backends.
-/// Stacked models retain their existing scalar CPU fallback.
 pub fn forward_train_chunk_batched(
     m: &mut PSSALayerV2,
     token_ids: &[usize],
     target_ids: &[usize],
 ) -> f32 {
     if m.depth() > 1 {
-        assert!(
-            !m.device.is_gpu(),
-            "stacked training is CPU-only; use Device::Cpu"
-        );
-        return m.forward_train_chunk(token_ids, target_ids);
+        return forward_train_chunk_stacked_batched(m, token_ids, target_ids);
     }
     assert!(!token_ids.is_empty(), "training chunk must be nonempty");
     assert_eq!(
@@ -1603,17 +1922,382 @@ fn bwd_stage_ssm_parallel(m: &mut PSSALayerV2, seq_len: usize) {
     }
 }
 
+#[inline]
+fn stacked_backward_mlp(block: &mut crate::pssa::PSSAContinuousBlockV2, seq_len: usize) {
+    let d = block.cfg.d_latent;
+    let mlp = 2 * d;
+    let gz = &block.bwd_g_zfinal[..seq_len * d];
+    dense_input_adjoint(
+        gz,
+        &block.mlp_w2.data,
+        seq_len,
+        d,
+        mlp,
+        &mut block.bwd_g_mlp[..seq_len * mlp],
+    );
+    dense_weight_adjoint(
+        gz,
+        &block.tape.mlp_act[..seq_len * mlp],
+        seq_len,
+        d,
+        mlp,
+        &mut block.mlp_w2.grad,
+    );
+    for i in 0..seq_len * mlp {
+        let h = block.tape.mlp_hidden[i];
+        let sig = sigmoid(h);
+        block.bwd_g_mlp[i] *= sig * (1.0 + h * (1.0 - sig));
+    }
+    dense_input_adjoint(
+        &block.bwd_g_mlp[..seq_len * mlp],
+        &block.mlp_w1.data,
+        seq_len,
+        mlp,
+        d,
+        &mut block.bwd_g_zraw[..seq_len * d],
+    );
+    dense_weight_adjoint(
+        &block.bwd_g_mlp[..seq_len * mlp],
+        &block.tape.z_raw[..seq_len * d],
+        seq_len,
+        mlp,
+        d,
+        &mut block.mlp_w1.grad,
+    );
+    for i in 0..seq_len * d {
+        block.bwd_g_zraw[i] += block.bwd_g_zfinal[i];
+    }
+}
+
+#[inline]
+fn stacked_backward_adapter(block: &mut crate::pssa::PSSAContinuousBlockV2, seq_len: usize) {
+    let d = block.cfg.d_latent;
+    let rank = block.adapters[0].rank;
+    adapter_up_input_adjoint(
+        &block.bwd_g_zraw[..seq_len * d],
+        &block.adapters[0].up_proj.data,
+        &block.adapters[0].consolidated_up,
+        seq_len,
+        d,
+        rank,
+        &mut block.bwd_g_ad_down[..seq_len * rank],
+    );
+    dense_weight_adjoint_forward(
+        &block.bwd_g_zraw[..seq_len * d],
+        &block.tape.adapter_act[..seq_len * rank],
+        seq_len,
+        d,
+        rank,
+        &mut block.adapters[0].up_proj.grad,
+    );
+    for t in 0..seq_len {
+        for r in 0..rank {
+            let off = t * rank + r;
+            let h = block.tape.adapter_hidden[off];
+            let sig = sigmoid(h);
+            block.bwd_g_ad_down[off] *= sig * (1.0 + h * (1.0 - sig));
+        }
+    }
+}
+
+#[inline]
+fn stacked_backward_adapter_down(block: &mut crate::pssa::PSSAContinuousBlockV2, seq_len: usize) {
+    let d = block.cfg.d_latent;
+    let rank = block.adapters[0].rank;
+    block.bwd_g_xnorm[..seq_len * d].fill(0.0);
+    dense_input_adjoint(
+        &block.bwd_g_ad_down[..seq_len * rank],
+        &block.adapters[0].down_proj.data,
+        seq_len,
+        rank,
+        d,
+        &mut block.bwd_g_xnorm[..seq_len * d],
+    );
+    dense_weight_adjoint_forward(
+        &block.bwd_g_ad_down[..seq_len * rank],
+        &block.tape.x_norm[..seq_len * d],
+        seq_len,
+        rank,
+        d,
+        &mut block.adapters[0].down_proj.grad,
+    );
+}
+
+#[inline]
+fn stacked_backward_memory(block: &mut crate::pssa::PSSAContinuousBlockV2, seq_len: usize) {
+    let d = block.cfg.d_latent;
+    let k = block.cfg.d_mem_key;
+    let cap = block.cfg.mem_capacity;
+    let g_m_proj = &mut block.bwd_g_zfinal[..seq_len * d];
+    let (g_gate, gate_x) = block.bwd_g_mlp[..2 * seq_len * d].split_at_mut(seq_len * d);
+    let g_zraw = &block.bwd_g_zraw[..seq_len * d];
+    let g_mem = &block.tape.g_mem[..seq_len * d];
+    let m_proj = &block.tape.m_proj[..seq_len * d];
+    for t in 0..seq_len {
+        let off = t * d;
+        for i in 0..d {
+            let gz = g_zraw[off + i];
+            let gm = g_mem[off + i];
+            g_m_proj[off + i] = gz * gm;
+            g_gate[off + i] = gz * m_proj[off + i] * gm * (1.0 - gm);
+        }
+    }
+    dense_input_adjoint(g_gate, &block.w_gate.data, seq_len, d, d, gate_x);
+    for i in 0..seq_len * d {
+        block.bwd_g_xnorm[i] += gate_x[i];
+    }
+    dense_input_adjoint(g_m_proj, &block.w_proj.data, seq_len, d, d, gate_x);
+    dense_weight_adjoint_forward(
+        g_gate,
+        &block.tape.x_norm[..seq_len * d],
+        seq_len,
+        d,
+        d,
+        &mut block.w_gate.grad,
+    );
+    dense_weight_adjoint_forward(
+        g_m_proj,
+        &block.tape.m_val[..seq_len * d],
+        seq_len,
+        d,
+        d,
+        &mut block.w_proj.grad,
+    );
+
+    for t in (0..seq_len).rev() {
+        let q_off = t * k;
+        let m_off = t * d;
+        let q = &block.tape.q_poincare[q_off..q_off + k];
+        let q_sq = crate::memory::HyperbolicEpisodicBankV2::squared_norm(q) as f64;
+        block.g_query_pnc.fill(0.0);
+        let g_m_val = &gate_x[m_off..m_off + d];
+        for entry in 0..block.memory.count {
+            let key_off = entry * k;
+            let key = &block.memory.keys[key_off..key_off + k];
+            let key_sq = block.memory.norm_sq[entry] as f64;
+            let value_off = entry * d;
+            let mut dot = 0.0f64;
+            for j in 0..d {
+                dot += g_m_val[j] as f64
+                    * (block.memory.values[value_off + j] - block.tape.m_val[m_off + j]) as f64;
+            }
+            let g_score = block.tape.mem_weights[t * cap + entry] as f64 * dot;
+            let mut sq = 0.0f64;
+            for j in 0..k {
+                let diff = q[j] as f64 - key[j] as f64;
+                sq += diff * diff;
+            }
+            if sq > 0.0 {
+                let denom = (1.0 - q_sq) * (1.0 - key_sq);
+                assert!(denom > 0.0 && denom.is_finite());
+                let z = sq / denom;
+                let dd_dz = 1.0 / (z * (1.0 + z)).sqrt();
+                for j in 0..k {
+                    let diff = q[j] as f64 - key[j] as f64;
+                    let ddenom = -2.0 * q[j] as f64 * (1.0 - key_sq);
+                    let dz = (2.0 * diff * denom - sq * ddenom) / (denom * denom);
+                    block.g_query_pnc[j] +=
+                        (g_score * (-1.0 / block.cfg.tau_mem as f64) * dd_dz * dz) as f32;
+                }
+            }
+        }
+        crate::memory::HyperbolicEpisodicBankV2::projection_adjoint(
+            &block.tape.q_euc[q_off..q_off + k],
+            &block.g_query_pnc,
+            &mut block.g_query_euc,
+        );
+        block.g_y_ssm.fill(0.0);
+        let xn = &block.tape.x_norm[m_off..m_off + d];
+        let y = &block.tape.y_ssm[m_off..m_off + d];
+        for r in 0..k {
+            let gq = block.g_query_euc[r];
+            let row = r * d;
+            for j in 0..d {
+                block.w_qx.grad[row + j] += gq * xn[j];
+                block.w_qh.grad[row + j] += gq * y[j];
+                block.bwd_g_xnorm[m_off + j] += gq * block.w_qx.data[row + j];
+                block.g_y_ssm[j] += gq * block.w_qh.data[row + j];
+            }
+        }
+        block.bwd_g_ysm[m_off..m_off + d].copy_from_slice(&block.g_y_ssm);
+    }
+}
+
+#[inline]
+fn stacked_backward_ssm(
+    block: &mut crate::pssa::PSSAContinuousBlockV2,
+    seq_len: usize,
+    input_adjoints: &mut [f32],
+) {
+    let d = block.cfg.d_latent;
+    let s = block.cfg.d_state;
+    let stride = d * s;
+    assert_eq!(input_adjoints.len(), seq_len * d);
+    block.refresh_ssm_rates();
+    block.grad_h_next.fill(0.0);
+    for t in (0..seq_len).rev() {
+        let d_off = t * d;
+        block.buf_g_delta.fill(0.0);
+        block.buf_g_b_proj.fill(0.0);
+        block.buf_g_c_proj.fill(0.0);
+        block.buf_g_h_prev.fill(0.0);
+        for i in 0..d {
+            let gz = block.bwd_g_zraw[d_off + i];
+            let gy = gz / (s as f32).sqrt() + block.bwd_g_ysm[d_off + i];
+            let delta = block.tape.delta[d_off + i];
+            for j in 0..s {
+                let idx = i * s + j;
+                let h_next = block.tape.h_states[(t + 1) * stride + idx];
+                let h_prev = block.tape.h_states[t * stride + idx];
+                let c = block.tape.c_proj[t * s + j];
+                let a = block.tape.bar_a[t * stride + idx];
+                let rate = block.ssm_rates[idx];
+                let b = block.tape.b_proj[t * s + j];
+                let gh = gy * c + block.grad_h_next[idx];
+                block.buf_g_c_proj[j] += gy * h_next;
+                block.buf_g_h_prev[idx] += gh * a;
+                block.a_mat.grad[idx] +=
+                    gh * (delta * a) * h_prev * block.ssm_rate_derivatives[idx];
+                block.buf_g_delta[i] += gh * (rate * a * h_prev + b * block.tape.x_norm[d_off + i]);
+                block.buf_g_b_proj[j] += gh * (delta * block.tape.x_norm[d_off + i]);
+                block.bwd_g_xnorm[d_off + i] += gh * block.tape.bar_b[t * stride + idx];
+            }
+        }
+        block.grad_h_next.copy_from_slice(&block.buf_g_h_prev);
+        for i in 0..d {
+            let gd = block.buf_g_delta[i] * sigmoid(block.tape.delta_raw[d_off + i]);
+            let row = i * d;
+            for j in 0..d {
+                block.bwd_g_xnorm[d_off + j] += gd * block.w_delta.data[row + j];
+                block.w_delta.grad[row + j] += gd * block.tape.x_norm[d_off + j];
+            }
+        }
+        for j in 0..s {
+            let row = j * d;
+            for k in 0..d {
+                block.bwd_g_xnorm[d_off + k] += block.buf_g_b_proj[j] * block.w_b.data[row + k]
+                    + block.buf_g_c_proj[j] * block.w_c.data[row + k];
+                block.w_b.grad[row + k] += block.buf_g_b_proj[j] * block.tape.x_norm[d_off + k];
+                block.w_c.grad[row + k] += block.buf_g_c_proj[j] * block.tape.x_norm[d_off + k];
+            }
+        }
+
+        let inv_rms = block.tape.inv_rms[t];
+        let raw = &block.tape.x_raw[d_off..d_off + d];
+        let mut dot = 0.0f32;
+        for i in 0..d {
+            let gx = block.bwd_g_xnorm[d_off + i];
+            block.norm_beta.grad[i] += gx;
+            block.norm_gamma.grad[i] += gx * (raw[i] * inv_rms);
+            dot += gx * block.norm_gamma.data[i] * raw[i];
+        }
+        for i in 0..d {
+            let gx = block.bwd_g_xnorm[d_off + i] * block.norm_gamma.data[i];
+            input_adjoints[d_off + i] =
+                inv_rms * (gx - raw[i] * (dot * inv_rms * inv_rms / d as f32));
+        }
+    }
+}
+
+#[inline]
+fn stacked_backward_block(
+    block: &mut crate::pssa::PSSAContinuousBlockV2,
+    output_adjoints: &[f32],
+    seq_len: usize,
+    input_adjoints: &mut [f32],
+) {
+    block.bwd_g_zfinal[..seq_len * block.cfg.d_latent].copy_from_slice(output_adjoints);
+    stacked_backward_mlp(block, seq_len);
+    stacked_backward_adapter(block, seq_len);
+    stacked_backward_adapter_down(block, seq_len);
+    stacked_backward_memory(block, seq_len);
+    stacked_backward_ssm(block, seq_len, input_adjoints);
+}
+
+#[inline]
+fn stacked_backward_logits(m: &mut PSSALayerV2, seq_len: usize, scale_loss: f32) {
+    let d = m.cfg.d_latent;
+    let v = m.cfg.d_vocab;
+    let logit_scale = 1.0 / (d as f32).sqrt();
+    let final_z = &m.continuous_inputs[..seq_len * d];
+    let (unembed, block) = (&mut m.unembed_w, &mut m.block);
+    for t in 0..seq_len {
+        let log_off = t * v;
+        let target = block.tape.target_ids[t];
+        for i in 0..v {
+            let indicator = if i == target { 1.0 } else { 0.0 };
+            block.bwd_g_logits[log_off + i] =
+                (block.tape.probs[log_off + i] - indicator) * scale_loss * logit_scale;
+        }
+    }
+    dense_input_adjoint(
+        &block.bwd_g_logits[..seq_len * v],
+        &unembed.data,
+        seq_len,
+        v,
+        d,
+        &mut block.bwd_g_zfinal[..seq_len * d],
+    );
+    dense_weight_adjoint(
+        &block.bwd_g_logits[..seq_len * v],
+        final_z,
+        seq_len,
+        v,
+        d,
+        &mut unembed.grad,
+    );
+}
+
+fn backward_chunk_stacked_batched(m: &mut PSSALayerV2, seq_len: usize, accumulation_scale: f32) {
+    assert!(
+        !m.device.is_gpu(),
+        "stacked training is CPU-only; use Device::Cpu"
+    );
+    assert!(seq_len > 0 && seq_len <= m.cfg.chunk_len);
+    assert!(accumulation_scale.is_finite());
+    let d = m.cfg.d_latent;
+    let n = seq_len * d;
+    stacked_backward_logits(m, seq_len, accumulation_scale / seq_len as f32);
+    m.output_adjoints[..n].copy_from_slice(&m.block.bwd_g_zfinal[..n]);
+    let depth = m.depth();
+    m.boundary_adjoints[depth][..n].copy_from_slice(&m.output_adjoints[..n]);
+    for layer in (0..m.extra_blocks.len()).rev() {
+        let scale = m.residual_scales[layer];
+        for i in 0..n {
+            m.residual_block_adjoints[i] = scale * m.output_adjoints[i];
+        }
+        stacked_backward_block(
+            &mut m.extra_blocks[layer],
+            &m.residual_block_adjoints[..n],
+            seq_len,
+            &mut m.residual_input_adjoints[..n],
+        );
+        for i in 0..n {
+            m.output_adjoints[i] += m.residual_input_adjoints[i];
+        }
+        m.boundary_adjoints[layer + 1][..n].copy_from_slice(&m.output_adjoints[..n]);
+    }
+    stacked_backward_block(
+        &mut m.block,
+        &m.output_adjoints[..n],
+        seq_len,
+        &mut m.input_adjoints[..n],
+    );
+    m.boundary_adjoints[0][..n].copy_from_slice(&m.input_adjoints[..n]);
+    for t in (0..seq_len).rev() {
+        let row = m.block.tape.x_ids[t] * d;
+        for i in 0..d {
+            m.embed_w.grad[row + i] += m.input_adjoints[t * d + i];
+        }
+    }
+}
+
 /// Full batched backward pass over a chunk: reverse affine SSM scan followed
 /// by local derivatives and deterministic shared-weight reductions, matching
 /// the scalar `backward_chunk` to f32 roundoff.
 pub fn backward_chunk_batched(m: &mut PSSALayerV2, seq_len: usize, accumulation_scale: f32) {
     if m.depth() > 1 {
-        assert!(
-            !m.device.is_gpu(),
-            "stacked training is CPU-only; use Device::Cpu"
-        );
-        m.backward_chunk(seq_len, accumulation_scale);
-        return;
+        return backward_chunk_stacked_batched(m, seq_len, accumulation_scale);
     }
     assert!(
         seq_len > 0 && seq_len <= m.cfg.chunk_len,
