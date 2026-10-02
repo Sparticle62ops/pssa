@@ -6,10 +6,10 @@
 //! or cross-sequence adjoints. Dense stages use the same CPU/GPU dispatch as L=1
 //! chunk training, but see the sum of the active sequence lengths as GEMM rows.
 //!
-//! Stacked and looped models use a CPU-only serial replay fallback: each lane
-//! retains every layer/pass carry and its chunk inputs, then recomputes its tape
-//! for backward.
-//! This preserves independent lanes and token weighting, not packed-GEMM speed.
+//! Stacked and looped models use a serial replay fallback for their recurrent
+//! lane scheduling: each lane retains every layer/pass carry and its chunk
+//! inputs, then recomputes its tape for backward. Dense stages in each replay
+//! still use the model's GPU dispatch when one is available.
 //! Parameters and memory must remain unchanged between forward and backward.
 use crate::{
     gpu_batch as stages,
@@ -93,9 +93,6 @@ impl SequenceBatch {
             );
         }
         let [l, d, s, v, k, mem, rank, depth] = shape(m);
-        if depth > 1 && m.device.is_gpu() {
-            return Err("stacked sequence batching is CPU-only; use Device::Cpu".into());
-        }
         let rows = l
             .checked_mul(batch_size)
             .ok_or("batch tape size overflow; reduce --batch-size")?;
@@ -123,6 +120,7 @@ impl SequenceBatch {
         m.bwd_g_ad_down.resize(rows * rank, 0.0);
         m.bwd_g_xnorm.resize(rows * d, 0.0);
         m.bwd_g_ysm.resize(rows * d, 0.0);
+        m.bwd_g_query_euc.resize(rows * k, 0.0);
         m.bwd_g_logits.resize(rows * v, 0.0);
         m.bwd_g_mlp.resize(rows * 2 * d, 0.0);
         let lanes = (0..batch_size)
@@ -181,9 +179,6 @@ impl SequenceBatch {
     }
 
     fn check_model(&self, m: &PSSALayerV2) -> Result<(), String> {
-        if m.depth() > 1 && m.device.is_gpu() {
-            return Err("stacked sequence batching is CPU-only; use Device::Cpu".into());
-        }
         let rows = self.shape[0] * self.lanes.len();
         if shape(m) != self.shape
             || m.block.tape.max_l < rows

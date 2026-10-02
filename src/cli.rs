@@ -631,35 +631,36 @@ impl CLIHandler {
         // Keep an explicit resume override in the checkpoint's persisted
         // configuration so a later link does not silently revert to the old LR.
         model.cfg.lr = options.lr;
-        // Stacks and repeated shared-block passes are CPU-only. Do not attach
-        // a device and misleadingly report GPU execution for these paths.
-        if model.depth() > 1 || model.loops() > 1 {
-            model.device = Device::Cpu;
-            println!(
-                "backend=cpu ({}; GPU execution unsupported)",
-                if model.depth() > 1 {
-                    format!("stacked depth {}", model.depth())
-                } else {
-                    format!("Ouro loops {}", model.loops())
-                }
-            );
-            if options.batch_size > 1 {
-                println!(
-                    "batch_backend=cpu-replay (independent stacked lanes; no packed GEMM acceleration)"
-                );
+        // Every model shape uses the same device selection. Dense forward and
+        // backward stages dispatch through cuBLAS when available; recurrence,
+        // retrieval, and elementwise work remain on the host for now.
+        match Device::try_gpu() {
+            Ok(gpu_device) => {
+                let label = gpu_device
+                    .gpu()
+                    .map(|g| g.backend_label())
+                    .unwrap_or_else(|| "cpu".to_string());
+                model.device = gpu_device;
+                println!("backend={label}");
             }
-        } else {
-            // Retain the accelerated depth-one stages and their CPU fallback.
-            match Device::try_gpu() {
-                Ok(gpu_device) => {
-                    let label = gpu_device
-                        .gpu()
-                        .map(|g| g.backend_label())
-                        .unwrap_or_else(|| "cpu".to_string());
-                    model.device = gpu_device;
-                    println!("backend={label}");
+            Err(e) => {
+                if model.depth() > 1 || model.loops() > 1 {
+                    println!(
+                        "backend=cpu ({}; GPU unavailable: {e})",
+                        if model.depth() > 1 {
+                            format!("stacked depth {}", model.depth())
+                        } else {
+                            format!("Ouro loops {}", model.loops())
+                        }
+                    );
+                    if options.batch_size > 1 {
+                        println!(
+                            "batch_backend=cpu-replay (independent lanes; no packed GEMM acceleration)"
+                        );
+                    }
+                } else {
+                    println!("backend=cpu ({e})");
                 }
-                Err(e) => println!("backend=cpu ({e})"),
             }
         }
         let docs = Self::documents(raw, &tokenizer, options.max_tokens, options.skip_tokens)?;
@@ -1628,7 +1629,7 @@ impl CLIHandler {
                 println!("      --vocab-size <N>          BPE vocabulary ceiling (default: 2048)");
                 println!("      --latent <N>              latent width (default: 256)");
                 println!(
-                    "      --depth <N>               continuous blocks, 1..32 (default: 1; stacks CPU-only)"
+                    "      --depth <N>               continuous blocks, 1..32 (default: 1)"
                 );
                 println!("      --loops <N>               shared Ouro passes, 1..32 (default: 1; repeat on resume; not checkpointed)");
                 println!("      --state <N>               recurrent state width (default: 16)");
