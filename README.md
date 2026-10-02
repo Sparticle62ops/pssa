@@ -1,5 +1,7 @@
 # PSSA: a plastic state-space architecture
 
+[![Discord](https://img.shields.io/badge/discord-join%20PSlabs-5865F2?logo=discord&logoColor=white)](https://discord.gg/9sqfKeqWYF)
+
 PSSA is a small language model that is not a transformer. It reads text one
 token at a time through a recurrent state-space layer, keeps a bank of episodic
 memories it can look things up in, and rewrites part of its own weights while it
