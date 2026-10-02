@@ -92,9 +92,7 @@ fn report_block_gradients(
     let mut worst_rel: f32 = 0.0;
     for (name, cpu_grad, gpu_grad) in pairs {
         let (abs, relative) = gradient_error(cpu_grad, gpu_grad);
-        println!(
-            "    grad {prefix}.{name:<14} max_abs={abs:.3e} relative={relative:.3e}"
-        );
+        println!("    grad {prefix}.{name:<14} max_abs={abs:.3e} relative={relative:.3e}");
         worst_abs = worst_abs.max(abs);
         worst_rel = worst_rel.max(relative);
     }
@@ -107,7 +105,11 @@ fn report_gradients(cpu: &PSSALayerV2, gpu: &PSSALayerV2, step: usize) -> Result
     let mut worst_rel: f32 = 0.0;
     for (name, cpu_grad, gpu_grad) in [
         ("embed_w", &cpu.embed_w.grad[..], &gpu.embed_w.grad[..]),
-        ("unembed_w", &cpu.unembed_w.grad[..], &gpu.unembed_w.grad[..]),
+        (
+            "unembed_w",
+            &cpu.unembed_w.grad[..],
+            &gpu.unembed_w.grad[..],
+        ),
     ] {
         let (abs, relative) = gradient_error(cpu_grad, gpu_grad);
         println!("    grad {name:<23} max_abs={abs:.3e} relative={relative:.3e}");
@@ -117,13 +119,11 @@ fn report_gradients(cpu: &PSSALayerV2, gpu: &PSSALayerV2, step: usize) -> Result
     let (abs, relative) = report_block_gradients("block", &cpu.block, &gpu.block);
     worst_abs = worst_abs.max(abs);
     worst_rel = worst_rel.max(relative);
-    for (index, (cpu_block, gpu_block)) in cpu
-        .extra_blocks
-        .iter()
-        .zip(&gpu.extra_blocks)
-        .enumerate()
+    for (index, (cpu_block, gpu_block)) in
+        cpu.extra_blocks.iter().zip(&gpu.extra_blocks).enumerate()
     {
-        let (abs, relative) = report_block_gradients(&format!("block[{index}]"), cpu_block, gpu_block);
+        let (abs, relative) =
+            report_block_gradients(&format!("block[{index}]"), cpu_block, gpu_block);
         worst_abs = worst_abs.max(abs);
         worst_rel = worst_rel.max(relative);
     }
