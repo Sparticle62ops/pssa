@@ -110,6 +110,7 @@ pub fn learning_rate_for_update(
     Ok(min + 0.5 * (base - min) * (1.0 + (std::f32::consts::PI * progress).cos()))
 }
 
+#[derive(Debug)]
 struct Parsed {
     flags: HashMap<String, String>,
     positional: Vec<String>,
@@ -136,9 +137,16 @@ impl Parsed {
                     i += 1;
                     continue;
                 }
-                if i + 1 >= args.len()
-                    || (args[i + 1].starts_with('-') && allowed.contains(args[i + 1].as_str()))
-                {
+                let missing_value = match args.get(i + 1) {
+                    None => true,
+                    Some(value) if !value.starts_with('-') => false,
+                    Some(value) if allowed.contains(value.as_str()) => true,
+                    // Negative numeric values are legitimate values for
+                    // flags such as --temperature; leave their eventual
+                    // domain validation to the typed option parser.
+                    Some(value) => value.parse::<f64>().is_err(),
+                };
+                if missing_value {
                     return Err(format!("option '{arg}' requires a value"));
                 }
                 if flags.insert(arg.clone(), args[i + 1].clone()).is_some() {
@@ -1102,8 +1110,17 @@ impl CLIHandler {
         Self::validate_loops(loops)?;
         let (mut model, tokenizer) = Self::load_for_inference(model_path, data)?;
         model.set_loops(loops)?;
+        let memory_slots = std::iter::once(&model.block)
+            .chain(model.extra_blocks.iter())
+            .map(|block| block.memory.capacity)
+            .sum::<usize>();
+        let adapter_count = std::iter::once(&model.block)
+            .chain(model.extra_blocks.iter())
+            .map(|block| block.adapters.len())
+            .sum::<usize>();
         let mut engine = PSSAInferenceEngine::try_new(&mut model, &tokenizer)?;
-        println!("interactive: /exit");
+        let mut temp = temp;
+        println!("interactive: /exit  /info  /temp <value>");
         loop {
             print!("user> ");
             io::stdout().flush().map_err(|e| e.to_string())?;
@@ -1118,6 +1135,26 @@ impl CLIHandler {
             let p = line.trim();
             if p == "/exit" || p == "quit" {
                 break;
+            }
+            if p == "/info" {
+                println!("model: {model_path}");
+                println!("memory slots: {memory_slots}");
+                println!("adapters: {adapter_count}");
+                continue;
+            }
+            let mut words = p.split_whitespace();
+            if words.next() == Some("/temp") {
+                match (words.next(), words.next()) {
+                    (Some(value), None) => match value.parse::<f32>() {
+                        Ok(next) if next.is_finite() && next >= 0.0 => {
+                            temp = next;
+                            println!("temperature set to {temp:.4}");
+                        }
+                        _ => eprintln!("error: /temp value must be a finite number >= 0"),
+                    },
+                    _ => eprintln!("error: usage: /temp <value>"),
+                }
+                continue;
             }
             if p.is_empty() {
                 continue;
@@ -1733,6 +1770,7 @@ impl CLIHandler {
                 println!("      --loops <N>               shared Ouro passes, 1..32 (repeat; not checkpointed)");
                 println!();
                 println!("Example: {bin} chat -m data/model.pssa --temperature 0.7");
+                println!("Commands: /exit (or quit), /info, /temp <value> (finite and >= 0)");
             }
             "score" | "score-transformer" => {
                 println!("Usage: {bin} {command} [DATA] [-m|--model PATH] [-d|--data SOURCE]");

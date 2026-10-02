@@ -1,5 +1,7 @@
 # PSSA: a plastic state-space architecture
 
+[![Discord](https://img.shields.io/badge/discord-join%20PSlabs-5865F2?logo=discord&logoColor=white)](https://discord.gg/9sqfKeqWYF)
+
 PSSA is a small language model that is not a transformer. It reads text one
 token at a time through a recurrent state-space layer, keeps a bank of episodic
 memories it can look things up in, and rewrites part of its own weights while it
@@ -487,8 +489,8 @@ cargo run --release -- train --data data/downloaded.txt --epochs 2 --out data/ex
 Inside the REPL:
 
 - `/exit` or `quit` exits the process.
-- `/info` prints the loaded model path, memory slot count, and adapter count.
-- `/temp <value>` reports a temperature value but does not apply it to later turns. Pass `--temp` when launching `chat` instead.
+- `/info` prints the loaded model path, total memory slot count, and adapter count.
+- `/temp <value>` changes the sampling temperature for later turns; it must be finite and at least zero.
 
 ## Training over a long corpus
 
@@ -638,7 +640,7 @@ Integration tests live in `tests/`: `allocations.rs`, `bpe_repair.rs`, `checkpoi
 - Model and tokenizer vocabularies must remain compatible; a size warning does not repair a mismatch.
 - Model shape cannot change across a resume chain: latent, state, key, memory and vocabulary must match the checkpoint being resumed.
 - Downloaded content can be large and may contain JSON, malformed text, or data unsuitable for training.
-- The REPL temperature command acknowledges a value without changing the active configuration.
+- The REPL temperature command changes the active sampling temperature for later turns.
 - Benchmark output is milestone-oriented and does not measure perplexity, factuality, latency, or safety.
 - Serialized `.pssa` files are project-specific binary artifacts without version migration tooling.
 
