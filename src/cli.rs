@@ -1140,6 +1140,7 @@ impl CLIHandler {
                 println!("model: {model_path}");
                 println!("memory slots: {memory_slots}");
                 println!("adapters: {adapter_count}");
+                println!("loops: {}", model.loops());
                 continue;
             }
             let mut words = p.split_whitespace();
