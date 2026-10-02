@@ -1131,7 +1131,14 @@ pub fn forward_train_chunk_batched(
     target_ids: &[usize],
 ) -> f32 {
     if m.depth() > 1 {
-        return forward_train_chunk_stacked_batched(m, token_ids, target_ids);
+        assert!(
+            !m.device.is_gpu(),
+            "stacked training is CPU-only; use Device::Cpu"
+        );
+        if m.loops() == 1 {
+            return forward_train_chunk_stacked_batched(m, token_ids, target_ids);
+        }
+        return m.forward_train_chunk(token_ids, target_ids);
     }
     assert!(!token_ids.is_empty(), "training chunk must be nonempty");
     assert_eq!(
@@ -2297,7 +2304,15 @@ fn backward_chunk_stacked_batched(m: &mut PSSALayerV2, seq_len: usize, accumulat
 /// the scalar `backward_chunk` to f32 roundoff.
 pub fn backward_chunk_batched(m: &mut PSSALayerV2, seq_len: usize, accumulation_scale: f32) {
     if m.depth() > 1 {
-        return backward_chunk_stacked_batched(m, seq_len, accumulation_scale);
+        assert!(
+            !m.device.is_gpu(),
+            "stacked training is CPU-only; use Device::Cpu"
+        );
+        if m.loops() == 1 {
+            return backward_chunk_stacked_batched(m, seq_len, accumulation_scale);
+        }
+        m.backward_chunk(seq_len, accumulation_scale);
+        return;
     }
     assert!(
         seq_len > 0 && seq_len <= m.cfg.chunk_len,
