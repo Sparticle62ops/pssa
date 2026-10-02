@@ -454,6 +454,10 @@ pub struct PSSAContinuousBlockV2 {
 
     // 4. Zero-Init Plastic Adapters
     pub adapters: Vec<PlasticAdapterV2>,
+    /// Host-side effective adapter-up matrix, refreshed before GPU forward.
+    /// Keeping it stable lets the device weight cache retain the combined
+    /// fast and consolidated projection without caching a temporary Vec.
+    pub adapter_up_effective: Vec<f32>,
 
     // 5. SiLU Feed-Forward Expansion Head
     pub mlp_w1: ParamMatrix,
@@ -585,6 +589,7 @@ impl PSSAContinuousBlockV2 {
 
         let mut adapters = Vec::new();
         adapters.push(PlasticAdapterV2::new(d_m, rank, rng));
+        let adapter_up_effective = vec![0.0; d_m * rank];
 
         let mlp_w1 = ParamMatrix::random_xavier(d_mlp, d_m, rng);
         let mlp_w2 = ParamMatrix::zeros(d_m, d_mlp);
@@ -610,6 +615,7 @@ impl PSSAContinuousBlockV2 {
             w_proj,
             memory,
             adapters,
+            adapter_up_effective,
             mlp_w1,
             mlp_w2,
             tape,
@@ -669,6 +675,19 @@ impl PSSAContinuousBlockV2 {
     /// One transform evaluation per changed raw rate, not per timestep. Compare
     /// values rather than an optimizer version: callers may mutate public weights
     /// directly, including finite-difference probes and checkpoint decoding.
+    pub(crate) fn refresh_adapter_up_effective(&mut self) {
+        let fast = &self.adapters[0].up_proj.data;
+        let consolidated = &self.adapters[0].consolidated_up;
+        for ((effective, fast), consolidated) in self
+            .adapter_up_effective
+            .iter_mut()
+            .zip(fast)
+            .zip(consolidated)
+        {
+            *effective = *fast + *consolidated;
+        }
+    }
+
     pub(crate) fn refresh_ssm_rates(&mut self) {
         for i in 0..self.a_mat.data.len() {
             let raw = self.a_mat.data[i];
@@ -2144,6 +2163,11 @@ impl PSSALayerV2 {
         self.block.ema_consolidate_plasticity();
         for b in &mut self.extra_blocks {
             b.ema_consolidate_plasticity();
+        }
+        // The effective adapter-up weights are cached by host pointer. EMA
+        // changes the consolidated half in place, so force a fresh upload.
+        if let Some(ctx) = self.device.gpu() {
+            ctx.invalidate_weights();
         }
     }
     pub fn insert_training_memory_at(&mut self, loss: f32, last: usize) {

@@ -333,6 +333,10 @@ pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
             "adapter.consolidated_up",
             checked_mul(m, 16, "slow adapter")?,
         ),
+        (
+            "adapter_up_effective",
+            checked_mul(m, 16, "effective adapter")?,
+        ),
         ("h_persistent", ms),
         ("ssm_raw_snapshot", ms),
         ("ssm_rates", ms),

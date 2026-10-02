@@ -782,18 +782,12 @@ pub fn stage_mlp(m: &mut PSSALayerV2, seq_len: usize) {
     }
     if let Some(gpu) = gpu.as_ref() {
         let rank = m.adapters[0].rank;
-        let mut up_total = vec![0.0f32; d_m * rank];
-        for (i, row) in up_total.chunks_exact_mut(rank).enumerate() {
-            for r in 0..rank {
-                row[r] = m.adapters[0].up_proj.data[i * rank + r]
-                    + m.adapters[0].consolidated_up[i * rank + r];
-            }
-        }
+        m.refresh_adapter_up_effective();
         // Reuse bwd_g_zraw as a packed adapter output scratch. It is filled
         // again by the backward pass after this forward stage completes.
         batched_matvec_dev(
             Some(gpu),
-            &up_total,
+            &m.adapter_up_effective,
             d_m,
             rank,
             &m.tape.adapter_act[..seq_len * rank],
@@ -1133,16 +1127,10 @@ fn stacked_adapter(
             let h = block.tape.adapter_hidden[i];
             block.tape.adapter_act[i] = h * sigmoid(h);
         }
-        let mut up_total = vec![0.0f32; d * rank];
-        for (i, row) in up_total.chunks_exact_mut(rank).enumerate() {
-            for r in 0..rank {
-                row[r] = block.adapters[0].up_proj.data[i * rank + r]
-                    + block.adapters[0].consolidated_up[i * rank + r];
-            }
-        }
+        block.refresh_adapter_up_effective();
         batched_matvec_dev(
             Some(gpu),
-            &up_total,
+            &block.adapter_up_effective,
             d,
             rank,
             &block.tape.adapter_act[..seq_len * rank],
@@ -1692,20 +1680,12 @@ pub fn bwd_stage_adapter(m: &mut PSSALayerV2, seq_len: usize) {
     let l = seq_len;
 
     if let Some(gpu) = gpu.as_ref() {
-        // The fast and consolidated up projections are one logical matrix.
-        // Materializing this small adapter matrix keeps the GPU path to the
-        // same two GEMMs as the scalar VJP without changing its parameters.
-        let mut up_total = vec![0.0f32; d_m * rank];
-        for (i, row) in up_total.chunks_exact_mut(rank).enumerate() {
-            for r in 0..rank {
-                row[r] = m.adapters[0].up_proj.data[i * rank + r]
-                    + m.adapters[0].consolidated_up[i * rank + r];
-            }
-        }
+        // The effective adapter-up matrix was materialized by the matching
+        // forward stage and remains unchanged until backward completes.
         gemm_nn_dev_into(
             Some(gpu),
             &m.bwd_g_zraw[..l * d_m],
-            &up_total,
+            &m.adapter_up_effective,
             l,
             d_m,
             rank,
@@ -2072,7 +2052,6 @@ fn bwd_stage_ssm_sequential_gpu(
     }
 
     for t in (0..l).rev() {
-        let x_id = block.tape.x_ids[t];
         let del_off = t * d_m;
         let m_off = t * d_m;
         block.buf_g_delta.fill(0.0);
@@ -2617,17 +2596,10 @@ fn stacked_backward_adapter(
     let d = block.cfg.d_latent;
     let rank = block.adapters[0].rank;
     if let Some(gpu) = gpu {
-        let mut up_total = vec![0.0f32; d * rank];
-        for (i, row) in up_total.chunks_exact_mut(rank).enumerate() {
-            for r in 0..rank {
-                row[r] = block.adapters[0].up_proj.data[i * rank + r]
-                    + block.adapters[0].consolidated_up[i * rank + r];
-            }
-        }
         gemm_nn_dev_into(
             Some(gpu),
             &block.bwd_g_zraw[..seq_len * d],
-            &up_total,
+            &block.adapter_up_effective,
             seq_len,
             d,
             rank,
@@ -2969,19 +2941,21 @@ fn stacked_backward_ssm(
             }
         }
 
-        let inv_rms = block.tape.inv_rms[t];
-        let raw = &block.tape.x_raw[d_off..d_off + d];
-        let mut dot = 0.0f32;
-        for i in 0..d {
-            let gx = block.bwd_g_xnorm[d_off + i];
-            block.norm_beta.grad[i] += gx;
-            block.norm_gamma.grad[i] += gx * (raw[i] * inv_rms);
-            dot += gx * block.norm_gamma.data[i] * raw[i];
-        }
-        for i in 0..d {
-            let gx = block.bwd_g_xnorm[d_off + i] * block.norm_gamma.data[i];
-            input_adjoints[d_off + i] =
-                inv_rms * (gx - raw[i] * (dot * inv_rms * inv_rms / d as f32));
+        if gpu.is_none() {
+            let inv_rms = block.tape.inv_rms[t];
+            let raw = &block.tape.x_raw[d_off..d_off + d];
+            let mut dot = 0.0f32;
+            for i in 0..d {
+                let gx = block.bwd_g_xnorm[d_off + i];
+                block.norm_beta.grad[i] += gx;
+                block.norm_gamma.grad[i] += gx * (raw[i] * inv_rms);
+                dot += gx * block.norm_gamma.data[i] * raw[i];
+            }
+            for i in 0..d {
+                let gx = block.bwd_g_xnorm[d_off + i] * block.norm_gamma.data[i];
+                input_adjoints[d_off + i] =
+                    inv_rms * (gx - raw[i] * (dot * inv_rms * inv_rms / d as f32));
+            }
         }
     }
     if let Some(gpu) = gpu {
@@ -3016,6 +2990,23 @@ fn stacked_backward_ssm(
                 d,
                 &mut w.grad,
             );
+        }
+        for t in (0..seq_len).rev() {
+            let d_off = t * d;
+            let inv_rms = block.tape.inv_rms[t];
+            let raw = &block.tape.x_raw[d_off..d_off + d];
+            let mut dot = 0.0f32;
+            for i in 0..d {
+                let gx = block.bwd_g_xnorm[d_off + i];
+                block.norm_beta.grad[i] += gx;
+                block.norm_gamma.grad[i] += gx * (raw[i] * inv_rms);
+                dot += gx * block.norm_gamma.data[i] * raw[i];
+            }
+            for i in 0..d {
+                let gx = block.bwd_g_xnorm[d_off + i] * block.norm_gamma.data[i];
+                input_adjoints[d_off + i] =
+                    inv_rms * (gx - raw[i] * (dot * inv_rms * inv_rms / d as f32));
+            }
         }
     }
 }

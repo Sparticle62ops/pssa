@@ -565,6 +565,7 @@ fn block_storage(b: &PSSAContinuousBlockV2) -> usize {
         &b.ssm_rates,
         &b.ssm_rate_derivatives,
         &b.adapters[0].consolidated_up,
+        &b.adapter_up_effective,
         &b.memory.keys,
         &b.memory.values,
         &b.memory.norm_sq,
