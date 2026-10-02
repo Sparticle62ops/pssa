@@ -340,14 +340,46 @@ impl SequenceBatch {
                 *dst += src;
             }
         }
-        // Projection adjoints share weights across ALL sequences, like the head.
+        // Projection adjoints share weights across ALL sequences, like the
+        // head. CUDA uses the same packed GEMMs as single-lane backward;
+        // WebGPU keeps the deterministic CPU twin until it has transposed
+        // backward kernels.
+        let gpu = m.device.gpu().filter(|g| g.accelerates_backward());
         for (g, w, rows) in [
-            (&self.gd, &mut m.block.w_delta, d),
-            (&self.gb, &mut m.block.w_b, s),
-            (&self.gc, &mut m.block.w_c, s),
+            (&self.gd[..n * d], &mut m.block.w_delta, d),
+            (&self.gb[..n * s], &mut m.block.w_b, s),
+            (&self.gc[..n * s], &mut m.block.w_c, s),
         ] {
-            stages::dense_input_adjoint(g, &w.data, n, rows, d, &mut self.gx[..n * d]);
-            stages::dense_weight_adjoint(g, &m.block.tape.x_norm, n, rows, d, &mut w.grad);
+            if let Some(gpu) = gpu.as_ref() {
+                gpu.gemm_nn_into(
+                    g,
+                    &w.data,
+                    n,
+                    rows,
+                    d,
+                    &mut self.gx[..n * d],
+                )
+                .expect("validated model GEMM dimensions");
+                gpu.gemm_tn_accumulate_into(
+                    g,
+                    &m.block.tape.x_norm[..n * d],
+                    n,
+                    rows,
+                    d,
+                    &mut w.grad,
+                )
+                .expect("validated model GEMM dimensions");
+            } else {
+                stages::dense_input_adjoint(g, &w.data, n, rows, d, &mut self.gx[..n * d]);
+                stages::dense_weight_adjoint(
+                    g,
+                    &m.block.tape.x_norm[..n * d],
+                    n,
+                    rows,
+                    d,
+                    &mut w.grad,
+                );
+            }
             for (dst, src) in m.block.bwd_g_xnorm[..n * d].iter_mut().zip(&self.gx) {
                 *dst += src;
             }
