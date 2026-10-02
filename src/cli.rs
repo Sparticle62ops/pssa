@@ -1091,8 +1091,17 @@ impl CLIHandler {
     }
     fn run_chat(model_path: &str, data: Option<&str>, temp: f32) -> Result<(), String> {
         let (mut model, tokenizer) = Self::load_for_inference(model_path, data)?;
+        let memory_slots = std::iter::once(&model.block)
+            .chain(model.extra_blocks.iter())
+            .map(|block| block.memory.capacity)
+            .sum::<usize>();
+        let adapter_count = std::iter::once(&model.block)
+            .chain(model.extra_blocks.iter())
+            .map(|block| block.adapters.len())
+            .sum::<usize>();
         let mut engine = PSSAInferenceEngine::try_new(&mut model, &tokenizer)?;
-        println!("interactive: /exit");
+        let mut temp = temp;
+        println!("interactive: /exit  /info  /temp <value>");
         loop {
             print!("user> ");
             io::stdout().flush().map_err(|e| e.to_string())?;
@@ -1107,6 +1116,26 @@ impl CLIHandler {
             let p = line.trim();
             if p == "/exit" || p == "quit" {
                 break;
+            }
+            if p == "/info" {
+                println!("model: {model_path}");
+                println!("memory slots: {memory_slots}");
+                println!("adapters: {adapter_count}");
+                continue;
+            }
+            let mut words = p.split_whitespace();
+            if words.next() == Some("/temp") {
+                match (words.next(), words.next()) {
+                    (Some(value), None) => match value.parse::<f32>() {
+                        Ok(next) if next.is_finite() && next >= 0.0 => {
+                            temp = next;
+                            println!("temperature set to {temp:.4}");
+                        }
+                        _ => eprintln!("error: /temp value must be a finite number >= 0"),
+                    },
+                    _ => eprintln!("error: usage: /temp <value>"),
+                }
+                continue;
             }
             if p.is_empty() {
                 continue;
@@ -1721,6 +1750,7 @@ impl CLIHandler {
                 println!("  -t, --temp, --temperature <F> sampling temperature (default: 0.70)");
                 println!();
                 println!("Example: {bin} chat -m data/model.pssa --temperature 0.7");
+                println!("Commands: /exit (or quit), /info, /temp <value> (finite and >= 0)");
             }
             "score" | "score-transformer" => {
                 println!("Usage: {bin} {command} [DATA] [-m|--model PATH] [-d|--data SOURCE]");
