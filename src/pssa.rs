@@ -343,7 +343,12 @@ impl ChunkActivationTape {
         loops: usize,
     ) -> Self {
         assert!((1..=32).contains(&loops));
-        let loop_l = max_l * loops;
+        // The staged batched path uses the zero-offset region as a working
+        // buffer. Keep one extra runtime-only slot so loop zero survives the
+        // later passes for reverse-mode; the historical scalar tape shape is
+        // unchanged when loops == 1.
+        let saved_slots = if loops > 1 { loops + 1 } else { 1 };
+        let loop_l = max_l * saved_slots;
         Self {
             max_l,
             x_ids: vec![0; max_l],
@@ -358,7 +363,12 @@ impl ChunkActivationTape {
             bar_a: vec![0.0; loop_l * d_latent * d_state],
             bar_b: vec![0.0; loop_l * d_latent * d_state],
             // Extra loop carries are runtime-only, after the activation slots.
-            h_states: vec![0.0; (loops * (max_l + 1) + loops - 1) * d_latent * d_state],
+            h_states: vec![
+                (0.0f32);
+                (saved_slots * (max_l + 1) + loops.saturating_sub(1))
+                    * d_latent
+                    * d_state
+            ],
             y_ssm: vec![0.0; loop_l * d_latent],
             q_euc: vec![0.0; loop_l * d_key],
             q_norm: vec![0.0; loop_l],
@@ -676,19 +686,130 @@ impl PSSAContinuousBlockV2 {
     /// Each virtual pass has its own causal temporal carry, but shares every
     /// weight, optimizer moment and memory bank. Keeping these extra carries
     /// in runtime tape storage leaves the historical checkpoint state intact.
+    fn loop_count(&self) -> usize {
+        let slots = self.tape.x_raw.len() / (self.tape.max_l * self.cfg.d_latent);
+        if slots > 1 { slots - 1 } else { 1 }
+    }
+
+    fn saved_loop_slot(&self, loop_index: usize) -> usize {
+        assert!(loop_index < self.loop_count());
+        if loop_index == 0 && self.loop_count() > 1 {
+            self.loop_count()
+        } else {
+            loop_index
+        }
+    }
+
     pub(crate) fn loop_carry_start(&self) -> usize {
-        let loops = self.tape.x_raw.len() / (self.tape.max_l * self.cfg.d_latent);
-        loops * (self.tape.max_l + 1) * self.h_persistent.len()
+        let loops = self.loop_count();
+        let saved_slots = if loops > 1 { loops + 1 } else { 1 };
+        saved_slots * (self.tape.max_l + 1) * self.h_persistent.len()
     }
 
     fn swap_loop_carry(&mut self, loop_index: usize) {
         if loop_index != 0 {
             let start = self.loop_carry_start() + (loop_index - 1) * self.h_persistent.len();
-            for (state, stored) in self.h_persistent.iter_mut()
-                .zip(&mut self.tape.h_states[start..]) {
+            for (state, stored) in self
+                .h_persistent
+                .iter_mut()
+                .zip(&mut self.tape.h_states[start..])
+            {
                 std::mem::swap(state, stored);
             }
         }
+    }
+
+    fn copy_loop_field_to_base(field: &mut [f32], max_l: usize, width: usize, loop_index: usize) {
+        if loop_index == 0 {
+            return;
+        }
+        let len = max_l * width;
+        let offset = loop_index * len;
+        let (base, rest) = field.split_at_mut(offset);
+        base[..len].copy_from_slice(&rest[..len]);
+    }
+
+    fn copy_base_field_to_loop(field: &mut [f32], max_l: usize, width: usize, loop_index: usize) {
+        if loop_index == 0 {
+            return;
+        }
+        let len = max_l * width;
+        let offset = loop_index * len;
+        let (base, rest) = field.split_at_mut(offset);
+        rest[..len].copy_from_slice(&base[..len]);
+    }
+
+    /// Move one loop's saved activations into the historical zero-offset tape
+    /// used by the allocation-free batched stages.
+    pub(crate) fn copy_loop_tape_to_base(&mut self, loop_index: usize) {
+        let l = self.tape.max_l;
+        let d = self.cfg.d_latent;
+        let s = self.cfg.d_state;
+        let k = self.cfg.d_mem_key;
+        let mem = self.cfg.mem_capacity;
+        let rank = self.adapters[0].rank;
+        let saved_slot = self.saved_loop_slot(loop_index);
+        Self::copy_loop_field_to_base(&mut self.tape.x_raw, l, d, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.x_norm, l, d, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.inv_rms, l, 1, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.delta_raw, l, d, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.delta, l, d, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.b_proj, l, s, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.c_proj, l, s, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.bar_a, l, d * s, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.bar_b, l, d * s, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.y_ssm, l, d, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.q_euc, l, k, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.q_norm, l, 1, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.q_poincare, l, k, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.mem_weights, l, mem, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.m_val, l, d, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.g_mem, l, d, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.m_inj, l, d, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.m_proj, l, d, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.adapter_hidden, l, rank, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.adapter_act, l, rank, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.z_raw, l, d, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.mlp_hidden, l, 2 * d, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.mlp_act, l, 2 * d, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.z_final, l, d, saved_slot);
+        Self::copy_loop_field_to_base(&mut self.tape.h_states, l + 1, d * s, saved_slot);
+    }
+
+    /// Save the batched stages' zero-offset activations into one loop slot.
+    pub(crate) fn copy_base_tape_to_loop(&mut self, loop_index: usize) {
+        let l = self.tape.max_l;
+        let d = self.cfg.d_latent;
+        let s = self.cfg.d_state;
+        let k = self.cfg.d_mem_key;
+        let mem = self.cfg.mem_capacity;
+        let rank = self.adapters[0].rank;
+        let saved_slot = self.saved_loop_slot(loop_index);
+        Self::copy_base_field_to_loop(&mut self.tape.x_raw, l, d, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.x_norm, l, d, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.inv_rms, l, 1, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.delta_raw, l, d, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.delta, l, d, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.b_proj, l, s, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.c_proj, l, s, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.bar_a, l, d * s, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.bar_b, l, d * s, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.y_ssm, l, d, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.q_euc, l, k, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.q_norm, l, 1, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.q_poincare, l, k, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.mem_weights, l, mem, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.m_val, l, d, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.g_mem, l, d, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.m_inj, l, d, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.m_proj, l, d, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.adapter_hidden, l, rank, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.adapter_act, l, rank, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.z_raw, l, d, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.mlp_hidden, l, 2 * d, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.mlp_act, l, 2 * d, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.z_final, l, d, saved_slot);
+        Self::copy_base_field_to_loop(&mut self.tape.h_states, l + 1, d * s, saved_slot);
     }
 
     fn forward_inference_loop(&mut self, input: &[f32], output: &mut [f32], loop_index: usize) {
@@ -967,6 +1088,9 @@ impl PSSAContinuousBlockV2 {
         self.h_persistent
             .copy_from_slice(&self.tape.h_states[last_h_off..last_h_off + d_m * d_s]);
         self.swap_loop_carry(loop_index);
+        if loop_index == 0 && self.loop_count() > 1 {
+            self.copy_base_tape_to_loop(0);
+        }
     }
 
     pub fn zero_gradients(&mut self) {
@@ -1021,6 +1145,9 @@ impl PSSAContinuousBlockV2 {
 
         self.refresh_ssm_rates();
         self.grad_h_next.fill(0.0);
+        if loop_index == 0 && self.loop_count() > 1 {
+            self.copy_loop_tape_to_base(0);
+        }
         let loop_l = loop_index * self.tape.max_l;
         let loop_state = loop_index * (self.tape.max_l + 1);
         assert!(loop_index < self.tape.x_raw.len() / (self.tape.max_l * d_m));
@@ -1473,18 +1600,27 @@ impl PSSALayerV2 {
     /// allocation cap without adding anything to serialized configuration.
     pub fn validate_loops_config(cfg: &PSSAConfigV2, loops: usize) -> Result<(), String> {
         if !(1..=Self::MAX_LOOPS).contains(&loops) {
-            return Err("--loops must be between 1 and 32; use --loops 1 for the original model".into());
+            return Err(
+                "--loops must be between 1 and 32; use --loops 1 for the original model".into(),
+            );
         }
         crate::checkpoint::validate_model_config(cfg)?;
         let base = crate::checkpoint::allocation_bytes(cfg).map_err(|e| e.to_string())? as u128;
-        let (d, s, k, l, mem) = (cfg.d_latent as u128, cfg.d_state as u128,
-            cfg.d_mem_key as u128, cfg.chunk_len as u128, cfg.mem_capacity as u128);
+        let (d, s, k, l, mem) = (
+            cfg.d_latent as u128,
+            cfg.d_state as u128,
+            cfg.d_mem_key as u128,
+            cfg.chunk_len as u128,
+            cfg.mem_capacity as u128,
+        );
         // All float activation arrays except the one shared vocabulary head.
         // Each extra pass also has an initial state row and a persistent carry.
         let per_pass = l * (15 * d + 2 * s + 2 * k + mem + 34 + 3 * d * s) + 2 * d * s;
         let bytes = base + 4 * cfg.depth as u128 * (loops - 1) as u128 * per_pass;
         if bytes > crate::checkpoint::MAX_LOAD_ALLOCATION_BYTES as u128 {
-            return Err(format!("Ouro runtime needs {bytes} bytes, over the model byte cap; reduce --loops, --chunk, or model dimensions"));
+            return Err(format!(
+                "Ouro runtime needs {bytes} bytes, over the model byte cap; reduce --loops, --chunk, or model dimensions"
+            ));
         }
         Ok(())
     }
@@ -1546,9 +1682,8 @@ impl PSSALayerV2 {
             dst[..hs].copy_from_slice(&block.h_persistent);
             if self.loops() > 1 {
                 let start = block.loop_carry_start();
-                dst[hs..].copy_from_slice(
-                    &block.tape.h_states[start..start + (self.loops() - 1) * hs],
-                );
+                dst[hs..]
+                    .copy_from_slice(&block.tape.h_states[start..start + (self.loops() - 1) * hs]);
             }
         }
     }
@@ -1564,8 +1699,7 @@ impl PSSALayerV2 {
             block.h_persistent.copy_from_slice(&src[..hs]);
             if loops > 1 {
                 let start = block.loop_carry_start();
-                block.tape.h_states[start..start + (loops - 1) * hs]
-                    .copy_from_slice(&src[hs..]);
+                block.tape.h_states[start..start + (loops - 1) * hs].copy_from_slice(&src[hs..]);
             }
         }
     }
@@ -1587,11 +1721,14 @@ impl PSSALayerV2 {
                 }
             }
         } else {
-            self.inf_features.copy_from_slice(&self.embed_w.data[x_id * d..(x_id + 1) * d]);
-            let loop_scale = 1.0 / (loops as f32).sqrt();
+            self.inf_features
+                .copy_from_slice(&self.embed_w.data[x_id * d..(x_id + 1) * d]);
+            let loop_scale = 1.0 / loops as f32;
             for loop_index in 0..loops {
                 self.block.forward_inference_loop(
-                    &self.inf_features, &mut self.inf_block_out, loop_index,
+                    &self.inf_features,
+                    &mut self.inf_block_out,
+                    loop_index,
                 );
                 for i in 0..d {
                     self.inf_features[i] += loop_scale * self.inf_block_out[i];
@@ -1627,6 +1764,63 @@ impl PSSALayerV2 {
         for logit in logits_out {
             *logit *= logit_scale;
         }
+    }
+
+    /// Forward one weight-shared loop through the batched CPU/GPU stages.
+    /// The stage implementation historically addresses the zero-offset tape;
+    /// loop activations are copied into and out of that workspace so the
+    /// optimized path can be reused without changing checkpoint layout.
+    pub(crate) fn forward_train_chunk_batched_loop(&mut self, seq_len: usize, loop_index: usize) {
+        assert!(self.loops() > 1);
+        assert!(seq_len > 0 && seq_len <= self.cfg.chunk_len);
+        let d = self.cfg.d_latent;
+        let n = seq_len * d;
+        assert!(loop_index < self.loops());
+
+        self.block.swap_loop_carry(loop_index);
+        self.block.tape.x_raw[..n].copy_from_slice(&self.continuous_inputs[..n]);
+        let state_width = d * self.cfg.d_state;
+        self.block.tape.h_states[..state_width].copy_from_slice(&self.block.h_persistent);
+
+        crate::gpu_batch::stage_input_norm_block(&mut self.block, seq_len);
+        crate::gpu_batch::stage_projections(self, seq_len);
+        crate::gpu_batch::stage_ssm_scan(self, seq_len);
+        crate::gpu_batch::stage_memory(self, seq_len);
+        crate::gpu_batch::stage_adapter(self, seq_len);
+        crate::gpu_batch::stage_mlp(self, seq_len);
+
+        let last_h_off = seq_len * state_width;
+        self.block
+            .h_persistent
+            .copy_from_slice(&self.block.tape.h_states[last_h_off..last_h_off + state_width]);
+        self.block.copy_base_tape_to_loop(loop_index);
+        self.block.swap_loop_carry(loop_index);
+    }
+
+    /// Backward one weight-shared loop through the batched stages. Each pass
+    /// contributes to the shared parameter gradients, while the raw RMSNorm
+    /// adjoint is returned for the outer residual chain.
+    pub(crate) fn backward_train_chunk_batched_loop(&mut self, seq_len: usize, loop_index: usize) {
+        assert!(self.loops() > 1);
+        assert!(seq_len > 0 && seq_len <= self.cfg.chunk_len);
+        let d = self.cfg.d_latent;
+        let n = seq_len * d;
+        assert!(loop_index < self.loops());
+
+        self.block.copy_loop_tape_to_base(loop_index);
+        self.block.bwd_g_zfinal[..n].copy_from_slice(&self.input_adjoints[..n]);
+        crate::gpu_batch::bwd_stage_mlp(self, seq_len);
+        crate::gpu_batch::bwd_stage_adapter(self, seq_len);
+        crate::gpu_batch::bwd_stage_adapter_down(self, seq_len);
+        crate::gpu_batch::bwd_stage_memory(self, seq_len);
+        // The outer PSSA backward owns the embedding VJP. Every loop therefore
+        // stops at its continuous input, including loop zero.
+        crate::gpu_batch::bwd_stage_ssm_with_input(self, seq_len, false);
+        crate::gpu_batch::bwd_stage_input_norm(
+            &self.block,
+            seq_len,
+            &mut self.residual_input_adjoints[..n],
+        );
     }
 
     pub fn forward_train_chunk(&mut self, token_ids: &[usize], target_ids: &[usize]) -> f32 {
@@ -1675,13 +1869,9 @@ impl PSSALayerV2 {
                 }
             }
         } else {
-            let loop_scale = 1.0 / (loops as f32).sqrt();
+            let loop_scale = 1.0 / loops as f32;
             for loop_index in 0..loops {
-                self.block.forward_train_chunk_loop(
-                    &self.continuous_inputs[..n],
-                    seq_len,
-                    loop_index,
-                );
+                self.forward_train_chunk_batched_loop(seq_len, loop_index);
                 let off = loop_index * self.block.tape.max_l * d;
                 for i in 0..n {
                     self.continuous_inputs[i] += loop_scale * self.block.tape.z_final[off + i];
@@ -1823,7 +2013,7 @@ impl PSSALayerV2 {
                 &mut self.input_adjoints[..n],
             );
         } else {
-            let loop_scale = 1.0 / (loops as f32).sqrt();
+            let loop_scale = 1.0 / loops as f32;
             for layer in (0..self.extra_blocks.len()).rev() {
                 let depth_scale = self.residual_scales[layer];
                 for i in 0..n {
@@ -1853,12 +2043,7 @@ impl PSSALayerV2 {
                 for i in 0..n {
                     self.input_adjoints[i] = loop_scale * self.residual_block_adjoints[i];
                 }
-                self.block.backward_chunk_loop(
-                    &self.input_adjoints[..n],
-                    seq_len,
-                    &mut self.residual_input_adjoints[..n],
-                    loop_index,
-                );
+                self.backward_train_chunk_batched_loop(seq_len, loop_index);
                 for i in 0..n {
                     self.residual_block_adjoints[i] += self.residual_input_adjoints[i];
                 }
