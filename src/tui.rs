@@ -9,8 +9,11 @@
 use crate::ui;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Sparkline, Tabs, Wrap};
+use ratatui::widgets::{
+    Axis, Block, Borders, Chart, Dataset, GraphType, LegendPosition, Paragraph, Tabs, Wrap,
+};
 use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
@@ -28,6 +31,60 @@ const BRIGHT_RED: Color = Color::Rgb(0xff, 0x2f, 0x3f);
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const PROGRESS_INTERPOLATION: Duration = Duration::from_millis(450);
 const EIGHTH_BLOCKS: [&str; 8] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"];
+const GRAPH_MAX_ZOOM: usize = 8;
+const GRAPH_INTERPOLATION: Duration = Duration::from_millis(300);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MetricSample {
+    loss: Option<f64>,
+    tokens_per_second: Option<f64>,
+    learning_rate: Option<f64>,
+}
+
+impl MetricSample {
+    fn has_value(self) -> bool {
+        self.loss.is_some() || self.tokens_per_second.is_some() || self.learning_rate.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GraphView {
+    #[default]
+    Loss,
+    Perplexity,
+    TokensPerSecond,
+    LearningRate,
+    Comparison,
+    All,
+    Memory,
+}
+
+impl GraphView {
+    fn from_key(key: char) -> Option<Self> {
+        match key {
+            '1' => Some(Self::Loss),
+            '2' => Some(Self::Perplexity),
+            '3' => Some(Self::TokensPerSecond),
+            '4' => Some(Self::LearningRate),
+            '5' => Some(Self::Comparison),
+            '6' => Some(Self::All),
+            '7' => Some(Self::Memory),
+            _ => None,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Loss => Self::Perplexity,
+            Self::Perplexity => Self::TokensPerSecond,
+            Self::TokensPerSecond => Self::LearningRate,
+            Self::LearningRate => Self::Comparison,
+            Self::Comparison => Self::All,
+            Self::All => Self::Memory,
+            Self::Memory => Self::Loss,
+        }
+    }
+}
 
 #[derive(Default)]
 struct RunState {
@@ -57,8 +114,17 @@ struct RunState {
     checkpoint_number: Option<u64>,
     checkpoint_target: Option<String>,
     last_checkpoint: Option<String>,
-    // losses over time (for the sparkline)
+    // Parsed progress samples used by the real line charts. `loss_series` is
+    // retained for health checks and existing log compatibility tests.
     loss_series: Vec<f64>,
+    metric_series: Vec<MetricSample>,
+    graph_from: Option<MetricSample>,
+    graph_updated_at: Option<Instant>,
+    graph_view: GraphView,
+    graph_zoom: usize,
+    graph_pan: usize,
+    comparison_series: Vec<MetricSample>,
+    comparison_label: Option<String>,
     // Health checks are presentation-only; they never affect training.
     problem: Option<String>,
     warning: Option<String>,
@@ -182,6 +248,9 @@ impl RunState {
             self.problem = None;
             self.warning = None;
             self.loss_series.clear();
+            self.metric_series.clear();
+            self.graph_from = None;
+            self.graph_updated_at = None;
             self.tok_s_history.clear();
             self.progress_pct = None;
             self.progress_from = None;
@@ -260,6 +329,19 @@ impl RunState {
                 self.tok_s_history.push(speed.max(0.0));
                 if self.tok_s_history.len() > 31 {
                     self.tok_s_history.remove(0);
+                }
+            }
+            let sample = MetricSample {
+                loss: raw_loss.filter(|v| v.is_finite()),
+                tokens_per_second: speed,
+                learning_rate: parse_kv::<f64>(line, "learning_rate=").filter(|v| v.is_finite()),
+            };
+            if sample.has_value() {
+                self.graph_from = self.metric_series.last().copied();
+                self.graph_updated_at = Some(Instant::now());
+                self.metric_series.push(sample);
+                if self.metric_series.len() > 600 {
+                    self.metric_series.remove(0);
                 }
             }
             if let Some((_, eta)) = line.split_once("eta=").or_else(|| line.split_once("eta ")) {
@@ -572,6 +654,73 @@ impl RunState {
         let eased = t * t * (3.0 - 2.0 * t);
         from + (target - from) * eased
     }
+
+    fn displayed_metric_at(&self, now: Instant) -> Option<MetricSample> {
+        let target = self.metric_series.last().copied()?;
+        let Some(from) = self.graph_from else {
+            return Some(target);
+        };
+        let Some(started) = self.graph_updated_at else {
+            return Some(target);
+        };
+        let t = (now.saturating_duration_since(started).as_secs_f64()
+            / GRAPH_INTERPOLATION.as_secs_f64())
+        .clamp(0.0, 1.0);
+        let eased = t * t * (3.0 - 2.0 * t);
+        let lerp = |before: Option<f64>, after: Option<f64>| match (before, after) {
+            (Some(before), Some(after)) => Some(before + (after - before) * eased),
+            (None, Some(after)) => Some(after * eased),
+            (Some(before), None) => Some(before),
+            (None, None) => None,
+        };
+        Some(MetricSample {
+            loss: lerp(from.loss, target.loss),
+            tokens_per_second: lerp(from.tokens_per_second, target.tokens_per_second),
+            learning_rate: lerp(from.learning_rate, target.learning_rate),
+        })
+    }
+
+    fn graph_data_len(&self) -> usize {
+        self.metric_series.len().max(self.comparison_series.len())
+    }
+
+    fn visible_graph_range(&self) -> (usize, usize) {
+        let len = self.graph_data_len();
+        if len == 0 {
+            return (0, 0);
+        }
+        let visible = (len / self.graph_zoom.max(1)).max(2).min(len);
+        let max_start = len.saturating_sub(visible);
+        let start = self.graph_pan.min(max_start);
+        (start, start + visible)
+    }
+
+    fn zoom_graph(&mut self, inward: bool) {
+        if inward {
+            self.graph_zoom = (self.graph_zoom + 1).min(GRAPH_MAX_ZOOM);
+        } else {
+            self.graph_zoom = self.graph_zoom.saturating_sub(1).max(1);
+        }
+        self.graph_pan = self.graph_pan.min(self.graph_data_len().saturating_sub(1));
+    }
+
+    fn pan_graph(&mut self, right: bool) {
+        let (start, end) = self.visible_graph_range();
+        let step = ((end.saturating_sub(start)) / 4).max(1);
+        let max_start = self
+            .graph_data_len()
+            .saturating_sub(end.saturating_sub(start));
+        self.graph_pan = if right {
+            self.graph_pan.saturating_add(step).min(max_start)
+        } else {
+            self.graph_pan.saturating_sub(step)
+        };
+    }
+
+    fn reset_graph_navigation(&mut self) {
+        self.graph_zoom = 1;
+        self.graph_pan = 0;
+    }
 }
 
 /// Pull `label  value` from a banner/summary row (two-space separated).
@@ -655,7 +804,11 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-fn run_app(rx: mpsc::Receiver<String>, chain_dir: PathBuf) -> io::Result<()> {
+fn run_app(
+    rx: mpsc::Receiver<String>,
+    chain_dir: PathBuf,
+    compare_path: Option<PathBuf>,
+) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let mut state = RunState {
         chain_dir: chain_dir.clone(),
@@ -663,6 +816,7 @@ fn run_app(rx: mpsc::Receiver<String>, chain_dir: PathBuf) -> io::Result<()> {
     };
     let mut tab = 0usize;
     let mut last_chain_scan = std::time::Instant::now() - Duration::from_secs(60);
+    let mut last_compare_scan = std::time::Instant::now() - Duration::from_secs(60);
     let mut input_closed = false;
 
     loop {
@@ -683,6 +837,12 @@ fn run_app(rx: mpsc::Receiver<String>, chain_dir: PathBuf) -> io::Result<()> {
             state.refresh_chain();
             last_chain_scan = std::time::Instant::now();
         }
+        if let Some(path) = compare_path.as_deref()
+            && last_compare_scan.elapsed() > Duration::from_secs(1)
+        {
+            reload_comparison(&mut state, path);
+            last_compare_scan = std::time::Instant::now();
+        }
 
         terminal.draw(|f| draw(f, &state, tab))?;
         if input_closed {
@@ -697,11 +857,40 @@ fn run_app(rx: mpsc::Receiver<String>, chain_dir: PathBuf) -> io::Result<()> {
                         crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
                             break;
                         }
-                        crossterm::event::KeyCode::Tab | crossterm::event::KeyCode::Right => {
+                        crossterm::event::KeyCode::Tab => {
                             tab = (tab + 1) % TABS.len();
                         }
                         crossterm::event::KeyCode::Left => {
-                            tab = (tab + TABS.len() - 1) % TABS.len();
+                            if tab == 0 {
+                                state.pan_graph(false);
+                            } else {
+                                tab = (tab + TABS.len() - 1) % TABS.len();
+                            }
+                        }
+                        crossterm::event::KeyCode::Right => {
+                            if tab == 0 {
+                                state.pan_graph(true);
+                            } else {
+                                tab = (tab + 1) % TABS.len();
+                            }
+                        }
+                        crossterm::event::KeyCode::Char('g') => {
+                            if tab == 0 {
+                                state.graph_view = state.graph_view.next();
+                            }
+                        }
+                        crossterm::event::KeyCode::Char(key) => {
+                            if tab == 0 {
+                                if let Some(view) = GraphView::from_key(key) {
+                                    state.graph_view = view;
+                                } else if key == '+' || key == '=' {
+                                    state.zoom_graph(true);
+                                } else if key == '-' {
+                                    state.zoom_graph(false);
+                                } else if key == '0' {
+                                    state.reset_graph_navigation();
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -711,6 +900,22 @@ fn run_app(rx: mpsc::Receiver<String>, chain_dir: PathBuf) -> io::Result<()> {
     }
     ratatui::restore();
     Ok(())
+}
+
+fn reload_comparison(state: &mut RunState, path: &std::path::Path) {
+    let Ok(file) = std::fs::File::open(path) else {
+        state.comparison_series.clear();
+        state.comparison_label = None;
+        return;
+    };
+    let mut comparison = RunState::default();
+    for line in io::BufReader::new(file).lines().map_while(Result::ok) {
+        comparison.ingest(&line);
+    }
+    state.comparison_series = comparison.metric_series;
+    state.comparison_label = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
 }
 
 fn accent() -> Style {
@@ -942,7 +1147,7 @@ fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
     );
     if large_title {
         f.render_widget(
-            Paragraph::new("q quit   tab / ← → switch").right_aligned(),
+            Paragraph::new("q quit   tab switch   g/1-7 views   +/- zoom").right_aligned(),
             nav[1],
         );
     }
@@ -955,17 +1160,429 @@ fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum MetricKind {
+    Loss,
+    Perplexity,
+    TokensPerSecond,
+    LearningRate,
+}
+
+fn metric_value(sample: MetricSample, kind: MetricKind) -> Option<f64> {
+    let value = match kind {
+        MetricKind::Loss => sample.loss?,
+        MetricKind::Perplexity => sample.loss?.exp().min(1.0e9),
+        MetricKind::TokensPerSecond => sample.tokens_per_second?,
+        MetricKind::LearningRate => sample.learning_rate?,
+    };
+    value.is_finite().then_some(value.max(0.0))
+}
+
+fn moving_loss_at(
+    series: &[MetricSample],
+    index: usize,
+    latest: Option<MetricSample>,
+) -> Option<f64> {
+    let start = index.saturating_sub(7);
+    let mut values = Vec::new();
+    for i in start..=index {
+        let sample = if i + 1 == series.len() {
+            latest.unwrap_or(series[i])
+        } else {
+            series[i]
+        };
+        if let Some(loss) = sample.loss.filter(|v| v.is_finite()) {
+            values.push(loss);
+        }
+    }
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn metric_points(
+    series: &[MetricSample],
+    kind: MetricKind,
+    start: usize,
+    end: usize,
+    latest: Option<MetricSample>,
+) -> Vec<(f64, f64)> {
+    (start..end.min(series.len()))
+        .filter_map(|index| {
+            let sample = if index + 1 == series.len() {
+                latest.unwrap_or(series[index])
+            } else {
+                series[index]
+            };
+            let value = if matches!(kind, MetricKind::Loss) {
+                sample.loss
+            } else {
+                metric_value(sample, kind)
+            }?;
+            value.is_finite().then_some((index as f64, value.max(0.0)))
+        })
+        .collect()
+}
+
+fn moving_loss_points(
+    series: &[MetricSample],
+    start: usize,
+    end: usize,
+    latest: Option<MetricSample>,
+) -> Vec<(f64, f64)> {
+    (start..end.min(series.len()))
+        .filter_map(|index| {
+            moving_loss_at(series, index, latest).map(|value| (index as f64, value))
+        })
+        .collect()
+}
+
+fn normalize_points(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let bounds: Option<(f64, f64)> = points.iter().map(|(_, y)| *y).fold(None, |bounds, y| {
+        Some(match bounds {
+            Some((min, max)) => (min.min(y), max.max(y)),
+            None => (y, y),
+        })
+    });
+    let Some((min, max)) = bounds else {
+        return Vec::new();
+    };
+    if (max - min).abs() <= f64::EPSILON {
+        return points.iter().map(|(x, _)| (*x, 0.5)).collect();
+    }
+    points
+        .iter()
+        .map(|(x, y)| (*x, (*y - min) / (max - min)))
+        .collect()
+}
+
+fn graph_y_bounds(data: &[&[(f64, f64)]], normalized: bool) -> [f64; 2] {
+    if normalized {
+        return [0.0, 1.0];
+    }
+    let bounds: Option<(f64, f64)> = data
+        .iter()
+        .flat_map(|points| points.iter().copied())
+        .map(|(_, y)| y)
+        .filter(|y| y.is_finite())
+        .fold(None, |bounds, y| {
+            Some(match bounds {
+                Some((min, max)) => (min.min(y), max.max(y)),
+                None => (y, y),
+            })
+        });
+    let Some((min, max)) = bounds else {
+        return [0.0, 1.0];
+    };
+    if (max - min).abs() <= f64::EPSILON {
+        let padding = (max.abs() * 0.1).max(1.0e-6);
+        [min - padding, max + padding]
+    } else {
+        let padding = (max - min) * 0.08;
+        [min - padding, max + padding]
+    }
+}
+
+fn graph_dataset<'a>(name: &'static str, data: &'a [(f64, f64)], color: Color) -> Dataset<'a> {
+    Dataset::default()
+        .name(name)
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::new().fg(color))
+        .data(data)
+}
+
+fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant) {
+    let view = state.graph_view;
+    if view == GraphView::Memory {
+        draw_memory_graph(f, area, state);
+        return;
+    }
+    let (start, end) = state.visible_graph_range();
+    if end == 0 {
+        f.render_widget(
+            Paragraph::new("Waiting for progress samples...").block(panel(" graph / waiting ")),
+            area,
+        );
+        return;
+    }
+
+    let latest = state.displayed_metric_at(now);
+    let (loss, moving_loss, compare_loss, perplexity, tokens, learning_rate) = match view {
+        GraphView::Loss => (
+            Some(metric_points(
+                &state.metric_series,
+                MetricKind::Loss,
+                start,
+                end,
+                latest,
+            )),
+            Some(moving_loss_points(&state.metric_series, start, end, latest)),
+            None,
+            None,
+            None,
+            None,
+        ),
+        GraphView::Perplexity => (
+            None,
+            None,
+            None,
+            Some(metric_points(
+                &state.metric_series,
+                MetricKind::Perplexity,
+                start,
+                end,
+                latest,
+            )),
+            None,
+            None,
+        ),
+        GraphView::TokensPerSecond => (
+            None,
+            None,
+            None,
+            None,
+            Some(metric_points(
+                &state.metric_series,
+                MetricKind::TokensPerSecond,
+                start,
+                end,
+                latest,
+            )),
+            None,
+        ),
+        GraphView::LearningRate => (
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(metric_points(
+                &state.metric_series,
+                MetricKind::LearningRate,
+                start,
+                end,
+                latest,
+            )),
+        ),
+        GraphView::Comparison => (
+            None,
+            Some(moving_loss_points(&state.metric_series, start, end, latest)),
+            Some(moving_loss_points(
+                &state.comparison_series,
+                start,
+                end,
+                None,
+            )),
+            None,
+            None,
+            None,
+        ),
+        GraphView::All => (
+            Some(normalize_points(&metric_points(
+                &state.metric_series,
+                MetricKind::Loss,
+                start,
+                end,
+                latest,
+            ))),
+            None,
+            None,
+            Some(normalize_points(&metric_points(
+                &state.metric_series,
+                MetricKind::Perplexity,
+                start,
+                end,
+                latest,
+            ))),
+            Some(normalize_points(&metric_points(
+                &state.metric_series,
+                MetricKind::TokensPerSecond,
+                start,
+                end,
+                latest,
+            ))),
+            Some(normalize_points(&metric_points(
+                &state.metric_series,
+                MetricKind::LearningRate,
+                start,
+                end,
+                latest,
+            ))),
+        ),
+        GraphView::Memory => unreachable!(),
+    };
+    let mut data: Vec<(&'static str, &[(f64, f64)], Color)> = Vec::new();
+    match view {
+        GraphView::Loss => {
+            data.push(("loss", loss.as_deref().unwrap_or(&[]), NORMAL_GREEN));
+            data.push((
+                "moving avg",
+                moving_loss.as_deref().unwrap_or(&[]),
+                Color::Rgb(0x80, 0xf5, 0xa8),
+            ));
+        }
+        GraphView::Perplexity => {
+            data.push((
+                "perplexity",
+                perplexity.as_deref().unwrap_or(&[]),
+                NORMAL_GREEN,
+            ));
+        }
+        GraphView::TokensPerSecond => {
+            data.push(("tokens/sec", tokens.as_deref().unwrap_or(&[]), NORMAL_GREEN));
+        }
+        GraphView::LearningRate => {
+            data.push((
+                "learning rate",
+                learning_rate.as_deref().unwrap_or(&[]),
+                NORMAL_GREEN,
+            ));
+        }
+        GraphView::Comparison => {
+            data.push((
+                "current loss",
+                moving_loss.as_deref().unwrap_or(&[]),
+                NORMAL_GREEN,
+            ));
+            if compare_loss
+                .as_deref()
+                .is_some_and(|points| !points.is_empty())
+            {
+                data.push((
+                    "compare loss",
+                    compare_loss.as_deref().unwrap_or(&[]),
+                    Color::Rgb(0x55, 0xd7, 0xff),
+                ));
+            }
+        }
+        GraphView::All => {
+            data.push(("loss", loss.as_deref().unwrap_or(&[]), NORMAL_GREEN));
+            data.push((
+                "perplexity",
+                perplexity.as_deref().unwrap_or(&[]),
+                Color::Rgb(0x55, 0xd7, 0xff),
+            ));
+            data.push((
+                "tokens/sec",
+                tokens.as_deref().unwrap_or(&[]),
+                Color::Rgb(0xc7, 0x92, 0xea),
+            ));
+            data.push((
+                "learning rate",
+                learning_rate.as_deref().unwrap_or(&[]),
+                Color::Rgb(0xff, 0xd1, 0x66),
+            ));
+        }
+        GraphView::Memory => unreachable!(),
+    }
+    let normalized = view == GraphView::All;
+
+    let datasets: Vec<_> = data
+        .iter()
+        .map(|(name, points, color)| graph_dataset(name, points, *color))
+        .collect();
+    let x_start = start as f64;
+    let x_end = (end.saturating_sub(1).max(start) as f64).max(x_start + 1.0);
+    let y_bounds = graph_y_bounds(
+        &data
+            .iter()
+            .map(|(_, points, _)| *points)
+            .collect::<Vec<_>>(),
+        normalized,
+    );
+    let mut title = match view {
+        GraphView::Loss => " graph / loss + moving average ",
+        GraphView::Perplexity => " graph / perplexity (exp loss) ",
+        GraphView::TokensPerSecond => " graph / tokens per second ",
+        GraphView::LearningRate => " graph / learning rate ",
+        GraphView::Comparison => {
+            if state.comparison_series.is_empty() {
+                " graph / comparison (use --compare LOG) "
+            } else {
+                " graph / comparison "
+            }
+        }
+        GraphView::All => " graph / normalized overlay ",
+        GraphView::Memory => unreachable!(),
+    }
+    .to_string();
+    if view == GraphView::Comparison && !state.comparison_series.is_empty() {
+        if let Some(label) = state.comparison_label.as_deref() {
+            title = format!(" graph / comparison / {label} ");
+        }
+    }
+    let chart = Chart::new(datasets)
+        .block(panel(&title))
+        .legend_position(Some(LegendPosition::TopRight))
+        .x_axis(
+            Axis::default()
+                .title("update")
+                .style(accent().add_modifier(Modifier::DIM))
+                .bounds([x_start, x_end])
+                .labels([
+                    format!("{start}"),
+                    format!("{}", (start + end.saturating_sub(1)) / 2),
+                    format!("{}", end.saturating_sub(1)),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .title(if normalized { "normalized" } else { "value" })
+                .style(accent().add_modifier(Modifier::DIM))
+                .bounds(y_bounds)
+                .labels([
+                    format!("{:.3}", y_bounds[0]),
+                    format!("{:.3}", (y_bounds[0] + y_bounds[1]) / 2.0),
+                    format!("{:.3}", y_bounds[1]),
+                ]),
+        );
+    f.render_widget(chart, area);
+}
+
+fn draw_memory_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
+    let mut boundary = Vec::with_capacity(97);
+    for step in 0..=96 {
+        let angle = std::f64::consts::TAU * step as f64 / 96.0;
+        boundary.push((angle.cos(), angle.sin()));
+    }
+    let occupancy = state.memory_used.unwrap_or(0) as usize;
+    let capacity = state.memory_capacity.unwrap_or(0) as usize;
+    let plotted = occupancy.min(256);
+    let mut entries = Vec::with_capacity(plotted);
+    for index in 0..plotted {
+        let fraction = (index as f64 + 0.5) / plotted.max(1) as f64;
+        let radius = 0.12 + 0.78 * fraction.sqrt();
+        let angle = index as f64 * 2.399963229728653;
+        entries.push((radius * angle.cos(), radius * angle.sin()));
+    }
+    let disk_points = vec![
+        graph_dataset("unit circle", &boundary, Color::Rgb(0x32, 0x8f, 0x60)),
+        graph_dataset("occupied entries", &entries, NORMAL_GREEN),
+    ];
+    let occupancy_label = if capacity > 0 {
+        format!("{occupancy}/{capacity}")
+    } else {
+        "not reported".to_string()
+    };
+    let title = format!(" memory / Poincare disk / occupancy only ({occupancy_label}) ");
+    let chart = Chart::new(disk_points)
+        .block(panel(&title))
+        .legend_position(Some(LegendPosition::TopRight))
+        .x_axis(Axis::default().bounds([-1.1, 1.1]).labels(["-1", "0", "1"]))
+        .y_axis(Axis::default().bounds([-1.1, 1.1]).labels(["-1", "0", "1"]));
+    f.render_widget(chart, area);
+}
+
 fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     // Prefer the metrics to a squashed graph on short terminals. Each visible
     // panel retains at least one content row and a complete top/bottom border.
-    let show_history = area.height >= 16;
+    let show_graph = area.height >= 14;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
-            Constraint::Min(if show_history { 3 } else { 0 }),
-            Constraint::Length(if show_history {
-                10
+            Constraint::Min(if show_graph { 6 } else { 0 }),
+            Constraint::Length(if show_graph {
+                9
             } else {
                 area.height.saturating_sub(4)
             }),
@@ -987,27 +1604,8 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         .map(|n| n.to_string())
         .unwrap_or_else(|| "-".into());
 
-    if show_history {
-        let block = panel(" loss history (raw updates) ");
-        if state.loss_series.is_empty() {
-            f.render_widget(
-                Paragraph::new("Waiting for progress samples...").block(block),
-                chunks[1],
-            );
-        } else {
-            let data: Vec<u64> = state
-                .loss_series
-                .iter()
-                .map(|l| (l.max(0.0) * 1000.0) as u64)
-                .collect();
-            f.render_widget(
-                Sparkline::default()
-                    .block(block)
-                    .data(&data)
-                    .style(Style::new().fg(health.color())),
-                chunks[1],
-            );
-        }
+    if show_graph {
+        draw_graph(f, chunks[1], state, Instant::now());
     }
 
     let memory = match (state.memory_used, state.memory_capacity) {
@@ -1071,7 +1669,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         )),
     ];
     f.render_widget(
-        Paragraph::new(lines).block(panel(if show_history {
+        Paragraph::new(lines).block(panel(if show_graph {
             " run metrics "
         } else {
             " run metrics / compact "
@@ -1144,6 +1742,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     // Keep the default useful on a local checkout; Kaggle callers can pass
     // their mounted chain explicitly (the training scripts already do).
     let mut chain_dir = PathBuf::from("chain");
+    let mut compare_path = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1161,9 +1760,23 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 chain_dir = PathBuf::from(value);
                 i += 1;
             }
+            "--compare" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "option '--compare' requires a log file; usage: oxide tui [--compare LOG]"
+                        .to_string()
+                })?;
+                if value.starts_with('-') {
+                    return Err(
+                        "option '--compare' requires a log file; usage: oxide tui [--compare LOG]"
+                            .to_string(),
+                    );
+                }
+                compare_path = Some(PathBuf::from(value));
+                i += 1;
+            }
             other => {
                 return Err(format!(
-                    "unknown tui flag '{other}'; usage: oxide tui [-c|--chain DIR]"
+                    "unknown tui flag '{other}'; usage: oxide tui [-c|--chain DIR] [--compare LOG]"
                 ));
             }
         }
@@ -1171,9 +1784,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
 
     if io::stdin().is_terminal() {
-        println!("Usage: oxide_ai_pssa train ... --no-tui | oxide_ai_pssa tui [-c|--chain DIR]");
         println!(
-            "Example: oxide_ai_pssa train data/corpus.txt -o chain/ck01.pssa --no-tui | oxide_ai_pssa tui --chain chain"
+            "Usage: oxide_ai_pssa train ... --no-tui | oxide_ai_pssa tui [-c|--chain DIR] [--compare LOG]"
+        );
+        println!(
+            "Example: oxide_ai_pssa train data/corpus.txt -o chain/ck01.pssa --no-tui | oxide_ai_pssa tui --chain chain --compare baseline.log"
         );
         return Ok(());
     }
@@ -1201,7 +1816,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
     });
 
-    if let Err(e) = run_app(rx, chain_dir) {
+    if let Err(e) = run_app(rx, chain_dir, compare_path) {
         ratatui::restore();
         return Err(e.to_string());
     }
@@ -1498,6 +2113,99 @@ mod tests {
         let visible = state.displayed_progress_at(Instant::now());
         assert!(visible >= state.progress_from.unwrap());
         assert!(visible <= 50.0);
+    }
+
+    #[test]
+    fn chart_samples_include_derived_metrics_and_moving_average() {
+        let mut state = RunState::default();
+        for (step, loss) in [4.0, 3.5, 3.0, 2.5].into_iter().enumerate() {
+            state.ingest(&format!(
+                "training {}/10 ({}%) loss={loss} tokens_per_second={} learning_rate=0.00{} eta=1s",
+                step + 1,
+                (step + 1) * 10,
+                100 + step,
+                step + 1
+            ));
+        }
+        assert_eq!(state.metric_series.len(), 4);
+        let (start, end) = state.visible_graph_range();
+        let loss = metric_points(
+            &state.metric_series,
+            MetricKind::Loss,
+            start,
+            end,
+            state.displayed_metric_at(Instant::now()),
+        );
+        let moving = moving_loss_points(
+            &state.metric_series,
+            start,
+            end,
+            state.displayed_metric_at(Instant::now()),
+        );
+        let perplexity = metric_points(
+            &state.metric_series,
+            MetricKind::Perplexity,
+            start,
+            end,
+            None,
+        );
+        assert_eq!(loss.len(), 4);
+        assert_eq!(moving.len(), 4);
+        assert_eq!(perplexity.len(), 4);
+        assert!((perplexity[0].1 - 4.0_f64.exp()).abs() < 1e-10);
+        assert!(moving[3].1 < moving[0].1);
+    }
+
+    #[test]
+    fn test_backend_renders_braille_chart_views_and_memory_disk() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = RunState::default();
+        for (step, loss) in [4.0, 3.8, 3.4, 3.1, 2.9, 2.7].into_iter().enumerate() {
+            state.ingest(&format!(
+                "training {}/10 ({}%) loss={loss} tokens_per_second={} learning_rate=0.001 eta=1s",
+                step + 1,
+                (step + 1) * 10,
+                100 + step
+            ));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("graph / loss + moving average"));
+        assert!(buffer.content().iter().any(|cell| {
+            cell.symbol()
+                .chars()
+                .next()
+                .is_some_and(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
+        }));
+
+        state.graph_view = GraphView::All;
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("graph / normalized overlay"));
+
+        state.graph_view = GraphView::Memory;
+        state.memory_used = Some(12);
+        state.memory_capacity = Some(64);
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Poincare disk"));
+        assert!(text.contains("12/64"));
     }
 
     #[test]
