@@ -161,6 +161,35 @@ fn full_batched_forward_and_backward_match_reference() {
 }
 
 #[test]
+fn parallel_memory_retrieval_matches_scalar_reference() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        let mut config = cfg();
+        config.d_vocab = 33;
+        config.d_latent = 32;
+        config.d_state = 2;
+        config.d_mem_key = 8;
+        config.mem_capacity = 512;
+        config.chunk_len = 64;
+        let mut reference = PSSALayerV2::new(config.clone(), 19);
+        let mut staged = PSSALayerV2::new(config, 19);
+        populate(&mut reference);
+        populate(&mut staged);
+        let ids: Vec<usize> = (0..64).map(|t| t % 33).collect();
+        let targets: Vec<usize> = (0..64).map(|t| (t + 1) % 33).collect();
+        let reference_loss = reference.forward_train_chunk(&ids, &targets);
+        let staged_loss = gpu_batch::forward_train_chunk_batched(&mut staged, &ids, &targets);
+        assert!((reference_loss - staged_loss).abs() < 1e-5);
+        reference.backward_chunk(64, 0.7);
+        gpu_batch::backward_chunk_batched(&mut staged, 64, 0.7);
+        assert!(max_model_grad_diff(&reference, &staged) < 1e-5);
+    });
+}
+
+#[test]
 fn coarse_parallel_backward_matches_scalar_with_accumulated_gradients() {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(4)

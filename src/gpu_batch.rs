@@ -30,6 +30,17 @@ fn parallel_backward(tokens: usize, rows: usize, cols: usize) -> bool {
     blocked_backward(tokens, rows, cols) && rayon::current_num_threads() > 1
 }
 
+// Retrieval is independent per token while the bank is read-only. Avoid
+// waking Rayon for tiny probes, but spread training-sized linear scans over
+// all available workers.
+fn parallel_memory_work(tokens: usize, count: usize, key: usize, value: usize) -> bool {
+    tokens
+        .saturating_mul(count)
+        .saturating_mul(key.saturating_add(value))
+        >= 1_048_576
+        && rayon::current_num_threads() > 1
+}
+
 /// The tree scan has more arithmetic and synchronization than the sequential
 /// recurrence at the short chunk lengths used by the trainer. Keep that fast
 /// path allocation-free and serial; only enable the scan once there is enough
@@ -599,6 +610,62 @@ fn stage_ssm_scan_parallel(m: &mut PSSALayerV2, seq_len: usize) {
     );
 }
 
+#[inline]
+fn retrieve_memory_row(
+    memory: &HyperbolicEpisodicBankV2,
+    q_euc: &[f32],
+    q_poincare: &mut [f32],
+    q_norm: &mut f32,
+    value: &mut [f32],
+    weights: &mut [f32],
+    tau: f32,
+) {
+    *q_norm = HyperbolicEpisodicBankV2::diffeomorphic_project(q_euc, q_poincare);
+    memory.retrieve_soft_into(q_poincare, tau, value, weights);
+}
+
+fn retrieve_memory_rows(
+    memory: &HyperbolicEpisodicBankV2,
+    q_euc: &[f32],
+    q_poincare: &mut [f32],
+    q_norm: &mut [f32],
+    values: &mut [f32],
+    weights: &mut [f32],
+    seq_len: usize,
+    d_key: usize,
+    d_value: usize,
+    capacity: usize,
+    tau: f32,
+    parallel: bool,
+) {
+    assert_eq!(q_euc.len(), seq_len * d_key);
+    assert_eq!(q_poincare.len(), seq_len * d_key);
+    assert_eq!(q_norm.len(), seq_len);
+    assert_eq!(values.len(), seq_len * d_value);
+    assert_eq!(weights.len(), seq_len * capacity);
+    if parallel {
+        q_euc
+            .par_chunks(d_key)
+            .zip(q_poincare.par_chunks_mut(d_key))
+            .zip(q_norm.par_iter_mut())
+            .zip(values.par_chunks_mut(d_value))
+            .zip(weights.par_chunks_mut(capacity))
+            .for_each(|((((q_euc, q_poincare), q_norm), value), weights)| {
+                retrieve_memory_row(memory, q_euc, q_poincare, q_norm, value, weights, tau);
+            });
+    } else {
+        q_euc
+            .chunks(d_key)
+            .zip(q_poincare.chunks_mut(d_key))
+            .zip(q_norm.iter_mut())
+            .zip(values.chunks_mut(d_value))
+            .zip(weights.chunks_mut(capacity))
+            .for_each(|((((q_euc, q_poincare), q_norm), value), weights)| {
+                retrieve_memory_row(memory, q_euc, q_poincare, q_norm, value, weights, tau);
+            });
+    }
+}
+
 /// Stage 4: Poincare query projection, diffeomorphic projection, soft
 /// retrieval, memory gate and injection for every token. Nonlinear retrieval
 /// stays outside the affine scan and reads an immutable bank. Protected writes
@@ -655,21 +722,21 @@ pub fn stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
             }
         }
     }
-    for t in 0..seq_len {
-        let q_off = t * d_k;
-        let m_off = t * d_m;
-        let mw_off = t * mem_cap;
-        m.tape.q_norm[t] = HyperbolicEpisodicBankV2::diffeomorphic_project(
-            &m.tape.q_euc[q_off..q_off + d_k],
-            &mut m.tape.q_poincare[q_off..q_off + d_k],
-        );
-        m.memory.retrieve_soft_into(
-            &m.tape.q_poincare[q_off..q_off + d_k],
-            m.cfg.tau_mem,
-            &mut m.tape.m_val[m_off..m_off + d_m],
-            &mut m.tape.mem_weights[mw_off..mw_off + mem_cap],
-        );
-    }
+    let parallel = parallel_memory_work(seq_len, m.memory.count, d_k, d_m);
+    retrieve_memory_rows(
+        &m.memory,
+        &m.tape.q_euc[..seq_len * d_k],
+        &mut m.tape.q_poincare[..seq_len * d_k],
+        &mut m.tape.q_norm[..seq_len],
+        &mut m.tape.m_val[..seq_len * d_m],
+        &mut m.tape.mem_weights[..seq_len * mem_cap],
+        seq_len,
+        d_k,
+        d_m,
+        mem_cap,
+        m.cfg.tau_mem,
+        parallel,
+    );
 
     // Gate, memory projection and injection as batched GEMMs over the chunk.
     batched_matvec_dev(
@@ -1778,10 +1845,64 @@ pub fn bwd_stage_adapter_down(m: &mut PSSALayerV2, seq_len: usize) {
     }
 }
 
+#[inline]
+fn memory_query_adjoint(
+    memory: &HyperbolicEpisodicBankV2,
+    q_poincare: &[f32],
+    q_euc: &[f32],
+    g_m_val: &[f32],
+    m_val: &[f32],
+    weights: &[f32],
+    tau: f32,
+    g_query_pnc: &mut [f32],
+    g_query_euc: &mut [f32],
+) {
+    let d_key = memory.dim_key;
+    let d_value = memory.dim_val;
+    assert_eq!(q_poincare.len(), d_key);
+    assert_eq!(q_euc.len(), d_key);
+    assert_eq!(g_m_val.len(), d_value);
+    assert_eq!(m_val.len(), d_value);
+    assert_eq!(weights.len(), memory.capacity);
+    g_query_pnc.fill(0.0);
+    let q_sq = HyperbolicEpisodicBankV2::squared_norm(q_poincare) as f64;
+    for entry in 0..memory.count {
+        let key_off = entry * d_key;
+        let key = &memory.keys[key_off..key_off + d_key];
+        let key_sq = memory.norm_sq[entry] as f64;
+        let mut dot_g_value_minus_mean = 0.0f64;
+        let value_off = entry * d_value;
+        for j in 0..d_value {
+            dot_g_value_minus_mean +=
+                g_m_val[j] as f64 * (memory.values[value_off + j] - m_val[j]) as f64;
+        }
+        let g_score = weights[entry] as f64 * dot_g_value_minus_mean;
+        let mut sq = 0.0f64;
+        for k in 0..d_key {
+            let diff = q_poincare[k] as f64 - key[k] as f64;
+            sq += diff * diff;
+        }
+        if sq > 0.0 {
+            let denom = (1.0 - q_sq) * (1.0 - key_sq);
+            assert!(denom > 0.0 && denom.is_finite());
+            let z = sq / denom;
+            let dd_dz = 1.0 / (z * (1.0 + z)).sqrt();
+            for k in 0..d_key {
+                let diff = q_poincare[k] as f64 - key[k] as f64;
+                let ddenom = -2.0 * q_poincare[k] as f64 * (1.0 - key_sq);
+                let dz = (2.0 * diff * denom - sq * ddenom) / (denom * denom);
+                g_query_pnc[k] +=
+                    (g_score * (-1.0 / tau as f64) * dd_dz * dz) as f32;
+            }
+        }
+    }
+    HyperbolicEpisodicBankV2::projection_adjoint(q_euc, g_query_pnc, g_query_euc);
+}
+
 /// Backward Stage 4: memory injection adjoint (gate, w_proj, memory query
 /// adjoint incl. hyperbolic distance chain), accumulating grad_x_norm.
-/// The per-token hyperbolic retrieval adjoint is inherently serial over the
-/// memory bank; token loops here mirror the reference accumulation order.
+/// Retrieval VJPs are independent per token and use Rayon for training-sized
+/// banks; shared parameter rows retain the reference reverse-token reduction.
 #[inline]
 pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
     let gpu = gpu_ctx(m).filter(|g| g.accelerates_backward());
@@ -1891,90 +2012,59 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
         );
     }
 
-    // Hyperbolic retrieval adjoint, reverse time.
-    for t in (0..l).rev() {
-        let q_off = t * d_k;
-        let m_off = t * d_m;
-        let q = &m.tape.q_poincare[q_off..q_off + d_k];
-        let q_sq = HyperbolicEpisodicBankV2::squared_norm(q) as f64;
-
-        m.g_query_pnc.fill(0.0);
-        // The projection adjoint was retained per token above; using one
-        // model-owned row here would accidentally reuse another token's value.
-        let g_m_val = &gate_x[m_off..m_off + d_m];
-
-        for entry in 0..m.memory.count {
-            let key_off = entry * d_k;
-            let key = &m.memory.keys[key_off..key_off + d_k];
-            let key_sq = m.memory.norm_sq[entry] as f64;
-            let mut dot_g_value_minus_mean = 0.0f64;
-            let value_off = entry * d_m;
-            for j in 0..d_m {
-                dot_g_value_minus_mean += g_m_val[j] as f64
-                    * (m.memory.values[value_off + j] - m.tape.m_val[m_off + j]) as f64;
-            }
-            let g_score = m.tape.mem_weights[t * mem_cap + entry] as f64 * dot_g_value_minus_mean;
-            let mut sq = 0.0f64;
-            for k in 0..d_k {
-                let diff = q[k] as f64 - key[k] as f64;
-                sq += diff * diff;
-            }
-            if sq > 0.0 {
-                let denom = (1.0 - q_sq) * (1.0 - key_sq);
-                assert!(denom > 0.0 && denom.is_finite());
-                let z = sq / denom;
-                let dd_dz = 1.0 / (z * (1.0 + z)).sqrt();
-                for k in 0..d_k {
-                    let diff = q[k] as f64 - key[k] as f64;
-                    let ddenom = -2.0 * q[k] as f64 * (1.0 - key_sq);
-                    let dz = (2.0 * diff * denom - sq * ddenom) / (denom * denom);
-                    m.g_query_pnc[k] +=
-                        (g_score * (-1.0 / m.cfg.tau_mem as f64) * dd_dz * dz) as f32;
-                }
-            }
-        }
-        HyperbolicEpisodicBankV2::projection_adjoint(
-            &m.tape.q_euc[q_off..q_off + d_k],
-            &m.g_query_pnc,
-            &mut m.g_query_euc,
-        );
-        if let Some(gpu) = gpu.as_ref() {
-            m.bwd_g_query_euc[q_off..q_off + d_k].copy_from_slice(&m.g_query_euc);
-            // Keep the q_h input adjoint in the per-token buffer. It is also
-            // the SSM readout adjoint and is overwritten by the batched GEMM
-            // after the retrieval loop has consumed all projection rows.
-            m.g_y_ssm.fill(0.0);
-            for r_i in 0..d_k {
-                let gq = m.g_query_euc[r_i];
-                let row = r_i * d_m;
-                for j in 0..d_m {
-                    m.g_y_ssm[j] += gq * m.w_qh.data[row + j];
-                }
-            }
-            m.bwd_g_ysm[m_off..m_off + d_m].copy_from_slice(&m.g_y_ssm);
-            let _ = gpu;
-        } else {
-            m.g_y_ssm.fill(0.0);
-            let xn = &m.tape.x_norm[m_off..m_off + d_m];
-            let y = &m.tape.y_ssm[m_off..m_off + d_m];
-            for r_i in 0..d_k {
-                let gq = m.g_query_euc[r_i];
-                let row = r_i * d_m;
-                for j in 0..d_m {
-                    m.w_qx.grad[row + j] += gq * xn[j];
-                    m.w_qh.grad[row + j] += gq * y[j];
-                    m.bwd_g_xnorm[m_off + j] += gq * m.w_qx.data[row + j];
-                    m.g_y_ssm[j] += gq * m.w_qh.data[row + j];
-                }
-            }
-            // Per-token g_y_ssm stored for the SSM stage.
-            m.bwd_g_ysm[m_off..m_off + d_m].copy_from_slice(&m.g_y_ssm);
-        }
+    // Every retrieval VJP reads the same immutable bank and writes one query
+    // row. Materialize those rows in parallel, then reduce shared CPU weight
+    // gradients in the historical reverse-token order.
+    let parallel = parallel_memory_work(l, m.memory.count, d_k, d_m);
+    let memory = &m.memory;
+    let q_poincare = &m.tape.q_poincare[..l * d_k];
+    let q_euc = &m.tape.q_euc[..l * d_k];
+    let m_values = &m.tape.m_val[..l * d_m];
+    let mem_weights = &m.tape.mem_weights[..l * mem_cap];
+    let g_m_values = &gate_x[..l * d_m];
+    let query_pnc = &mut m.bwd_g_query_pnc[..l * d_k];
+    let query_euc = &mut m.bwd_g_query_euc[..l * d_k];
+    if parallel {
+        query_pnc
+            .par_chunks_mut(d_k)
+            .zip(query_euc.par_chunks_mut(d_k))
+            .enumerate()
+            .for_each(|(t, (pnc, euc))| {
+                memory_query_adjoint(
+                    memory,
+                    &q_poincare[t * d_k..(t + 1) * d_k],
+                    &q_euc[t * d_k..(t + 1) * d_k],
+                    &g_m_values[t * d_m..(t + 1) * d_m],
+                    &m_values[t * d_m..(t + 1) * d_m],
+                    &mem_weights[t * mem_cap..(t + 1) * mem_cap],
+                    m.cfg.tau_mem,
+                    pnc,
+                    euc,
+                );
+            });
+    } else {
+        query_pnc
+            .chunks_mut(d_k)
+            .zip(query_euc.chunks_mut(d_k))
+            .enumerate()
+            .for_each(|(t, (pnc, euc))| {
+                memory_query_adjoint(
+                    memory,
+                    &q_poincare[t * d_k..(t + 1) * d_k],
+                    &q_euc[t * d_k..(t + 1) * d_k],
+                    &g_m_values[t * d_m..(t + 1) * d_m],
+                    &m_values[t * d_m..(t + 1) * d_m],
+                    &mem_weights[t * mem_cap..(t + 1) * mem_cap],
+                    m.cfg.tau_mem,
+                    pnc,
+                    euc,
+                );
+            });
     }
     if let Some(gpu) = gpu.as_ref() {
         gemm_tn_dev_accumulate(
             Some(gpu),
-            &m.bwd_g_query_euc[..l * d_k],
+            query_euc,
             &m.tape.x_norm[..l * d_m],
             l,
             d_k,
@@ -1983,7 +2073,7 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
         );
         gemm_tn_dev_accumulate(
             Some(gpu),
-            &m.bwd_g_query_euc[..l * d_k],
+            query_euc,
             &m.tape.y_ssm[..l * d_m],
             l,
             d_k,
@@ -1992,7 +2082,7 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
         );
         gemm_nn_dev_into(
             Some(gpu),
-            &m.bwd_g_query_euc[..l * d_k],
+            query_euc,
             &m.w_qx.data,
             l,
             d_k,
@@ -2007,13 +2097,34 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
         }
         gemm_nn_dev_into(
             Some(gpu),
-            &m.bwd_g_query_euc[..l * d_k],
+            query_euc,
             &m.w_qh.data,
             l,
             d_k,
             d_m,
             &mut m.bwd_g_ysm[..l * d_m],
         );
+    } else {
+        m.g_y_ssm.fill(0.0);
+        for t in (0..l).rev() {
+            let q_off = t * d_k;
+            let m_off = t * d_m;
+            let xn = &m.tape.x_norm[m_off..m_off + d_m];
+            let y = &m.tape.y_ssm[m_off..m_off + d_m];
+            let query = &query_euc[q_off..q_off + d_k];
+            for r_i in 0..d_k {
+                let gq = query[r_i];
+                let row = r_i * d_m;
+                for j in 0..d_m {
+                    m.w_qx.grad[row + j] += gq * xn[j];
+                    m.w_qh.grad[row + j] += gq * y[j];
+                    m.bwd_g_xnorm[m_off + j] += gq * m.w_qx.data[row + j];
+                    m.g_y_ssm[j] += gq * m.w_qh.data[row + j];
+                }
+            }
+            m.bwd_g_ysm[m_off..m_off + d_m].copy_from_slice(&m.g_y_ssm);
+            m.g_y_ssm.fill(0.0);
+        }
     }
 }
 
