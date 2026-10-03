@@ -1863,12 +1863,12 @@ impl CLIHandler {
                 println!("Example: {bin} help train");
             }
             "tui" => {
-                println!("Usage: {bin} tui [-c|--chain DIR]");
+                println!("Usage: {bin} tui [-c|--chain DIR] [--compare LOG]");
                 println!();
                 println!(
                     "Render a live dashboard for a piped training run; piped output is passed through plainly."
                 );
-                println!("Example: {bin} train data/downloaded.txt --no-tui | {bin} tui");
+                println!("Example: {bin} train data/downloaded.txt --no-tui | {bin} tui --compare transformer.log");
             }
             _ => return Err(format!("unknown command '{command}'; run {bin} help")),
         }
