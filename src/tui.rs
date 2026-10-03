@@ -10,10 +10,10 @@ use crate::ui;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Sparkline, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Sparkline, Tabs, Wrap};
 use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 const TABS: [&str; 3] = ["monitor", "chain", "model"];
@@ -26,6 +26,8 @@ const NORMAL_GREEN: Color = Color::Rgb(0x39, 0xe0, 0x7a);
 const AMBER: Color = Color::Rgb(0xff, 0xbf, 0x00);
 const BRIGHT_RED: Color = Color::Rgb(0xff, 0x2f, 0x3f);
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+const PROGRESS_INTERPOLATION: Duration = Duration::from_millis(450);
+const EIGHTH_BLOCKS: [&str; 8] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"];
 
 #[derive(Default)]
 struct RunState {
@@ -36,7 +38,12 @@ struct RunState {
     memory: Option<String>,
     schedule: Option<String>,
     // monitor tab
+    // `progress_pct` is the latest target from the log. The two animation
+    // fields keep the bar moving smoothly between producer updates without
+    // changing the parsed value used by the rest of the dashboard.
     progress_pct: Option<f64>,
+    progress_from: Option<f64>,
+    progress_updated_at: Option<Instant>,
     live_loss: Option<f64>,
     loss_average: Option<f64>,
     tok_s: Option<f64>,
@@ -176,6 +183,9 @@ impl RunState {
             self.warning = None;
             self.loss_series.clear();
             self.tok_s_history.clear();
+            self.progress_pct = None;
+            self.progress_from = None;
+            self.progress_updated_at = None;
         }
 
         let raw_loss = parse_kv::<f64>(line, "loss=").or_else(|| parse_kv(line, "loss "));
@@ -209,6 +219,17 @@ impl RunState {
                 }
             }
             if let Some(p) = parse_pct(line) {
+                let now = Instant::now();
+                let current = self.displayed_progress_at(now);
+                if self.progress_pct.is_none() {
+                    self.progress_from = Some(p);
+                    self.progress_updated_at = Some(now);
+                } else if self.progress_pct != Some(p) {
+                    // Start the next tween at the currently visible value so
+                    // closely spaced updates never cause a backwards jump.
+                    self.progress_from = Some(current);
+                    self.progress_updated_at = Some(now);
+                }
                 self.progress_pct = Some(p);
             }
             // ui::Progress emits key=value fields when piped, and a bar
@@ -533,6 +554,24 @@ impl RunState {
     fn health_status(&self) -> HealthStatus {
         self.health_status_at(Instant::now())
     }
+
+    fn displayed_progress_at(&self, now: Instant) -> f64 {
+        let target = self.progress_pct.unwrap_or(0.0).clamp(0.0, 100.0);
+        let Some(started) = self.progress_updated_at else {
+            return target;
+        };
+        let from = self.progress_from.unwrap_or(target).clamp(0.0, 100.0);
+        if !self.training_active {
+            return target;
+        }
+        let t = (now.saturating_duration_since(started).as_secs_f64()
+            / PROGRESS_INTERPOLATION.as_secs_f64())
+        .clamp(0.0, 1.0);
+        // Smoothstep gives the bar a gentle ease-in/ease-out rather than a
+        // visibly mechanical jump between the trainer's samples.
+        let eased = t * t * (3.0 - 2.0 * t);
+        from + (target - from) * eased
+    }
 }
 
 /// Pull `label  value` from a banner/summary row (two-space separated).
@@ -716,6 +755,99 @@ fn status_badge(health: &HealthStatus) -> Line<'static> {
     Line::from(spans)
 }
 
+fn progress_gradient(index: u16, width: u16) -> Color {
+    let denominator = f64::from(width.saturating_sub(1).max(1));
+    let t = (f64::from(index) / denominator).clamp(0.0, 1.0);
+    let channel = |start: u8, end: u8| {
+        (f64::from(start) + (f64::from(end) - f64::from(start)) * t).round() as u8
+    };
+    Color::Rgb(
+        channel(0x16, 0x39),
+        channel(0x73, 0xe0),
+        channel(0x45, 0x7a),
+    )
+}
+
+fn shine_position(width: u16) -> Option<u16> {
+    if width == 0 {
+        return None;
+    }
+    static ANIMATION_START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = ANIMATION_START.get_or_init(Instant::now).elapsed();
+    Some(((elapsed.as_millis() / 45) as u16) % width)
+}
+
+fn progress_label(state: &RunState, pct: f64, width: u16) -> String {
+    let done = state
+        .updates_done
+        .or(state.optimizer_updates)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "-".into());
+    let total = state
+        .updates_total
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "-".into());
+    let eta = state.eta.as_deref().unwrap_or("-");
+    if width >= 48 {
+        format!("{pct:>3.0}%   updates {done}/{total}   ETA {eta}")
+    } else if width >= 28 {
+        format!("{pct:>3.0}%  {done}/{total}  ETA {eta}")
+    } else {
+        format!("{pct:>3.0}% {done}/{total}")
+    }
+}
+
+fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64) {
+    let block = panel(" progress ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+
+    let ratio = (pct / 100.0).clamp(0.0, 1.0);
+    let total_eighths = (ratio * f64::from(inner.width) * 8.0).round() as u16;
+    let full_cells = total_eighths / 8;
+    let partial = usize::from(total_eighths % 8);
+    let shine = shine_position(inner.width);
+    for index in 0..inner.width {
+        let (symbol, mut style) = if index < full_cells {
+            (
+                EIGHTH_BLOCKS[7],
+                Style::new().fg(progress_gradient(index, inner.width)),
+            )
+        } else if index == full_cells && partial > 0 {
+            (
+                EIGHTH_BLOCKS[partial - 1],
+                Style::new().fg(progress_gradient(index, inner.width)),
+            )
+        } else {
+            ("░", Style::new().fg(Color::Rgb(0x0d, 0x2b, 0x1d)))
+        };
+        let filled = index < full_cells || (index == full_cells && partial > 0);
+        if shine == Some(index) && filled {
+            // A single-cell glint keeps the bar lively without obscuring its
+            // green gradient or turning it into a second status color.
+            style = Style::new().fg(Color::Rgb(0x9a, 0xff, 0xb9));
+        }
+        style = style.bg(Color::Black);
+        if let Some(cell) = f.buffer_mut().cell_mut((inner.x + index, inner.y)) {
+            cell.set_symbol(symbol);
+            cell.set_style(style);
+        }
+    }
+    if inner.height >= 2 {
+        let label = progress_label(state, pct, inner.width);
+        f.buffer_mut().set_stringn(
+            inner.x,
+            inner.y + 1,
+            label,
+            usize::from(inner.width),
+            Style::new().fg(NORMAL_GREEN).add_modifier(Modifier::BOLD),
+        );
+    }
+}
+
 fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
     let area = f.area();
     if area.is_empty() {
@@ -830,17 +962,21 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Min(if show_history { 3 } else { 0 }),
-            Constraint::Length(if show_history { 10 } else { area.height - 3 }),
+            Constraint::Length(if show_history {
+                10
+            } else {
+                area.height.saturating_sub(4)
+            }),
         ])
         .split(area);
 
-    let pct = state.progress_pct.unwrap_or(0.0);
-    let loss = state.live_loss.or(state.epoch_loss).unwrap_or(0.0);
-    let average = state.loss_average.or(state.live_loss).unwrap_or(loss);
     let health = state.health_status();
     let health_style = Style::new().fg(health.color()).add_modifier(Modifier::BOLD);
+    let display_pct = state.displayed_progress_at(Instant::now());
+    draw_progress(f, chunks[0], state, display_pct);
+
     let done = state
         .updates_done
         .or(state.optimizer_updates)
@@ -850,20 +986,6 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         .updates_total
         .map(|n| n.to_string())
         .unwrap_or_else(|| "-".into());
-    let label = if area.width >= 80 {
-        format!("{pct:.0}%  |  updates {done}/{total}  |  loss {loss:.4}  avg {average:.4}")
-    } else {
-        format!("{pct:.0}%  {done}/{total}  loss {loss:.4}")
-    };
-    // Phase 2 only restyles the frame; keep the existing gauge and sparkline.
-    f.render_widget(
-        Gauge::default()
-            .label(Span::styled(label, health_style))
-            .ratio((pct / 100.0).clamp(0.0, 1.0))
-            .gauge_style(Style::new().fg(health.color()).bg(Color::Black))
-            .block(panel(" monitor ")),
-        chunks[0],
-    );
 
     if show_history {
         let block = panel(" loss history (raw updates) ");
@@ -1325,6 +1447,57 @@ mod tests {
         assert!(row(0).contains("┌"));
         assert!(row(2).contains("└"));
         assert!(row(1).contains("[ TRAINING ]"));
+    }
+
+    #[test]
+    fn test_backend_renders_eighth_block_bar_gradient_and_metrics() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::collections::HashSet;
+
+        let mut state = RunState::default();
+        state.ingest(
+            "training 13/100 (13%) loss=4.0 tokens_per_second=100 optimizer_updates=13 updates_total=100 eta=12s",
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            text.contains("▏")
+                || text.contains("▎")
+                || text.contains("▍")
+                || text.contains("▌")
+                || text.contains("▋")
+                || text.contains("▊")
+                || text.contains("▉")
+        );
+        assert!(text.contains("13%"));
+        assert!(text.contains("updates 13/100"));
+        assert!(text.contains("ETA 12s"));
+
+        let colors: HashSet<_> = buffer
+            .content()
+            .iter()
+            .filter(|cell| EIGHTH_BLOCKS.contains(&cell.symbol()))
+            .map(|cell| cell.fg)
+            .collect();
+        assert!(
+            colors.len() >= 2,
+            "the filled bar should use a green gradient"
+        );
+    }
+
+    #[test]
+    fn progress_bar_interpolates_between_targets() {
+        let mut state = RunState::default();
+        state.ingest("training 10/100 (10%) loss=4.0 tokens_per_second=100 eta=1s");
+        state.ingest("training 50/100 (50%) loss=4.0 tokens_per_second=100 eta=1s");
+        assert!(state.progress_from.unwrap() >= 10.0);
+        assert!(state.progress_from.unwrap() < 50.0);
+        let visible = state.displayed_progress_at(Instant::now());
+        assert!(visible >= state.progress_from.unwrap());
+        assert!(visible <= 50.0);
     }
 
     #[test]
