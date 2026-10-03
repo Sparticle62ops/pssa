@@ -884,6 +884,7 @@ fn actual_block_storage(b: &oxide_ai_pssa::pssa::PSSAContinuousBlockV2) -> usize
         bwd_ssm_delta,
         bwd_ssm_b,
         bwd_ssm_c,
+        bwd_g_query_pnc,
         bwd_ssm_a,
     } = b;
     let params: usize = [
@@ -967,7 +968,8 @@ fn actual_block_storage(b: &oxide_ai_pssa::pssa::PSSAContinuousBlockV2) -> usize
     ]
     .into_iter()
     .map(vector_bytes)
-    .sum();
+    .sum::<usize>()
+        + vector_bytes(bwd_g_query_pnc);
     let oxide_ai_pssa::memory::HyperbolicEpisodicBankV2 {
         capacity: _,
         count: _,
