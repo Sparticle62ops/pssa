@@ -7,13 +7,21 @@
 //! and exits, and Ctrl+C / q always hands the terminal back cleanly.
 
 use crate::ui;
-use ratatui::style::Color;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Sparkline, Tabs, Wrap};
 use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const TABS: [&str; 3] = ["monitor", "chain", "model"];
+const PSSA_LOGO: [&str; 3] = [
+    "███  ████  ████   ███",
+    "█ █  █     █      █ █",
+    "███  ████  ████   ███",
+];
 const NORMAL_GREEN: Color = Color::Rgb(0x39, 0xe0, 0x7a);
 const AMBER: Color = Color::Rgb(0xff, 0xbf, 0x00);
 const BRIGHT_RED: Color = Color::Rgb(0xff, 0x2f, 0x3f);
@@ -666,54 +674,165 @@ fn run_app(rx: mpsc::Receiver<String>, chain_dir: PathBuf) -> io::Result<()> {
     Ok(())
 }
 
+fn accent() -> Style {
+    Style::new().fg(NORMAL_GREEN)
+}
+
+fn panel(title: &str) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(accent().add_modifier(Modifier::DIM))
+        .title(Line::styled(title, accent().add_modifier(Modifier::BOLD)))
+}
+
+fn divider(width: u16) -> Line<'static> {
+    Line::styled(
+        "╌".repeat(width.into()),
+        accent().add_modifier(Modifier::DIM),
+    )
+}
+
+fn status_badge(health: &HealthStatus) -> Line<'static> {
+    let label = match health.level {
+        HealthLevel::Problem => "ERROR",
+        HealthLevel::Warning | HealthLevel::Normal => {
+            if health.normal_label == "DONE" {
+                "DONE"
+            } else {
+                "TRAINING"
+            }
+        }
+    };
+    let mut spans = vec![Span::styled(
+        format!("[ {label} ]"),
+        Style::new().fg(health.color()).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(reason) = &health.reason {
+        spans.push(Span::styled(
+            format!("  {reason}"),
+            Style::new().fg(health.color()),
+        ));
+    }
+    Line::from(spans)
+}
+
 fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
     let area = f.area();
-    if area.height == 0 {
+    if area.is_empty() {
         return;
     }
-    let header = ratatui::layout::Layout::default()
-        .direction(ratatui::layout::Direction::Vertical)
+    f.render_widget(
+        Block::default().style(Style::new().fg(Color::Gray).bg(Color::Black)),
+        area,
+    );
+    let health = state.health_status();
+    // Do not squeeze bordered widgets into one-cell fragments on tiny screens.
+    if area.width < 30 || area.height < 10 {
+        let detail = match tab {
+            0 => format!(
+                "{:.0}%  loss {:.4}",
+                state.progress_pct.unwrap_or(0.0),
+                state.live_loss.or(state.epoch_loss).unwrap_or(0.0)
+            ),
+            1 => format!(
+                "{} checkpoints in {}",
+                state.checkpoints.len(),
+                state.chain_dir.display()
+            ),
+            _ => format!("width {}", state.width.as_deref().unwrap_or("-")),
+        };
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    format!("PSSA / {}", TABS[tab.min(TABS.len() - 1)]),
+                    accent(),
+                ),
+                status_badge(&health),
+                Line::from(detail),
+                Line::from("q quit / tab switch"),
+                Line::from("Enlarge for full view"),
+            ]),
+            area,
+        );
+        return;
+    }
+    let large_title = area.width >= 80 && area.height >= 22;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
         .constraints([
-            ratatui::layout::Constraint::Length(1),
-            ratatui::layout::Constraint::Length(1),
-            ratatui::layout::Constraint::Min(0),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
         ])
         .split(area);
-    let title = "oxide tui  |  q quit  tab switch";
-    f.render_widget(
-        ratatui::widgets::Paragraph::new(ratatui::text::Line::styled(
-            title,
-            ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::DIM),
-        )),
-        header[0],
-    );
-    let tabs = ratatui::widgets::Tabs::new(TABS)
-        .select(tab)
-        .highlight_style(
-            ratatui::style::Style::new()
-                .fg(ratatui::style::Color::Cyan)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        )
-        .padding("", "");
-    f.render_widget(tabs, header[1]);
-    if area.height < 3 {
-        return;
+    let header = chunks[0];
+    if area.width >= 40 {
+        f.render_widget(
+            Paragraph::new(PSSA_LOGO.map(|row| Line::styled(row, accent())).to_vec()),
+            Rect::new(header.x, header.y, 24, 3),
+        );
+        f.render_widget(
+            Paragraph::new(status_badge(&health)).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::new().fg(health.color())),
+            ),
+            Rect::new(header.x + 24, header.y, header.width - 24, 3),
+        );
+    } else {
+        let title = if area.width >= 34 {
+            "PSSA / oxide tui  q quit  tab switch"
+        } else {
+            "PSSA / oxide tui  q quit"
+        };
+        f.render_widget(
+            Paragraph::new(vec![Line::styled(title, accent()), status_badge(&health)]),
+            header,
+        );
     }
+    let nav = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(29), Constraint::Min(0)])
+        .split(chunks[1]);
+    f.render_widget(
+        Tabs::new(TABS)
+            .select(tab)
+            .style(accent().add_modifier(Modifier::DIM))
+            .highlight_style(
+                accent()
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                    .remove_modifier(Modifier::DIM),
+            )
+            .divider(" / ")
+            .padding(" ", " "),
+        nav[0],
+    );
+    if large_title {
+        f.render_widget(
+            Paragraph::new("q quit   tab / ← → switch").right_aligned(),
+            nav[1],
+        );
+    }
+    f.render_widget(Paragraph::new(divider(area.width)), chunks[2]);
 
     match tab {
-        0 => draw_monitor(f, header[2], state),
-        1 => draw_chain(f, header[2], state),
-        _ => draw_model(f, header[2], state),
+        0 => draw_monitor(f, chunks[3], state),
+        1 => draw_chain(f, chunks[3], state),
+        _ => draw_model(f, chunks[3], state),
     }
 }
 
-fn draw_monitor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &RunState) {
-    let chunks = ratatui::layout::Layout::default()
-        .direction(ratatui::layout::Direction::Vertical)
+fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
+    // Prefer the metrics to a squashed graph on short terminals. Each visible
+    // panel retains at least one content row and a complete top/bottom border.
+    let show_history = area.height >= 16;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
         .constraints([
-            ratatui::layout::Constraint::Length(5),
-            ratatui::layout::Constraint::Min(6),
-            ratatui::layout::Constraint::Length(9),
+            Constraint::Length(3),
+            Constraint::Min(if show_history { 3 } else { 0 }),
+            Constraint::Length(if show_history { 10 } else { area.height - 3 }),
         ])
         .split(area);
 
@@ -721,9 +840,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Run
     let loss = state.live_loss.or(state.epoch_loss).unwrap_or(0.0);
     let average = state.loss_average.or(state.live_loss).unwrap_or(loss);
     let health = state.health_status();
-    let health_style = ratatui::style::Style::default()
-        .fg(health.color())
-        .add_modifier(ratatui::style::Modifier::BOLD);
+    let health_style = Style::new().fg(health.color()).add_modifier(Modifier::BOLD);
     let done = state
         .updates_done
         .or(state.optimizer_updates)
@@ -733,41 +850,43 @@ fn draw_monitor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Run
         .updates_total
         .map(|n| n.to_string())
         .unwrap_or_else(|| "-".into());
-    let gauge = ratatui::widgets::Gauge::default()
-        .label(ratatui::text::Span::styled(
-            format!(
-                "{pct:.0}%  |  updates {done}/{total}  |  loss {loss:.4}  avg {average:.4}  |  {}",
-                health.label()
-            ),
-            health_style,
-        ))
-        .ratio((pct / 100.0).clamp(0.0, 1.0))
-        .gauge_style(
-            ratatui::style::Style::new()
-                .fg(health.color())
-                .bg(ratatui::style::Color::Black),
-        )
-        .block(
-            ratatui::widgets::Block::default()
-                .title(" monitor ")
-                .borders(ratatui::widgets::Borders::ALL),
-        );
-    f.render_widget(gauge, chunks[0]);
+    let label = if area.width >= 80 {
+        format!("{pct:.0}%  |  updates {done}/{total}  |  loss {loss:.4}  avg {average:.4}")
+    } else {
+        format!("{pct:.0}%  {done}/{total}  loss {loss:.4}")
+    };
+    // Phase 2 only restyles the frame; keep the existing gauge and sparkline.
+    f.render_widget(
+        Gauge::default()
+            .label(Span::styled(label, health_style))
+            .ratio((pct / 100.0).clamp(0.0, 1.0))
+            .gauge_style(Style::new().fg(health.color()).bg(Color::Black))
+            .block(panel(" monitor ")),
+        chunks[0],
+    );
 
-    let data: Vec<u64> = state
-        .loss_series
-        .iter()
-        .map(|l| (l.max(0.0) * 1000.0) as u64)
-        .collect();
-    let spark = ratatui::widgets::Sparkline::default()
-        .block(
-            ratatui::widgets::Block::default()
-                .title(" loss history (raw updates) ")
-                .borders(ratatui::widgets::Borders::ALL),
-        )
-        .data(&data)
-        .style(ratatui::style::Style::new().fg(health.color()));
-    f.render_widget(spark, chunks[1]);
+    if show_history {
+        let block = panel(" loss history (raw updates) ");
+        if state.loss_series.is_empty() {
+            f.render_widget(
+                Paragraph::new("Waiting for progress samples...").block(block),
+                chunks[1],
+            );
+        } else {
+            let data: Vec<u64> = state
+                .loss_series
+                .iter()
+                .map(|l| (l.max(0.0) * 1000.0) as u64)
+                .collect();
+            f.render_widget(
+                Sparkline::default()
+                    .block(block)
+                    .data(&data)
+                    .style(Style::new().fg(health.color())),
+                chunks[1],
+            );
+        }
+    }
 
     let memory = match (state.memory_used, state.memory_capacity) {
         (Some(used), Some(capacity)) if capacity > 0 => {
@@ -783,22 +902,18 @@ fn draw_monitor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Run
         (_, Some(path)) => path.to_string(),
         _ => "not configured".into(),
     };
-    let last_checkpoint = state
-        .last_checkpoint
-        .as_deref()
-        .unwrap_or("not written yet");
     let lines = vec![
-        ratatui::text::Line::from(vec![
-            ratatui::text::Span::raw("status       "),
-            ratatui::text::Span::styled(health.label(), health_style),
+        Line::from(vec![
+            Span::raw("status      "),
+            Span::styled(health.label(), health_style),
         ]),
-        ratatui::text::Line::from(format!(
-            "speed       {:>7.0} tokens/s    ETA {}",
+        Line::from(format!(
+            "speed       {:.0} tokens/s  ETA {}",
             state.tok_s.unwrap_or(0.0),
             state.eta.as_deref().unwrap_or("-")
         )),
-        ratatui::text::Line::from(format!(
-            "optimizer   {done}/{total} updates    {} remaining    lr {}",
+        Line::from(format!(
+            "optimizer   {done}/{total} updates  {} remaining  lr {}",
             state
                 .updates_remaining
                 .map(|n| n.to_string())
@@ -808,16 +923,22 @@ fn draw_monitor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Run
                 .map(|lr| format!("{lr:.6e}"))
                 .unwrap_or_else(|| "-".into())
         )),
-        ratatui::text::Line::from(format!("memory bank {memory}")),
-        ratatui::text::Line::from(format!("checkpoint  {checkpoint}")),
-        ratatui::text::Line::from(format!("last saved  {last_checkpoint}")),
-        ratatui::text::Line::from(format!(
+        Line::from(format!("memory bank {memory}")),
+        Line::from(format!("checkpoint  {checkpoint}")),
+        Line::from(format!(
+            "last saved  {}",
+            state
+                .last_checkpoint
+                .as_deref()
+                .unwrap_or("not written yet")
+        )),
+        Line::from(format!(
             "last epoch  loss {:.4}   tokens {}   updates {}",
             state.epoch_loss.unwrap_or(0.0),
             state.epoch_tokens.unwrap_or(0),
             state.epoch_updates.unwrap_or(0)
         )),
-        ratatui::text::Line::from(format!(
+        Line::from(format!(
             "run         wall {}   resumed from {}   prior steps {}",
             state.wall.as_deref().unwrap_or("-"),
             state.resumed_from.as_deref().unwrap_or("-"),
@@ -828,70 +949,71 @@ fn draw_monitor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Run
         )),
     ];
     f.render_widget(
-        ratatui::widgets::Paragraph::new(lines).block(
-            ratatui::widgets::Block::default()
-                .title(" run metrics ")
-                .borders(ratatui::widgets::Borders::ALL),
-        ),
+        Paragraph::new(lines).block(panel(if show_history {
+            " run metrics "
+        } else {
+            " run metrics / compact "
+        })),
         chunks[2],
     );
 }
 
-fn draw_chain(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &RunState) {
-    let rows: Vec<ratatui::text::Line> = if state.checkpoints.is_empty() {
-        vec![ratatui::text::Line::from(format!(
-            "no checkpoint files found in {}",
-            state.chain_dir.display()
-        ))]
+fn draw_chain(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
+    let mut rows = vec![
+        Line::from(format!("directory  {}", state.chain_dir.display())),
+        divider(area.width.saturating_sub(2)),
+    ];
+    if state.checkpoints.is_empty() {
+        rows.push(Line::from("No checkpoint files found yet."));
     } else {
         let last = state.checkpoints.len().saturating_sub(1);
-        state
-            .checkpoints
-            .iter()
-            .enumerate()
-            .map(|(i, (name, loss))| {
-                let marker = if i == last { "●" } else { "○" };
-                let style = NORMAL_GREEN;
-                let loss_text = loss
-                    .map(|l| format!("{l:.4}"))
-                    .unwrap_or_else(|| "—".into());
-                let suffix = if i == last { "  (latest)" } else { "" };
-                ratatui::text::Line::styled(
-                    format!("{marker} {name}  loss {loss_text}{suffix}"),
-                    ratatui::style::Style::new().fg(style),
-                )
-            })
-            .collect()
-    };
-    let block = ratatui::widgets::Paragraph::new(rows).block(
-        ratatui::widgets::Block::default()
-            .title(format!(" chain ({}) ", state.chain_dir.display()))
-            .borders(ratatui::widgets::Borders::ALL),
+        rows.extend(
+            state
+                .checkpoints
+                .iter()
+                .enumerate()
+                .map(|(i, (name, loss))| {
+                    let marker = if i == last { "●" } else { "○" };
+                    let loss_text = loss
+                        .map(|l| format!("{l:.4}"))
+                        .unwrap_or_else(|| "—".into());
+                    let suffix = if i == last { "  (latest)" } else { "" };
+                    Line::styled(
+                        format!("{marker} {name}  loss {loss_text}{suffix}"),
+                        accent(),
+                    )
+                }),
+        );
+    }
+    f.render_widget(
+        Paragraph::new(rows)
+            .wrap(Wrap { trim: false })
+            .block(panel(" chain / checkpoints ")),
+        area,
     );
-    f.render_widget(block, area);
 }
 
-fn draw_model(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &RunState) {
-    let rows = [
-        ("corpus", state.corpus.clone()),
-        ("vocabulary", state.vocab.clone()),
-        ("width", state.width.clone()),
-        ("memory", state.memory.clone()),
-        ("schedule", state.schedule.clone()),
+fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
+    let mut lines = vec![
+        Line::from("Configuration from the training log"),
+        divider(area.width.saturating_sub(2)),
     ];
-    let lines: Vec<ratatui::text::Line> = rows
-        .iter()
-        .map(|(label, value)| {
-            let value = value.clone().unwrap_or_else(|| "-".into());
-            ratatui::text::Line::from(format!("{label:<14}{value}"))
-        })
-        .collect();
+    for (label, value) in [
+        ("corpus", &state.corpus),
+        ("vocabulary", &state.vocab),
+        ("width", &state.width),
+        ("memory", &state.memory),
+        ("schedule", &state.schedule),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label:<14}"), accent()),
+            Span::raw(value.as_deref().unwrap_or("not reported")),
+        ]));
+    }
     f.render_widget(
-        ratatui::widgets::Paragraph::new(lines).block(
-            ratatui::widgets::Block::default()
-                .title(" model ")
-                .borders(ratatui::widgets::Borders::ALL),
-        ),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(panel(" model / configuration ")),
         area,
     );
 }
@@ -1172,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_keeps_title_and_tabs_in_separate_rows() {
+    fn test_backend_renders_retro_header_and_closed_status_box() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -1194,11 +1316,34 @@ mod tests {
                 })
                 .collect()
         };
-        assert!(row(0).contains("oxide tui"));
-        assert!(row(1).contains("monitor"));
-        assert!(row(1).contains("chain"));
-        assert!(row(1).contains("model"));
-        assert!(!row(1).contains("modelt"));
+        assert!(row(0).contains("███"));
+        assert!(row(3).contains("monitor"));
+        assert!(row(3).contains("chain"));
+        assert!(row(3).contains("model"));
+        assert!(!row(3).contains("modelt"));
+        assert!(row(4).contains("╌"));
+        assert!(row(0).contains("┌"));
+        assert!(row(2).contains("└"));
+        assert!(row(1).contains("[ TRAINING ]"));
+    }
+
+    #[test]
+    fn test_backend_renders_done_status_badge() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = RunState::default();
+        state.ingest("training 1/1 (100%) loss=4.0 tokens_per_second=100 optimizer_updates=1 updates_total=1");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("[ DONE ]"));
     }
 
     #[test]
