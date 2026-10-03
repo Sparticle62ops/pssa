@@ -1,6 +1,8 @@
 use crate::backend::{Device, gemm_cpu_reference};
 use crate::checkpoint::{self, CheckpointFormat};
-use crate::dataset::{DatasetManager, Tokenizer, TokenizerKind, clean_wikitext};
+use crate::dataset::{
+    DatasetManager, HuggingFaceDatasetOptions, Tokenizer, TokenizerKind, clean_wikitext,
+};
 use crate::inference::{InferenceConfig, PSSAInferenceEngine};
 use crate::pssa::{PSSAConfigV2, PSSALayerV2};
 use crate::ui;
@@ -37,6 +39,12 @@ pub struct TrainingOptions {
     pub seed: u64,
     /// A global cap across documents; documents are never individually reset to this cap.
     pub max_tokens: Option<usize>,
+    /// Optional streamed Hugging Face dataset source. These fields are
+    /// runtime-only and are deliberately not written into checkpoints.
+    pub hf_dataset: Option<String>,
+    pub hf_config: Option<String>,
+    pub hf_split: String,
+    pub hf_field: String,
     pub tokenizer: TokenizerKind,
     pub vocab_size: usize,
     /// Continue training from an existing checkpoint instead of fresh initialization.
@@ -72,6 +80,10 @@ impl Default for TrainingOptions {
             schedule_total_updates: None,
             seed: 42,
             max_tokens: None,
+            hf_dataset: None,
+            hf_config: None,
+            hf_split: "train".into(),
+            hf_field: "text".into(),
             skip_tokens: 0,
             tokenizer: TokenizerKind::Bpe,
             vocab_size: 2048,
@@ -319,6 +331,16 @@ impl CLIHandler {
                         .map_err(|_| "--max-tokens must be a positive integer".to_string())
                 })
                 .transpose()?,
+            hf_dataset: parsed.string("--hf-dataset", "").map(str::to_string),
+            hf_config: parsed.string("--hf-config", "").map(str::to_string),
+            hf_split: parsed
+                .string("--hf-split", "")
+                .unwrap_or("train")
+                .to_string(),
+            hf_field: parsed
+                .string("--hf-field", "")
+                .unwrap_or("text")
+                .to_string(),
             tokenizer,
             vocab_size: parsed.usize_nonzero("--vocab-size", "", 2048)?,
             resume: parsed.string("--resume", "").map(str::to_string),
@@ -339,6 +361,26 @@ impl CLIHandler {
             && (parsed.flags.contains_key("--loss-every") || x.tokens_seen.is_some())
         {
             return Err("--loss-every and --tokens-seen require --loss-csv PATH".into());
+        }
+        if let Some(dataset) = x.hf_dataset.as_deref() {
+            DatasetManager::validate_huggingface_dataset_name(dataset)?;
+            if x.hf_split.trim().is_empty() {
+                return Err("--hf-split must not be empty".into());
+            }
+            if x.hf_field.trim().is_empty() {
+                return Err("--hf-field must not be empty".into());
+            }
+            if x.hf_config
+                .as_deref()
+                .is_some_and(|config| config.trim().is_empty())
+            {
+                return Err("--hf-config must not be empty".into());
+            }
+        } else if x.hf_config.is_some()
+            || parsed.flags.contains_key("--hf-split")
+            || parsed.flags.contains_key("--hf-field")
+        {
+            return Err("--hf-config, --hf-split, and --hf-field require --hf-dataset".into());
         }
         if !(x.lr > 0.0) {
             return Err("--lr must be positive".into());
@@ -682,6 +724,9 @@ impl CLIHandler {
             }
         }
         let docs = Self::documents(raw, &tokenizer, options.max_tokens, options.skip_tokens)?;
+        // Feed metadata is derived from the actual selected training window,
+        // never estimated from row lengths. Local training keeps its old path.
+        let mut feed_rows_consumed = 0usize;
         let chunk_len = if options.resume.is_some() {
             // A checkpoint owns its tape capacity.  Using a fresh CLI default
             // here could make the plan longer than that tape and panic in the
@@ -884,6 +929,38 @@ impl CLIHandler {
                 if let Some(curve) = &mut curve {
                     curve.record(total_tokens, model.step_counter, loss_sum - prior_loss)?;
                 }
+                if let Some(dataset) = options.hf_dataset.as_deref() {
+                    feed_rows_consumed += group
+                        .iter()
+                        .flatten()
+                        .filter(|c| c.start + c.len + 1 == docs[c.doc].len())
+                        .count();
+                    // Decode only a bounded slice, only when the existing logger
+                    // is due (5s piped / 200ms interactive). No extra tokenization
+                    // or work in the forward/backward path.
+                    if progress.should_emit(update) {
+                        let c = group.iter().flatten().last().expect("nonempty update");
+                        let end = c.start + c.len;
+                        let ids = &docs[c.doc][end.saturating_sub(16).max(c.start)..end];
+                        let snippet: String = tokenizer.decode(ids).chars().take(96).collect();
+                        let token_ids = ids
+                            .iter()
+                            .map(usize::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        progress.set_feed(
+                            dataset,
+                            options.hf_config.as_deref(),
+                            &options.hf_split,
+                            &options.hf_field,
+                            feed_rows_consumed,
+                            tokens_seen,
+                            c.doc + 1,
+                            &snippet,
+                            &token_ids,
+                        );
+                    }
+                }
                 let update_loss = (loss_sum - prior_loss) / total_tokens.max(1) as f64;
                 progress.update_with_metrics(
                     update,
@@ -934,7 +1011,15 @@ impl CLIHandler {
 
     pub fn run_training(data: &str, options: &TrainingOptions, out: &str) -> Result<(), String> {
         let _plain_output = ui::plain_output(options.no_tui);
-        let raw = DatasetManager::try_load_dataset(Some(data))?;
+        let raw = if let Some(dataset) = options.hf_dataset.as_deref() {
+            let mut request = HuggingFaceDatasetOptions::new(dataset);
+            request.config = options.hf_config.clone();
+            request.split = options.hf_split.clone();
+            request.field = options.hf_field.clone();
+            DatasetManager::load_huggingface_dataset(&request)?
+        } else {
+            DatasetManager::try_load_dataset(Some(data))?
+        };
         let mut run_options = options.clone();
         run_options.checkpoint_path = Some(out.to_string());
         let (model, _) = Self::train_corpus(&raw, &run_options)?;
@@ -1526,7 +1611,9 @@ impl CLIHandler {
         println!(
             "    {:<48}{}",
             "  --latent n --state n --depth n --loops n",
-            ui::dim("width, recurrent state size, blocks, shared Ouro passes (1..32; default 1; repeat on resume; not checkpointed)")
+            ui::dim(
+                "width, recurrent state size, blocks, shared Ouro passes (1..32; default 1; repeat on resume; not checkpointed)"
+            )
         );
         println!(
             "    {:<48}{}",
@@ -1560,6 +1647,16 @@ impl CLIHandler {
         );
         println!(
             "    {:<48}{}",
+            "  --hf-dataset OWNER/NAME",
+            ui::dim("stream Hugging Face rows; split train and field text by default")
+        );
+        println!(
+            "    {:<48}{}",
+            "  --hf-config CONFIG --hf-split SPLIT --hf-field FIELD",
+            ui::dim("optional config, split, and dotted text field")
+        );
+        println!(
+            "    {:<48}{}",
             "  --skip-tokens n",
             ui::dim("drop this many tokens from the front first")
         );
@@ -1587,6 +1684,9 @@ impl CLIHandler {
         );
         println!(
             "    Example: {bin} train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1"
+        );
+        println!(
+            "    Example: {bin} train --hf-dataset Salesforce/wikitext --hf-config wikitext-103-v1 --hf-field text -e 1"
         );
         println!();
         println!(
@@ -1683,10 +1783,10 @@ impl CLIHandler {
                 println!("      --tokenizer <bpe|word>    tokenizer family (default: bpe)");
                 println!("      --vocab-size <N>          BPE vocabulary ceiling (default: 2048)");
                 println!("      --latent <N>              latent width (default: 256)");
+                println!("      --depth <N>               continuous blocks, 1..32 (default: 1)");
                 println!(
-                    "      --depth <N>               continuous blocks, 1..32 (default: 1)"
+                    "      --loops <N>               shared Ouro passes, 1..32 (default: 1; repeat on resume; not checkpointed)"
                 );
-                println!("      --loops <N>               shared Ouro passes, 1..32 (default: 1; repeat on resume; not checkpointed)");
                 println!("      --state <N>               recurrent state width (default: 16)");
                 println!("      --key <N>                 memory key width (default: 32)");
                 println!("      --memory <N>              memory capacity (default: 512)");
@@ -1702,6 +1802,14 @@ impl CLIHandler {
                 );
                 println!("      --seed <N>                initialization seed (default: 42)");
                 println!("      --max-tokens <N>          global token cap");
+                println!(
+                    "      --hf-dataset <OWNER/NAME> stream Hugging Face rows (default split train, field text)"
+                );
+                println!("      --hf-config <CONFIG>      optional dataset configuration");
+                println!("      --hf-split <SPLIT>        dataset split (default train)");
+                println!(
+                    "      --hf-field <FIELD>        text field, including dotted paths (default text)"
+                );
                 println!("      --skip-tokens <N>         offset into the corpus; wraps at EOF");
                 println!(
                     "      --resume <PATH>            continue optimizer/model state from a checkpoint"
@@ -1722,6 +1830,9 @@ impl CLIHandler {
                 println!("Example:");
                 println!(
                     "  {bin} train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1"
+                );
+                println!(
+                    "  {bin} train --hf-dataset Salesforce/wikitext --hf-config wikitext-103-v1 --hf-field text -e 1"
                 );
                 println!(
                     "  {bin} train data/downloaded.txt -o data/ck02.pssa --resume data/ck01.pssa --skip-tokens 200000 --max-tokens 200000 -e 1"
@@ -1748,7 +1859,9 @@ impl CLIHandler {
                     "      --max-new-tokens <N>      generation cap (default: 64, max: {MAX_GENERATION_TOKENS})"
                 );
                 if command == "generate" {
-                    println!("      --loops <N>               shared Ouro passes, 1..32 (repeat; not checkpointed)");
+                    println!(
+                        "      --loops <N>               shared Ouro passes, 1..32 (repeat; not checkpointed)"
+                    );
                 }
                 println!();
                 println!("Example:");
@@ -1767,7 +1880,9 @@ impl CLIHandler {
                 println!("  -m, --model <PATH>            checkpoint (default: data/model.pssa)");
                 println!("  -d, --data <SOURCE>           legacy tokenizer provenance source");
                 println!("  -t, --temp, --temperature <F> sampling temperature (default: 0.70)");
-                println!("      --loops <N>               shared Ouro passes, 1..32 (repeat; not checkpointed)");
+                println!(
+                    "      --loops <N>               shared Ouro passes, 1..32 (repeat; not checkpointed)"
+                );
                 println!();
                 println!("Example: {bin} chat -m data/model.pssa --temperature 0.7");
                 println!("Commands: /exit (or quit), /info, /temp <value> (finite and >= 0)");
@@ -1780,7 +1895,9 @@ impl CLIHandler {
                     "  --skip-tokens N --max-tokens N  strict held-out slice, never wraps at EOF"
                 );
                 if command == "score" {
-                    println!("  --loops N                      shared Ouro passes, 1..32 (repeat; not checkpointed)");
+                    println!(
+                        "  --loops N                      shared Ouro passes, 1..32 (repeat; not checkpointed)"
+                    );
                 }
                 println!("Use the embedded tokenizer; no training or checkpoint writes.");
                 let model = if command == "score" {
@@ -1868,7 +1985,9 @@ impl CLIHandler {
                 println!(
                     "Render a live dashboard for a piped training run; piped output is passed through plainly."
                 );
-                println!("Example: {bin} train data/downloaded.txt --no-tui | {bin} tui --compare transformer.log");
+                println!(
+                    "Example: {bin} train data/downloaded.txt --no-tui | {bin} tui --compare transformer.log"
+                );
             }
             _ => return Err(format!("unknown command '{command}'; run {bin} help")),
         }
@@ -1917,6 +2036,10 @@ impl CLIHandler {
                 let mut allowed = vec![
                     "--data",
                     "-d",
+                    "--hf-dataset",
+                    "--hf-config",
+                    "--hf-split",
+                    "--hf-field",
                     "--out",
                     "-o",
                     "--epochs",
@@ -1948,6 +2071,9 @@ impl CLIHandler {
                     allowed.extend(["--batch-size", "--depth", "--loops"]);
                 }
                 let p = Parsed::parse(&args[2..], &allowed)?;
+                if baseline && p.string("--hf-dataset", "").is_some() {
+                    return Err("--hf-dataset is supported by train, not train-transformer".into());
+                }
                 for (names, label) in [
                     (&["--data", "-d"][..], "--data"),
                     (&["--out", "-o"][..], "--out"),
@@ -1962,6 +2088,10 @@ impl CLIHandler {
                     return Err(
                         "train source was specified both positionally and with --data".into(),
                     );
+                }
+                let explicit_data = p.string("--data", "-d").is_some() || !p.positional.is_empty();
+                if p.string("--hf-dataset", "").is_some() && explicit_data {
+                    return Err("--hf-dataset cannot be combined with SOURCE or --data; choose one dataset source".into());
                 }
                 let data = p
                     .string("--data", "-d")
