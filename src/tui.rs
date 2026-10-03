@@ -6,7 +6,11 @@
 //! the chain directory, and draws. When stdin is not a pipe it prints its help
 //! and exits, and Ctrl+C / q always hands the terminal back cleanly.
 
+mod background;
+mod session;
+
 use crate::ui;
+use background::HexBackground;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
@@ -884,7 +888,9 @@ fn run_app(
     chain_dir: PathBuf,
     compare_path: Option<PathBuf>,
 ) -> io::Result<()> {
-    let mut terminal = ratatui::init();
+    let (_session, mut terminal) = session::Session::start()?;
+    let mut background = HexBackground::default();
+    let mut last_frame = Instant::now();
     let mut state = RunState {
         chain_dir: chain_dir.clone(),
         ..RunState::default()
@@ -921,7 +927,10 @@ fn run_app(
         }
 
         if Instant::now() >= next_frame || input_closed {
-            terminal.draw(|f| draw(f, &state, tab))?;
+            let now = Instant::now();
+            background.advance(now.saturating_duration_since(last_frame));
+            last_frame = now;
+            terminal.draw(|f| draw_with_background(f, &state, tab, &background))?;
             next_frame = Instant::now() + FRAME_INTERVAL;
         }
         if input_closed {
@@ -932,8 +941,23 @@ fn run_app(
         // cannot drive animation above the frame cap. The dedicated stdin
         // reader still feeds the unbounded channel independently of rendering.
         if crossterm::event::poll(next_frame.saturating_duration_since(Instant::now()))? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+            let event = crossterm::event::read()?;
+            match event {
+                crossterm::event::Event::Mouse(mouse) => background.mouse(mouse.column, mouse.row),
+                crossterm::event::Event::FocusLost | crossterm::event::Event::Resize(_, _) => {
+                    background.leave();
+                }
+                _ => {}
+            }
+            if let crossterm::event::Event::Key(key) = event {
                 if key.kind == crossterm::event::KeyEventKind::Press {
+                    if key.code == crossterm::event::KeyCode::Char('c')
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                    {
+                        break;
+                    }
                     match key.code {
                         crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
                             break;
@@ -979,7 +1003,6 @@ fn run_app(
             }
         }
     }
-    ratatui::restore();
     Ok(())
 }
 
@@ -1405,7 +1428,17 @@ fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64)
     }
 }
 
+#[cfg(test)]
 fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
+    draw_with_background(f, state, tab, &HexBackground::default());
+}
+
+fn draw_with_background(
+    f: &mut ratatui::Frame,
+    state: &RunState,
+    tab: usize,
+    background: &HexBackground,
+) {
     let area = f.area();
     if area.is_empty() {
         return;
@@ -1414,6 +1447,8 @@ fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
         Block::default().style(Style::new().fg(Color::Gray).bg(Color::Black)),
         area,
     );
+    background.draw(f);
+    let area = HexBackground::content_area(area);
     let health = state.health_status();
     // Do not squeeze bordered widgets into one-cell fragments on tiny screens.
     if area.width < 30 || area.height < 10 {
@@ -1454,7 +1489,7 @@ fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
         );
         return;
     }
-    let large_title = area.width >= 80 && area.height >= 22;
+    let large_title = f.area().width >= 80 && f.area().height >= 22;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2146,11 +2181,13 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
                 .unwrap_or_else(|| "-".into())
         )),
     ];
-    let metrics_area = if chunks[2].width >= 80 && chunks[2].height >= 5 {
+    // The decorative gutter must not change the existing wide-screen
+    // breakpoint or the neuron panel's requested width.
+    let metrics_area = if f.area().width >= 80 && chunks[2].height >= 5 {
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length((chunks[2].width / 4).clamp(30, 48)),
+                Constraint::Length((f.area().width / 4).clamp(30, 48)),
                 Constraint::Min(0),
             ])
             .split(chunks[2]);
@@ -2311,11 +2348,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
     });
 
-    if let Err(e) = run_app(rx, chain_dir, compare_path) {
-        ratatui::restore();
-        return Err(e.to_string());
-    }
-    Ok(())
+    run_app(rx, chain_dir, compare_path).map_err(|e| e.to_string())
 }
 
 #[allow(dead_code)]
@@ -2548,15 +2581,16 @@ mod tests {
                 })
                 .collect()
         };
-        assert!(row(0).contains("███"));
-        assert!(row(3).contains("monitor"));
-        assert!(row(3).contains("chain"));
-        assert!(row(3).contains("model"));
-        assert!(!row(3).contains("modelt"));
-        assert!(row(4).contains("╌"));
-        assert!(row(0).contains("┌"));
-        assert!(row(2).contains("└"));
-        assert!(row(1).contains("[ TRAINING ]"));
+        // Wide layouts now have a one-row background gutter.
+        assert!(row(1).contains("███"));
+        assert!(row(4).contains("monitor"));
+        assert!(row(4).contains("chain"));
+        assert!(row(4).contains("model"));
+        assert!(!row(4).contains("modelt"));
+        assert!(row(5).contains("╌"));
+        assert!(row(1).contains("┌"));
+        assert!(row(3).contains("└"));
+        assert!(row(2).contains("[ TRAINING ]"));
     }
 
     #[test]
@@ -3061,6 +3095,42 @@ mod tests {
         for (width, height) in [(120, 40), (80, 24), (60, 20), (30, 10), (10, 5), (1, 1)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|f| draw(f, &state, 3)).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_backend_hex_background_preserves_panels_and_resize_fallback() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut pressed = HexBackground::default();
+        pressed.mouse(0, 8);
+        for _ in 0..10 {
+            pressed.advance(FRAME_INTERVAL);
+        }
+        // The same hovered state must remain safe after resizing, on every tab.
+        for (width, height) in [(120, 40), (80, 24), (79, 24), (30, 10), (1, 1)] {
+            for tab in 0..TABS.len() {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| draw_with_background(f, &RunState::default(), tab, &pressed))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let content = HexBackground::content_area(buffer.area);
+                // Monitor has a clock-driven neuron animation; the other
+                // default tabs are static, so compare every panel cell exactly.
+                if tab != 0 {
+                    let hovered = buffer.clone();
+                    terminal
+                        .draw(|f| draw(f, &RunState::default(), tab))
+                        .unwrap();
+                    let resting = terminal.backend().buffer();
+                    for y in content.y..content.bottom() {
+                        for x in content.x..content.right() {
+                            assert_eq!(hovered[(x, y)], resting[(x, y)]);
+                        }
+                    }
+                }
+            }
         }
     }
 
