@@ -475,6 +475,9 @@ Options:
 | `--loss-csv <path>` / `--loss-every <n>` | unset / `10000` | `train`, `train-transformer` | Append target-token training curves at update boundaries. |
 | `--tokens-seen <n>` | unset | `train`, `train-transformer` | Offset for a new loss CSV on resume. |
 | `--no-tui` | off | `train`, `train-transformer` | Disable cursor updates and emit rate-limited plain progress lines. |
+| `--hf-dataset <owner/name>` | unset | `train` | Train from a paged, disk-cached Hugging Face dataset instead of a local source. |
+| `--hf-config <config>` | auto | `train` | Dataset configuration; required when the repository has multiple configurations. |
+| `--hf-split <split>` / `--hf-field <field>` | `train` / `text` | `train` | Split and text column (dotted nested fields supported). |
 | `--skip-tokens <n>` / `--max-tokens <n>` | `0` / unset | `score`, `score-transformer`, `throughput` | Select a strict held-out slice; scoring never wraps at EOF. |
 
 Positional arguments and long/short options can be mixed:
@@ -530,6 +533,38 @@ Download a Hugging Face dataset into a local text file:
 ```bash
 cargo run --release -- download wikimedia/wikipedia --out data/downloaded.txt
 ```
+
+### Hugging Face training and live feed
+
+```bash
+oxide_ai_pssa train --hf-dataset Salesforce/wikitext \
+  --hf-config wikitext-103-v1 --hf-split train --hf-field text \
+  --max-tokens 200000 -e 1 --no-tui | oxide_ai_pssa tui
+```
+
+Use **Tab** to open **feed**: it shows the dataset, completed selected-window rows,
+trained tokens, and a short decoded preview sliding into a token-ID shredder.
+The displayed IDs are actual input tokens from the latest reported training chunk;
+with batching, the preview is the last lane in that update. Row counts include
+repeated epochs/windows, and the selected row number is after skip/cap selection,
+not a global Hugging Face row ID. Older logs and local training still work without
+sample metadata. The animation is cosmetic and runs only in the log reader.
+
+HF downloads use the datasets-server rows API, streaming pages to an atomic disk
+cache before the existing in-memory tokenizer/trainer reads the corpus. This is
+not online/infinite-dataset training: `--max-tokens` caps training, not the download.
+Set `OXIDE_PSSA_HF_CACHE` to a writable cache directory (for example
+`/kaggle/working/oxide-hf-cache` on Kaggle, with Internet enabled); otherwise the
+cache lives under `$XDG_CACHE_HOME/oxide-ai-pssa/huggingface` or
+`~/.cache/oxide-ai-pssa/huggingface`. Cached data can be reused offline; delete its
+cache file to refresh it. Choose a configuration explicitly when discovery reports
+multiple choices. Gated/private dataset login is not part of this phase.
+
+HF runs add percent-encoded `feed_*` fields to the existing throttled progress
+lines (at most every five seconds when piped, plus first/final updates). These
+include a short sample of dataset content; treat saved logs accordingly. Local
+runs do not add these fields. Do not combine `--hf-dataset` with a positional
+source or `--data`.
 
 Network downloads are not validated or curated by Oxide AI. Review licensing, privacy, and content before training on an external corpus.
 

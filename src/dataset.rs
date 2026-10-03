@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokenizers::models::bpe::{BPE, BpeTrainer};
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
@@ -566,6 +567,78 @@ fn clean_wikitext_line(mut text: &str, out: &mut String) {
     }
 }
 
+fn encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn field_value<'a>(value: &'a serde_json::Value, field: &str) -> Option<&'a serde_json::Value> {
+    if let Some(value) = value.get(field) {
+        return Some(value);
+    }
+    field
+        .split('.')
+        .try_fold(value, |current, part| current.get(part))
+}
+
+// Keep each HF row on one cache line, including null/blank rows. Arrays of
+// strings belong to the same row, rather than becoming additional feed items.
+fn append_text_value(value: &serde_json::Value, output: &mut String) -> Result<(), String> {
+    match value {
+        serde_json::Value::String(text) => {
+            for part in text
+                .split(['\r', '\n'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if !output.is_empty() {
+                    output.push(' ');
+                }
+                output.push_str(part);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                append_text_value(value, output)?;
+            }
+        }
+        serde_json::Value::Null => {}
+        _ => return Err("expected text, an array of text, or null".into()),
+    }
+    Ok(())
+}
+
+static HF_CACHE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A streamed Hugging Face dataset request. The rows API is paged into a
+/// local text cache, so a training run can be resumed without downloading the
+/// same corpus again. This type intentionally contains no model state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HuggingFaceDatasetOptions {
+    pub dataset: String,
+    pub config: Option<String>,
+    pub split: String,
+    pub field: String,
+}
+
+impl HuggingFaceDatasetOptions {
+    pub fn new(dataset: impl Into<String>) -> Self {
+        Self {
+            dataset: dataset.into(),
+            config: None,
+            split: "train".into(),
+            field: "text".into(),
+        }
+    }
+}
+
 pub struct DatasetManager;
 impl DatasetManager {
     pub const SCIENCE_REFERENCE_CORPUS: &'static str = "the solar system consists of the sun and the planetary objects orbiting it .\nthe four inner terrestrial planets are mercury , venus , earth , and mars , composed primarily of rock and metal .\nquantum mechanics is the branch of physics studying the behavior of matter and light at atomic scale .\ncomputer science is the study of computation , information , and the theoretical foundations of computation .\nartificial intelligence focuses on building computational models and software that learn .\nphotosynthesis is the biological process used by plants to convert light into energy .\ndna contains the genetic instructions necessary for the development and reproduction of living organisms .\nsocial science is the study of human societies and interconnected relationships .\ndata science involves analyzing large volumes of information to extract patterns .\n";
@@ -708,6 +781,382 @@ impl DatasetManager {
         }
         Ok(body.trim().to_string())
     }
+    /// Validate the explicit `owner/name` spelling before making a network
+    /// request. This turns common typos into an immediate actionable error,
+    /// including on Kaggle where a failed remote request is otherwise noisy.
+    pub fn validate_huggingface_dataset_name(repo: &str) -> Result<(), String> {
+        let mut parts = repo.split('/');
+        let owner = parts.next().unwrap_or_default();
+        let name = parts.next().unwrap_or_default();
+        if owner.is_empty()
+            || name.is_empty()
+            || parts.next().is_some()
+            || !owner
+                .bytes()
+                .chain(name.bytes())
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || owner == "."
+            || name == "."
+            || owner == ".."
+            || name == ".."
+        {
+            return Err(format!(
+                "invalid Hugging Face dataset '{repo}'; expected an owner/name repository"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Download a Hugging Face rows API request a page at a time and cache the
+    /// newline-delimited selected field. The API is used instead of a heavy
+    /// parquet dependency, which keeps the default Kaggle binary small.
+    pub fn load_huggingface_dataset(options: &HuggingFaceDatasetOptions) -> Result<String, String> {
+        Self::load_huggingface_cached(
+            options,
+            &Self::huggingface_cache_path(options),
+            &mut Self::request_huggingface_json,
+        )
+    }
+
+    // Inject only the HTTP boundary and cache location for offline fixtures.
+    fn load_huggingface_cached(
+        options: &HuggingFaceDatasetOptions,
+        cache_path: &Path,
+        fetch: &mut impl FnMut(&str) -> Result<serde_json::Value, String>,
+    ) -> Result<String, String> {
+        Self::validate_huggingface_dataset_name(&options.dataset)?;
+        if options.split.trim().is_empty() {
+            return Err("Hugging Face split must not be empty".into());
+        }
+        if options.field.trim().is_empty() {
+            return Err("Hugging Face field must not be empty".into());
+        }
+        if options
+            .config
+            .as_deref()
+            .is_some_and(|config| config.trim().is_empty())
+        {
+            return Err("Hugging Face config must not be empty".into());
+        }
+
+        match fs::read_to_string(cache_path) {
+            Ok(cached) if !cached.trim().is_empty() => return Ok(cached),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot read Hugging Face cache {}: {error}",
+                    cache_path.display()
+                ));
+            }
+        }
+
+        let mut resolved = options.clone();
+        if resolved.config.is_none() {
+            resolved.config = Some(Self::discover_huggingface_config(options, fetch)?);
+        }
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "cannot create Hugging Face cache directory {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+        let sequence = HF_CACHE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temporary = cache_path.with_extension(format!("tmp-{}-{sequence}", std::process::id()));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|e| {
+                format!(
+                    "cannot create Hugging Face cache {}: {e}",
+                    temporary.display()
+                )
+            })?;
+        let result = (|| {
+            let mut output = io::BufWriter::new(file);
+            Self::fetch_huggingface_rows(&resolved, &mut output, fetch)?;
+            output
+                .flush()
+                .and_then(|()| output.get_ref().sync_all())
+                .map_err(|e| {
+                    format!(
+                        "cannot flush Hugging Face cache {}: {e}",
+                        temporary.display()
+                    )
+                })?;
+            drop(output);
+            fs::rename(&temporary, cache_path).map_err(|e| {
+                format!(
+                    "cannot commit Hugging Face cache {}: {e}",
+                    cache_path.display()
+                )
+            })?;
+            // Preserve the existing corpus String API, but only allocate the full
+            // corpus after the complete download is safely on disk.
+            fs::read_to_string(cache_path).map_err(|e| {
+                format!(
+                    "cannot read Hugging Face cache {}: {e}",
+                    cache_path.display()
+                )
+            })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    fn huggingface_cache_path(options: &HuggingFaceDatasetOptions) -> PathBuf {
+        let root = std::env::var_os("OXIDE_PSSA_HF_CACHE")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("XDG_CACHE_HOME")
+                    .map(|p| PathBuf::from(p).join("oxide-ai-pssa/huggingface"))
+            })
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|p| PathBuf::from(p).join(".cache/oxide-ai-pssa/huggingface"))
+            })
+            .unwrap_or_else(|| std::env::temp_dir().join("oxide-ai-pssa/huggingface"));
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // Invalidate older caches that split one source row across several lines.
+        "hf-row-lines-v2".hash(&mut hasher);
+        options.dataset.hash(&mut hasher);
+        options.config.hash(&mut hasher);
+        options.split.hash(&mut hasher);
+        options.field.hash(&mut hasher);
+        root.join(format!("{:016x}.txt", hasher.finish()))
+    }
+
+    fn request_huggingface_json(endpoint: &str) -> Result<serde_json::Value, String> {
+        let response = match ureq::get(endpoint)
+            .set("User-Agent", "oxide-ai/0.5.0")
+            .timeout(std::time::Duration::from_secs(60))
+            .call()
+        {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, response)) => {
+                let detail = response
+                    .into_string()
+                    .ok()
+                    .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                    .and_then(|value| {
+                        value
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "dataset server rejected the request".into());
+                return Err(format!("HTTP {status}: {detail}"));
+            }
+            Err(error) => return Err(format!("HTTP request failed: {error}")),
+        };
+        let body = response
+            .into_string()
+            .map_err(|e| format!("cannot read response: {e}"))?;
+        serde_json::from_str(&body).map_err(|e| format!("invalid dataset server JSON: {e}"))
+    }
+
+    fn huggingface_response(
+        options: &HuggingFaceDatasetOptions,
+        endpoint: &str,
+        fetch: &mut impl FnMut(&str) -> Result<serde_json::Value, String>,
+    ) -> Result<serde_json::Value, String> {
+        let context = |error: String| {
+            format!(
+                "cannot load Hugging Face dataset '{}' (config '{}', split '{}'): {error}; check the repository name, access permissions, --hf-config and --hf-split",
+                options.dataset,
+                options.config.as_deref().unwrap_or("auto"),
+                options.split
+            )
+        };
+        let value = fetch(endpoint).map_err(&context)?;
+        if let Some(error) = value.get("error") {
+            return Err(context(
+                error
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| error.to_string()),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn discover_huggingface_config(
+        options: &HuggingFaceDatasetOptions,
+        fetch: &mut impl FnMut(&str) -> Result<serde_json::Value, String>,
+    ) -> Result<String, String> {
+        let endpoint = format!(
+            "https://datasets-server.huggingface.co/splits?dataset={}",
+            encode_query_component(&options.dataset)
+        );
+        let value = Self::huggingface_response(options, &endpoint, fetch)?;
+        let splits = value.get("splits").and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("Hugging Face dataset '{}' returned no splits; specify --hf-config explicitly if discovery is unavailable", options.dataset))?;
+        let mut configs = Vec::new();
+        let mut available_splits = Vec::new();
+        for entry in splits {
+            let (Some(config), Some(split)) = (
+                entry.get("config").and_then(serde_json::Value::as_str),
+                entry.get("split").and_then(serde_json::Value::as_str),
+            ) else {
+                continue;
+            };
+            available_splits.push(split);
+            if split == options.split {
+                configs.push(config);
+            }
+        }
+        configs.sort_unstable();
+        configs.dedup();
+        available_splits.sort_unstable();
+        available_splits.dedup();
+        if configs.contains(&"default") {
+            return Ok("default".into());
+        }
+        match configs.as_slice() {
+            [config] => Ok((*config).into()),
+            [] => Err(format!(
+                "Hugging Face dataset '{}' has no available split '{}'; available splits: {}; check --hf-split or specify --hf-config if the dataset is still processing",
+                options.dataset,
+                options.split,
+                available_splits.join(", ")
+            )),
+            _ => Err(format!(
+                "Hugging Face dataset '{}' has multiple configs for split '{}': {}; select one with --hf-config",
+                options.dataset,
+                options.split,
+                configs.join(", ")
+            )),
+        }
+    }
+
+    fn fetch_huggingface_rows(
+        options: &HuggingFaceDatasetOptions,
+        output: &mut impl Write,
+        fetch: &mut impl FnMut(&str) -> Result<serde_json::Value, String>,
+    ) -> Result<(), String> {
+        const PAGE_SIZE: u64 = 100; // datasets-server /rows maximum
+        let mut offset = 0u64;
+        let mut total_rows = None;
+        let mut has_text = false;
+        let config = options
+            .config
+            .as_deref()
+            .ok_or("Hugging Face config was not resolved")?;
+        loop {
+            let endpoint = format!(
+                "https://datasets-server.huggingface.co/rows?dataset={}&config={}&split={}&offset={offset}&length={PAGE_SIZE}",
+                encode_query_component(&options.dataset),
+                encode_query_component(config),
+                encode_query_component(&options.split)
+            );
+            let value = Self::huggingface_response(options, &endpoint, fetch)?;
+            let rows = value
+                .get("rows")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    format!(
+                        "Hugging Face dataset '{}' returned invalid rows JSON: missing rows array",
+                        options.dataset
+                    )
+                })?;
+            if let Some(total) = value
+                .get("num_rows_total")
+                .and_then(serde_json::Value::as_u64)
+            {
+                if total_rows.is_some_and(|previous| previous != total) {
+                    return Err("Hugging Face row count changed during download; retry to avoid an inconsistent cache".into());
+                }
+                total_rows = Some(total);
+            }
+            if rows.is_empty() {
+                if total_rows.is_some_and(|total| offset < total) {
+                    return Err(format!(
+                        "Hugging Face dataset '{}' ended early at row {offset} of {}; incomplete download was not cached",
+                        options.dataset,
+                        total_rows.unwrap()
+                    ));
+                }
+                break;
+            }
+            if rows.len() as u64 > PAGE_SIZE
+                || total_rows.is_some_and(|total| offset + rows.len() as u64 > total)
+            {
+                return Err(
+                    "Hugging Face rows response exceeds the requested page or advertised total"
+                        .into(),
+                );
+            }
+            for (index, row) in rows.iter().enumerate() {
+                let row_index = offset + index as u64;
+                if row
+                    .get("row_idx")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|idx| idx != row_index)
+                {
+                    return Err(format!(
+                        "Hugging Face dataset '{}' returned an unexpected row index at {row_index}; incomplete download was not cached",
+                        options.dataset
+                    ));
+                }
+                let record = row.get("row").unwrap_or(row);
+                let field = field_value(record, &options.field).ok_or_else(|| {
+                    let available = record.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default();
+                    format!("Hugging Face dataset '{}' field '{}' is missing at row {row_index}; available fields: {available}; select a text column with --hf-field", options.dataset, options.field)
+                })?;
+                if row
+                    .get("truncated_cells")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|cells| {
+                        cells.iter().any(|cell| {
+                            cell.as_str().is_some_and(|name| {
+                                name == options.field
+                                    || options.field.starts_with(&format!("{name}."))
+                            })
+                        })
+                    })
+                {
+                    return Err(format!(
+                        "Hugging Face field '{}' at row {row_index} is truncated by the rows API; use a local dataset export instead",
+                        options.field
+                    ));
+                }
+                let mut text = String::new();
+                append_text_value(field, &mut text).map_err(|e| format!(
+                    "Hugging Face dataset '{}' field '{}' at row {row_index}: {e}; select a text column with --hf-field",
+                    options.dataset, options.field
+                ))?;
+                has_text |= !text.is_empty();
+                writeln!(output, "{text}")
+                    .map_err(|e| format!("cannot write Hugging Face cache: {e}"))?;
+            }
+            // Make each completed page visible on disk before fetching the next.
+            output
+                .flush()
+                .map_err(|e| format!("cannot flush Hugging Face cache: {e}"))?;
+            offset += rows.len() as u64;
+            if total_rows.is_some_and(|total| offset == total)
+                || (total_rows.is_none() && (rows.len() as u64) < PAGE_SIZE)
+            {
+                break;
+            }
+        }
+        if !has_text {
+            return Err(format!(
+                "Hugging Face dataset '{}' split '{}' has no text values in field '{}'; check --hf-config, --hf-split and --hf-field",
+                options.dataset, options.split, options.field
+            ));
+        }
+        Ok(())
+    }
+
+    /// Preserve the legacy download/hf: source behavior (including automatic
+    /// common-field extraction). Explicit --hf-* training uses the paged,
+    /// selected-field cache above without changing existing script inputs.
     pub fn download_huggingface_dataset(repo: &str) -> Result<String, String> {
         let endpoint = format!(
             "https://datasets-server.huggingface.co/rows?dataset={repo}&split=train&offset=0&limit=1000"
@@ -789,6 +1238,321 @@ impl DatasetManager {
             "the speed of light is 300000 . ".repeat(6),
             "the speed of light is 500 . ".repeat(burst_count)
         )
+    }
+}
+
+#[cfg(test)]
+mod huggingface_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    struct CacheFixture(PathBuf);
+    impl CacheFixture {
+        fn new() -> Self {
+            let sequence = HF_CACHE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self(
+                std::env::temp_dir()
+                    .join(format!("oxide-hf-test-{}-{sequence}", std::process::id())),
+            )
+        }
+        fn path(&self) -> PathBuf {
+            self.0.join("corpus.txt")
+        }
+    }
+    impl Drop for CacheFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn options() -> HuggingFaceDatasetOptions {
+        let mut options = HuggingFaceDatasetOptions::new("owner/corpus");
+        options.config = Some("default".into());
+        options
+    }
+
+    fn page(offset: u64, count: u64, total: u64) -> Value {
+        json!({
+            "num_rows_total": total,
+            "rows": (offset..offset + count).map(|idx| json!({
+                "row_idx": idx, "row": {"text": format!("row {idx}")}
+            })).collect::<Vec<_>>()
+        })
+    }
+
+    #[test]
+    fn pages_at_100_and_flushes_to_cache_before_next_request() {
+        let cache = CacheFixture::new();
+        let mut requests = 0;
+        let corpus =
+            DatasetManager::load_huggingface_cached(&options(), &cache.path(), &mut |url| {
+                assert!(url.contains("dataset=owner%2Fcorpus&config=default&split=train"));
+                assert!(url.ends_with("&length=100"));
+                let offset = requests * 100;
+                assert!(url.contains(&format!("&offset={offset}&")));
+                if requests > 0 {
+                    assert!(
+                        !cache.path().exists(),
+                        "partial cache must not be published"
+                    );
+                    let files = fs::read_dir(&cache.0)
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                    assert_eq!(files.len(), 1);
+                    assert_eq!(
+                        fs::read_to_string(files[0].path()).unwrap().lines().count(),
+                        offset as usize
+                    );
+                }
+                requests += 1;
+                Ok(page(offset, (205 - offset).min(100), 205))
+            })
+            .unwrap();
+        assert_eq!(requests, 3);
+        assert_eq!(corpus.lines().count(), 205);
+        assert!(corpus.ends_with("row 204\n"));
+        assert_eq!(fs::read_to_string(cache.path()).unwrap(), corpus);
+        let cached =
+            DatasetManager::load_huggingface_cached(&options(), &cache.path(), &mut |_| {
+                panic!("cache hit must not perform discovery or fetch")
+            })
+            .unwrap();
+        assert_eq!(cached, corpus);
+    }
+
+    #[test]
+    fn short_pages_use_reported_total_and_unknown_total_ends_on_empty_page() {
+        let mut out = Vec::new();
+        let mut calls = 0;
+        DatasetManager::fetch_huggingface_rows(&options(), &mut out, &mut |url| {
+            assert!(url.contains(&format!("&offset={calls}&")));
+            let result = page(calls, 1, 2);
+            calls += 1;
+            Ok(result)
+        })
+        .unwrap();
+        assert_eq!(out, b"row 0\nrow 1\n");
+        assert_eq!(calls, 2);
+
+        calls = 0;
+        out.clear();
+        DatasetManager::fetch_huggingface_rows(&options(), &mut out, &mut |url| {
+            let mut result = if calls == 0 {
+                page(0, 100, 100)
+            } else {
+                assert!(url.contains("&offset=100&"));
+                page(100, 0, 100)
+            };
+            result.as_object_mut().unwrap().remove("num_rows_total");
+            calls += 1;
+            Ok(result)
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(String::from_utf8(out).unwrap().lines().count(), 100);
+    }
+
+    #[test]
+    fn discovers_default_or_unique_config_and_explains_ambiguity_and_missing_split() {
+        let options = HuggingFaceDatasetOptions::new("owner/corpus");
+        let discover = |splits: Value| {
+            DatasetManager::discover_huggingface_config(&options, &mut |url| {
+                assert!(url.ends_with("/splits?dataset=owner%2Fcorpus"));
+                Ok(json!({"splits": splits}))
+            })
+        };
+        assert_eq!(
+            discover(json!([
+                {"config": "other", "split": "train"},
+                {"config": "default", "split": "train"}
+            ]))
+            .unwrap(),
+            "default"
+        );
+        assert_eq!(
+            discover(json!([
+                {"config": "default", "split": "test"},
+                {"config": "en v1", "split": "train"}
+            ]))
+            .unwrap(),
+            "en v1"
+        );
+        let error = discover(json!([
+            {"config": "en", "split": "train"},
+            {"config": "fr", "split": "train"}
+        ]))
+        .unwrap_err();
+        assert!(error.contains("en, fr") && error.contains("--hf-config"));
+        let error = discover(json!([{"config": "en", "split": "test"}])).unwrap_err();
+        assert!(
+            error.contains("no available split 'train'")
+                && error.contains("test")
+                && error.contains("--hf-split")
+        );
+    }
+
+    #[test]
+    fn discovered_config_is_encoded_and_cached_without_further_discovery() {
+        let cache = CacheFixture::new();
+        let options = HuggingFaceDatasetOptions::new("owner/corpus");
+        let mut calls = 0;
+        let corpus = DatasetManager::load_huggingface_cached(&options, &cache.path(), &mut |url| {
+            calls += 1;
+            if url.contains("/splits?") {
+                Ok(json!({"splits": [{"config": "en/v 1", "split": "train"}]}))
+            } else {
+                assert!(url.contains("&config=en%2Fv%201&"));
+                Ok(page(0, 1, 1))
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(corpus, "row 0\n");
+        assert_eq!(
+            DatasetManager::load_huggingface_cached(&options, &cache.path(), &mut |_| panic!(
+                "offline cache hit"
+            ))
+            .unwrap(),
+            corpus
+        );
+    }
+
+    #[test]
+    fn nested_and_literal_fields_preserve_one_line_per_source_row() {
+        let mut options = options();
+        options.field = "document.text".into();
+        let mut out = Vec::new();
+        DatasetManager::fetch_huggingface_rows(&options, &mut out, &mut |_| {
+            Ok(json!({
+                "num_rows_total": 4,
+                "rows": [
+                    {"row": {"document": {"text": " first\r\nsecond\n第三 "}}},
+                    {"row": {"document.text": ["a\nb", "c"], "document": {"text": "wrong"}}},
+                    {"row": {"document": {"text": null}}},
+                    {"row": {"document": {"text": "  "}}}
+                ]
+            }))
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "first second 第三\na b c\n\n\n"
+        );
+    }
+
+    #[test]
+    fn field_and_response_errors_are_actionable() {
+        for (response, expected) in [
+            (
+                json!({"rows": [{"row": {"content": "hello"}}]}),
+                "available fields: content",
+            ),
+            (json!({"rows": [{"row": {"text": 42}}]}), "expected text"),
+            (json!({"rows": [{"row": {"text": null}}]}), "no text values"),
+            (json!({"rows": []}), "no text values"),
+            (
+                json!({"rows": [{"row": {"text": "short"}, "truncated_cells": ["text"]}]}),
+                "truncated",
+            ),
+            (
+                json!({"rows": [{"row_idx": 3, "row": {"text": "hello"}}]}),
+                "unexpected row index",
+            ),
+            (json!({"error": "Dataset not found"}), "Dataset not found"),
+            (json!({"unexpected": []}), "missing rows array"),
+        ] {
+            let error =
+                DatasetManager::fetch_huggingface_rows(&options(), &mut Vec::new(), &mut |_| {
+                    Ok(response.clone())
+                })
+                .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        let error =
+            DatasetManager::fetch_huggingface_rows(&options(), &mut Vec::new(), &mut |_| {
+                Err("HTTP 404: split not found".into())
+            })
+            .unwrap_err();
+        for expected in ["owner/corpus", "default", "train", "HTTP 404", "--hf-split"] {
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn failed_downloads_remove_partial_cache_and_can_retry() {
+        for fail_with_empty_page in [false, true] {
+            let cache = CacheFixture::new();
+            let mut calls = 0;
+            let error =
+                DatasetManager::load_huggingface_cached(&options(), &cache.path(), &mut |_| {
+                    calls += 1;
+                    match calls {
+                        1 => Ok(page(0, 100, 101)),
+                        _ if fail_with_empty_page => Ok(page(100, 0, 101)),
+                        _ => Err("connection lost".into()),
+                    }
+                })
+                .unwrap_err();
+            assert!(error.contains(if fail_with_empty_page {
+                "ended early"
+            } else {
+                "connection lost"
+            }));
+            assert!(!cache.path().exists());
+            assert_eq!(fs::read_dir(&cache.0).unwrap().count(), 0);
+            assert_eq!(
+                DatasetManager::load_huggingface_cached(&options(), &cache.path(), &mut |_| Ok(
+                    page(0, 1, 1)
+                ))
+                .unwrap(),
+                "row 0\n"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_options_fail_before_http_and_cache_keys_include_selection() {
+        let cache = CacheFixture::new();
+        let mut variants = Vec::new();
+        for repo in [
+            "",
+            "corpus",
+            "owner/",
+            "../corpus",
+            "owner/corpus/extra",
+            "owner/bad?name",
+        ] {
+            variants.push(HuggingFaceDatasetOptions::new(repo));
+        }
+        let mut invalid = options();
+        invalid.split.clear();
+        variants.push(invalid);
+        let mut invalid = options();
+        invalid.field.clear();
+        variants.push(invalid);
+        let mut invalid = options();
+        invalid.config = Some(" ".into());
+        variants.push(invalid);
+        for invalid in variants {
+            assert!(
+                DatasetManager::load_huggingface_cached(&invalid, &cache.path(), &mut |_| panic!(
+                    "invalid input must not fetch"
+                ))
+                .is_err()
+            );
+        }
+        let base = options();
+        let mut variants = vec![base.clone(); 4];
+        variants[0].dataset = "other/corpus".into();
+        variants[1].config = None;
+        variants[2].split = "test".into();
+        variants[3].field = "content".into();
+        let base_path = DatasetManager::huggingface_cache_path(&base);
+        for variant in variants {
+            assert_ne!(DatasetManager::huggingface_cache_path(&variant), base_path);
+        }
+        assert_eq!(encode_query_component("é +&"), "%C3%A9%20%2B%26");
     }
 }
 

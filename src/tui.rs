@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-const TABS: [&str; 3] = ["monitor", "chain", "model"];
+const TABS: [&str; 4] = ["monitor", "chain", "model", "feed"];
 const PSSA_LOGO: [&str; 3] = [
     "███  ████  ████   ███",
     "█ █  █     █      █ █",
@@ -94,7 +94,22 @@ impl GraphView {
 }
 
 #[derive(Default)]
+struct FeedState {
+    dataset: String,
+    config: String,
+    split: String,
+    field: String,
+    rows: u64,
+    tokens: u64,
+    row: u64,
+    snippet: String,
+    token_ids: Vec<u64>,
+    updated_at: Option<Instant>,
+}
+
+#[derive(Default)]
 struct RunState {
+    feed: Option<FeedState>,
     // header card
     corpus: Option<String>,
     vocab: Option<String>,
@@ -262,6 +277,31 @@ impl RunState {
             self.progress_pct = None;
             self.progress_from = None;
             self.progress_updated_at = None;
+            self.feed = None;
+        }
+
+        if let Some(dataset) = parse_log_value(line, "feed_dataset") {
+            self.feed = Some(FeedState {
+                dataset,
+                config: parse_log_value(line, "feed_config").unwrap_or_default(),
+                split: parse_log_value(line, "feed_split").unwrap_or_else(|| "train".into()),
+                field: parse_log_value(line, "feed_field").unwrap_or_else(|| "text".into()),
+                rows: parse_kv(line, "feed_rows=").unwrap_or(0),
+                tokens: parse_kv(line, "feed_tokens=").unwrap_or(0),
+                row: parse_kv(line, "feed_row=").unwrap_or(0),
+                snippet: parse_log_value(line, "feed_snippet")
+                    .unwrap_or_default()
+                    .chars()
+                    .take(96)
+                    .collect(),
+                token_ids: parse_log_value(line, "feed_token_ids")
+                    .unwrap_or_default()
+                    .split(',')
+                    .take(16)
+                    .filter_map(|id| id.parse().ok())
+                    .collect(),
+                updated_at: Some(Instant::now()),
+            });
         }
 
         let raw_loss = parse_kv::<f64>(line, "loss=").or_else(|| parse_kv(line, "loss "));
@@ -353,7 +393,12 @@ impl RunState {
             }
             if let Some((_, eta)) = line.split_once("eta=").or_else(|| line.split_once("eta ")) {
                 // ui::duration can contain spaces, e.g. `2h 14m 09s`.
-                self.eta = Some(eta.trim().to_string());
+                self.eta = Some(
+                    eta.split_once(" last_checkpoint=")
+                        .map_or(eta, |(eta, _)| eta)
+                        .trim()
+                        .to_string(),
+                );
             }
             if self.loss_series.len() > 600 {
                 self.loss_series.remove(0);
@@ -744,6 +789,29 @@ fn parse_field(line: &str, label: &str) -> Option<String> {
         return None;
     }
     Some(value.to_string())
+}
+
+/// Feed strings are percent-encoded UTF-8, never raw terminal control codes.
+fn parse_log_value(line: &str, key: &str) -> Option<String> {
+    let value = line.split_whitespace().find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        (name == key).then_some(value)
+    })?;
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() && decoded.len() < 1024 {
+        if bytes[i] == b'%' {
+            let digits = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            decoded.push(u8::from_str_radix(digits, 16).ok()?);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let text = String::from_utf8(decoded).ok()?;
+    Some(ui::terminal_text(&text))
 }
 
 /// Pull `key=value` (or `key value`) numeric pairs out of a line.
@@ -1325,12 +1393,21 @@ fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
                 state.checkpoints.len(),
                 state.chain_dir.display()
             ),
-            _ => format!("width {}", state.width.as_deref().unwrap_or("-")),
+            2 => format!("width {}", state.width.as_deref().unwrap_or("-")),
+            _ => state.feed.as_ref().map_or_else(
+                || "Waiting for feed samples".into(),
+                |feed| {
+                    format!(
+                        "{} / {} rows / {} tokens",
+                        feed.dataset, feed.rows, feed.tokens
+                    )
+                },
+            ),
         };
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(
-                    format!("PSSA / {}", TABS[tab.min(TABS.len() - 1)]),
+                    format!("{} / PSSA", TABS[tab.min(TABS.len() - 1)]),
                     accent(),
                 ),
                 status_badge(&health),
@@ -1379,21 +1456,29 @@ fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
     }
     let nav = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(29), Constraint::Min(0)])
+        .constraints([Constraint::Length(38), Constraint::Min(0)])
         .split(chunks[1]);
-    f.render_widget(
-        Tabs::new(TABS)
-            .select(tab)
-            .style(accent().add_modifier(Modifier::DIM))
-            .highlight_style(
-                accent()
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                    .remove_modifier(Modifier::DIM),
-            )
-            .divider(" / ")
-            .padding(" ", " "),
-        nav[0],
-    );
+    if area.width < 38 {
+        f.render_widget(
+            Paragraph::new(format!(" {} / tab switch", TABS[tab.min(TABS.len() - 1)]))
+                .style(accent()),
+            nav[0],
+        );
+    } else {
+        f.render_widget(
+            Tabs::new(TABS)
+                .select(tab)
+                .style(accent().add_modifier(Modifier::DIM))
+                .highlight_style(
+                    accent()
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                        .remove_modifier(Modifier::DIM),
+                )
+                .divider(" / ")
+                .padding(" ", " "),
+            nav[0],
+        );
+    }
     if large_title {
         f.render_widget(
             Paragraph::new("q quit   tab switch   g/1-7 views   +/- zoom").right_aligned(),
@@ -1405,7 +1490,115 @@ fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
     match tab {
         0 => draw_monitor(f, chunks[3], state),
         1 => draw_chain(f, chunks[3], state),
-        _ => draw_model(f, chunks[3], state),
+        2 => draw_model(f, chunks[3], state),
+        _ => draw_feed(f, chunks[3], state),
+    }
+}
+
+fn draw_feed(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
+    let elapsed = state
+        .feed
+        .as_ref()
+        .and_then(|feed| feed.updated_at)
+        .map(|at| at.elapsed())
+        .unwrap_or_default();
+    draw_feed_at(f, area, state, elapsed);
+}
+
+fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: Duration) {
+    let Some(feed) = state.feed.as_ref() else {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::styled("Waiting for feed samples", accent()),
+                Line::from("Train with --hf-dataset OWNER/NAME --no-tui | oxide_ai_pssa tui"),
+                Line::from("Older/local logs remain supported; no sample metadata is available."),
+            ])
+            .wrap(Wrap { trim: false })
+            .block(panel(" feed / idle ")),
+            area,
+        );
+        return;
+    };
+    if area.height < 9 {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::styled(&feed.dataset, accent()),
+                Line::from(format!(
+                    "{} rows / {} tokens consumed",
+                    feed.rows, feed.tokens
+                )),
+                Line::from(feed.snippet.as_str()),
+            ])
+            .block(panel(" feed ")),
+            area,
+        );
+        return;
+    }
+    let sections = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).split(area);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                format!(
+                    "{} / {} / {} / field {}",
+                    feed.dataset, feed.config, feed.split, feed.field
+                ),
+                accent(),
+            ),
+            Line::from(format!(
+                "{} rows consumed / {} tokens / selected row {}",
+                feed.rows, feed.tokens, feed.row
+            )),
+            Line::styled(
+                "Selected-window rows (including repeats); latest chunk preview, not every sample.",
+                Style::new().fg(Color::DarkGray),
+            ),
+        ])
+        .block(panel(" dataset feed ")),
+        sections[0],
+    );
+    let block = panel(" shredder / text -> token ids ");
+    let inner = block.inner(sections[1]);
+    f.render_widget(block, sections[1]);
+    if inner.width == 0 || inner.height < 2 {
+        return;
+    }
+
+    // Cosmetic motion runs only in the reader at the shared ~30fps cap. The
+    // numbers and preview never invent data between producer samples.
+    let tick = (elapsed.as_millis() / 140) as u64;
+    let blade = (inner.height / 2).min(4);
+    let incoming_y = (tick % (blade as u64 + 2)) as u16;
+    if incoming_y < blade {
+        let indent = (inner.width / 12).min(5);
+        f.render_widget(
+            Paragraph::new(feed.snippet.as_str()).style(accent()),
+            Rect::new(
+                inner.x + indent,
+                inner.y + incoming_y,
+                inner.width - indent,
+                1,
+            ),
+        );
+    }
+    let teeth = if tick % 2 == 0 { "▾▿" } else { "▿▾" };
+    f.render_widget(
+        Paragraph::new(teeth.repeat(inner.width as usize / 2 + 1)).style(accent()),
+        Rect::new(inner.x, inner.y + blade, inner.width, 1),
+    );
+    let output_height = inner.height.saturating_sub(blade + 1);
+    if output_height == 0 {
+        return;
+    }
+    let columns = (inner.width / 10).max(1) as usize;
+    for (index, id) in feed.token_ids.iter().enumerate() {
+        let x = inner.x + (index % columns) as u16 * (inner.width / columns as u16);
+        let y =
+            inner.y + blade + 1 + ((tick + (index / columns) as u64) % output_height as u64) as u16;
+        f.render_widget(
+            Paragraph::new(format!("│{id}│"))
+                .style(Style::new().fg(progress_gradient(index as u16, 16))),
+            Rect::new(x, y, inner.width / columns as u16, 1),
+        );
     }
 }
 
@@ -2646,6 +2839,7 @@ mod tests {
                             "run metrics",
                             "chain / checkpoints",
                             "model / configuration",
+                            "feed / idle",
                         ];
                         assert!(text.contains(expected[tab]));
                     } else {
@@ -2656,6 +2850,68 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn feed_log_roundtrip_preserves_unicode_metrics_and_paths() {
+        let mut state = RunState::default();
+        let snippet = "héllo 世界 100% loss=NaN\nnext";
+        state.ingest(&format!("training 1/2 (50%) loss=4 tokens_per_second=100 feed_dataset=owner/name feed_config=small feed_split=train feed_field=body.text feed_rows=2 feed_tokens=17 feed_row=3 feed_snippet={} feed_token_ids=12%2C34%2C56 eta=2h 14m 09s last_checkpoint=/tmp/my chain/ck02.pssa", ui::encode_log_value(snippet)));
+        let feed = state.feed.as_ref().unwrap();
+        assert_eq!(feed.dataset, "owner/name");
+        assert_eq!(feed.snippet, "héllo 世界 100% loss=NaN next");
+        assert_eq!(feed.token_ids, [12, 34, 56]);
+        assert_eq!((feed.rows, feed.tokens, feed.row), (2, 17, 3));
+        assert_eq!(state.live_loss, Some(4.0));
+        assert_eq!(state.progress_pct, Some(50.0));
+        assert_eq!(state.eta.as_deref(), Some("2h 14m 09s"));
+        assert_eq!(
+            state.last_checkpoint.as_deref(),
+            Some("/tmp/my chain/ck02.pssa")
+        );
+        assert!(state.problem.is_none());
+        state.ingest("progress_schema=2 updates_total=2");
+        assert!(state.feed.is_none(), "new run clears previous samples");
+        assert_eq!(parse_log_value("feed_snippet=%ZZ", "feed_snippet"), None);
+        assert_eq!(parse_log_value("feed_snippet=%", "feed_snippet"), None);
+        assert_eq!(parse_log_value("feed_snippet=%FF", "feed_snippet"), None);
+        assert_eq!(
+            parse_log_value("feed_snippet=%1B%0A", "feed_snippet").as_deref(),
+            Some("  ")
+        );
+    }
+
+    #[test]
+    fn test_backend_renders_feed_frames_and_narrow_fallbacks() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut state = RunState::default();
+        state.ingest("feed_dataset=owner/name feed_config=default feed_split=train feed_field=text feed_rows=7 feed_tokens=128 feed_row=2 feed_snippet=hello%20world feed_token_ids=12%2C34%2C56");
+        let mut terminal = Terminal::new(TestBackend::new(80, 19)).unwrap();
+        let mut frames = Vec::new();
+        for millis in [0, 420, 840] {
+            terminal
+                .draw(|f| draw_feed_at(f, f.area(), &state, Duration::from_millis(millis)))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+            assert!(text.contains("owner/name"));
+            assert!(text.contains("7 rows consumed / 128 tokens / selected row 2"));
+            assert!(text.contains("shredder"));
+            assert!(text.contains("│12│"));
+            assert_eq!(buffer.cell((0, 5)).unwrap().symbol(), "┌");
+            assert_eq!(buffer.cell((79, 18)).unwrap().symbol(), "┘");
+            assert!(!buffer.content().iter().any(|c| c.fg == BRIGHT_RED));
+            frames.push(buffer.clone());
+        }
+        assert_ne!(
+            frames[0], frames[1],
+            "text and strips animate between samples"
+        );
+        assert_ne!(frames[1], frames[2]);
+        for (width, height) in [(120, 40), (80, 24), (60, 20), (30, 10), (10, 5), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| draw(f, &state, 3)).unwrap();
         }
     }
 

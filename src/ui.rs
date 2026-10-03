@@ -311,6 +311,18 @@ pub struct Progress {
     last_checkpoint: Option<String>,
     prior_updates: usize,
     memory_occupancy: Option<(usize, usize)>,
+    // Optional Hugging Face feed metadata. These fields are presentation-only
+    // and are emitted as additional key=value fields, so older log consumers
+    // can ignore them unchanged.
+    feed_dataset: Option<String>,
+    feed_config: Option<String>,
+    feed_split: Option<String>,
+    feed_field: Option<String>,
+    feed_rows: Option<usize>,
+    feed_tokens: Option<usize>,
+    feed_row: Option<usize>,
+    feed_snippet: Option<String>,
+    feed_token_ids: Option<String>,
     interactive: bool,
     emitted: bool,
     drawn_rows: u16,
@@ -337,6 +349,15 @@ impl Progress {
             last_checkpoint: None,
             prior_updates: 0,
             memory_occupancy: None,
+            feed_dataset: None,
+            feed_config: None,
+            feed_split: None,
+            feed_field: None,
+            feed_rows: None,
+            feed_tokens: None,
+            feed_row: None,
+            feed_snippet: None,
+            feed_token_ids: None,
             interactive: tui && color_enabled(),
             emitted: false,
             drawn_rows: 0,
@@ -372,6 +393,38 @@ impl Progress {
             memory.filter(|(used, capacity)| *used <= *capacity && *capacity > 0);
     }
 
+    /// Set the optional source/sample metadata shown by the feed tab. The
+    /// sample is deliberately short and the IDs are already formatted by the
+    /// caller so the progress logger never needs to know tokenizer details.
+    pub fn set_feed(
+        &mut self,
+        dataset: &str,
+        config: Option<&str>,
+        split: &str,
+        field: &str,
+        rows: usize,
+        tokens: usize,
+        row: usize,
+        snippet: &str,
+        token_ids: &str,
+    ) {
+        self.feed_dataset = Some(dataset.to_string());
+        self.feed_config = config.map(str::to_string);
+        self.feed_split = Some(split.to_string());
+        self.feed_field = Some(field.to_string());
+        self.feed_rows = Some(rows);
+        self.feed_tokens = Some(tokens);
+        self.feed_row = Some(row);
+        self.feed_snippet = Some(snippet.to_string());
+        self.feed_token_ids = Some(token_ids.to_string());
+    }
+
+    /// Let optional presentation work share the logger's existing throttle.
+    pub(crate) fn should_emit(&self, done: usize) -> bool {
+        let min_gap = if self.interactive { 0.2 } else { 5.0 };
+        !self.emitted || self.last_draw.elapsed().as_secs_f64() >= min_gap || done >= self.total
+    }
+
     /// Record `token_delta` freshly processed tokens at step `done`.
     pub fn update(&mut self, done: usize, token_delta: usize, loss: f64) {
         self.update_with_metrics(done, token_delta, loss, None, None);
@@ -396,8 +449,7 @@ impl Progress {
             }
             self.loss_history.push_back((loss, token_delta));
         }
-        let min_gap = if self.interactive { 0.2 } else { 5.0 };
-        if self.emitted && self.last_draw.elapsed().as_secs_f64() < min_gap && done < self.total {
+        if !self.should_emit(done) {
             return;
         }
         self.last_draw = Instant::now();
@@ -438,11 +490,12 @@ impl Progress {
             .as_deref()
             .map(|path| format!(" last_checkpoint={path}"))
             .unwrap_or_default();
+        let feed_fields = self.feed_fields();
         let global = self.prior_updates.saturating_add(done);
 
         if self.interactive {
             self.clear();
-            let rows = [
+            let mut rows = vec![
                 format!(
                     "{} {:>3.0}% | updates {done}/{} | {remaining_updates} remaining (global {global})",
                     self.label,
@@ -459,6 +512,15 @@ impl Progress {
                 format!("checkpoint #{number} pending: {checkpoint}"),
                 format!("last checkpoint: {last_checkpoint}"),
             ];
+            if let Some(dataset) = self.feed_dataset.as_deref() {
+                rows.push(format!(
+                    "feed {dataset} selected row {} / {} rows consumed / {} tokens: {}",
+                    self.feed_row.unwrap_or(0),
+                    self.feed_rows.unwrap_or(0),
+                    self.feed_tokens.unwrap_or(0),
+                    terminal_text(self.feed_snippet.as_deref().unwrap_or("-"))
+                ));
+            }
             let (columns, height) = crossterm::terminal::size().unwrap_or((80, 24));
             // Never wrap a row; leave the final column free. ratatui truncates
             // by display width (including wide Unicode paths), not bytes.
@@ -478,7 +540,7 @@ impl Progress {
             let _ = io::stdout().flush();
         } else {
             println!(
-                "  {} {}/{} ({:.0}%) loss={loss:.6} loss_average={average:.6} tokens_per_second={rate:.0} optimizer_updates={done} updates_total={} updates_remaining={remaining_updates} global_update={global} learning_rate={lr} memory_occupancy={memory} checkpoint_number={number} elapsed_seconds={elapsed:.3} eta={}{last_checkpoint_field}",
+                "  {} {}/{} ({:.0}%) loss={loss:.6} loss_average={average:.6} tokens_per_second={rate:.0} optimizer_updates={done} updates_total={} updates_remaining={remaining_updates} global_update={global} learning_rate={lr} memory_occupancy={memory} checkpoint_number={number} elapsed_seconds={elapsed:.3}{feed_fields} eta={}{last_checkpoint_field}",
                 self.label,
                 done,
                 self.total,
@@ -488,6 +550,24 @@ impl Progress {
             );
             let _ = io::stdout().flush();
         }
+    }
+
+    fn feed_fields(&self) -> String {
+        let Some(dataset) = self.feed_dataset.as_deref() else {
+            return String::new();
+        };
+        format!(
+            " feed_dataset={} feed_config={} feed_split={} feed_field={} feed_rows={} feed_tokens={} feed_row={} feed_snippet={} feed_token_ids={}",
+            encode_log_value(dataset),
+            encode_log_value(self.feed_config.as_deref().unwrap_or("auto")),
+            encode_log_value(self.feed_split.as_deref().unwrap_or("train")),
+            encode_log_value(self.feed_field.as_deref().unwrap_or("text")),
+            self.feed_rows.unwrap_or(0),
+            self.feed_tokens.unwrap_or(0),
+            self.feed_row.unwrap_or(0),
+            encode_log_value(self.feed_snippet.as_deref().unwrap_or("")),
+            encode_log_value(self.feed_token_ids.as_deref().unwrap_or("")),
+        )
     }
 
     fn loss_average(&self) -> Option<f64> {
@@ -517,6 +597,26 @@ impl Progress {
     pub fn finish(&mut self) {
         self.drawn_rows = 0;
     }
+}
+
+/// Dataset text is untrusted terminal content, even when decoded from a log.
+pub(crate) fn terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+pub(crate) fn encode_log_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 /// Kaggle chain convention; no assumption about arbitrary checkpoint names.
@@ -554,6 +654,47 @@ mod progress_tests {
         assert_eq!(progress.loss_average(), Some(3.0));
         progress.update(3, 1, f64::NAN);
         assert_eq!(progress.loss_average(), Some(3.0));
+    }
+
+    #[test]
+    fn feed_terminal_text_preserves_unicode_without_control_sequences() {
+        assert_eq!(
+            terminal_text("héllo 世界\n\r\t\x1b[2J\u{009b}31m"),
+            "héllo 世界    [2J 31m"
+        );
+    }
+
+    #[test]
+    fn feed_metadata_is_optional_escaped_and_shares_progress_throttle() {
+        let mut progress = Progress::new_with_tui("training", 10, false);
+        assert!(progress.feed_fields().is_empty());
+        assert!(progress.should_emit(1));
+        progress.set_feed(
+            "owner/name",
+            None,
+            "train",
+            "text",
+            2,
+            8,
+            3,
+            "a b\n%é",
+            "1,2",
+        );
+        let fields = progress.feed_fields();
+        assert!(fields.contains(" feed_dataset=owner/name"));
+        assert!(fields.contains(" feed_rows=2 feed_tokens=8 feed_row=3"));
+        assert!(fields.contains(" feed_snippet=a%20b%0A%25%C3%A9"));
+        assert!(fields.contains(" feed_token_ids=1%2C2"));
+        assert!(!fields.contains('\n'));
+        progress.emitted = true;
+        progress.last_draw = Instant::now();
+        assert!(!progress.should_emit(2));
+        assert!(
+            progress.should_emit(10),
+            "final preview is never throttled away"
+        );
+        progress.last_draw = Instant::now() - std::time::Duration::from_secs(6);
+        assert!(progress.should_emit(2));
     }
 
     #[test]
