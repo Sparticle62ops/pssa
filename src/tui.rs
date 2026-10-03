@@ -13,6 +13,7 @@ use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Axis, Block, Borders, Chart, Dataset, GraphType, LegendPosition, Paragraph, Tabs, Wrap,
+    canvas::{Canvas, Line as CanvasLine, Points},
 };
 use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
@@ -33,6 +34,12 @@ const PROGRESS_INTERPOLATION: Duration = Duration::from_millis(450);
 const EIGHTH_BLOCKS: [&str; 8] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"];
 const GRAPH_MAX_ZOOM: usize = 8;
 const GRAPH_INTERPOLATION: Duration = Duration::from_millis(300);
+const FRAME_INTERVAL: Duration = Duration::from_millis(34); // at most ~30 fps
+const NEURON_CYCLE: Duration = Duration::from_millis(9_000);
+const NEURON_GROW_START: f64 = 0.09;
+const NEURON_GROW_END: f64 = 0.64;
+const NEURON_COLLAPSE_END: f64 = 0.84;
+const NEURON_NODE_COUNT: usize = 30;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MetricSample {
@@ -818,6 +825,7 @@ fn run_app(
     let mut last_chain_scan = std::time::Instant::now() - Duration::from_secs(60);
     let mut last_compare_scan = std::time::Instant::now() - Duration::from_secs(60);
     let mut input_closed = false;
+    let mut next_frame = Instant::now();
 
     loop {
         // Drain stdin. A completed producer should leave the final dashboard
@@ -844,13 +852,18 @@ fn run_app(
             last_compare_scan = std::time::Instant::now();
         }
 
-        terminal.draw(|f| draw(f, &state, tab))?;
+        if Instant::now() >= next_frame || input_closed {
+            terminal.draw(|f| draw(f, &state, tab))?;
+            next_frame = Instant::now() + FRAME_INTERVAL;
+        }
         if input_closed {
             break;
         }
 
-        // poll events for up to 200ms, then loop back to stdin
-        if crossterm::event::poll(Duration::from_millis(200))? {
+        // Events may wake poll early. Gate drawing separately so key repeats
+        // cannot drive animation above the frame cap. The dedicated stdin
+        // reader still feeds the unbounded channel independently of rendering.
+        if crossterm::event::poll(next_frame.saturating_duration_since(Instant::now()))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 if key.kind == crossterm::event::KeyEventKind::Press {
                     match key.code {
@@ -980,6 +993,242 @@ fn shine_position(width: u16) -> Option<u16> {
     static ANIMATION_START: OnceLock<Instant> = OnceLock::new();
     let elapsed = ANIMATION_START.get_or_init(Instant::now).elapsed();
     Some(((elapsed.as_millis() / 45) as u16) % width)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NeuronNode {
+    x: f64,
+    y: f64,
+    parent: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NeuronFrame {
+    cycle: u64,
+    phase: f64,
+    growth: f64,
+    scale: f64,
+    network_alpha: f64,
+    collapsed: bool,
+}
+
+/// A tiny deterministic generator keeps the animation cheap without adding a
+/// dependency or sharing mutable state with the trainer. The cycle number is
+/// part of the seed, so each net is different while the collapsed endpoint is
+/// always the same root dot.
+#[derive(Clone, Copy)]
+struct NeuronRng(u64);
+
+impl NeuronRng {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut value = self.0;
+        value ^= value << 7;
+        value ^= value >> 9;
+        value ^= value << 8;
+        self.0 = value;
+        value
+    }
+
+    fn unit(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+fn smoothstep(value: f64) -> f64 {
+    let value = value.clamp(0.0, 1.0);
+    value * value * (3.0 - 2.0 * value)
+}
+
+fn neuron_frame_at(elapsed: Duration) -> NeuronFrame {
+    let cycle_millis = NEURON_CYCLE.as_millis();
+    let elapsed_millis = elapsed.as_millis();
+    let cycle = (elapsed_millis / cycle_millis) as u64;
+    let phase = (elapsed_millis % cycle_millis) as f64 / cycle_millis as f64;
+    if phase < NEURON_GROW_START {
+        return NeuronFrame {
+            cycle,
+            phase,
+            growth: 0.0,
+            scale: 1.0,
+            network_alpha: 1.0,
+            collapsed: false,
+        };
+    }
+    if phase < NEURON_GROW_END {
+        let progress = (phase - NEURON_GROW_START) / (NEURON_GROW_END - NEURON_GROW_START);
+        let growth = progress.powf(1.6);
+        // The net grows faster as this virtual camera pulls back. This keeps
+        // the early neuron legible and lets the finished net settle smaller.
+        let zoom = smoothstep((progress - 0.18) / 0.82);
+        return NeuronFrame {
+            cycle,
+            phase,
+            growth,
+            scale: 1.0 - 0.68 * zoom,
+            network_alpha: 1.0,
+            collapsed: false,
+        };
+    }
+    if phase < NEURON_COLLAPSE_END {
+        let collapse = (phase - NEURON_GROW_END) / (NEURON_COLLAPSE_END - NEURON_GROW_END);
+        return NeuronFrame {
+            cycle,
+            phase,
+            growth: 1.0,
+            scale: 0.32 * (1.0 - smoothstep(collapse)) + 0.03 * smoothstep(collapse),
+            network_alpha: 1.0 - smoothstep(collapse),
+            collapsed: false,
+        };
+    }
+    NeuronFrame {
+        cycle,
+        phase,
+        growth: 1.0,
+        scale: 0.0,
+        network_alpha: 0.0,
+        collapsed: true,
+    }
+}
+
+fn neuron_network(cycle: u64) -> Vec<NeuronNode> {
+    let seed = 0x9e37_79b9_7f4a_7c15_u64.wrapping_add(cycle.wrapping_mul(0x517c_c1b7_2722_0a95));
+    let mut rng = NeuronRng::new(seed);
+    let mut nodes = vec![NeuronNode {
+        x: 0.0,
+        y: 0.0,
+        parent: 0,
+    }];
+    for index in 1..NEURON_NODE_COUNT {
+        let parent = if index < 3 {
+            0
+        } else {
+            rng.next() as usize % index
+        };
+        let angle = rng.unit() * std::f64::consts::TAU;
+        let length = 0.10 + rng.unit() * 0.18;
+        let parent_node = nodes[parent];
+        nodes.push(NeuronNode {
+            x: parent_node.x + angle.cos() * length,
+            y: parent_node.y + angle.sin() * length,
+            parent,
+        });
+    }
+    // Normalize the extent so every seed makes a legible net before the
+    // camera shrinks it, without clipping a cycle with a long branch chain.
+    let furthest = nodes
+        .iter()
+        .map(|node| node.x.abs().max(node.y.abs()))
+        .fold(0.0_f64, f64::max);
+    if furthest > 0.0 {
+        let factor = 0.86 / furthest;
+        for node in nodes.iter_mut().skip(1) {
+            node.x *= factor;
+            node.y *= factor;
+        }
+    }
+    nodes
+}
+
+fn neuron_green(intensity: f64) -> Color {
+    let intensity = intensity.clamp(0.0, 1.0);
+    Color::Rgb(
+        (f64::from(0x39) * intensity).round() as u8,
+        (f64::from(0xe0) * intensity).round() as u8,
+        (f64::from(0x7a) * intensity).round() as u8,
+    )
+}
+
+fn neuron_title(frame: NeuronFrame) -> &'static str {
+    // Keep the collapsed endpoint and the next cycle's seed visually
+    // identical: the title is part of the panel, so changing it at the seam
+    // would make the loop flash even though both frames contain one dot.
+    if frame.collapsed || frame.growth < 0.02 {
+        " neuron / dot / next cycle "
+    } else if frame.network_alpha < 0.98 {
+        " neuron / collapsing net "
+    } else {
+        " neuron / growing braille net "
+    }
+}
+
+fn draw_neuron_animation(f: &mut ratatui::Frame, area: Rect, now: Instant) {
+    static ANIMATION_START: OnceLock<Instant> = OnceLock::new();
+    let started = *ANIMATION_START.get_or_init(Instant::now);
+    draw_neuron_animation_at(f, area, now.saturating_duration_since(started));
+}
+
+fn draw_neuron_animation_at(f: &mut ratatui::Frame, area: Rect, elapsed: Duration) {
+    let frame = neuron_frame_at(elapsed);
+    let nodes = neuron_network(frame.cycle);
+    let title = neuron_title(frame);
+    let inner = panel(title).inner(area);
+    if inner.width < 2 || inner.height < 2 {
+        f.render_widget(panel(title), area);
+        return;
+    }
+    // Braille cells have two by four dots. Match the virtual camera's aspect
+    // to those pixels, keeping the seed circular on wide and tall panels.
+    let pixel_width = f64::from(inner.width) * 2.0 - 1.0;
+    let pixel_height = f64::from(inner.height) * 4.0 - 1.0;
+    let aspect = pixel_width / pixel_height;
+    let dot = [(-1.0, 0.0), (0.0, -1.0), (0.0, 0.0), (0.0, 1.0), (1.0, 0.0)].map(|(x, y)| {
+        (
+            ((pixel_width / 2.0).floor() + x + 0.25) * 2.0 * aspect / pixel_width - aspect,
+            1.0 - ((pixel_height / 2.0).floor() + y + 0.25) * 2.0 / pixel_height,
+        )
+    });
+    let canvas = Canvas::default()
+        .block(panel(title))
+        .marker(Marker::Braille)
+        .background_color(Color::Black)
+        .x_bounds([-aspect, aspect])
+        .y_bounds([-1.0, 1.0])
+        .paint(move |ctx| {
+            if !frame.collapsed {
+                for (index, node) in nodes.iter().enumerate().skip(1) {
+                    let node_progress =
+                        frame.growth * (NEURON_NODE_COUNT + 1) as f64 - (index - 1) as f64;
+                    if node_progress <= 0.0 {
+                        continue;
+                    }
+                    let edge_progress = smoothstep(node_progress);
+                    let parent = nodes[node.parent];
+                    let end_x = parent.x + (node.x - parent.x) * edge_progress;
+                    let end_y = parent.y + (node.y - parent.y) * edge_progress;
+                    ctx.draw(&CanvasLine::new(
+                        parent.x * frame.scale,
+                        parent.y * frame.scale,
+                        end_x * frame.scale,
+                        end_y * frame.scale,
+                        neuron_green(0.42 * frame.network_alpha * edge_progress),
+                    ));
+                }
+                for (index, node) in nodes.iter().enumerate().skip(1) {
+                    let node_progress =
+                        frame.growth * (NEURON_NODE_COUNT + 1) as f64 - index as f64;
+                    if node_progress <= 0.0 {
+                        continue;
+                    }
+                    // Fade in only once the tendril has reached this node.
+                    let fade = smoothstep(node_progress) * frame.network_alpha;
+                    ctx.draw(&Points {
+                        coords: &[(node.x * frame.scale, node.y * frame.scale)],
+                        color: neuron_green(fade),
+                    });
+                }
+            }
+            // A fixed five-pixel filled seed stays visible as the net folds
+            // into it. Its size and position never change across cycle seams.
+            ctx.draw(&Points {
+                coords: &dot,
+                color: neuron_green(1.0),
+            });
+        });
+    f.render_widget(canvas, area);
 }
 
 fn progress_label(state: &RunState, pct: f64, width: u16) -> String {
@@ -1591,7 +1840,8 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
 
     let health = state.health_status();
     let health_style = Style::new().fg(health.color()).add_modifier(Modifier::BOLD);
-    let display_pct = state.displayed_progress_at(Instant::now());
+    let now = Instant::now();
+    let display_pct = state.displayed_progress_at(now);
     draw_progress(f, chunks[0], state, display_pct);
 
     let done = state
@@ -1605,7 +1855,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         .unwrap_or_else(|| "-".into());
 
     if show_graph {
-        draw_graph(f, chunks[1], state, Instant::now());
+        draw_graph(f, chunks[1], state, now);
     }
 
     let memory = match (state.memory_used, state.memory_capacity) {
@@ -1668,13 +1918,30 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
                 .unwrap_or_else(|| "-".into())
         )),
     ];
+    let metrics_area = if chunks[2].width >= 80 && chunks[2].height >= 5 {
+        let bottom = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length((chunks[2].width / 4).clamp(24, 36)),
+                Constraint::Min(0),
+            ])
+            .split(chunks[2]);
+        // The same panel animates while waiting for the first progress line:
+        // the idle dashboard doubles as the splash, without a blocking delay.
+        draw_neuron_animation(f, bottom[0], now);
+        bottom[1]
+    } else {
+        // Preserve readable metrics rather than squeezing two tiny panels
+        // side by side on a narrow or very short terminal.
+        chunks[2]
+    };
     f.render_widget(
         Paragraph::new(lines).block(panel(if show_graph {
             " run metrics "
         } else {
             " run metrics / compact "
         })),
-        chunks[2],
+        metrics_area,
     );
 }
 
@@ -2206,6 +2473,190 @@ mod tests {
             .collect();
         assert!(text.contains("Poincare disk"));
         assert!(text.contains("12/64"));
+    }
+
+    #[test]
+    fn neuron_animation_grows_collapses_and_reseeds_at_cycle_boundary() {
+        let first = neuron_frame_at(Duration::ZERO);
+        let growing = neuron_frame_at(Duration::from_millis(3_000));
+        let collapsing = neuron_frame_at(Duration::from_millis(6_800));
+        let settled = neuron_frame_at(NEURON_CYCLE - Duration::from_millis(1));
+        let next = neuron_frame_at(NEURON_CYCLE);
+
+        assert_eq!(first.growth, 0.0);
+        assert!(growing.growth > 0.0 && growing.growth < 1.0);
+        assert!(collapsing.network_alpha < 1.0);
+        assert!(settled.collapsed);
+        // The rendered endpoint is the same root dot as the next cycle's
+        // first frame, while the next cycle receives a fresh random network.
+        assert_eq!(settled.scale, 0.0);
+        assert_eq!(settled.network_alpha, 0.0);
+        assert_eq!(next.phase, 0.0);
+        assert_eq!(next.scale, first.scale);
+        assert_eq!(next.network_alpha, first.network_alpha);
+        assert_eq!(neuron_title(settled), neuron_title(next));
+        assert_ne!(
+            neuron_network(first.cycle + 1)[1].x,
+            neuron_network(first.cycle)[1].x
+        );
+    }
+
+    #[test]
+    fn neuron_growth_accelerates_while_camera_pulls_back_and_network_stays_bounded() {
+        let early = neuron_frame_at(Duration::from_millis(2_000));
+        let middle = neuron_frame_at(Duration::from_millis(3_000));
+        let late = neuron_frame_at(Duration::from_millis(4_000));
+        assert!(late.growth - middle.growth > middle.growth - early.growth);
+        assert!(early.scale > middle.scale && middle.scale > late.scale);
+        for cycle in 0..100 {
+            let nodes = neuron_network(cycle);
+            assert_eq!(nodes.len(), NEURON_NODE_COUNT);
+            assert_eq!((nodes[0].x, nodes[0].y), (0.0, 0.0));
+            for (index, node) in nodes.iter().enumerate().skip(1) {
+                assert!(node.parent < index, "branches attach to existing nodes");
+                assert!(node.x.is_finite() && node.x.abs() < 0.87);
+                assert!(node.y.is_finite() && node.y.abs() < 0.87);
+            }
+        }
+    }
+
+    fn braille_pixels(buffer: &ratatui::buffer::Buffer) -> u32 {
+        buffer
+            .content()
+            .iter()
+            .filter_map(|cell| cell.symbol().chars().next())
+            .filter(|ch| ('\u{2800}'..='\u{28ff}').contains(ch))
+            .map(|ch| (ch as u32 - 0x2800).count_ones())
+            .sum()
+    }
+
+    #[test]
+    fn test_backend_renders_neuron_animation_frames_on_braille_canvas() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(52, 12)).unwrap();
+        for elapsed in [
+            Duration::ZERO,
+            Duration::from_millis(2_500),
+            Duration::from_millis(6_800),
+            NEURON_CYCLE - Duration::from_millis(1),
+        ] {
+            terminal
+                .draw(|frame| draw_neuron_animation_at(frame, frame.area(), elapsed))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("neuron /"));
+            assert!(buffer.content().iter().any(|cell| {
+                cell.symbol()
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
+            }));
+            assert!(buffer.content().iter().any(|cell| cell.fg == NORMAL_GREEN));
+            if elapsed == Duration::ZERO || elapsed == NEURON_CYCLE - Duration::from_millis(1) {
+                assert_eq!(braille_pixels(buffer), 5, "one filled circular seed");
+            } else if elapsed == Duration::from_millis(2_500) {
+                assert!(braille_pixels(buffer) > 5, "branches grow beyond the seed");
+                assert!(buffer.content().iter().any(|cell| {
+                    matches!(cell.fg, Color::Rgb(r, g, b) if r > 0 && r < 0x39 && g > b && b > r)
+                }), "branches and newly born nodes fade in green");
+            }
+        }
+
+        // The final collapsed frame and the next cycle's seed are the same
+        // rendered dot, not merely the same animation state numerically.
+        terminal
+            .draw(|frame| {
+                draw_neuron_animation_at(
+                    frame,
+                    frame.area(),
+                    NEURON_CYCLE - Duration::from_millis(1),
+                )
+            })
+            .unwrap();
+        let collapsed = terminal.backend().buffer().content().to_vec();
+        terminal
+            .draw(|frame| draw_neuron_animation_at(frame, frame.area(), NEURON_CYCLE))
+            .unwrap();
+        assert_eq!(collapsed, terminal.backend().buffer().content());
+    }
+
+    #[test]
+    fn test_backend_neuron_seam_survives_resizes_and_new_seeds_change_the_net() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for (width, height) in [(0, 0), (1, 1), (2, 2), (12, 5), (24, 9), (52, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| draw_neuron_animation_at(f, f.area(), Duration::ZERO))
+                .unwrap();
+            let seed = terminal.backend().buffer().clone();
+            for elapsed in [NEURON_CYCLE - Duration::from_millis(1), NEURON_CYCLE] {
+                terminal
+                    .draw(|f| draw_neuron_animation_at(f, f.area(), elapsed))
+                    .unwrap();
+                assert_eq!(terminal.backend().buffer(), &seed);
+            }
+            if width >= 24 {
+                terminal
+                    .draw(|f| draw_neuron_animation_at(f, f.area(), Duration::from_secs(3)))
+                    .unwrap();
+                let first_net = terminal.backend().buffer().clone();
+                terminal
+                    .draw(|f| {
+                        draw_neuron_animation_at(f, f.area(), NEURON_CYCLE + Duration::from_secs(3))
+                    })
+                    .unwrap();
+                assert_ne!(terminal.backend().buffer(), &first_net);
+                assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "┌");
+                assert_eq!(
+                    terminal.backend().buffer()[(width - 1, height - 1)].symbol(),
+                    "┘"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_backend_keeps_neuron_on_idle_and_training_monitor_and_preserves_other_tabs() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = RunState::default();
+        for active in [false, true] {
+            if active {
+                state.ingest("training 1/2 (50%) loss=4.0 tokens_per_second=100 eta=1s");
+            }
+            for (width, height) in [(80, 24), (120, 40), (60, 20), (30, 10), (10, 5)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                for tab in 0..TABS.len() {
+                    terminal.draw(|f| draw(f, &state, tab)).unwrap();
+                    let text: String = terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    assert!(text.contains(TABS[tab]));
+                    if width >= 80 {
+                        assert_eq!(text.contains("neuron /"), tab == 0);
+                        let expected = [
+                            "run metrics",
+                            "chain / checkpoints",
+                            "model / configuration",
+                        ];
+                        assert!(text.contains(expected[tab]));
+                    } else {
+                        assert!(
+                            !text.contains("neuron /"),
+                            "narrow metrics retain full width"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
