@@ -171,7 +171,8 @@ impl<'a> PSSAInferenceEngine<'a> {
         Ok(id)
     }
     /// Generates autoregressively. BPE callbacks receive decoded UTF-8 segments,
-    /// never internal ByteLevel labels; an incomplete final UTF-8 suffix is held.
+    /// never internal ByteLevel labels; incomplete UTF-8 is held until the next
+    /// token and any incomplete final suffix is emitted as a replacement character.
     pub fn try_generate_chat_turn<F>(
         &mut self,
         prompt: &str,
@@ -180,6 +181,57 @@ impl<'a> PSSAInferenceEngine<'a> {
     ) -> Result<String, String>
     where
         F: FnMut(&str),
+    {
+        self.try_generate_chat_turn_impl(
+            prompt,
+            cfg,
+            |_, delta, _| {
+                if let Some(delta) = delta {
+                    callback(delta);
+                }
+            },
+            || false,
+        )
+    }
+
+    /// Generates with cooperative cancellation checked before each prompt token
+    /// and each generation step. Cancellation returns the partial reply as `Ok`.
+    ///
+    /// The callback receives the cumulative decoded reply and number of generated
+    /// tokens after every token, even when an incomplete BPE UTF-8 sequence leaves
+    /// the reply unchanged. A final incomplete sequence is replaced with U+FFFD;
+    /// that final update invokes the callback again with the same token count.
+    pub fn try_generate_chat_turn_controlled<F, C>(
+        &mut self,
+        prompt: &str,
+        cfg: &InferenceConfig,
+        mut callback: F,
+        cancelled: C,
+    ) -> Result<String, String>
+    where
+        F: FnMut(&str, usize),
+        C: Fn() -> bool,
+    {
+        self.try_generate_chat_turn_impl(
+            prompt,
+            cfg,
+            |out, _, count| callback(out, count),
+            cancelled,
+        )
+    }
+
+    // `delta` preserves legacy word-token / decoded-BPE-segment callbacks, while
+    // `out` and `count` expose progress even when a token has no decoded text yet.
+    fn try_generate_chat_turn_impl<F, C>(
+        &mut self,
+        prompt: &str,
+        cfg: &InferenceConfig,
+        mut callback: F,
+        cancelled: C,
+    ) -> Result<String, String>
+    where
+        F: FnMut(&str, Option<&str>, usize),
+        C: Fn() -> bool,
     {
         Self::validate(cfg)?;
         let prompt_ids = self.tokenizer.try_encode(prompt, true)?;
@@ -197,6 +249,9 @@ impl<'a> PSSAInferenceEngine<'a> {
         generated_ids.extend_from_slice(&prompt_ids);
         self.model.reset_recurrent_state();
         for &id in &prompt_ids {
+            if cancelled() {
+                return Ok(String::new());
+            }
             if id >= d_v {
                 return Err(format!("prompt ID {id} outside model vocabulary"));
             }
@@ -207,6 +262,9 @@ impl<'a> PSSAInferenceEngine<'a> {
                 let mut out = String::with_capacity(cfg.max_new_tokens.saturating_mul(8));
                 let mut sentence_count = 0;
                 for step in 0..cfg.max_new_tokens {
+                    if cancelled() {
+                        break;
+                    }
                     if step > 0 {
                         self.model.forward_inference(
                             *generated_ids.last().expect("generated token"),
@@ -235,7 +293,7 @@ impl<'a> PSSAInferenceEngine<'a> {
                         }
                         out.push_str(token);
                     }
-                    callback(token);
+                    callback(&out, Some(token), step + 1);
                     if matches!(token.as_str(), "." | "?" | "!") {
                         sentence_count += 1;
                         if sentence_count >= 2 {
@@ -257,6 +315,9 @@ impl<'a> PSSAInferenceEngine<'a> {
                 let mut out = String::with_capacity(raw_capacity.saturating_mul(3));
                 let mut emitted = 0usize;
                 for step in 0..cfg.max_new_tokens {
+                    if cancelled() {
+                        break;
+                    }
                     if step > 0 {
                         self.model.forward_inference(
                             *generated_ids.last().expect("generated token"),
@@ -305,9 +366,8 @@ impl<'a> PSSAInferenceEngine<'a> {
                             }
                         }
                     }
-                    if out.len() > begin {
-                        callback(&out[begin..]);
-                    }
+                    let delta = (out.len() > begin).then_some(&out[begin..]);
+                    callback(&out, delta, step + 1);
                 }
                 // A byte-level token stream may end in the middle of a UTF-8
                 // sequence.  Preserve that output as the standard replacement
@@ -315,7 +375,7 @@ impl<'a> PSSAInferenceEngine<'a> {
                 if emitted < raw.len() {
                     let tail = String::from_utf8_lossy(&raw[emitted..]);
                     out.push_str(&tail);
-                    callback(&tail);
+                    callback(&out, Some(&tail), generated_ids.len() - prompt_ids.len());
                 }
                 Ok(out)
             }
@@ -337,17 +397,260 @@ impl<'a> PSSAInferenceEngine<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::unknown_prompt_error;
+    use super::{InferenceConfig, PSSAInferenceEngine, unknown_prompt_error};
     use crate::dataset::Tokenizer;
+    use crate::pssa::{PSSAConfigV2, PSSALayerV2};
+    use std::cell::Cell;
+
+    fn tiny_model(tokenizer: &Tokenizer) -> PSSALayerV2 {
+        let mut model = PSSALayerV2::new(
+            PSSAConfigV2 {
+                d_vocab: tokenizer.vocab_size,
+                d_latent: 4,
+                d_state: 2,
+                d_mem_key: 2,
+                mem_capacity: 2,
+                chunk_len: 2,
+                ..Default::default()
+            },
+            5,
+        );
+        model.vocabulary = tokenizer.ordered_vocabulary().unwrap();
+        model.tokenizer_json = tokenizer.serialized_metadata();
+        // Equal finite logits make greedy sampling select ID 1 deterministically.
+        model.unembed_w.data.fill(0.0);
+        model
+    }
+
+    fn greedy(max_new_tokens: usize) -> InferenceConfig {
+        InferenceConfig {
+            temperature: 0.0,
+            max_new_tokens,
+            ..Default::default()
+        }
+    }
+
+    fn word_tokenizer(first: &str) -> Tokenizer {
+        Tokenizer::from_vocabulary(&["<unk>".into(), first.into(), "prompt".into()]).unwrap()
+    }
+
+    fn bpe_tokenizer(first_byte: u8) -> Tokenizer {
+        let tokenizer = Tokenizer::from_corpus_bpe("a", 257).unwrap();
+        let target = (1..tokenizer.vocab_size)
+            .find(|&id| tokenizer.token_bytes(id) == Some(&[first_byte][..]))
+            .unwrap();
+        // Keep the full byte alphabet but put the byte under test at greedy ID 1.
+        let mut metadata: serde_json::Value =
+            serde_json::from_str(&tokenizer.serialized_metadata().unwrap()).unwrap();
+        let vocab = metadata["model"]["vocab"].as_object_mut().unwrap();
+        vocab.insert(tokenizer.id_to_token[&1].clone(), target.into());
+        vocab.insert(tokenizer.id_to_token[&target].clone(), 1.into());
+        Tokenizer::from_serialized(&metadata.to_string()).unwrap()
+    }
+
+    #[test]
+    fn controlled_words_are_cumulative_and_legacy_callbacks_remain_raw() {
+        for (token, expected, snapshots) in [
+            (
+                "word",
+                "word word word",
+                vec!["word", "word word", "word word word"],
+            ),
+            (".", "..", vec![".", ".."]),
+        ] {
+            let tokenizer = word_tokenizer(token);
+            let mut model = tiny_model(&tokenizer);
+            let mut engine = PSSAInferenceEngine::new(&mut model, &tokenizer);
+            let mut legacy = Vec::new();
+            let legacy_out = engine
+                .try_generate_chat_turn("prompt prompt", &greedy(3), |s| legacy.push(s.to_owned()))
+                .unwrap();
+            let mut progress = Vec::new();
+            let controlled_out = engine
+                .try_generate_chat_turn_controlled(
+                    "prompt prompt",
+                    &greedy(3),
+                    |s, count| progress.push((s.to_owned(), count)),
+                    || false,
+                )
+                .unwrap();
+            assert_eq!(legacy_out, expected);
+            assert_eq!(controlled_out, legacy_out);
+            assert_eq!(legacy, vec![token; snapshots.len()]);
+            assert_eq!(
+                progress,
+                snapshots
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, text)| (text.to_owned(), index + 1))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_bpe_preserves_legacy_decoded_deltas_and_counts_incomplete_tokens() {
+        for (byte, expected, deltas, snapshots) in [
+            (
+                b' ',
+                "   ",
+                vec![" ", " ", " "],
+                vec![(" ", 1), ("  ", 2), ("   ", 3)],
+            ),
+            // Each leading byte is incomplete until the next byte proves it invalid.
+            // Final flushing emits a replacement without inventing a fourth token.
+            (
+                0xc3,
+                "���",
+                vec!["�", "�", "�"],
+                vec![("", 1), ("�", 2), ("��", 3), ("���", 3)],
+            ),
+        ] {
+            let tokenizer = bpe_tokenizer(byte);
+            let mut model = tiny_model(&tokenizer);
+            let mut engine = PSSAInferenceEngine::new(&mut model, &tokenizer);
+            let mut legacy = Vec::new();
+            let legacy_out = engine
+                .try_generate_chat_turn("a", &greedy(3), |s| legacy.push(s.to_owned()))
+                .unwrap();
+            let mut progress = Vec::new();
+            let controlled_out = engine
+                .try_generate_chat_turn_controlled(
+                    "a",
+                    &greedy(3),
+                    |s, count| progress.push((s.to_owned(), count)),
+                    || false,
+                )
+                .unwrap();
+            assert_eq!(legacy_out, expected);
+            assert_eq!(legacy, deltas);
+            assert_eq!(controlled_out, legacy_out);
+            assert_eq!(
+                progress,
+                snapshots
+                    .into_iter()
+                    .map(|(text, count)| (text.to_owned(), count))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_returns_partial_words_and_resets_on_next_turn() {
+        let tokenizer = word_tokenizer("word");
+        let mut model = tiny_model(&tokenizer);
+        let mut engine = PSSAInferenceEngine::new(&mut model, &tokenizer);
+        let count = Cell::new(0);
+        let out = engine
+            .try_generate_chat_turn_controlled(
+                "prompt",
+                &greedy(10),
+                |_, generated| count.set(generated),
+                || count.get() >= 2,
+            )
+            .unwrap();
+        assert_eq!(out, "word word");
+        assert_eq!(count.get(), 2);
+        assert_eq!(
+            engine
+                .try_generate_chat_turn("prompt", &greedy(3), |_| {})
+                .unwrap(),
+            "word word word"
+        );
+    }
+
+    #[test]
+    fn cancellation_after_incomplete_bpe_token_flushes_partial_reply() {
+        let tokenizer = bpe_tokenizer(0xc3);
+        let mut model = tiny_model(&tokenizer);
+        let count = Cell::new(0);
+        let mut progress = Vec::new();
+        let out = PSSAInferenceEngine::new(&mut model, &tokenizer)
+            .try_generate_chat_turn_controlled(
+                "a",
+                &greedy(10),
+                |s, generated| {
+                    count.set(generated);
+                    progress.push((s.to_owned(), generated));
+                },
+                || count.get() >= 1,
+            )
+            .unwrap();
+        assert_eq!(out, "�");
+        assert_eq!(progress, vec![(String::new(), 1), ("�".into(), 1)]);
+    }
+
+    #[test]
+    fn cancellation_during_prefill_stops_before_next_prompt_token() {
+        for tokenizer in [word_tokenizer("word"), bpe_tokenizer(b' ')] {
+            let prompt = "prompt prompt prompt";
+            let ids = tokenizer.try_encode(prompt, true).unwrap();
+            assert!(ids.len() > 2);
+            let mut model = tiny_model(&tokenizer);
+            let mut expected = tiny_model(&tokenizer);
+            expected.reset_recurrent_state();
+            expected.forward_inference(ids[0], &mut vec![0.0; tokenizer.vocab_size]);
+            let checks = Cell::new(0);
+            let out = PSSAInferenceEngine::new(&mut model, &tokenizer)
+                .try_generate_chat_turn_controlled(
+                    prompt,
+                    &greedy(10),
+                    |_, _| panic!("prefill must not emit generated-token callbacks"),
+                    || {
+                        checks.set(checks.get() + 1);
+                        checks.get() == 2
+                    },
+                )
+                .unwrap();
+            assert_eq!(out, "");
+            assert_eq!(checks.get(), 2);
+            assert_eq!(model.inf_features, expected.inf_features);
+            assert_eq!(model.inf_z_final, expected.inf_z_final);
+        }
+    }
+
+    #[test]
+    fn cancellation_before_generation_and_zero_budget_emit_no_callbacks() {
+        for tokenizer in [word_tokenizer("word"), bpe_tokenizer(b' ')] {
+            for max_new_tokens in [0, 3] {
+                let mut model = tiny_model(&tokenizer);
+                let out = PSSAInferenceEngine::new(&mut model, &tokenizer)
+                    .try_generate_chat_turn_controlled(
+                        "prompt",
+                        &greedy(max_new_tokens),
+                        |_, _| panic!("no generated tokens expected"),
+                        || max_new_tokens > 0,
+                    )
+                    .unwrap();
+                assert_eq!(out, "");
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_generation_preserves_validation_errors() {
+        let tokenizer = word_tokenizer("word");
+        let mut model = tiny_model(&tokenizer);
+        let mut engine = PSSAInferenceEngine::new(&mut model, &tokenizer);
+        for prompt in ["", "unknown", "prompt"] {
+            let mut cfg = greedy(1);
+            if prompt == "prompt" {
+                cfg.temperature = f32::NAN;
+            }
+            let legacy = engine
+                .try_generate_chat_turn(prompt, &cfg, |_| {})
+                .unwrap_err();
+            let controlled = engine
+                .try_generate_chat_turn_controlled(prompt, &cfg, |_, _| {}, || false)
+                .unwrap_err();
+            assert_eq!(controlled, legacy);
+        }
+    }
 
     #[test]
     fn unknown_prompt_error_explains_word_vocabulary() {
-        let tokenizer = Tokenizer::from_vocabulary(&[
-            "<unk>".into(),
-            "alpha".into(),
-            "beta".into(),
-        ])
-        .unwrap();
+        let tokenizer =
+            Tokenizer::from_vocabulary(&["<unk>".into(), "alpha".into(), "beta".into()]).unwrap();
         let error = unknown_prompt_error(&tokenizer, "hello saturn hello");
         assert!(error.contains("word-level tokenizer, 2 words learned from the training text"));
         assert!(error.contains(": hello, saturn."));

@@ -2,6 +2,9 @@
 # Rust build artifacts
 target/
 
+# Local inference conversations (may contain private prompts/attachments)
+/chats/
+
 # Test dataset (wikimedia/wikipedia)
 data/downloaded.txt
 

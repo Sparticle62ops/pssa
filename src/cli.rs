@@ -1980,10 +1980,10 @@ impl CLIHandler {
                 println!("Example: {bin} help train");
             }
             "tui" => {
-                println!("Usage: {bin} tui [-c|--chain DIR] [--compare LOG]");
+                println!("Usage: {bin} tui [-c|--chain DIR] [--compare LOG] [--chats-dir DIR]");
                 println!();
                 println!(
-                    "Render a live dashboard for a piped training run; piped output is passed through plainly."
+                    "Open the dashboard and local inference chat; piped output is passed through plainly."
                 );
                 println!(
                     "Example: {bin} train data/downloaded.txt --no-tui | {bin} tui --compare transformer.log"
@@ -1996,6 +1996,10 @@ impl CLIHandler {
 
     pub fn parse_and_execute(args: Vec<String>) -> Result<(), String> {
         if args.len() < 2 {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                return crate::tui::run(&[]);
+            }
             Self::print_home();
             return Ok(());
         }
