@@ -7,12 +7,17 @@
 //! and exits, and Ctrl+C / q always hands the terminal back cleanly.
 
 use crate::ui;
+use ratatui::style::Color;
 use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TABS: [&str; 3] = ["monitor", "chain", "model"];
+const NORMAL_GREEN: Color = Color::Rgb(0x39, 0xe0, 0x7a);
+const AMBER: Color = Color::Rgb(0xff, 0xbf, 0x00);
+const BRIGHT_RED: Color = Color::Rgb(0xff, 0x2f, 0x3f);
+const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct RunState {
@@ -39,6 +44,15 @@ struct RunState {
     last_checkpoint: Option<String>,
     // losses over time (for the sparkline)
     loss_series: Vec<f64>,
+    // Health checks are presentation-only; they never affect training.
+    problem: Option<String>,
+    warning: Option<String>,
+    tok_s_history: Vec<f64>,
+    last_progress_at: Option<Instant>,
+    training_active: bool,
+    expected_lr_base: Option<f64>,
+    expected_lr_total: Option<u64>,
+    expected_lr_warmup: Option<u64>,
     // last finished epoch line
     epoch_loss: Option<f64>,
     epoch_tokens: Option<u64>,
@@ -55,6 +69,39 @@ struct RunState {
     prior_steps: Option<u64>,
     current_offset: Option<u64>,
     raw_lines: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HealthLevel {
+    Normal,
+    Warning,
+    Problem,
+}
+
+struct HealthStatus {
+    level: HealthLevel,
+    reason: Option<String>,
+    normal_label: &'static str,
+}
+
+impl HealthStatus {
+    fn color(&self) -> Color {
+        match self.level {
+            HealthLevel::Normal => NORMAL_GREEN,
+            HealthLevel::Warning => AMBER,
+            HealthLevel::Problem => BRIGHT_RED,
+        }
+    }
+
+    fn label(&self) -> String {
+        match (&self.level, &self.reason) {
+            (HealthLevel::Normal, _) => self.normal_label.to_string(),
+            (HealthLevel::Warning, Some(reason)) => format!("WARNING: {reason}"),
+            (HealthLevel::Problem, Some(reason)) => format!("PROBLEM: {reason}"),
+            (HealthLevel::Warning, None) => "WARNING".to_string(),
+            (HealthLevel::Problem, None) => "PROBLEM".to_string(),
+        }
+    }
 }
 
 impl RunState {
@@ -84,46 +131,134 @@ impl RunState {
             }
         }
 
-        let loss = parse_kv::<f64>(line, "loss=")
-            .or_else(|| parse_kv(line, "loss "))
-            .filter(|v| v.is_finite());
-        if let Some(v) = loss {
-            if line.starts_with("epoch ") && line.contains("updates=") {
-                // Epoch summaries are distinct from live progress samples.
-                self.epoch_loss = Some(v);
-                self.epoch_tokens = parse_kv(line, "tokens=");
-                self.epoch_updates = parse_kv(line, "updates=");
-                self.loss_series.push(v);
-            } else if line.contains("tokens_per_second=") || line.contains("tok/s") {
-                // ui::Progress emits key=value fields when piped, and a bar
-                // with space-separated fields on an interactive terminal.
-                self.live_loss = Some(v);
-                self.loss_series.push(v);
-                if let Some(p) = parse_pct(line) {
-                    self.progress_pct = Some(p);
-                }
-                self.tok_s = parse_kv::<f64>(line, "tokens_per_second=")
-                    .or_else(|| {
-                        line.split_once("tok/s")?
-                            .0
-                            .split_whitespace()
-                            .last()?
-                            .parse()
-                            .ok()
-                    })
-                    .filter(|v| v.is_finite());
-                if let Some((_, eta)) = line.split_once("eta=").or_else(|| line.split_once("eta "))
+        if line.contains("lr_schedule=") {
+            self.expected_lr_total =
+                parse_kv(line, "horizon=").or_else(|| parse_kv(line, "to_step="));
+            self.expected_lr_warmup = Some(parse_kv(line, "warmup=").unwrap_or(0));
+        }
+        if let Some(schedule) = parse_field(line, "schedule") {
+            self.expected_lr_base = parse_kv::<f64>(&schedule, "base ");
+            // The human-readable banner groups horizons with commas.
+            self.expected_lr_total = parse_kv(&schedule.replace(',', ""), "horizon ");
+            if self.expected_lr_warmup.is_none() {
+                // Fresh legacy schedules do not emit warmup metadata. Their
+                // first update is base / warmup (or base without warmup).
+                // Infer only when the rounded banner supports that value.
+                if let (Some(base), Some(first)) =
+                    (self.expected_lr_base, parse_kv::<f64>(&schedule, "first="))
                 {
-                    // ui::duration can contain spaces, e.g. `2h 14m 09s`.
-                    self.eta = Some(eta.trim().to_string());
+                    let warmup = (base / first).round();
+                    if base > 0.0
+                        && first > 0.0
+                        && warmup.is_finite()
+                        && warmup >= 1.0
+                        && (base / warmup - first).abs() <= 1e-8
+                    {
+                        self.expected_lr_warmup =
+                            Some(if warmup == 1.0 { 0 } else { warmup as u64 });
+                    }
                 }
+            }
+        }
+        if line.contains("progress_schema=") {
+            // Start the stall clock even before the first update arrives.
+            self.last_progress_at = Some(Instant::now());
+            self.training_active = true;
+            self.problem = None;
+            self.warning = None;
+            self.loss_series.clear();
+            self.tok_s_history.clear();
+        }
+
+        let raw_loss = parse_kv::<f64>(line, "loss=").or_else(|| parse_kv(line, "loss "));
+        let is_progress = line.contains("tokens_per_second=") || line.contains("tok/s");
+        if is_progress {
+            self.last_progress_at = Some(Instant::now());
+            self.training_active = true;
+            // Problems remain visible until the next progress sample checks
+            // whether the run recovered; unrelated log rows cannot clear them.
+            self.problem = None;
+            self.warning = None;
+            if let Some(v) = raw_loss {
+                if !v.is_finite() {
+                    self.record_problem("loss is NaN/inf");
+                } else {
+                    // Compare against the preceding samples so the current
+                    // spike cannot hide itself by raising its own average.
+                    if let Some(average) = self.recent_loss_average() {
+                        if v > average * 1.5 {
+                            self.record_problem(format!(
+                                "loss spike {v:.4} > 1.5x recent avg {average:.4}"
+                            ));
+                        } else if v > average * 1.25 {
+                            self.record_warning(format!(
+                                "loss rising {v:.4} vs recent avg {average:.4}"
+                            ));
+                        }
+                    }
+                    self.live_loss = Some(v);
+                    self.loss_series.push(v);
+                }
+            }
+            if let Some(p) = parse_pct(line) {
+                self.progress_pct = Some(p);
+            }
+            // ui::Progress emits key=value fields when piped, and a bar
+            // with space-separated fields on an interactive terminal.
+            let speed = parse_kv::<f64>(line, "tokens_per_second=")
+                .or_else(|| {
+                    line.split_once("tok/s")?
+                        .0
+                        .split_whitespace()
+                        .last()?
+                        .parse()
+                        .ok()
+                })
+                .filter(|v| v.is_finite());
+            if let Some(speed) = speed {
+                self.tok_s = Some(speed);
+                if let Some(median) = self.running_tok_s_median() {
+                    if speed < median * 0.6 {
+                        self.record_problem(format!(
+                            "speed {speed:.0} tok/s < 60% of median {median:.0}"
+                        ));
+                    } else if speed < median * 0.75 {
+                        self.record_warning(format!(
+                            "speed {speed:.0} tok/s below median {median:.0}"
+                        ));
+                    }
+                }
+                self.tok_s_history.push(speed.max(0.0));
+                if self.tok_s_history.len() > 31 {
+                    self.tok_s_history.remove(0);
+                }
+            }
+            if let Some((_, eta)) = line.split_once("eta=").or_else(|| line.split_once("eta ")) {
+                // ui::duration can contain spaces, e.g. `2h 14m 09s`.
+                self.eta = Some(eta.trim().to_string());
             }
             if self.loss_series.len() > 600 {
                 self.loss_series.remove(0);
             }
+        } else if line.starts_with("epoch ")
+            && line.contains("updates=")
+            && raw_loss.is_some_and(|v| v.is_finite())
+        {
+            // Epoch summaries are distinct from live progress samples.
+            let v = raw_loss.expect("is_finite checked above");
+            self.epoch_loss = Some(v);
+            self.epoch_tokens = parse_kv(line, "tokens=");
+            self.epoch_updates = parse_kv(line, "updates=");
+            self.loss_series.push(v);
+            if self.loss_series.len() > 600 {
+                self.loss_series.remove(0);
+            }
+        } else if raw_loss.is_some_and(|v| !v.is_finite()) {
+            self.record_problem("loss is NaN/inf");
         }
         if let Some(t) = parse_kv(line, "training_seconds=") {
             self.training_seconds = Some(t);
+            self.training_active = false;
         }
         if let Some(u) = parse_kv(line, "optimizer_updates=") {
             self.optimizer_updates = Some(u);
@@ -154,10 +289,21 @@ impl RunState {
         if let Some(done) = parse_kv(line, "global_update=") {
             self.optimizer_updates = Some(done);
         }
-        if let Some(lr) = parse_kv::<f64>(line, "learning_rate=")
-            && lr.is_finite()
+        if is_progress
+            && self
+                .updates_done
+                .zip(self.updates_total)
+                .is_some_and(|(done, total)| done >= total)
         {
-            self.learning_rate = Some(lr);
+            self.training_active = false;
+        }
+        if let Some(lr) = parse_kv::<f64>(line, "learning_rate=") {
+            if lr.is_finite() {
+                self.learning_rate = Some(lr);
+                self.check_learning_rate(lr);
+            } else {
+                self.record_problem("learning rate is NaN/inf");
+            }
         }
         if let Some(number) = parse_kv(line, "checkpoint_number=") {
             self.checkpoint_number = Some(number);
@@ -258,6 +404,127 @@ impl RunState {
         self.checkpoints
             .sort_by_key(|(name, _)| checkpoint_sort_key(name));
     }
+
+    fn record_problem(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        match &mut self.problem {
+            Some(existing) if !existing.contains(&reason) => {
+                existing.push_str("; ");
+                existing.push_str(&reason);
+            }
+            Some(_) => {}
+            None => self.problem = Some(reason),
+        }
+    }
+
+    fn record_warning(&mut self, reason: impl Into<String>) {
+        if self.problem.is_some() {
+            return;
+        }
+        let reason = reason.into();
+        match &mut self.warning {
+            Some(existing) if !existing.contains(&reason) => {
+                existing.push_str("; ");
+                existing.push_str(&reason);
+            }
+            Some(_) => {}
+            None => self.warning = Some(reason),
+        }
+    }
+
+    fn recent_loss_average(&self) -> Option<f64> {
+        let recent: Vec<f64> = self.loss_series.iter().rev().take(8).copied().collect();
+        (!recent.is_empty()).then(|| recent.iter().sum::<f64>() / recent.len() as f64)
+    }
+
+    fn running_tok_s_median(&self) -> Option<f64> {
+        if self.tok_s_history.len() < 3 {
+            return None;
+        }
+        let mut values = self.tok_s_history.clone();
+        values.sort_by(f64::total_cmp);
+        Some(values[values.len() / 2])
+    }
+
+    fn check_learning_rate(&mut self, actual: f64) {
+        if actual <= 0.0 {
+            self.record_problem(format!("lr {actual:.3e} must be positive"));
+            return;
+        }
+        let (Some(base), Some(total), Some(step), Some(warmup)) = (
+            self.expected_lr_base,
+            self.expected_lr_total,
+            self.optimizer_updates,
+            self.expected_lr_warmup,
+        ) else {
+            return;
+        };
+        let (Ok(total), Ok(step), Ok(warmup)) = (
+            usize::try_from(total),
+            usize::try_from(step),
+            usize::try_from(warmup),
+        ) else {
+            return;
+        };
+        let Ok(expected) = crate::cli::learning_rate_for_update(base as f32, step, total, warmup)
+        else {
+            return;
+        };
+        let expected = f64::from(expected);
+        // Allow rounding of the banner base (eight decimal places) and the
+        // progress field, but flag a real schedule mismatch.
+        let tolerance = expected.abs() * 0.02 + 1e-8;
+        if (actual - expected).abs() > tolerance {
+            self.record_problem(format!(
+                "lr {actual:.3e} outside schedule (expected {expected:.3e})"
+            ));
+        }
+    }
+
+    fn health_status_at(&self, now: Instant) -> HealthStatus {
+        let normal_label = if self.training_active {
+            "TRAINING"
+        } else if self.last_progress_at.is_some() {
+            "DONE"
+        } else {
+            "WAITING"
+        };
+        if let Some(reason) = &self.problem {
+            return HealthStatus {
+                level: HealthLevel::Problem,
+                reason: Some(reason.clone()),
+                normal_label,
+            };
+        }
+        if let Some(at) = self.last_progress_at {
+            if self.training_active && now.saturating_duration_since(at) > STALL_TIMEOUT {
+                return HealthStatus {
+                    level: HealthLevel::Problem,
+                    reason: Some(format!(
+                        "no progress line for {}s",
+                        now.saturating_duration_since(at).as_secs()
+                    )),
+                    normal_label,
+                };
+            }
+        }
+        if let Some(reason) = &self.warning {
+            return HealthStatus {
+                level: HealthLevel::Warning,
+                reason: Some(reason.clone()),
+                normal_label,
+            };
+        }
+        HealthStatus {
+            level: HealthLevel::Normal,
+            reason: None,
+            normal_label,
+        }
+    }
+
+    fn health_status(&self) -> HealthStatus {
+        self.health_status_at(Instant::now())
+    }
 }
 
 /// Pull `label  value` from a banner/summary row (two-space separated).
@@ -283,7 +550,7 @@ fn parse_kv<T: std::str::FromStr>(line: &str, key: &str) -> Option<T> {
         .trim_start()
         .split_whitespace()
         .next()?
-        .trim_end_matches(['%', ',', 's']);
+        .trim_end_matches(['%', ',', 's', ')']);
     token.parse().ok()
 }
 
@@ -341,15 +608,6 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-fn loss_color(loss: f64) -> ratatui::style::Color {
-    match loss {
-        l if l < 3.5 => ratatui::style::Color::Green,
-        l if l < 4.0 => ratatui::style::Color::LightGreen,
-        l if l < 4.2 => ratatui::style::Color::Yellow,
-        _ => ratatui::style::Color::Red,
-    }
-}
-
 fn run_app(rx: mpsc::Receiver<String>, chain_dir: PathBuf) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let mut state = RunState {
@@ -369,6 +627,7 @@ fn run_app(rx: mpsc::Receiver<String>, chain_dir: PathBuf) -> io::Result<()> {
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     input_closed = true;
+                    state.training_active = false;
                     break;
                 }
             }
@@ -409,6 +668,25 @@ fn run_app(rx: mpsc::Receiver<String>, chain_dir: PathBuf) -> io::Result<()> {
 
 fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
     let area = f.area();
+    if area.height == 0 {
+        return;
+    }
+    let header = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Min(0),
+        ])
+        .split(area);
+    let title = "oxide tui  |  q quit  tab switch";
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(ratatui::text::Line::styled(
+            title,
+            ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::DIM),
+        )),
+        header[0],
+    );
     let tabs = ratatui::widgets::Tabs::new(TABS)
         .select(tab)
         .highlight_style(
@@ -417,32 +695,15 @@ fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
                 .add_modifier(ratatui::style::Modifier::BOLD),
         )
         .padding("", "");
-    let title = format!("oxide tui  |  q quit  tab switch");
-    f.render_widget(
-        ratatui::widgets::Paragraph::new(ratatui::text::Line::styled(
-            title,
-            ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::DIM),
-        )),
-        area,
-    );
-    let tabs_area = ratatui::layout::Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: 1,
-    };
-    f.render_widget(tabs, tabs_area);
+    f.render_widget(tabs, header[1]);
+    if area.height < 3 {
+        return;
+    }
 
-    let body = ratatui::layout::Rect {
-        x: area.x,
-        y: area.y + 1,
-        width: area.width,
-        height: area.height.saturating_sub(1),
-    };
     match tab {
-        0 => draw_monitor(f, body, state),
-        1 => draw_chain(f, body, state),
-        _ => draw_model(f, body, state),
+        0 => draw_monitor(f, header[2], state),
+        1 => draw_chain(f, header[2], state),
+        _ => draw_model(f, header[2], state),
     }
 }
 
@@ -459,6 +720,10 @@ fn draw_monitor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Run
     let pct = state.progress_pct.unwrap_or(0.0);
     let loss = state.live_loss.or(state.epoch_loss).unwrap_or(0.0);
     let average = state.loss_average.or(state.live_loss).unwrap_or(loss);
+    let health = state.health_status();
+    let health_style = ratatui::style::Style::default()
+        .fg(health.color())
+        .add_modifier(ratatui::style::Modifier::BOLD);
     let done = state
         .updates_done
         .or(state.optimizer_updates)
@@ -469,13 +734,17 @@ fn draw_monitor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Run
         .map(|n| n.to_string())
         .unwrap_or_else(|| "-".into());
     let gauge = ratatui::widgets::Gauge::default()
-        .label(format!(
-            "{pct:.0}%  |  updates {done}/{total}  |  loss {loss:.4}  avg {average:.4}"
+        .label(ratatui::text::Span::styled(
+            format!(
+                "{pct:.0}%  |  updates {done}/{total}  |  loss {loss:.4}  avg {average:.4}  |  {}",
+                health.label()
+            ),
+            health_style,
         ))
         .ratio((pct / 100.0).clamp(0.0, 1.0))
         .gauge_style(
             ratatui::style::Style::new()
-                .fg(loss_color(loss))
+                .fg(health.color())
                 .bg(ratatui::style::Color::Black),
         )
         .block(
@@ -497,7 +766,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Run
                 .borders(ratatui::widgets::Borders::ALL),
         )
         .data(&data)
-        .style(ratatui::style::Style::new().fg(loss_color(loss)));
+        .style(ratatui::style::Style::new().fg(health.color()));
     f.render_widget(spark, chunks[1]);
 
     let memory = match (state.memory_used, state.memory_capacity) {
@@ -519,6 +788,10 @@ fn draw_monitor(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &Run
         .as_deref()
         .unwrap_or("not written yet");
     let lines = vec![
+        ratatui::text::Line::from(vec![
+            ratatui::text::Span::raw("status       "),
+            ratatui::text::Span::styled(health.label(), health_style),
+        ]),
         ratatui::text::Line::from(format!(
             "speed       {:>7.0} tokens/s    ETA {}",
             state.tok_s.unwrap_or(0.0),
@@ -578,7 +851,7 @@ fn draw_chain(f: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &RunSt
             .enumerate()
             .map(|(i, (name, loss))| {
                 let marker = if i == last { "●" } else { "○" };
-                let style = loss.map(loss_color).unwrap_or(ratatui::style::Color::Green);
+                let style = NORMAL_GREEN;
                 let loss_text = loss
                     .map(|l| format!("{l:.4}"))
                     .unwrap_or_else(|| "—".into());
@@ -856,5 +1129,91 @@ mod tests {
         assert_eq!(state.live_loss, Some(4.0));
         assert_eq!(state.tok_s, Some(146.0));
         assert_eq!(parse_pct("(inf%)"), None);
+    }
+
+    #[test]
+    fn health_uses_one_green_and_explains_red_conditions() {
+        let mut state = RunState::default();
+        for _ in 0..3 {
+            state.ingest("training 1/10 (10%) loss=4.0 tokens_per_second=100 eta=1s");
+        }
+        assert_eq!(state.health_status().level, HealthLevel::Normal);
+        assert_eq!(state.health_status().color(), NORMAL_GREEN);
+
+        state.ingest("training 2/10 (20%) loss=7.0 tokens_per_second=100 eta=1s");
+        let health = state.health_status();
+        assert_eq!(health.level, HealthLevel::Problem);
+        assert!(health.label().contains("loss spike"));
+        assert_eq!(health.color(), BRIGHT_RED);
+
+        state.ingest("training 3/10 (30%) loss=4.0 tokens_per_second=50 eta=1s");
+        let health = state.health_status();
+        assert_eq!(health.level, HealthLevel::Problem);
+        assert!(health.label().contains("speed"));
+    }
+
+    #[test]
+    fn schedule_mismatch_and_stall_are_explicit_problems() {
+        let mut state = RunState::default();
+        state.ingest(
+            "schedule 1 epoch(s), 100 updates, lr first=0.00100000 last=0.00001000 (base 0.00100000, horizon 100)",
+        );
+        state.ingest("lr_schedule=fixed horizon=100 from_step=0 to_step=100 warmup=0");
+        state.ingest(
+            "training 1/100 (1%) loss=4.0 tokens_per_second=100 optimizer_updates=1 global_update=1 learning_rate=5.0e-4",
+        );
+        assert!(state.health_status().label().contains("outside schedule"));
+
+        state.problem = None;
+        state.last_progress_at = Some(Instant::now() - STALL_TIMEOUT - Duration::from_secs(1));
+        let health = state.health_status();
+        assert_eq!(health.level, HealthLevel::Problem);
+        assert!(health.label().contains("no progress line"));
+    }
+
+    #[test]
+    fn test_backend_keeps_title_and_tabs_in_separate_rows() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &RunState::default(), 2))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String {
+            (0..80)
+                .map(|x| {
+                    buffer
+                        .cell((x, y))
+                        .unwrap()
+                        .symbol()
+                        .chars()
+                        .next()
+                        .unwrap_or(' ')
+                })
+                .collect()
+        };
+        assert!(row(0).contains("oxide tui"));
+        assert!(row(1).contains("monitor"));
+        assert!(row(1).contains("chain"));
+        assert!(row(1).contains("model"));
+        assert!(!row(1).contains("modelt"));
+    }
+
+    #[test]
+    fn test_backend_renders_problem_reason_in_bright_red() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = RunState::default();
+        state.ingest("training 1/2 (50%) loss=4.0 tokens_per_second=100 eta=1s");
+        state.ingest("training 2/2 (100%) loss=7.0 tokens_per_second=100 eta=0s");
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("loss spike"));
+        assert!(buffer.content().iter().any(|cell| cell.fg == BRIGHT_RED));
     }
 }
