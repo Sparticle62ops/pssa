@@ -1,13 +1,12 @@
-//! Live read-only dashboard for oxide training runs.
-//!
-//! `oxide train ... | oxide tui` renders the run as a full-screen dashboard in
-//! your own terminal. The TUI never writes to the model, the checkpoints or the
-//! logs: it reads the structured `key=value` lines the CLI already prints and
-//! the chain directory, and draws. When stdin is not a pipe it prints its help
-//! and exits, and Ctrl+C / q always hands the terminal back cleanly.
+//! Training dashboard and local checkpoint chat. Model/checkpoint files are
+//! read-only; inference conversations are saved separately in the chats directory.
+//! Piped non-TTY output remains plain logging.
 
 mod background;
+mod chat;
 mod session;
+#[cfg(feature = "speech")]
+mod speech;
 
 use crate::ui;
 use background::HexBackground;
@@ -24,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-const TABS: [&str; 4] = ["monitor", "chain", "model", "feed"];
+const TABS: [&str; 5] = ["monitor", "chain", "model", "feed", "inference"];
 const PSSA_LOGO: [&str; 3] = [
     "███  ████  ████   ███",
     "█ █  █     █      █ █",
@@ -887,7 +886,9 @@ fn run_app(
     rx: mpsc::Receiver<String>,
     chain_dir: PathBuf,
     compare_path: Option<PathBuf>,
+    chats_dir: PathBuf,
 ) -> io::Result<()> {
+    let mut chat = chat::Chat::new(chats_dir, chain_dir.clone());
     let (_session, mut terminal) = session::Session::start()?;
     let mut background = HexBackground::default();
     let mut last_frame = Instant::now();
@@ -930,7 +931,9 @@ fn run_app(
             let now = Instant::now();
             background.advance(now.saturating_duration_since(last_frame));
             last_frame = now;
-            terminal.draw(|f| draw_with_background(f, &state, tab, &background))?;
+            chat.poll();
+            terminal
+                .draw(|f| draw_with_background(f, &state, tab, &background, Some(&mut chat)))?;
             next_frame = Instant::now() + FRAME_INTERVAL;
         }
         if input_closed {
@@ -957,6 +960,10 @@ fn run_app(
                             .contains(crossterm::event::KeyModifiers::CONTROL)
                     {
                         break;
+                    }
+                    if tab == 4 && key.code != crossterm::event::KeyCode::Tab {
+                        chat.key(key);
+                        continue;
                     }
                     match key.code {
                         crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
@@ -1430,7 +1437,7 @@ fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64)
 
 #[cfg(test)]
 fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
-    draw_with_background(f, state, tab, &HexBackground::default());
+    draw_with_background(f, state, tab, &HexBackground::default(), None);
 }
 
 fn draw_with_background(
@@ -1438,6 +1445,7 @@ fn draw_with_background(
     state: &RunState,
     tab: usize,
     background: &HexBackground,
+    chat: Option<&mut chat::Chat>,
 ) {
     let area = f.area();
     if area.is_empty() {
@@ -1452,6 +1460,12 @@ fn draw_with_background(
     let health = state.health_status();
     // Do not squeeze bordered widgets into one-cell fragments on tiny screens.
     if area.width < 30 || area.height < 10 {
+        if tab == 4
+            && let Some(chat) = chat
+        {
+            chat.draw(f, area);
+            return;
+        }
         let detail = match tab {
             0 => format!(
                 "{:.0}%  loss {:.4}",
@@ -1464,6 +1478,7 @@ fn draw_with_background(
                 state.chain_dir.display()
             ),
             2 => format!("width {}", state.width.as_deref().unwrap_or("-")),
+            4 => "Local checkpoint chat / enlarge to compose".into(),
             _ => state.feed.as_ref().map_or_else(
                 || "Waiting for feed samples".into(),
                 |feed| {
@@ -1526,9 +1541,9 @@ fn draw_with_background(
     }
     let nav = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(38), Constraint::Min(0)])
+        .constraints([Constraint::Length(52), Constraint::Min(0)])
         .split(chunks[1]);
-    if area.width < 38 {
+    if area.width < 52 {
         f.render_widget(
             Paragraph::new(format!(" {} / tab switch", TABS[tab.min(TABS.len() - 1)]))
                 .style(accent()),
@@ -1551,7 +1566,12 @@ fn draw_with_background(
     }
     if large_title {
         f.render_widget(
-            Paragraph::new("q quit   tab switch   g/1-7 views   +/- zoom").right_aligned(),
+            Paragraph::new(if tab == 4 {
+                "Ctrl+C quit   Tab tabs   /help"
+            } else {
+                "q quit   tab switch   g/1-7 views   +/- zoom"
+            })
+            .right_aligned(),
             nav[1],
         );
     }
@@ -1561,6 +1581,13 @@ fn draw_with_background(
         0 => draw_monitor(f, chunks[3], state),
         1 => draw_chain(f, chunks[3], state),
         2 => draw_model(f, chunks[3], state),
+        4 => {
+            if let Some(chat) = chat {
+                chat.draw(f, chunks[3]);
+            } else {
+                chat::Chat::new(PathBuf::from("chats"), state.chain_dir.clone()).draw(f, chunks[3]);
+            }
+        }
         _ => draw_feed(f, chunks[3], state),
     }
 }
@@ -2275,6 +2302,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     // their mounted chain explicitly (the training scripts already do).
     let mut chain_dir = PathBuf::from("chain");
     let mut compare_path = None;
+    let mut chats_dir = PathBuf::from("chats");
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2290,6 +2318,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     ));
                 }
                 chain_dir = PathBuf::from(value);
+                i += 1;
+            }
+            "--chats-dir" => {
+                let value = args
+                    .get(i + 1)
+                    .filter(|v| !v.starts_with('-'))
+                    .ok_or("--chats-dir requires a directory")?;
+                chats_dir = PathBuf::from(value);
                 i += 1;
             }
             "--compare" => {
@@ -2316,11 +2352,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
 
     if io::stdin().is_terminal() {
+        if io::stdout().is_terminal() {
+            // Retain the sender so the standalone app stays open until quit.
+            let (_tx, rx) = mpsc::channel();
+            return run_app(rx, chain_dir, compare_path, chats_dir).map_err(|e| e.to_string());
+        }
         println!(
-            "Usage: oxide_ai_pssa train ... --no-tui | oxide_ai_pssa tui [-c|--chain DIR] [--compare LOG]"
-        );
-        println!(
-            "Example: oxide_ai_pssa train data/corpus.txt -o chain/ck01.pssa --no-tui | oxide_ai_pssa tui --chain chain --compare baseline.log"
+            "Usage: oxide_ai_pssa tui [-c|--chain DIR] [--compare LOG] [--chats-dir DIR] (interactive TTY required)"
         );
         return Ok(());
     }
@@ -2348,7 +2386,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
     });
 
-    run_app(rx, chain_dir, compare_path).map_err(|e| e.to_string())
+    run_app(rx, chain_dir, compare_path, chats_dir).map_err(|e| e.to_string())
 }
 
 #[allow(dead_code)]
@@ -3023,6 +3061,7 @@ mod tests {
                             "chain / checkpoints",
                             "model / configuration",
                             "feed / idle",
+                            "conversation",
                         ];
                         assert!(text.contains(expected[tab]));
                     } else {
@@ -3112,7 +3151,7 @@ mod tests {
             for tab in 0..TABS.len() {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
-                    .draw(|f| draw_with_background(f, &RunState::default(), tab, &pressed))
+                    .draw(|f| draw_with_background(f, &RunState::default(), tab, &pressed, None))
                     .unwrap();
                 let buffer = terminal.backend().buffer();
                 let content = HexBackground::content_area(buffer.area);

@@ -429,7 +429,7 @@ Commands:
 | `download <repo>` | Pull a Hugging Face dataset to a local file. |
 | `clean-wikitext INPUT -o OUTPUT` | Stream-clean a raw WikiText file into a new UTF-8 corpus. |
 | `benchmark` | End-to-end smoke test or feature benchmark. |
-| `tui` | Render a live dashboard for piped training output. |
+| `tui` | Open the dashboard and local checkpoint chat, or view piped training output. |
 | `gpu-probe` | Check whether a WebGPU compute device is usable. |
 | `help` | Print command and option help, including examples. |
 
@@ -442,6 +442,49 @@ rate, memory occupancy, and checkpoint events. To view a piped log interactively
 oxide_ai_pssa train data/downloaded.txt -o chain/ck01.pssa --max-tokens 200000 -e 1 --no-tui \\
   | oxide_ai_pssa tui --chain chain
 ```
+
+### Local inference chat (TUI)
+
+Run `oxide_ai_pssa tui` in a terminal (or run with no arguments on a TTY), then
+press **Tab** to reach **inference**. Existing `chat`/`generate` CLI commands and
+`--no-tui` logging are unchanged. Non-TTY `tui` output remains a plain log passthrough.
+
+- `/model` lists PSSA checkpoints in `--chain DIR` and `data`; `/model PATH`
+  selects one. Paths may contain spaces, without shell quotes. Checkpoints and
+  their embedded tokenizers are loaded read-only in a worker, not the render loop.
+- Type a message and press **Enter**. Tokens stream into the conversation with
+  an actual token count and live average tokens/sec (including load/prefill time).
+  **Esc** or `/stop` cancels; partial replies are retained. Checkpoint loading is
+  not interruptible, but prefill/generation check cancellation between tokens.
+- `/new`, `/chats`, `/open ID`, `/rename NAME`, `/delete ID` manage conversations.
+  Repeat `/delete ID` to confirm. JSON documents in `chats/` contain the model
+  path, messages, system prompt and settings; use `tui --chats-dir DIR` to change
+  the location. Writes are atomic; files are owner-only on Unix. These local
+  files include attachment contents—treat them as private. No chat is uploaded.
+- `/temp 0.7`, `/top-p 0.85`, `/top-k 24`, `/max-tokens 64`, and
+  `/repetition-penalty 1.25` change sampling controls; `/system TEXT` sets the
+  system prompt (empty clears it). Max output is 1–4096 tokens. Context is a
+  plain `System`/`User`/`Assistant` transcript, not an instruction-tuned chat
+  template: the quality depends on the trained checkpoint. Overlong context
+  (>256 KiB) is rejected rather than silently discarding history.
+- `/attach PATH` inserts a UTF-8 text file into the **next** message (64 KiB total
+  pending attachments); `/detach` clears them. Images, PDFs, audio, binaries and
+  other non-text files display “not supported by this model yet”.
+- **PgUp/PgDn** scroll through wrapped history; **End** follows the latest reply.
+  `/copy` requests terminal clipboard access via OSC 52 (the terminal must permit
+  it). `/help` lists controls. **Ctrl+U** clears input; `//text` sends a leading
+  slash. In inference, `q` is text and Esc stops, not quits; **Ctrl+C** quits, or
+  Tab to another tab and use the existing `q` key.
+
+Optional local speech capture (Linux/ALSA) is built with `cargo build --release
+--features speech`. Install an existing local **whisper.cpp** `whisper-cli` (or
+`main`) and **arecord**, then set `OXIDE_WHISPER_BIN` and `OXIDE_WHISPER_MODEL` to
+the binary and ggml model paths. Without overrides the app searches PATH for
+`whisper-cli`/`main` and `models/ggml-{base.en,base,tiny.en}.bin` for a local model.
+`/speech` records ten seconds, transcribes locally, deletes temporary audio, and
+inserts text in the input box for review; it never auto-sends. Esc cancels the
+child process. Missing tools/model or a default build show enablement guidance.
+No models are downloaded and the default build has **no audio dependencies**.
 
 Options:
 
