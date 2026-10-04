@@ -4,7 +4,10 @@
 
 mod background;
 mod chat;
+mod depth_zoom;
+mod ring;
 mod session;
+mod setup;
 #[cfg(feature = "speech")]
 mod speech;
 
@@ -23,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-const TABS: [&str; 5] = ["monitor", "chain", "model", "feed", "inference"];
+const TABS: [&str; 6] = ["monitor", "chain", "model", "feed", "inference", "setup"];
 const PSSA_LOGO: [&str; 3] = [
     "███  ████  ████   ███",
     "█ █  █     █      █ █",
@@ -112,6 +115,7 @@ struct FeedState {
 
 #[derive(Default)]
 struct RunState {
+    loop_count: usize,
     feed: Option<FeedState>,
     // header card
     corpus: Option<String>,
@@ -216,6 +220,9 @@ impl RunState {
         let line = line.trim();
         if line.is_empty() {
             return;
+        }
+        if let Some(loops) = parse_kv::<usize>(line, "loops=") {
+            self.loop_count = loops.clamp(1, 32);
         }
         self.raw_lines.push(line.to_string());
         if self.raw_lines.len() > 400 {
@@ -889,6 +896,8 @@ fn run_app(
     chats_dir: PathBuf,
 ) -> io::Result<()> {
     let mut chat = chat::Chat::new(chats_dir, chain_dir.clone());
+    let mut setup = setup::Setup::default();
+    let mut training: Option<setup::TrainingRun> = None;
     let (_session, mut terminal) = session::Session::start()?;
     let mut background = HexBackground::default();
     let mut last_frame = Instant::now();
@@ -905,13 +914,15 @@ fn run_app(
     loop {
         // Drain stdin. A completed producer should leave the final dashboard
         // frame visible once, then let the wrapper restore the terminal.
-        loop {
+        while !input_closed {
             match rx.try_recv() {
                 Ok(line) => state.ingest(&line),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     input_closed = true;
-                    state.training_active = false;
+                    if training.is_none() {
+                        state.training_active = false;
+                    }
                     break;
                 }
             }
@@ -927,16 +938,20 @@ fn run_app(
             last_compare_scan = std::time::Instant::now();
         }
 
-        if Instant::now() >= next_frame || input_closed {
+        if Instant::now() >= next_frame || (input_closed && training.is_none()) {
             let now = Instant::now();
             background.advance(now.saturating_duration_since(last_frame));
             last_frame = now;
             chat.poll();
-            terminal
-                .draw(|f| draw_with_background(f, &state, tab, &background, Some(&mut chat)))?;
+            if let Some(run) = &mut training {
+                run.poll(&mut state);
+            }
+            terminal.draw(|f| {
+                draw_with_background(f, &state, tab, &background, Some(&mut chat), Some(&mut setup))
+            })?;
             next_frame = Instant::now() + FRAME_INTERVAL;
         }
-        if input_closed {
+        if input_closed && training.is_none() {
             break;
         }
 
@@ -960,6 +975,22 @@ fn run_app(
                             .contains(crossterm::event::KeyModifiers::CONTROL)
                     {
                         break;
+                    }
+                    if tab == 5
+                        && key.code != crossterm::event::KeyCode::Tab
+                        && (setup.editing()
+                            || !matches!(key.code, crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc))
+                    {
+                        if setup.key(key)
+                            && let Some(run) = setup.launch(
+                                state.training_active || training.as_ref().is_some_and(|run| run.active()),
+                            )
+                        {
+                            run.initialize(&mut state);
+                            training = Some(run);
+                            tab = 0;
+                        }
+                        continue;
                     }
                     if tab == 4 && key.code != crossterm::event::KeyCode::Tab {
                         chat.key(key);
@@ -1284,6 +1315,10 @@ fn draw_neuron_animation(f: &mut ratatui::Frame, area: Rect, now: Instant) {
 fn draw_neuron_animation_at(f: &mut ratatui::Frame, area: Rect, elapsed: Duration) {
     let frame = neuron_frame_at(elapsed);
     let title = neuron_title(frame);
+    draw_neuron_frame(f, area, frame, title);
+}
+
+fn draw_neuron_frame(f: &mut ratatui::Frame, area: Rect, frame: NeuronFrame, title: &str) {
     let inner = panel(title).inner(area);
     if inner.width < 2 || inner.height < 2 {
         f.render_widget(panel(title), area);
@@ -1437,7 +1472,7 @@ fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64)
 
 #[cfg(test)]
 fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
-    draw_with_background(f, state, tab, &HexBackground::default(), None);
+    draw_with_background(f, state, tab, &HexBackground::default(), None, None);
 }
 
 fn draw_with_background(
@@ -1446,6 +1481,7 @@ fn draw_with_background(
     tab: usize,
     background: &HexBackground,
     chat: Option<&mut chat::Chat>,
+    setup: Option<&mut setup::Setup>,
 ) {
     let area = f.area();
     if area.is_empty() {
@@ -1460,6 +1496,14 @@ fn draw_with_background(
     let health = state.health_status();
     // Do not squeeze bordered widgets into one-cell fragments on tiny screens.
     if area.width < 30 || area.height < 10 {
+        if tab == 5 {
+            if let Some(setup) = setup {
+                setup.draw(f, area);
+            } else {
+                setup::Setup::default().draw(f, area);
+            }
+            return;
+        }
         if tab == 4
             && let Some(chat) = chat
         {
@@ -1541,9 +1585,9 @@ fn draw_with_background(
     }
     let nav = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(52), Constraint::Min(0)])
+        .constraints([Constraint::Length(64), Constraint::Min(0)])
         .split(chunks[1]);
-    if area.width < 52 {
+    if area.width < 64 {
         f.render_widget(
             Paragraph::new(format!(" {} / tab switch", TABS[tab.min(TABS.len() - 1)]))
                 .style(accent()),
@@ -1586,6 +1630,13 @@ fn draw_with_background(
                 chat.draw(f, chunks[3]);
             } else {
                 chat::Chat::new(PathBuf::from("chats"), state.chain_dir.clone()).draw(f, chunks[3]);
+            }
+        }
+        5 => {
+            if let Some(setup) = setup {
+                setup.draw(f, chunks[3]);
+            } else {
+                setup::Setup::default().draw(f, chunks[3]);
             }
         }
         _ => draw_feed(f, chunks[3], state),
@@ -2220,7 +2271,15 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             .split(chunks[2]);
         // The same panel animates while waiting for the first progress line:
         // the idle dashboard doubles as the splash, without a blocking delay.
-        draw_neuron_animation(f, bottom[0], now);
+        if state.loop_count > 1 {
+            static RING_START: OnceLock<Instant> = OnceLock::new();
+            ring::draw(
+                f, bottom[0], state.loop_count,
+                RING_START.get_or_init(Instant::now).elapsed(),
+            );
+        } else {
+            draw_neuron_animation(f, bottom[0], now);
+        }
         bottom[1]
     } else {
         // Preserve readable metrics rather than squeezing two tiny panels
@@ -2494,7 +2553,8 @@ mod tests {
         // A child process makes ui::Progress actually write to a pipe, avoiding
         // unstable stdout-capture APIs or a duplicate copy of its format string.
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tui::tests::ui_producer_fixture", "--nocapture"])
+            // Serial libtest otherwise prefixes the first log line with the test name.
+            .args(["--exact", "tui::tests::ui_producer_fixture", "--nocapture", "--quiet"])
             .env("OXIDE_TUI_PRODUCER_FIXTURE", "1")
             .output()
             .unwrap();
@@ -3062,6 +3122,7 @@ mod tests {
                             "model / configuration",
                             "feed / idle",
                             "conversation",
+                            "parameters",
                         ];
                         assert!(text.contains(expected[tab]));
                     } else {
@@ -3151,7 +3212,7 @@ mod tests {
             for tab in 0..TABS.len() {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
-                    .draw(|f| draw_with_background(f, &RunState::default(), tab, &pressed, None))
+                    .draw(|f| draw_with_background(f, &RunState::default(), tab, &pressed, None, None))
                     .unwrap();
                 let buffer = terminal.backend().buffer();
                 let content = HexBackground::content_area(buffer.area);

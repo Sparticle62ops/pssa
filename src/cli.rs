@@ -1,3 +1,6 @@
+mod backend_choice;
+pub use backend_choice::TrainingBackend;
+
 use crate::backend::{Device, gemm_cpu_reference};
 use crate::checkpoint::{self, CheckpointFormat};
 use crate::dataset::{
@@ -16,6 +19,8 @@ const MAX_GENERATION_TOKENS: usize = 100_000;
 
 #[derive(Clone, Debug)]
 pub struct TrainingOptions {
+    /// Runtime-only selection; automatic GPU/CPU fallback remains the default.
+    pub backend: TrainingBackend,
     pub epochs: usize,
     pub latent: usize,
     /// Continuous PSSA blocks, sharing one embedding and output head.
@@ -64,6 +69,7 @@ pub struct TrainingOptions {
 impl Default for TrainingOptions {
     fn default() -> Self {
         Self {
+            backend: TrainingBackend::Auto,
             epochs: 4,
             latent: 256,
             depth: 1,
@@ -300,6 +306,7 @@ impl CLIHandler {
             x => return Err(format!("--tokenizer must be bpe or word, got '{x}'")),
         };
         let x = TrainingOptions {
+            backend: TrainingBackend::parse(parsed.string("--backend", "").unwrap_or("auto"))?,
             epochs: parsed.usize_nonzero("--epochs", "-e", 4)?,
             latent: parsed.usize_nonzero("--latent", "", 256)?,
             depth: parsed.usize_nonzero("--depth", "", 1)?,
@@ -694,7 +701,10 @@ impl CLIHandler {
         // Every model shape uses the same device selection. Dense forward and
         // backward stages dispatch through cuBLAS when available; recurrence,
         // retrieval, and elementwise work remain on the host for now.
-        match Device::try_gpu() {
+        match options.backend.device() {
+            Err(e) if options.backend != TrainingBackend::Auto => {
+                return Err(format!("requested training backend unavailable: {e}"));
+            }
             Ok(gpu_device) => {
                 let label = gpu_device
                     .gpu()
@@ -1788,6 +1798,7 @@ impl CLIHandler {
                     "      --loops <N>               shared Ouro passes, 1..32 (default: 1; repeat on resume; not checkpointed)"
                 );
                 println!("      --state <N>               recurrent state width (default: 16)");
+                println!("      --backend <NAME>          auto (default), cpu, webgpu, cuda (feature required)");
                 println!("      --key <N>                 memory key width (default: 32)");
                 println!("      --memory <N>              memory capacity (default: 512)");
                 println!("      --chunk <N>               training chunk length (default: 64)");
@@ -2072,7 +2083,7 @@ impl CLIHandler {
                     allowed.retain(|x| !["--latent", "--state", "--key", "--memory"].contains(x));
                     allowed.push("--tokenizer-from");
                 } else {
-                    allowed.extend(["--batch-size", "--depth", "--loops"]);
+                    allowed.extend(["--batch-size", "--depth", "--loops", "--backend"]);
                 }
                 let p = Parsed::parse(&args[2..], &allowed)?;
                 if baseline && p.string("--hf-dataset", "").is_some() {
