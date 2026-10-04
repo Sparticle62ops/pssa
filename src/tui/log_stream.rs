@@ -5,7 +5,7 @@ use super::{accent, network, panel, panel_area};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Line,
     widgets::{Paragraph, Wrap},
@@ -230,13 +230,19 @@ impl LogStream {
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
         let area = panel_area(f, area);
+        let block = panel(" Cloud log stream ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.is_empty() {
+            return;
+        }
         let value = self.input.as_deref().unwrap_or(&self.source);
         let shown = if remote(value) {
             "[URL hidden: may contain a private access query]".into()
         } else {
             network::clean(value)
         };
-        let mut lines = vec![
+        let lines = vec![
             Line::styled("CLOUD LOG / separate live view", accent()),
             Line::from(format!(
                 "> Source: {shown}{}",
@@ -248,23 +254,41 @@ impl LogStream {
             ),
             Line::from("PgUp/PgDn history • End live • green checkpoint / cyan throughput"),
         ];
-        let available = area.height.saturating_sub(7) as usize;
+        let header = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let header_height = header.line_count(inner.width).min(inner.height as usize) as u16;
+        let rows = Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)])
+            .split(inner);
+        f.render_widget(header, rows[0]);
+        if rows[1].is_empty() {
+            return;
+        }
+        let available = rows[1].height as usize;
         let end = self.history.len().saturating_sub(self.scroll);
-        let begin = end.saturating_sub(available);
+        let mut lines = Vec::new();
+        let mut wrapped_height = 0;
+        // Select from the tail by rendered rows, not by logical line count.
+        for line in self.history.iter().take(end).rev() {
+            let line = Line::styled(line.as_str(), line_style(line));
+            wrapped_height += Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(rows[1].width);
+            lines.push(line);
+            if wrapped_height >= available {
+                break;
+            }
+        }
+        lines.reverse();
         if self.history.is_empty() {
             lines.push(Line::from(
                 "Waiting for complete lines. Partial lines survive append/reconnect.",
             ));
-        } else {
-            for line in self.history.iter().skip(begin).take(end - begin) {
-                lines.push(Line::styled(line.as_str(), line_style(line)));
-            }
         }
+        let scroll = wrapped_height.saturating_sub(available).min(u16::MAX as usize) as u16;
         f.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .block(panel(" Cloud log stream ")),
-            area,
+                .scroll((scroll, 0)),
+            rows[1],
         );
     }
 }
@@ -774,6 +798,57 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn live_and_end_show_the_newest_wrapped_log_output() {
+        for (width, height) in [(120, 40), (80, 24)] {
+            let mut view = LogStream::with_opener(Arc::new(|_, _| panic!("draw must not open")));
+            for i in 0..40 {
+                view.history.push_back(format!("old-{i} {}", "x".repeat(320)));
+            }
+            view.history
+                .push_back(format!("{} NEWEST_ENTRY", "y".repeat(320)));
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let mut render = |view: &LogStream| -> String {
+                terminal.draw(|f| view.draw(f, f.area())).unwrap();
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect()
+            };
+            let live = render(&view);
+            assert!(live.contains("NEWEST_ENTRY"), "live at {width}x{height}");
+            assert!(live.contains("CLOUD LOG / separate live view"));
+            view.key(key(KeyCode::PageUp));
+            assert!(!render(&view).contains("NEWEST_ENTRY"));
+            view.key(key(KeyCode::End));
+            assert!(
+                render(&view).contains("NEWEST_ENTRY"),
+                "End at {width}x{height}"
+            );
+
+            // A newly arrived line can itself be taller than the entire viewport.
+            let (tx, rx) = mpsc::sync_channel(1);
+            view.worker = Some(Worker {
+                rx,
+                cancel: Arc::new(AtomicBool::new(false)),
+            });
+            tx.send(Message::Line(format!(
+                "{} APPENDED_ENTRY",
+                "界 ".repeat(1024)
+            )))
+            .unwrap();
+            view.poll();
+            assert!(
+                render(&view).contains("APPENDED_ENTRY"),
+                "append at {width}x{height}"
+            );
+        }
+    }
+
     #[test]
     fn editing_validation_and_render_wide_narrow_tiny() {
         let mut view = LogStream::with_opener(Arc::new(|_, _| panic!("draw/edit must not open")));
