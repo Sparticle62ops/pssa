@@ -449,7 +449,7 @@ Run `oxide_ai_pssa tui` in a terminal (or run with no arguments on a TTY), then
 press **Tab** to reach **inference**. Existing `chat`/`generate` CLI commands and
 `--no-tui` logging are unchanged. Non-TTY `tui` output remains a plain log passthrough.
 
-- `/model` lists PSSA checkpoints in `--chain DIR` and `data`; `/model PATH`
+- `/model` lists PSSA/TRFM checkpoints in `--chain DIR` and `data`; `/model PATH`
   selects one. Paths may contain spaces, without shell quotes. Checkpoints and
   their embedded tokenizers are loaded read-only in a worker, not the render loop.
 - Type a message and press **Enter**. Tokens stream into the conversation with
@@ -477,9 +477,67 @@ press **Tab** to reach **inference**. Existing `chat`/`generate` CLI commands an
   `?` are text and Esc stops, not quits; **Ctrl+C** quits, or Tab to another tab
   and use the existing `q` key. Outside text input, **?** also opens help.
 
-The tab order is **monitor, chain, model, feed, inference, setup**. The
-[training setup wizard](docs/training-setup.md) launches a separate trainer
-and returns to the monitor; **Tab** switches tabs even while editing a field.
+The tab order is **monitor, chain, model, feed, inference, setup, library,
+mixer, eval, memory**. The [training setup wizard](docs/training-setup.md)
+launches a separate trainer and returns to the monitor; **Tab** switches tabs
+even while editing a field. **F1** lists the shared, context-specific keys.
+
+### Local models, datasets and evaluation (TUI)
+
+- **Library:** **m** sets the models folder, **d** sets the datasets folder,
+  **r** rescans, and **Up/Down** selects a file. Folder preferences and the eval
+  prompt path are saved in `$XDG_CONFIG_HOME/oxide-ai/tui.json` (otherwise
+  `~/.config/oxide-ai/tui.json`); unrelated config fields are preserved.
+  Scans are non-recursive and run off-thread, listing `.pssa`/`.trfm` models
+  and `.txt`/`.jsonl`/`.parquet` datasets with size and UTC modification date.
+  Model dimensions are header hints, not a full validation or a weight load.
+  **c** opens a checkpoint in chat; **u** fills Setup's Resume and cheap header
+  shape hints. A `.trfm` resume uses the existing CPU `train-transformer`
+  command; PSSA-only wizard fields do not apply. Review settings before launch.
+- Selected datasets show record/line counts, approximate tokens, and sample
+  lines. Stats use the existing **word tokenizer**, not a checkpoint's BPE;
+  prefixes target 256 KiB / 2,048 records (at most one extra bounded record),
+  with extrapolated totals explicitly labelled as estimates. Skewed files can bias these estimates.
+  **Enter** refreshes the selected stats. **t** fills Setup's Dataset; JSONL
+  and Parquet are converted off-thread into a new UTF-8 corpus first.
+  JSONL accepts strings or `text`, `content`, or `body` string fields.
+  Parquet uses the optional **local** `python3` + `pyarrow` adapter in
+  [`scripts/tui_parquet.py`](scripts/tui_parquet.py), embedded in the binary so
+  installed builds need no source checkout. It uses the same column names and
+  streams small batches; missing tools show an error. Nothing is downloaded.
+  Records over 1 MiB are rejected with guidance.
+- **Mixer:** **Up/Down** chooses a source; **+/-** changes its relative token
+  share (zero disables it). The bars show weights, percentages show normalized
+  shares, and per-source/total counts use the same word-token estimates.
+  **Enter** writes `corpus.txt` plus `mix.json` under the datasets folder's
+  `.pssa-mixes/` and fills Setup's Dataset when finished. Exports use deterministic
+  weighted source prefixes without repetition, at most one million word tokens
+  and 256 MiB. The manifest records actual counts, which may differ from
+  sampled targets. Inputs are never overwritten. Mixing is opt-in; ordinary
+  CLI/wizard training defaults are unchanged.
+- **Eval:** automatically watches completed checkpoints, generating fixed greedy
+  answers and teacher-forced reference-answer loss/perplexity in one separate,
+  low-priority CPU process. It uses one thread, pauses between forwards, and
+  has file/model/time limits (64 MiB checkpoint, 128 MiB model/tape allocation,
+  120 seconds); unsupported, oversized or invalid checkpoints are recorded as
+  skipped, not training errors. The trainer never waits for evaluation.
+  Results append to `auto-eval.jsonl` beside checkpoints, keyed by checkpoint
+  identity and prompt-suite hash. The chart shows reference NLL over checkpoint
+  numbers; answer panes compare adjacent checkpoints. **Up/Down** selects a
+  checkpoint, **PgUp/PgDn** a prompt, **a** pauses/resumes, **p** edits the prompt
+  JSON path (empty restores the built-in suite), and **r** reloads it.
+  Copy `assets/eval_prompts.json` as a starting point; `OXIDE_EVAL_PROMPTS` also
+  supplies a startup path when no persisted path is set. Scores are tokenizer-
+  specific, not a correctness grade or directly comparable across tokenizers.
+  PSSA evaluation uses checkpoint memory, fresh carry, and runtime loops=1.
+  The TUI must remain open to continue watching/evaluating.
+- **Memory:** while chat streams, shows actual occupied-slot retrieval strengths
+  from the latest PSSA token, ranked strength bars, and a bounded recent-token
+  history. Query/input and predicted token are distinguished; stacked layers
+  and the final loop pass are labelled. This is a read-only copy of existing
+  inference state, not another retrieval or a synthetic animation. Transformer
+  checkpoints report that they have no PSSA slots. No telemetry is saved to
+  the checkpoint. Narrow terminals use compact/stacked layouts.
 
 Optional local speech capture (Linux/ALSA) is built with `cargo build --release
 --features speech`. Install an existing local **whisper.cpp** `whisper-cli` (or

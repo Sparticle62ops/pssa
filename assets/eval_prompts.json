@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "max_new_tokens": 24,
+  "prompts": [
+    {
+      "id": "solar",
+      "prompt": "the solar system",
+      "reference": " consists of the sun"
+    },
+    {
+      "id": "computer",
+      "prompt": "computer science is",
+      "reference": " the study of computation"
+    },
+    {
+      "id": "photosynthesis",
+      "prompt": "photosynthesis is",
+      "reference": " the biological process used by plants"
+    }
+  ]
+}

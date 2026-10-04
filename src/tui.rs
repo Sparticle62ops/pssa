@@ -6,6 +6,11 @@ mod background;
 mod chat;
 mod depth_zoom;
 mod keybindings;
+mod library;
+mod local;
+mod mixer;
+mod eval;
+mod memory_view;
 mod ring;
 mod session;
 mod setup;
@@ -27,7 +32,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-const TABS: [&str; 6] = ["monitor", "chain", "model", "feed", "inference", "setup"];
+use keybindings::TABS;
 // Five scanlines leave room for the P's stem, both S turns and the A's crossbar.
 const PSSA_LOGO: [&str; 5] = [
     "███    ███   ███   ██ ",
@@ -892,6 +897,7 @@ fn run_app(
 ) -> io::Result<()> {
     let mut chat = chat::Chat::new(chats_dir, chain_dir.clone());
     let mut setup = setup::Setup::default();
+    let mut local = local::Local::new(chain_dir.clone());
     let mut help = keybindings::Help::default();
     let mut training: Option<setup::TrainingRun> = None;
     let (_session, mut terminal) = session::Session::start()?;
@@ -942,8 +948,10 @@ fn run_app(
             if let Some(run) = &mut training {
                 run.poll(&mut state);
             }
+            local.poll(&mut setup, &state);
             terminal.draw(|f| {
                 draw_with_background(f, &state, tab, &background, Some(&mut chat), Some(&mut setup));
+                local.draw(f, tab, &chat);
                 if help.open {
                     help.draw(f);
                 }
@@ -972,7 +980,7 @@ fn run_app(
                     let context = if help.open {
                         Context::Help
                     } else {
-                        Context::for_tab(tab, setup.editing())
+                        Context::for_tab(tab, (tab == 5 && setup.editing()) || local.editing(tab))
                     };
                     match keybindings::action(key, context) {
                         Some(Action::Quit) => break,
@@ -993,6 +1001,7 @@ fn run_app(
                         Some(Action::HelpTop) => help.scroll = 0,
                         Some(Action::HelpBottom) => help.scroll = u16::MAX,
                         Some(Action::Chat) => chat.key(key),
+                        Some(Action::Local) => local.key(&mut tab, key, &mut chat, &mut setup),
                         Some(Action::Setup) => {
                             if setup.key(key)
                                 && let Some(run) = setup.launch(
@@ -1675,8 +1684,11 @@ fn draw_with_background(
         .constraints([Constraint::Length(tabs_width), Constraint::Min(0)])
         .split(chunks[1]);
     if area.width < tabs_width {
+        let labels = if area.width >= 70 {
+            if tab < 6 { TABS[..6].join(" / ") } else { TABS[6..].join(" / ") }
+        } else { TABS[tab.min(TABS.len() - 1)].into() };
         f.render_widget(
-            Paragraph::new(format!(" {} / Tab tabs / F1 help", TABS[tab.min(TABS.len() - 1)]))
+            Paragraph::new(format!(" {labels} / Tab / F1 help"))
                 .style(accent()),
             nav[0],
         );
@@ -1731,6 +1743,7 @@ fn draw_with_background(
                 setup::Setup::default().draw(f, chunks[3]);
             }
         }
+        6.. => {}, // local screens are rendered by local::Local after the shell.
         _ => draw_feed(f, chunks[3], state),
     }
 }
@@ -2572,6 +2585,7 @@ fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
+    if let Some(result) = eval::run_worker(args) { return result; }
     // Keep the default useful on a local checkout; Kaggle callers can pass
     // their mounted chain explicitly (the training scripts already do).
     let mut chain_dir = PathBuf::from("chain");
@@ -2881,13 +2895,13 @@ mod tests {
     #[test]
     fn test_backend_tab_order_is_unique_and_every_label_is_visible() {
         use ratatui::{Terminal, backend::TestBackend};
-        assert_eq!(TABS, ["monitor", "chain", "model", "feed", "inference", "setup"]);
+        assert_eq!(TABS, ["monitor", "chain", "model", "feed", "inference", "setup", "library", "mixer", "eval", "memory"]);
         let unique: std::collections::HashSet<_> = TABS.iter().collect();
         assert_eq!(unique.len(), TABS.len());
         for tab in 0..TABS.len() {
-            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
             terminal.draw(|f| draw(f, &RunState::default(), tab)).unwrap();
-            let rows: Vec<String> = terminal.backend().buffer().content().chunks(80)
+            let rows: Vec<String> = terminal.backend().buffer().content().chunks(120)
                 .map(|row| row.iter().map(|cell| cell.symbol()).collect()).collect();
             let nav = rows.iter().find(|row| TABS.iter().all(|label| row.contains(label))).unwrap();
             let mut previous = 0;
@@ -3589,7 +3603,11 @@ mod tests {
                             "conversation",
                             "parameters",
                         ];
-                        assert!(text.contains(expected[tab]));
+                        // These six bodies belong to the shell. Local screens
+                        // render afterward and have their own TestBackend tests.
+                        if let Some(expected) = expected.get(tab) {
+                            assert!(text.contains(*expected));
+                        }
                     } else if width >= 30 && tab == 0 {
                         let buffer = terminal.backend().buffer();
                         let metrics_row = buffer
