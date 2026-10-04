@@ -22,7 +22,16 @@ impl TrainingBackend {
         }
     }
 
-    pub(super) fn device(self) -> Result<Device, String> {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::WebGpu => "webgpu",
+            Self::Cuda => "cuda",
+        }
+    }
+
+    pub(crate) fn device(self) -> Result<Device, String> {
         match self {
             Self::Auto => Device::try_gpu(),
             Self::Cpu => Ok(Device::Cpu),
@@ -44,7 +53,7 @@ mod tests {
         assert_eq!(TrainingBackend::default(), TrainingBackend::Auto);
         assert!(matches!(TrainingBackend::Cpu.device(), Ok(Device::Cpu)));
         for value in ["auto", "cpu", "webgpu"] {
-            assert!(TrainingBackend::parse(value).is_ok());
+            assert_eq!(TrainingBackend::parse(value).unwrap().as_str(), value);
         }
         assert!(TrainingBackend::parse("tpu").is_err());
         assert_eq!(

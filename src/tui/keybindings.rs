@@ -9,6 +9,35 @@ use ratatui::{
     widgets::{Clear, Paragraph, Wrap},
 };
 
+pub(super) const HF_TAB: usize = 6;
+pub(super) const KAGGLE_TAB: usize = 7;
+pub(super) const MEMORY_TAB: usize = 8;
+pub(super) const RUNS_TAB: usize = 9;
+pub(super) const BENCHMARK_TAB: usize = 10;
+pub(super) const SAMPLE_TAB: usize = 11;
+pub(super) const HARDWARE_TAB: usize = 12;
+pub(super) const MATH_TAB: usize = 13;
+pub(super) const DEVICE_TAB: usize = 14;
+pub(super) const LIMITS_TAB: usize = 15;
+pub(super) const TABS: [&str; 16] = [
+    "monitor",
+    "chain",
+    "model",
+    "feed",
+    "inference",
+    "setup",
+    "HF login",
+    "Kaggle",
+    "memory",
+    "runs",
+    "benchmark",
+    "sample",
+    "hardware",
+    "math",
+    "devices",
+    "limits",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Context {
     Monitor,
@@ -26,6 +55,11 @@ pub(super) enum Context {
     BenchmarkEdit,
     Palette,
     Help,
+    Sample,
+    Math,
+    Device,
+    Limits,
+    LimitsEdit,
 }
 impl Context {
     fn mask(self) -> u32 {
@@ -38,14 +72,19 @@ impl Context {
             4 => Self::Chat,
             5 if editing => Self::SetupEdit,
             5 => Self::Setup,
-            super::HF_TAB => Self::HfInput,
-            super::KAGGLE_TAB if editing => Self::KaggleInput,
-            super::KAGGLE_TAB => Self::KaggleBusy,
-            super::MEMORY_TAB => Self::Memory,
-            super::RUNS_TAB if editing => Self::RunsEdit,
-            super::RUNS_TAB => Self::Runs,
-            super::BENCHMARK_TAB if editing => Self::BenchmarkEdit,
-            super::BENCHMARK_TAB => Self::Benchmark,
+            HF_TAB => Self::HfInput,
+            KAGGLE_TAB if editing => Self::KaggleInput,
+            KAGGLE_TAB => Self::KaggleBusy,
+            MEMORY_TAB => Self::Memory,
+            RUNS_TAB if editing => Self::RunsEdit,
+            RUNS_TAB => Self::Runs,
+            BENCHMARK_TAB if editing => Self::BenchmarkEdit,
+            BENCHMARK_TAB => Self::Benchmark,
+            SAMPLE_TAB => Self::Sample,
+            MATH_TAB => Self::Math,
+            DEVICE_TAB => Self::Device,
+            LIMITS_TAB if editing => Self::LimitsEdit,
+            LIMITS_TAB => Self::Limits,
             _ => Self::Dashboard,
         }
     }
@@ -69,8 +108,14 @@ const HELP: u32 = 1 << Context::Help as u32;
 const EXTRA_EDIT: u32 = KAGGLE_INPUT | RUNS_EDIT | BENCHMARK_EDIT;
 const EXTRA_BROWSE: u32 = KAGGLE_BUSY | MEMORY | RUNS | BENCHMARK;
 const EXTRA: u32 = EXTRA_EDIT | EXTRA_BROWSE;
-const BROWSE: u32 = MONITOR | DASHBOARD | SETUP | EXTRA_BROWSE;
-const ALL: u32 = BROWSE | CHAT | EDIT | HF | EXTRA_EDIT | PALETTE | HELP;
+const SAMPLE: u32 = 1 << Context::Sample as u32;
+const MATH: u32 = 1 << Context::Math as u32;
+const DEVICE: u32 = 1 << Context::Device as u32;
+const LIMITS: u32 = 1 << Context::Limits as u32;
+const LIMIT_EDIT: u32 = 1 << Context::LimitsEdit as u32;
+const PAGES: u32 = DASHBOARD | SAMPLE | MATH | DEVICE | LIMITS;
+const BROWSE: u32 = MONITOR | PAGES | SETUP | EXTRA_BROWSE;
+const ALL: u32 = BROWSE | CHAT | EDIT | HF | EXTRA_EDIT | PALETTE | HELP | LIMIT_EDIT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
@@ -84,6 +129,14 @@ pub(super) enum Action {
     Setup,
     Hf,
     Extras,
+    OpenTab(usize),
+    Heatmap,
+    Preview,
+    MathScroll(i16),
+    MathTop,
+    MathBottom,
+    Device,
+    Limits,
     Pan(bool),
     CycleGraph,
     Graph(GraphView),
@@ -126,15 +179,22 @@ const BINDINGS: &[Binding] = &[
         routes: &[(ALL, Quit)],
     },
     bind!(Tab, "Tab", "Next application tab (also while editing)", ALL => NextTab),
+    bind!(F(6), "F6", "Chat / monitor / sample: toggle raw token confidence heatmap", CHAT | MONITOR | SAMPLE => Heatmap),
+    bind!(F(7), "F7", "Monitor / sample: pause or resume live checkpoint preview", MONITOR | SAMPLE => Preview),
+    bind!(F(8), "F8", "Open hardware telemetry", ALL => OpenTab(HARDWARE_TAB)),
+    bind!(F(9), "F9", "Open training device picker", ALL => OpenTab(DEVICE_TAB)),
+    bind!(F(10), "F10", "Open resource limits for the next run", ALL => OpenTab(LIMITS_TAB)),
+    bind!(F(11), "F11", "Open live PSSA math reference", ALL => OpenTab(MATH_TAB)),
+    bind!(F(12), "F12", "Open full checkpoint sample", ALL => OpenTab(SAMPLE_TAB)),
     bind!(F(1), "F1", "Open/close help, including inside text input", ALL => ToggleHelp),
     bind!(Char('?'), "?", "Open/close help outside text input; type normally in editors", BROWSE | HELP => ToggleHelp),
     bind!(Char('q'), "q", "Quit outside text input; close help", BROWSE => Quit, HELP => ToggleHelp),
     bind!(Esc, "Esc", "Dashboard/setup: quit; editors: cancel/clear; chat/extras: stop (Kaggle detaches); overlays: close",
-        MONITOR | DASHBOARD | SETUP => Quit, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, PALETTE => Palette, HELP => ToggleHelp),
+        MONITOR | PAGES | SETUP => Quit, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, PALETTE => Palette, HELP => ToggleHelp),
     bind!(Left, "Left", "Monitor: pan older; dashboard/extras: previous tab; setup: previous page",
-        MONITOR => Pan(false), DASHBOARD | EXTRA_BROWSE => PreviousTab, SETUP => Setup),
+        MONITOR => Pan(false), PAGES | EXTRA_BROWSE => PreviousTab, SETUP => Setup),
     bind!(Right, "Right", "Monitor: pan newer; dashboard/extras: next tab; setup: next page",
-        MONITOR => Pan(true), DASHBOARD | EXTRA_BROWSE => NextTab, SETUP => Setup),
+        MONITOR => Pan(true), PAGES | EXTRA_BROWSE => NextTab, SETUP => Setup),
     bind!(Char('g'), "g", "Monitor: cycle graph view", MONITOR => CycleGraph),
     bind!(Char('1'), "1", "Monitor: loss", MONITOR => Graph(GraphView::Loss)),
     bind!(Char('2'), "2", "Monitor: perplexity", MONITOR => Graph(GraphView::Perplexity)),
@@ -147,31 +207,37 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('='), "=", "Monitor: zoom in", MONITOR => Zoom(true)),
     bind!(Char('-'), "-", "Monitor: zoom out; setup: decrease selected depth/loops", MONITOR => Zoom(false), SETUP => Setup),
     bind!(Char('0'), "0", "Monitor: reset graph navigation", MONITOR => ResetGraph),
-    bind!(Up, "Up", "Setup/runs/benchmark/palette: previous item; help/preview: scroll up", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, HELP => ScrollHelp(-1)),
-    bind!(Down, "Down", "Setup/runs/benchmark/palette: next item; help/preview: scroll down", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, HELP => ScrollHelp(1)),
+    bind!(Up, "Up", "Setup/runs/benchmark/palette/devices/limits: previous item; math/help: scroll up", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, MATH => MathScroll(-1), HELP => ScrollHelp(-1)),
+    bind!(Down, "Down", "Setup/runs/benchmark/palette/devices/limits: next item; math/help: scroll down", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, MATH => MathScroll(1), HELP => ScrollHelp(1)),
     bind!(BackTab, "Shift+Tab", "Setup: previous wizard page", SETUP => Setup),
     bind!(F(5), "F5", "Setup: next wizard page", SETUP => Setup),
     bind!(Char('c'), "c", "Setup: toggle command preview; runs: open checkpoint in chat", SETUP => Setup, RUNS => Extras),
-    bind!(Char('r'), "r", "Memory/runs: refresh saved snapshot/list", MEMORY | RUNS => Extras),
+    bind!(Char('r'), "r", "Memory/runs: refresh saved snapshot/list; devices: refresh runtime availability", MEMORY | RUNS => Extras, DEVICE => Device),
     bind!(Char('s'), "s", "Runs: score checkpoint on a held-out file", RUNS => Extras),
     bind!(Char('b'), "b", "Benchmark: run configured matched comparison", BENCHMARK => Extras),
     bind!(Char('y'), "y", "Kaggle preview: confirm upload and launch", KAGGLE_BUSY => Extras),
     bind!(Char('Y'), "Y", "Kaggle preview: confirm upload and launch (uppercase)", KAGGLE_BUSY => Extras),
     bind!(Char('n'), "n", "Kaggle preview: cancel launch", KAGGLE_BUSY => Extras),
     bind!(Char('N'), "N", "Kaggle preview: cancel launch (uppercase)", KAGGLE_BUSY => Extras),
-    bind!(PageUp, "PgUp", "Chat, setup preview, memory, help: scroll up", CHAT => Chat, SETUP => Setup, MEMORY => Extras, HELP => ScrollHelp(-8)),
-    bind!(PageDown, "PgDn", "Chat, setup preview, memory, help: scroll down", CHAT => Chat, SETUP => Setup, MEMORY => Extras, HELP => ScrollHelp(8)),
-    bind!(Home, "Home", "Help: first line", HELP => HelpTop),
-    bind!(End, "End", "Chat: follow latest output; help: last line", CHAT => Chat, HELP => HelpBottom),
-    bind!(Enter, "Enter", "Chat: send; setup: edit/save/start button; HF: login; Kaggle: review; runs: monitor/score; benchmark: edit/save; palette: execute", CHAT => Chat, SETUP | EDIT => Setup, HF => Hf, KAGGLE_INPUT | RUNS | RUNS_EDIT | BENCHMARK | BENCHMARK_EDIT => Extras, PALETTE => Palette),
-    bind!(Char(' '), "Space", "Setup: activate selected field/button; editors: type a space", SETUP => Setup),
-    bind!(Backspace, "Backspace", "Text editors/palette: delete last character", CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA_EDIT => Extras, PALETTE => Palette),
+    bind!(PageUp, "PgUp", "Chat, setup preview, memory, math, help: scroll up", CHAT => Chat, SETUP => Setup, MEMORY => Extras, MATH => MathScroll(-8), HELP => ScrollHelp(-8)),
+    bind!(PageDown, "PgDn", "Chat, setup preview, memory, math, help: scroll down", CHAT => Chat, SETUP => Setup, MEMORY => Extras, MATH => MathScroll(8), HELP => ScrollHelp(8)),
+    bind!(Home, "Home", "Math/help: first line; devices/limits: first field", HELP => HelpTop, MATH => MathTop, DEVICE => Device, LIMITS => Limits),
+    bind!(End, "End", "Chat: follow; math/help: last line; devices/limits: last field", CHAT => Chat, HELP => HelpBottom, MATH => MathBottom, DEVICE => Device, LIMITS => Limits),
+    bind!(Enter, "Enter", "Chat: send; setup: edit/save/start; HF: login; Kaggle: review; runs: monitor/score; benchmark: edit/save; palette: execute; devices/limits: select/edit/apply", CHAT => Chat, SETUP | EDIT => Setup, HF => Hf, KAGGLE_INPUT | RUNS | RUNS_EDIT | BENCHMARK | BENCHMARK_EDIT => Extras, PALETTE => Palette, DEVICE => Device, LIMITS | LIMIT_EDIT => Limits),
+    bind!(Char(' '), "Space", "Setup/devices/limits: activate selected field/button; text editors: type space", SETUP => Setup, DEVICE => Device, LIMITS => Limits),
+    bind!(Char('d'), "d", "Limits: reset draft to defaults (Apply to confirm)", LIMITS => Limits),
+    bind!(Backspace, "Backspace", "Text editors/palette: delete last character", CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA_EDIT => Extras, PALETTE => Palette, LIMIT_EDIT => Limits),
     Binding {
         code: Char('u'),
         modifiers: KeyModifiers::CONTROL,
         label: "Ctrl+U",
-        description: "Chat/setup/Kaggle/score/benchmark editor: clear input",
-        routes: &[(CHAT, Chat), (EDIT, Setup), (EXTRA_EDIT, Extras)],
+        description: "Chat/setup/Kaggle/score/benchmark/limits editor: clear input",
+        routes: &[
+            (CHAT, Chat),
+            (EDIT, Setup),
+            (EXTRA_EDIT, Extras),
+            (LIMIT_EDIT, Limits),
+        ],
     },
     Binding {
         code: Char('l'),
@@ -216,6 +282,7 @@ pub(super) fn action(key: KeyEvent, context: Context) -> Option<Action> {
             Context::HfInput => Some(Hf),
             Context::KaggleInput | Context::RunsEdit | Context::BenchmarkEdit => Some(Extras),
             Context::Palette => Some(Palette),
+            Context::LimitsEdit => Some(Limits),
             _ => None,
         };
     }
@@ -246,7 +313,7 @@ impl Help {
             .map(|binding| Line::from(format!("{:<10} {}", binding.label, binding.description)))
             .collect();
         lines.push(Line::from(
-            "Other printable characters type into editors/palette, not shortcuts. Chat and A/B slash commands: /help.",
+            "Other printable characters type into editors/palette, not shortcuts; limits accept digits. BPE byte groups share their minimum confidence color. Chat and A/B slash commands: /help.",
         ));
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         let max = paragraph
@@ -269,6 +336,30 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
     use std::collections::HashSet;
+
+    #[test]
+    fn phase12_routes_preserve_editing_and_every_new_key_is_helped() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for context in [Context::Monitor, Context::Chat, Context::Sample] {
+            assert_eq!(action(key(F(6)), context), Some(Heatmap));
+        }
+        for context in [Context::SetupEdit, Context::LimitsEdit] {
+            assert_eq!(action(key(F(6)), context), None);
+            assert_eq!(action(key(F(9)), context), Some(OpenTab(DEVICE_TAB)));
+        }
+        assert_eq!(action(key(Char('2')), Context::LimitsEdit), Some(Limits));
+        assert_eq!(action(key(Esc), Context::LimitsEdit), Some(Limits));
+        assert_eq!(action(key(Char('d')), Context::Limits), Some(Limits));
+        assert_eq!(action(key(Char('r')), Context::Device), Some(Device));
+        assert_eq!(action(key(PageDown), Context::Math), Some(MathScroll(8)));
+        for code in [F(6), F(7), F(8), F(9), F(10), F(11), F(12)] {
+            assert!(
+                BINDINGS
+                    .iter()
+                    .any(|b| b.code == code && !b.description.is_empty())
+            );
+        }
+    }
 
     #[test]
     fn no_duplicate_keybindings_across_tabs_and_global_keys() {
@@ -325,6 +416,102 @@ mod tests {
                 assert_eq!(
                     action(KeyEvent::new(Char('c'), KeyModifiers::CONTROL), context),
                     Some(Quit)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merged_tab_indices_contexts_and_modal_bindings_do_not_collide() {
+        let tabs = [
+            (0, "monitor", Context::Monitor, Context::Monitor),
+            (1, "chain", Context::Dashboard, Context::Dashboard),
+            (2, "model", Context::Dashboard, Context::Dashboard),
+            (3, "feed", Context::Dashboard, Context::Dashboard),
+            (4, "inference", Context::Chat, Context::Chat),
+            (5, "setup", Context::Setup, Context::SetupEdit),
+            (HF_TAB, "HF login", Context::HfInput, Context::HfInput),
+            (
+                KAGGLE_TAB,
+                "Kaggle",
+                Context::KaggleBusy,
+                Context::KaggleInput,
+            ),
+            (MEMORY_TAB, "memory", Context::Memory, Context::Memory),
+            (RUNS_TAB, "runs", Context::Runs, Context::RunsEdit),
+            (
+                BENCHMARK_TAB,
+                "benchmark",
+                Context::Benchmark,
+                Context::BenchmarkEdit,
+            ),
+            (SAMPLE_TAB, "sample", Context::Sample, Context::Sample),
+            (
+                HARDWARE_TAB,
+                "hardware",
+                Context::Dashboard,
+                Context::Dashboard,
+            ),
+            (MATH_TAB, "math", Context::Math, Context::Math),
+            (DEVICE_TAB, "devices", Context::Device, Context::Device),
+            (LIMITS_TAB, "limits", Context::Limits, Context::LimitsEdit),
+        ];
+        let mut indices = HashSet::new();
+        let mut contexts = vec![Context::Help, Context::Palette];
+        for (index, label, browse, edit) in tabs {
+            assert!(indices.insert(index), "duplicate tab index: {label}");
+            assert_eq!(TABS[index], label);
+            assert_eq!(Context::for_tab(index, false), browse, "{label}");
+            assert_eq!(Context::for_tab(index, true), edit, "{label} editor");
+            contexts.extend([browse, edit]);
+        }
+        assert_eq!(indices.len(), TABS.len());
+        // All twenty contexts must retain a distinct bit, including Phase 12
+        // scopes beyond u16 and the palette/help scopes not represented by tabs.
+        assert_eq!(
+            contexts
+                .iter()
+                .fold(0, |mask, context| mask | context.mask()),
+            ALL
+        );
+        assert_eq!(ALL.count_ones(), 20);
+        for context in contexts {
+            for binding in BINDINGS {
+                let matching: Vec<_> = BINDINGS
+                    .iter()
+                    .filter(|other| {
+                        other.code == binding.code && other.modifiers == binding.modifiers
+                    })
+                    .flat_map(|other| other.routes)
+                    .filter(|(scope, _)| scope & context.mask() != 0)
+                    .collect();
+                assert!(
+                    matching.len() <= 1,
+                    "duplicate {} in {context:?}",
+                    binding.label
+                );
+                if let Some((_, expected)) = matching.first() {
+                    assert_eq!(
+                        action(KeyEvent::new(binding.code, binding.modifiers), context),
+                        Some(*expected)
+                    );
+                }
+            }
+            for (code, modifiers, expected) in [
+                (Tab, KeyModifiers::NONE, NextTab),
+                (F(1), KeyModifiers::NONE, ToggleHelp),
+                (Char('c'), KeyModifiers::CONTROL, Quit),
+                (Char('k'), KeyModifiers::CONTROL, TogglePalette),
+                (F(8), KeyModifiers::NONE, OpenTab(HARDWARE_TAB)),
+                (F(9), KeyModifiers::NONE, OpenTab(DEVICE_TAB)),
+                (F(10), KeyModifiers::NONE, OpenTab(LIMITS_TAB)),
+                (F(11), KeyModifiers::NONE, OpenTab(MATH_TAB)),
+                (F(12), KeyModifiers::NONE, OpenTab(SAMPLE_TAB)),
+            ] {
+                assert_eq!(
+                    action(KeyEvent::new(code, modifiers), context),
+                    Some(expected),
+                    "{context:?}: {code:?}"
                 );
             }
         }
