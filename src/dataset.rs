@@ -932,32 +932,7 @@ impl DatasetManager {
     }
 
     fn request_huggingface_json(endpoint: &str) -> Result<serde_json::Value, String> {
-        let response = match ureq::get(endpoint)
-            .set("User-Agent", "oxide-ai/0.5.0")
-            .timeout(std::time::Duration::from_secs(60))
-            .call()
-        {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, response)) => {
-                let detail = response
-                    .into_string()
-                    .ok()
-                    .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-                    .and_then(|value| {
-                        value
-                            .get("error")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_else(|| "dataset server rejected the request".into());
-                return Err(format!("HTTP {status}: {detail}"));
-            }
-            Err(error) => return Err(format!("HTTP request failed: {error}")),
-        };
-        let body = response
-            .into_string()
-            .map_err(|e| format!("cannot read response: {e}"))?;
-        serde_json::from_str(&body).map_err(|e| format!("invalid dataset server JSON: {e}"))
+        crate::tui::hf::dataset_json(endpoint)
     }
 
     fn huggingface_response(
@@ -1161,7 +1136,7 @@ impl DatasetManager {
         let endpoint = format!(
             "https://datasets-server.huggingface.co/rows?dataset={repo}&split=train&offset=0&limit=1000"
         );
-        let body = Self::download_url_raw(&endpoint)?;
+        let body = Self::request_huggingface_json(&endpoint)?.to_string();
         let text = Self::extract_json_text(&body).ok_or_else(|| {
             format!("dataset '{repo}' response contains no supported text fields")
         })?;

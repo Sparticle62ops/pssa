@@ -4,6 +4,7 @@
 
 mod background;
 mod chat;
+pub(crate) mod hf;
 mod session;
 #[cfg(feature = "speech")]
 mod speech;
@@ -23,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-const TABS: [&str; 5] = ["monitor", "chain", "model", "feed", "inference"];
+const TABS: [&str; 6] = ["monitor", "chain", "model", "feed", "inference", "HF login"];
 const PSSA_LOGO: [&str; 3] = [
     "███  ████  ████   ███",
     "█ █  █     █      █ █",
@@ -889,6 +890,7 @@ fn run_app(
     chats_dir: PathBuf,
 ) -> io::Result<()> {
     let mut chat = chat::Chat::new(chats_dir, chain_dir.clone());
+    let mut hf_login = hf::Login::new();
     let (_session, mut terminal) = session::Session::start()?;
     let mut background = HexBackground::default();
     let mut last_frame = Instant::now();
@@ -932,8 +934,11 @@ fn run_app(
             background.advance(now.saturating_duration_since(last_frame));
             last_frame = now;
             chat.poll();
-            terminal
-                .draw(|f| draw_with_background(f, &state, tab, &background, Some(&mut chat)))?;
+            hf_login.poll();
+            terminal.draw(|f| {
+                draw_with_background(f, &state, tab, &background, Some(&mut chat));
+                if tab == 5 { hf_login.draw(f, feature_area(f.area())); }
+            })?;
             next_frame = Instant::now() + FRAME_INTERVAL;
         }
         if input_closed {
@@ -960,6 +965,10 @@ fn run_app(
                             .contains(crossterm::event::KeyModifiers::CONTROL)
                     {
                         break;
+                    }
+                    if tab == 5 && key.code != crossterm::event::KeyCode::Tab {
+                        hf_login.key(key);
+                        continue;
                     }
                     if tab == 4 && key.code != crossterm::event::KeyCode::Tab {
                         chat.key(key);
@@ -1435,6 +1444,13 @@ fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64)
     }
 }
 
+// The additive feature tabs use the same content rectangle as the shell.
+fn feature_area(area: Rect) -> Rect {
+    let area = HexBackground::content_area(area);
+    if area.width < 30 || area.height < 10 { return area; }
+    Rect::new(area.x, area.y + 5, area.width, area.height.saturating_sub(5))
+}
+
 #[cfg(test)]
 fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
     draw_with_background(f, state, tab, &HexBackground::default(), None);
@@ -1543,7 +1559,7 @@ fn draw_with_background(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(52), Constraint::Min(0)])
         .split(chunks[1]);
-    if area.width < 52 {
+    if area.width < 52 || tab >= 5 {
         f.render_widget(
             Paragraph::new(format!(" {} / tab switch", TABS[tab.min(TABS.len() - 1)]))
                 .style(accent()),
@@ -1588,6 +1604,7 @@ fn draw_with_background(
                 chat::Chat::new(PathBuf::from("chats"), state.chain_dir.clone()).draw(f, chunks[3]);
             }
         }
+        5 => {}, // rendered by the independent HF login module
         _ => draw_feed(f, chunks[3], state),
     }
 }
@@ -2521,6 +2538,8 @@ mod tests {
         if std::env::var_os("OXIDE_TUI_PRODUCER_FIXTURE").is_none() {
             return;
         }
+        // libtest's single-threaded progress prefix has no trailing newline.
+        println!();
         ui::field("corpus", "/tmp/producer corpus.txt");
         ui::field("width", "256");
         ui::panel_field("wall time", "14m 09s");
@@ -3062,6 +3081,7 @@ mod tests {
                             "model / configuration",
                             "feed / idle",
                             "conversation",
+                            "HF login",
                         ];
                         assert!(text.contains(expected[tab]));
                     } else {
