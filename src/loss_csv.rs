@@ -316,7 +316,7 @@ mod tests {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             loop {
                 let dir = std::env::temp_dir().join(format!(
-                    "oxide-loss-csv-{}-{}",
+                    "pssa-loss-csv-{}-{}",
                     std::process::id(),
                     NEXT.fetch_add(1, Ordering::Relaxed)
                 ));

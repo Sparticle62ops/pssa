@@ -4,7 +4,7 @@
 //! nonzero carry, unequal-length accumulation, Adam, consolidation and inference.
 #[path = "support/depth_one_reference.rs"]
 mod reference;
-use oxide_ai_pssa::checkpoint::{CheckpointFormat, load_checkpoint, save_model};
+use pssa::checkpoint::{CheckpointFormat, load_checkpoint, save_model};
 
 const INITIAL: &[u8] = include_bytes!("fixtures/depth_one_main85d9d33_initial.pssa");
 const TRAINED: &[u8] = include_bytes!("fixtures/depth_one_main85d9d33_trained.pssa");
@@ -12,7 +12,7 @@ const OBSERVED: &[u8] = include_bytes!("fixtures/depth_one_main85d9d33_observed.
 
 #[test]
 fn depth_one_is_bit_exact_with_main_and_loads_unchanged_v7_checkpoints() {
-    let dir = std::env::temp_dir().join(format!("oxide-main-depth-one-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pssa-main-depth-one-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let new = dir.join("new.pssa");
     let old = dir.join("old.pssa");

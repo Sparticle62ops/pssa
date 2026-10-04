@@ -1,6 +1,6 @@
-use oxide_ai_pssa::checkpoint::{self, CheckpointFormat};
-use oxide_ai_pssa::dataset::Tokenizer;
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSAContinuousBlockV2, PSSALayerV2, ParamMatrix};
+use pssa::checkpoint::{self, CheckpointFormat};
+use pssa::dataset::Tokenizer;
+use pssa::pssa::{PSSAConfigV2, PSSAContinuousBlockV2, PSSALayerV2, ParamMatrix};
 use std::{
     fs,
     path::PathBuf,
@@ -12,7 +12,7 @@ struct File(PathBuf);
 impl File {
     fn new() -> Self {
         Self(std::env::temp_dir().join(format!(
-            "oxide-stacked-checkpoint-{}-{}.pssa",
+            "pssa-stacked-checkpoint-{}-{}.pssa",
             std::process::id(),
             NEXT_PATH.fetch_add(1, Ordering::Relaxed)
         )))

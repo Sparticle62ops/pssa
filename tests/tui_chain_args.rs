@@ -1,4 +1,4 @@
-use oxide_ai_pssa::tui;
+use pssa::tui;
 
 #[test]
 fn chain_requires_a_directory_value() {
@@ -20,8 +20,8 @@ fn non_tty_tui_still_passes_plain_logs_without_creating_chats() {
         io::Write,
         process::{Command, Stdio},
     };
-    let dir = std::env::temp_dir().join(format!("oxide no chats {}", std::process::id()));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"))
+    let dir = std::env::temp_dir().join(format!("pssa no chats {}", std::process::id()));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pssa"))
         .args(["tui", "--chain", "chain with spaces", "--chats-dir"])
         .arg(&dir)
         .stdin(Stdio::piped())

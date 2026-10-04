@@ -1,4 +1,4 @@
-use oxide_ai_pssa::{
+use pssa::{
     checkpoint::{self, CheckpointFormat},
     cli::{CLIHandler, TrainingOptions},
     dataset::{Tokenizer, TokenizerKind},
@@ -19,7 +19,7 @@ impl TempDir {
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
-            "oxide-stacked-training-{}-{}",
+            "pssa-stacked-training-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -330,7 +330,7 @@ fn cli_depth_defaults_validation_resume_and_stacked_cpu_reporting() {
     let dir = TempDir::new();
     let corpus = dir.file("corpus.txt");
     fs::write(&corpus, "a b c d e f\nb c d\ne f a b").unwrap();
-    let exe = env!("CARGO_BIN_EXE_oxide_ai_pssa");
+    let exe = env!("CARGO_BIN_EXE_pssa");
     let run = |out: &str, extra: &[&str]| {
         Command::new(exe)
             .env("RAYON_NUM_THREADS", "2")

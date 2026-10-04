@@ -185,7 +185,7 @@ impl Config {
                     .unwrap_or_else(|| PathBuf::from("."))
                     .join(".config")
             });
-        Self::load_at(root.join("oxide-ai/tui.json"), models)
+        Self::load_at(root.join("pssa/tui.json"), models)
     }
     fn load_at(path: PathBuf, models: PathBuf) -> Self {
         let value = File::open(&path)

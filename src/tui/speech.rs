@@ -19,13 +19,13 @@ fn executable(name: &str) -> Option<PathBuf> {
     })
 }
 pub(super) fn discover() -> Result<Config, String> {
-    let binary=std::env::var_os("OXIDE_WHISPER_BIN").map(PathBuf::from)
+    let binary=crate::env_var_os("PSSA_WHISPER_BIN", "OXIDE_WHISPER_BIN").map(PathBuf::from)
         .or_else(||executable("whisper-cli")).or_else(||executable("main"))
-        .filter(|p|p.is_file()).ok_or("Speech needs an existing local whisper.cpp whisper-cli/main; set OXIDE_WHISPER_BIN. Nothing is downloaded.")?;
-    let model=std::env::var_os("OXIDE_WHISPER_MODEL").map(PathBuf::from)
+        .filter(|p|p.is_file()).ok_or("Speech needs an existing local whisper.cpp whisper-cli/main; set PSSA_WHISPER_BIN. Nothing is downloaded.")?;
+    let model=crate::env_var_os("PSSA_WHISPER_MODEL", "OXIDE_WHISPER_MODEL").map(PathBuf::from)
         .or_else(||["models/ggml-base.en.bin","models/ggml-base.bin","models/ggml-tiny.en.bin"].into_iter().map(PathBuf::from).find(|p|p.is_file()))
-        .filter(|p|p.is_file()).ok_or("Set OXIDE_WHISPER_MODEL to an existing local whisper.cpp ggml model. Nothing is downloaded.")?;
-    let recorder=executable("arecord").ok_or("Speech capture needs local arecord (Linux ALSA); no audio libraries are linked into oxide.")?;
+        .filter(|p|p.is_file()).ok_or("Set PSSA_WHISPER_MODEL to an existing local whisper.cpp ggml model. Nothing is downloaded.")?;
+    let recorder=executable("arecord").ok_or("Speech capture needs local arecord (Linux ALSA); no audio libraries are linked into pssa.")?;
     Ok(Config {
         binary,
         model,
@@ -76,7 +76,7 @@ fn private_temp() -> Result<Temp, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("oxide-speech-{}-{stamp}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pssa-speech-{}-{stamp}", std::process::id()));
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {

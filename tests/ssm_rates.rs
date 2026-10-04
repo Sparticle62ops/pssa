@@ -1,5 +1,5 @@
-use oxide_ai_pssa::gpu_batch::{backward_chunk_batched, forward_train_chunk_batched};
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use pssa::gpu_batch::{backward_chunk_batched, forward_train_chunk_batched};
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 
 fn model(raw_rate: f32, raw_delta: f32, carry: f32, input: f32) -> PSSALayerV2 {
     let mut cfg = PSSAConfigV2::default();

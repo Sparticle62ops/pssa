@@ -1,7 +1,7 @@
-use oxide_ai_pssa::cli::{self, CLIHandler};
-use oxide_ai_pssa::dataset::{DatasetManager, Tokenizer};
-use oxide_ai_pssa::inference::{InferenceConfig, PSSAInferenceEngine};
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use pssa::cli::{self, CLIHandler};
+use pssa::dataset::{DatasetManager, Tokenizer};
+use pssa::inference::{InferenceConfig, PSSAInferenceEngine};
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
-        "oxide-runtime-{name}-{}-{}",
+        "pssa-runtime-{name}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -117,7 +117,7 @@ fn evaluate_uniform_logits_has_known_loss_and_oov_count() {
 fn fixed_schedule_horizon_survives_resume() {
     let raw = "a b c d\na b c d\n";
     let first_opts = cli::TrainingOptions {
-        tokenizer: oxide_ai_pssa::dataset::TokenizerKind::Word,
+        tokenizer: pssa::dataset::TokenizerKind::Word,
         epochs: 1,
         latent: 4,
         state: 2,
@@ -134,7 +134,7 @@ fn fixed_schedule_horizon_survives_resume() {
     CLIHandler::save_model_v2(&first, checkpoint.to_str().unwrap()).unwrap();
     let second_opts = cli::TrainingOptions {
         resume: Some(checkpoint.to_str().unwrap().to_string()),
-        tokenizer: oxide_ai_pssa::dataset::TokenizerKind::Word,
+        tokenizer: pssa::dataset::TokenizerKind::Word,
         epochs: 1,
         accumulate: 1,
         max_tokens: Some(8),
@@ -150,7 +150,7 @@ fn fixed_schedule_horizon_survives_resume() {
 fn fixed_warmup_resume_matches_uninterrupted_training_before_and_after_warmup() {
     let raw = "a b c d\na b c d\n";
     let opts = cli::TrainingOptions {
-        tokenizer: oxide_ai_pssa::dataset::TokenizerKind::Word,
+        tokenizer: pssa::dataset::TokenizerKind::Word,
         epochs: 3,
         latent: 4,
         state: 2,
@@ -202,7 +202,7 @@ fn fixed_warmup_resume_matches_uninterrupted_training_before_and_after_warmup() 
 #[test]
 fn word_tokenizer_reports_unusable_corpus_and_windows_wrap_at_eof() {
     let bad = cli::TrainingOptions {
-        tokenizer: oxide_ai_pssa::dataset::TokenizerKind::Word,
+        tokenizer: pssa::dataset::TokenizerKind::Word,
         epochs: 1,
         latent: 4,
         state: 2,
@@ -216,7 +216,7 @@ fn word_tokenizer_reports_unusable_corpus_and_windows_wrap_at_eof() {
     assert!(CLIHandler::train_corpus("😀😀\n", &bad).is_err());
 
     let wrapped = cli::TrainingOptions {
-        tokenizer: oxide_ai_pssa::dataset::TokenizerKind::Word,
+        tokenizer: pssa::dataset::TokenizerKind::Word,
         epochs: 1,
         latent: 4,
         state: 2,
@@ -232,7 +232,7 @@ fn word_tokenizer_reports_unusable_corpus_and_windows_wrap_at_eof() {
 }
 #[test]
 fn cli_errors_do_not_train_or_write_and_bad_numeric_exits_nonzero() {
-    let exe = env!("CARGO_BIN_EXE_oxide_ai_pssa");
+    let exe = env!("CARGO_BIN_EXE_pssa");
     let out = temp("should-not-exist");
     let missing = Command::new(exe)
         .args([
@@ -284,7 +284,7 @@ fn cli_errors_do_not_train_or_write_and_bad_numeric_exits_nonzero() {
 }
 #[test]
 fn shipped_legacy_v5_chat_uses_checkpoint_vocabulary_with_or_without_data() {
-    let exe = env!("CARGO_BIN_EXE_oxide_ai_pssa");
+    let exe = env!("CARGO_BIN_EXE_pssa");
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let model = manifest.join("data/model.pssa");
     let data = manifest.join("data/downloaded.txt");
@@ -323,7 +323,7 @@ fn shipped_legacy_v5_chat_uses_checkpoint_vocabulary_with_or_without_data() {
 
 #[test]
 fn process_train_save_then_generate_without_corpus() {
-    let exe = env!("CARGO_BIN_EXE_oxide_ai_pssa");
+    let exe = env!("CARGO_BIN_EXE_pssa");
     let data = temp("reference.txt");
     let model = temp("reference.pssa");
     fs::write(&data, "alpha beta gamma delta epsilon\nalpha beta gamma delta epsilon\nalpha beta gamma delta epsilon\n").unwrap();

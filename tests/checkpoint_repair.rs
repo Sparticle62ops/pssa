@@ -1,9 +1,9 @@
-use oxide_ai_pssa::checkpoint::{self, CheckpointFormat};
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2, ParamMatrix, ParamVector};
+use pssa::checkpoint::{self, CheckpointFormat};
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2, ParamMatrix, ParamVector};
 use std::{fs, path::PathBuf};
 
 fn path(s: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("oxide-checkpoint-{s}-{}", std::process::id()))
+    std::env::temp_dir().join(format!("pssa-checkpoint-{s}-{}", std::process::id()))
 }
 fn fill(x: &mut [f32], v: f32) {
     for (i, n) in x.iter_mut().enumerate() {
@@ -811,8 +811,8 @@ fn actual_numeric_storage(m: &PSSALayerV2) -> usize {
             .sum::<usize>()
 }
 
-fn actual_block_storage(b: &oxide_ai_pssa::pssa::PSSAContinuousBlockV2) -> usize {
-    let oxide_ai_pssa::pssa::PSSAContinuousBlockV2 {
+fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
+    let pssa::pssa::PSSAContinuousBlockV2 {
         cfg: _,
         norm_gamma,
         norm_beta,
@@ -968,7 +968,7 @@ fn actual_block_storage(b: &oxide_ai_pssa::pssa::PSSAContinuousBlockV2) -> usize
     .into_iter()
     .map(vector_bytes)
     .sum();
-    let oxide_ai_pssa::memory::HyperbolicEpisodicBankV2 {
+    let pssa::memory::HyperbolicEpisodicBankV2 {
         capacity: _,
         count: _,
         dim_key: _,
@@ -985,7 +985,7 @@ fn actual_block_storage(b: &oxide_ai_pssa::pssa::PSSAContinuousBlockV2) -> usize
         .map(vector_bytes)
         .sum::<usize>()
         + vector_bytes(last_seen_step);
-    let oxide_ai_pssa::pssa::ChunkActivationTape {
+    let pssa::pssa::ChunkActivationTape {
         max_l: _,
         x_ids,
         target_ids,
@@ -1058,7 +1058,7 @@ fn actual_block_storage(b: &oxide_ai_pssa::pssa::PSSAContinuousBlockV2) -> usize
 
 #[test]
 fn large_projected_memory_keys_use_the_banks_norm_policy_on_save_and_load() {
-    use oxide_ai_pssa::memory::HyperbolicEpisodicBankV2;
+    use pssa::memory::HyperbolicEpisodicBankV2;
     let p = path("high-dimensional-memory");
     let mut m = PSSALayerV2::new(
         PSSAConfigV2 {

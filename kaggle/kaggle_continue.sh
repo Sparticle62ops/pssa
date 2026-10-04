@@ -4,7 +4,7 @@
 # from scratch. Safe to run after kaggle_gpu_setup.sh died partway.
 set -euo pipefail
 
-REPO="${REPO:-https://github.com/Sparticle62ops/oxide-ai.git}"
+REPO="${REPO:-https://github.com/Sparticle62ops/pssa.git}"
 WORK="${WORK:-/kaggle/working}"
 BRANCH="${BRANCH:-main}"
 TOTAL="${TOTAL:-64}"
@@ -39,14 +39,14 @@ fi
 cargo --version
 
 echo "### 1. Update checkout to $BRANCH"
-if [ -d "$WORK/oxide-ai/.git" ]; then
-  cd "$WORK/oxide-ai"
+if [ -d "$WORK/pssa/.git" ]; then
+  cd "$WORK/pssa"
   git fetch --quiet origin "$BRANCH"
   git checkout --quiet -B "$BRANCH" "origin/$BRANCH"
 else
   cd "$WORK"
   git clone --quiet --branch "$BRANCH" "$REPO"
-  cd oxide-ai
+  cd pssa
 fi
 git log --oneline -1
 
@@ -94,7 +94,7 @@ echo "data=$DATA bytes=$(wc -c < "$DATA")"
 echo
 echo "### 2. Build"
 cargo build --release --features cuda
-HELP_TEXT="$(./target/release/oxide_ai_pssa help 2>&1 || true)"
+HELP_TEXT="$(./target/release/pssa help 2>&1 || true)"
 case "$HELP_TEXT" in
   *--resume*) echo "--resume present" ;;
   *) echo "ERROR: this checkout has no --resume, stopping"; exit 1 ;;
@@ -109,7 +109,7 @@ CLEAN="${CLEAN:-$WORK/corpus/big.clean.txt}"
 if [ "$DATA" = "$BIG" ]; then
   if [ ! -s "$CLEAN" ]; then
     rm -f "$CLEAN"
-    ./target/release/oxide_ai_pssa clean-wikitext "$BIG" -o "$CLEAN"
+    ./target/release/pssa clean-wikitext "$BIG" -o "$CLEAN"
   fi
   if [ -s "$CLEAN" ]; then
     DATA="$CLEAN"
@@ -195,14 +195,14 @@ for i in $(seq "$START" "$TOTAL"); do
   SKIP=$(( (i - 1) * WINDOW ))
   echo "--- ck$(printf '%02d' "$i") (corpus offset $SKIP) ---"
   if [ -z "$PREV" ]; then
-    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --batch-size "$BATCH" --accumulate "$ACC" --total-updates "$TOTAL_UPDATES" --no-tui
+    ./target/release/pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --batch-size "$BATCH" --accumulate "$ACC" --total-updates "$TOTAL_UPDATES" --no-tui
   else
-    ./target/release/oxide_ai_pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --batch-size "$BATCH" --accumulate "$ACC" --resume "$PREV" --total-updates "$TOTAL_UPDATES" --no-tui
+    ./target/release/pssa train "$DATA" -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --batch-size "$BATCH" --accumulate "$ACC" --resume "$PREV" --total-updates "$TOTAL_UPDATES" --no-tui
   fi
   PREV="$OUT"
 done
 
 echo
 echo "### 4. Sample"
-./target/release/oxide_ai_pssa generate -m "$PREV" -p "The sun is"
-./target/release/oxide_ai_pssa generate -m "$PREV" -p "Anarchism is"
+./target/release/pssa generate -m "$PREV" -p "The sun is"
+./target/release/pssa generate -m "$PREV" -p "Anarchism is"

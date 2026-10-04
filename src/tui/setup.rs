@@ -602,7 +602,7 @@ impl Setup {
     }
 
     fn command(&self) -> String {
-        let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("oxide_ai_pssa"));
+        let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pssa"));
         let output = safe_path(self.value(Output));
         let checkpoint = Path::new(&output).join(self.checkpoint_name());
         format!(
@@ -764,7 +764,7 @@ impl Setup {
                 rows.push(Line::from(
                     "Threads can change reduction rounding; tiny RAM budgets may abort the child.",
                 ));
-                rows.push(Line::from("Quitting the TUI leaves training running; reopen with tail -f train.log | oxide_ai_pssa tui."));
+                rows.push(Line::from("Quitting the TUI leaves training running; reopen with tail -f train.log | pssa tui."));
             }
         }
         let parameters_area = panel_area(f, body[0]);

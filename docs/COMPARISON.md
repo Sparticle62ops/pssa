@@ -12,10 +12,10 @@ epochs=1, batch-size=8, accumulate=1):
 
 ```sh
 export CC=/workspace/bin/zigcc CXX=/workspace/bin/zigcc AR=/workspace/bin/ar
-export CARGO_TARGET_DIR=/workspace/oxide-target-test
+export CARGO_TARGET_DIR=/workspace/pssa-target-test
 cargo build --release
 cargo test
-BIN="$CARGO_TARGET_DIR/release/oxide_ai_pssa"
+BIN="$CARGO_TARGET_DIR/release/pssa"
 
 "$BIN" compare /kaggle/working/corpus/big.clean.txt \
   --chain-dir /kaggle/working/chain \
@@ -26,7 +26,7 @@ BIN="$CARGO_TARGET_DIR/release/oxide_ai_pssa"
 ```
 
 On Kaggle use its normal Rust toolchain/build and set
-`BIN=./target/release/oxide_ai_pssa` instead of the workspace-specific Zig paths.
+`BIN=./target/release/pssa` instead of the workspace-specific Zig paths.
 The output directory must not already exist; its parent must exist. This avoids
 overwriting a previous experiment. Defaults match the flags above; evaluation's
 default offset is the sum of the links' encoded-token budgets. Seed defaults to

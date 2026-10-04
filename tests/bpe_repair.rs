@@ -1,14 +1,14 @@
-use oxide_ai_pssa::checkpoint::{self, CheckpointFormat};
-use oxide_ai_pssa::cli::{CLIHandler, TrainingOptions};
-use oxide_ai_pssa::dataset::{Tokenizer, TokenizerKind};
-use oxide_ai_pssa::inference::{InferenceConfig, PSSAInferenceEngine};
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use pssa::checkpoint::{self, CheckpointFormat};
+use pssa::cli::{CLIHandler, TrainingOptions};
+use pssa::dataset::{Tokenizer, TokenizerKind};
+use pssa::inference::{InferenceConfig, PSSAInferenceEngine};
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
-        "oxide-bpe-{name}-{}",
+        "pssa-bpe-{name}-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

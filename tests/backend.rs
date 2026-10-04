@@ -1,4 +1,4 @@
-use oxide_ai_pssa::backend::{gemm_cpu_into, gemm_cpu_reference, gemm_nn_cpu, gemm_tn_cpu};
+use pssa::backend::{gemm_cpu_into, gemm_cpu_reference, gemm_nn_cpu, gemm_tn_cpu};
 
 fn values(len: usize) -> Vec<f32> {
     (0..len)
@@ -92,7 +92,7 @@ fn blocked_cpu_output_into_matches_dot_order_for_tails_and_parallel_tiles() {
             for j in 0..n {
                 assert_eq!(
                     out[t * n + j],
-                    oxide_ai_pssa::linalg::dot_slice(
+                    pssa::linalg::dot_slice(
                         &x[t * k..(t + 1) * k],
                         &w[j * k..(j + 1) * k]
                     )
@@ -131,11 +131,14 @@ fn rayon_gemms_match_single_thread_bitwise_including_partial_tiles() {
 
 #[test]
 fn backend_initialization_environment_child() {
-    if std::env::var_os("OXIDE_BACKEND_ENV_CHILD").is_none() {
+    if std::env::var_os("PSSA_BACKEND_ENV_CHILD")
+        .or_else(|| std::env::var_os("OXIDE_BACKEND_ENV_CHILD"))
+        .is_none()
+    {
         return;
     }
     assert!(std::env::var_os("XDG_RUNTIME_DIR").is_none());
-    let _ = oxide_ai_pssa::backend::WgpuContext::init_blocking();
+    let _ = pssa::backend::WgpuContext::init_blocking();
     assert!(
         std::env::var_os("XDG_RUNTIME_DIR").is_none(),
         "backend mutated process environment"
@@ -150,7 +153,7 @@ fn backend_initialization_does_not_set_process_environment() {
             "backend_initialization_environment_child",
             "--nocapture",
         ])
-        .env("OXIDE_BACKEND_ENV_CHILD", "1")
+        .env("PSSA_BACKEND_ENV_CHILD", "1")
         .env_remove("XDG_RUNTIME_DIR")
         .output()
         .unwrap();
@@ -178,7 +181,7 @@ fn backend_kernel_benchmark() {
                 let mut out = vec![0.0; m * n];
                 let serial = |out: &mut [f32]| {
                     for t in 0..m { for j in 0..n {
-                        out[t * n + j] = oxide_ai_pssa::linalg::dot_slice(&x[t * k..(t + 1) * k], &w[j * k..(j + 1) * k]);
+                        out[t * n + j] = pssa::linalg::dot_slice(&x[t * k..(t + 1) * k], &w[j * k..(j + 1) * k]);
                     }}
                 };
                 serial(&mut out);

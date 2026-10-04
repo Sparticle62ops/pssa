@@ -1,4 +1,4 @@
-use oxide_ai_pssa::{
+use pssa::{
     checkpoint,
     cli::{CLIHandler, TrainingOptions},
     dataset::TokenizerKind,
@@ -14,7 +14,7 @@ use std::{
 fn path(label: &str) -> String {
     std::env::temp_dir()
         .join(format!(
-            "oxide-batch-{label}-{}-{}",
+            "pssa-batch-{label}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -145,7 +145,7 @@ fn batched_schedule_resume_is_exact_and_old_horizonless_checkpoint_loads() {
 
 #[test]
 fn cli_batch_one_is_byte_identical_and_bad_sizes_do_not_write() {
-    let exe = env!("CARGO_BIN_EXE_oxide_ai_pssa");
+    let exe = env!("CARGO_BIN_EXE_pssa");
     let corpus = path("corpus.txt");
     fs::write(
         &corpus,
@@ -271,7 +271,7 @@ fn cli_batch_one_is_byte_identical_and_bad_sizes_do_not_write() {
 
 #[test]
 fn transformer_api_rejects_unsupported_sequence_batches() {
-    let result = oxide_ai_pssa::transformer_training::train_corpus(
+    let result = pssa::transformer_training::train_corpus(
         "alpha beta\n",
         &TrainingOptions {
             batch_size: 2,

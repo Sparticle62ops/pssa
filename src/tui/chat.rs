@@ -741,7 +741,7 @@ impl Chat {
     fn speech(&mut self) -> Result<(), String> {
         #[cfg(not(feature = "speech"))]
         {
-            Err("Speech is optional: build with --features speech; install local whisper-cli (or main) and arecord; set OXIDE_WHISPER_BIN and OXIDE_WHISPER_MODEL to existing local files. No downloads are performed.".into())
+            Err("Speech is optional: build with --features speech; install local whisper-cli (or main) and arecord; set PSSA_WHISPER_BIN and PSSA_WHISPER_MODEL to existing local files. No downloads are performed.".into())
         }
         #[cfg(feature = "speech")]
         {
@@ -1025,7 +1025,7 @@ mod tests {
     fn fixture() -> Chat {
         let doc = Document::new(String::new());
         Chat::new(
-            std::env::temp_dir().join(format!("oxide-chat-{}", doc.id)),
+            std::env::temp_dir().join(format!("pssa-chat-{}", doc.id)),
             PathBuf::from("missing"),
         )
     }

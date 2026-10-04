@@ -1,5 +1,5 @@
 //! Regression coverage for the runtime-only weight-shared Ouro passes.
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 
 const IDS: [usize; 3] = [1, 3, 5];
 const TARGETS: [usize; 3] = [3, 5, 0];

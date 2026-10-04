@@ -254,8 +254,8 @@ over-read:
 ```bash
 git clone https://github.com/Sparticle62ops/pssa.git
 cd pssa
-cargo build --release
-./target/release/oxide_ai_pssa
+cargo install --path .
+pssa
 ```
 
 Running it with no arguments gives you a home screen listing every command plus
@@ -412,7 +412,7 @@ Both read `TOTAL`, `WINDOW` and `FRESH` from the environment and write
 General form:
 
 ```text
-oxide_ai_pssa <COMMAND> [OPTIONS]
+pssa <COMMAND> [OPTIONS]
 ```
 
 Commands:
@@ -440,8 +440,8 @@ still includes loss, a short moving average, speed, ETA, update counts, learning
 rate, memory occupancy, and checkpoint events. To view a piped log interactively:
 
 ```bash
-oxide_ai_pssa train data/downloaded.txt -o chain/ck01.pssa --max-tokens 200000 -e 1 --no-tui \\
-  | oxide_ai_pssa tui --chain chain
+pssa train data/downloaded.txt -o chain/ck01.pssa --max-tokens 200000 -e 1 --no-tui \\
+  | pssa tui --chain chain
 ```
 
 ### Project dashboard extras (TUI)
@@ -455,7 +455,7 @@ and `/ab b PATH` compare PSSA/transformer replies side by side. See
 
 ### Local inference chat (TUI)
 
-Run `oxide_ai_pssa tui` in a terminal (or run with no arguments on a TTY), then
+Run `pssa tui` in a terminal (or run with no arguments on a TTY), then
 press **Tab** to reach **inference**. Existing `chat`/`generate` CLI commands and
 `--no-tui` logging are unchanged. Non-TTY `tui` output remains a plain log passthrough.
 
@@ -631,7 +631,7 @@ is unchanged.
 For example, the optional CLI limits can also be used without the TUI:
 
 ```bash
-oxide_ai_pssa train science --backend cpu --threads 2 --ram-mib 2048 \
+pssa train science --backend cpu --threads 2 --ram-mib 2048 \
   --batch-size 1 --max-tokens 20000 --no-tui -o runs/limited.pssa
 ```
 
@@ -639,8 +639,8 @@ oxide_ai_pssa train science --backend cpu --threads 2 --ram-mib 2048 \
 
 - **Library:** **m** sets the models folder, **d** sets the datasets folder,
   **r** rescans, and **Up/Down** selects a file. Folder preferences and the eval
-  prompt path are saved in `$XDG_CONFIG_HOME/oxide-ai/tui.json` (otherwise
-  `~/.config/oxide-ai/tui.json`); unrelated config fields are preserved.
+  prompt path are saved in `$XDG_CONFIG_HOME/pssa/tui.json` (otherwise
+  `~/.config/pssa/tui.json`); unrelated config fields are preserved.
   Scans are non-recursive and run off-thread, listing `.pssa`/`.trfm` models
   and `.txt`/`.jsonl`/`.parquet` datasets with size and UTC modification date.
   Model dimensions are header hints, not a full validation or a weight load.
@@ -679,7 +679,7 @@ oxide_ai_pssa train science --backend cpu --threads 2 --ram-mib 2048 \
   numbers; answer panes compare adjacent checkpoints. **Up/Down** selects a
   checkpoint, **PgUp/PgDn** a prompt, **a** pauses/resumes, **p** edits the prompt
   JSON path (empty restores the built-in suite), and **r** reloads it.
-  Copy `assets/eval_prompts.json` as a starting point; `OXIDE_EVAL_PROMPTS` also
+  Copy `assets/eval_prompts.json` as a starting point; `PSSA_EVAL_PROMPTS` also
   supplies a startup path when no persisted path is set. Scores are tokenizer-
   specific, not a correctness grade or directly comparable across tokenizers.
   PSSA evaluation uses checkpoint memory, fresh carry, and runtime loops=1.
@@ -696,7 +696,7 @@ oxide_ai_pssa train science --backend cpu --threads 2 --ram-mib 2048 \
 
 Optional local speech capture (Linux/ALSA) is built with `cargo build --release
 --features speech`. Install an existing local **whisper.cpp** `whisper-cli` (or
-`main`) and **arecord**, then set `OXIDE_WHISPER_BIN` and `OXIDE_WHISPER_MODEL` to
+`main`) and **arecord**, then set `PSSA_WHISPER_BIN` and `PSSA_WHISPER_MODEL` to
 the binary and ggml model paths. Without overrides the app searches PATH for
 `whisper-cli`/`main` and `models/ggml-{base.en,base,tiny.en}.bin` for a local model.
 `/speech` records ten seconds, transcribes locally, deletes temporary audio, and
@@ -798,9 +798,9 @@ cargo run --release -- download wikimedia/wikipedia --out data/downloaded.txt
 ### Hugging Face training and live feed
 
 ```bash
-oxide_ai_pssa train --hf-dataset Salesforce/wikitext \
+pssa train --hf-dataset Salesforce/wikitext \
   --hf-config wikitext-103-v1 --hf-split train --hf-field text \
-  --max-tokens 200000 -e 1 --no-tui | oxide_ai_pssa tui
+  --max-tokens 200000 -e 1 --no-tui | pssa tui
 ```
 
 Use **Tab** to open **feed**: it shows the dataset, completed selected-window rows,
@@ -814,14 +814,18 @@ sample metadata. The animation is cosmetic and runs only in the log reader.
 HF downloads use the datasets-server rows API, streaming pages to an atomic disk
 cache before the existing in-memory tokenizer/trainer reads the corpus. This is
 not online/infinite-dataset training: `--max-tokens` caps training, not the download.
-Set `OXIDE_PSSA_HF_CACHE` to a writable cache directory (for example
-`/kaggle/working/oxide-hf-cache` on Kaggle, with Internet enabled); otherwise the
-cache lives under `$XDG_CACHE_HOME/oxide-ai-pssa/huggingface` or
-`~/.cache/oxide-ai-pssa/huggingface`. Cached data can be reused offline; delete its
+Set `PSSA_HF_CACHE` to a writable cache directory (for example
+`/kaggle/working/pssa-hf-cache` on Kaggle, with Internet enabled); otherwise the
+cache lives under `$XDG_CACHE_HOME/pssa/huggingface` or
+`~/.cache/pssa/huggingface`. Cached data can be reused offline; delete its
 cache file to refresh it. Choose a configuration explicitly when discovery reports
 multiple choices.
 
-For private/gated datasets, open **HF login** with Tab in `oxide_ai_pssa tui`.
+Renamed environment variables still accept their legacy `OXIDE_*` fallback
+when the corresponding `PSSA_*` variable is unset (including `OXIDE_PSSA_HF_CACHE`
+for `PSSA_HF_CACHE`). A set `PSSA_*` value always takes precedence, even if empty.
+
+For private/gated datasets, open **HF login** with Tab in `pssa tui`.
 Enter a read token (masked) and press **Enter**: the app verifies the account with
 HF's `whoami-v2` API and atomically saves `~/.cache/huggingface/token` with mode
 `0600`. Existing `HF_TOKEN` credentials take precedence over that file on startup;
@@ -840,16 +844,16 @@ include a short sample of dataset content; treat saved logs accordingly. Local
 runs do not add these fields. Do not combine `--hf-dataset` with a positional
 source or `--data`.
 
-Network downloads are not validated or curated by Oxide AI. Review licensing, privacy, and content before training on an external corpus.
+Network downloads are not validated or curated by PSSA. Review licensing, privacy, and content before training on an external corpus.
 
 ### Cleaning WikiText raw corpora
 
 Clean extracted `wikitext-103-raw` text **before a fresh training run**:
 
 ```bash
-./target/release/oxide_ai_pssa clean-wikitext wiki.train.raw --out data/wikitext-clean.txt
-./target/release/oxide_ai_pssa train data/wikitext-clean.txt -o data/model.pssa
-# Also available: oxide_ai_pssa help clean-wikitext
+./target/release/pssa clean-wikitext wiki.train.raw --out data/wikitext-clean.txt
+./target/release/pssa train data/wikitext-clean.txt -o data/model.pssa
+# Also available: pssa help clean-wikitext
 ```
 
 The same command can be used in Kaggle after extracting text from Parquet; it
@@ -870,7 +874,7 @@ The pass:
   Removing a heading does not introduce a blank line.
 - Writes LF line endings, including a newline on the last retained line.
 
-`oxide_ai_pssa::dataset::clean_wikitext(reader, writer)` is the reusable library
+`pssa::dataset::clean_wikitext(reader, writer)` is the reusable library
 API (`BufRead` / `Write`, returning `std::io::Result<()>`). The CLI uses buffered
 file I/O, and the cleaner retains only its input/output line buffers: memory is
 proportional to the longest line, not the corpus size. Library callers using a

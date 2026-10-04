@@ -1,6 +1,6 @@
 # Phase 11: the project dashboard
 
-Start `oxide_ai_pssa tui --chain "path to chain"` in a terminal. `Tab` cycles
+Start `pssa tui --chain "path to chain"` in a terminal. `Tab` cycles
 screens; `Ctrl+K` opens a searchable command palette. `?` opens help outside text
 entry; `F1` opens help everywhere (question marks still work in prompts/paths).
 `Ctrl+C` quits everywhere. Existing piped / `--no-tui` CLI behavior is unchanged.

@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 #[test]
 fn chat_handles_info_and_updates_temperature() {
     let model = format!("{}/data/model.pssa", env!("CARGO_MANIFEST_DIR"));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pssa"))
         .args(["chat", "--model", &model, "--temp", "0.7"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

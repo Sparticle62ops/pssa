@@ -2,8 +2,8 @@
 //! and MLP backward stages must reproduce the fused per-token loops exactly
 //! enough for training, run with `gpu = None` so the CPU twins are exercised.
 
-use oxide_ai_pssa::gpu_batch;
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use pssa::gpu_batch;
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 
 fn cfg() -> PSSAConfigV2 {
     PSSAConfigV2 {

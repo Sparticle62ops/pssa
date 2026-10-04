@@ -98,7 +98,7 @@ Run sequentially against the same unchanged corpus file:
 ```sh
 mkdir -p comparison
 
-target/release/oxide_ai_pssa train data/downloaded.txt \
+target/release/pssa train data/downloaded.txt \
   -o comparison/pssa-01.pssa \
   --tokenizer bpe --vocab-size 2048 \
   --latent 256 --state 16 --key 32 --memory 512 \
@@ -106,7 +106,7 @@ target/release/oxide_ai_pssa train data/downloaded.txt \
   --total-updates 50000 --max-tokens 200000 --skip-tokens 0 -e 1 \
   > comparison/pssa-01.log 2>&1
 
-target/release/oxide_ai_pssa train-transformer data/downloaded.txt \
+target/release/pssa train-transformer data/downloaded.txt \
   -o comparison/transformer-01.trfm \
   --tokenizer-from comparison/pssa-01.pssa \
   --chunk 64 --accumulate 8 --lr 0.001 --seed 42 \
@@ -126,13 +126,13 @@ Do not pass `--tokenizer-from` on a transformer resume: its own tokenizer is
 already embedded.
 
 ```sh
-target/release/oxide_ai_pssa train data/downloaded.txt \
+target/release/pssa train data/downloaded.txt \
   -o comparison/pssa-02.pssa --resume comparison/pssa-01.pssa \
   --accumulate 8 --total-updates 50000 \
   --max-tokens 200000 --skip-tokens 200000 -e 1 \
   > comparison/pssa-02.log 2>&1
 
-target/release/oxide_ai_pssa train-transformer data/downloaded.txt \
+target/release/pssa train-transformer data/downloaded.txt \
   -o comparison/transformer-02.trfm --resume comparison/transformer-01.trfm \
   --accumulate 8 --total-updates 50000 \
   --max-tokens 200000 --skip-tokens 200000 -e 1 \
@@ -178,9 +178,9 @@ Old checkpoints need no new metadata and remain readable. Historical curves
 cannot be recovered from checkpoints that were trained without logging.
 
 ```sh
-oxide_ai_pssa train CORPUS -o ck01.pssa -e 1 --max-tokens 200000 \
+pssa train CORPUS -o ck01.pssa -e 1 --max-tokens 200000 \
   --loss-csv pssa.csv --loss-every 10000
-oxide_ai_pssa train-transformer CORPUS -o ck01.trfm -e 1 --max-tokens 200000 \
+pssa train-transformer CORPUS -o ck01.trfm -e 1 --max-tokens 200000 \
   --tokenizer-from ck01.pssa --loss-csv transformer.csv --loss-every 10000
 ```
 
@@ -194,9 +194,9 @@ trained episodic bank; the transformer resets attention per chunk. Outputs retai
 the existing JSON schema (`cross_entropy` is mean loss, `perplexity = exp(loss)`).
 
 ```sh
-oxide_ai_pssa evaluate CORPUS -m chain/ck64.pssa \
+pssa evaluate CORPUS -m chain/ck64.pssa \
   --skip-tokens 12800000 --max-tokens 200000
-oxide_ai_pssa evaluate-transformer CORPUS -m comparison/ck64.trfm \
+pssa evaluate-transformer CORPUS -m comparison/ck64.trfm \
   --skip-tokens 12800000 --max-tokens 200000
 ```
 
@@ -207,12 +207,12 @@ unseen slice. Do not clean/change the corpus midway through a comparison.
 ## Evaluation, generation, and limitations
 
 ```sh
-target/release/oxide_ai_pssa evaluate data/heldout.txt -m comparison/pssa-02.pssa
-target/release/oxide_ai_pssa evaluate-transformer data/heldout.txt -m comparison/transformer-02.trfm
+target/release/pssa evaluate data/heldout.txt -m comparison/pssa-02.pssa
+target/release/pssa evaluate-transformer data/heldout.txt -m comparison/transformer-02.trfm
 
-target/release/oxide_ai_pssa generate -m comparison/pssa-02.pssa \
+target/release/pssa generate -m comparison/pssa-02.pssa \
   -p "The purpose of a scientific experiment is" --temperature 0 --max-new-tokens 64
-target/release/oxide_ai_pssa generate-transformer -m comparison/transformer-02.trfm \
+target/release/pssa generate-transformer -m comparison/transformer-02.trfm \
   -p "The purpose of a scientific experiment is" --temperature 0 --max-new-tokens 64
 ```
 

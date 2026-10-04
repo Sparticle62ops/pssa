@@ -408,7 +408,7 @@ impl TempDir {
     fn new() -> Result<Self, String> {
         for _ in 0..10 {
             let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("oxide-eval-{}-{id}", std::process::id()));
+            let path = std::env::temp_dir().join(format!("pssa-eval-{}-{id}", std::process::id()));
             let mut builder = fs::DirBuilder::new();
             #[cfg(unix)]
             {
@@ -1111,7 +1111,7 @@ impl Default for Eval {
 }
 impl Eval {
     pub(super) fn new() -> Self {
-        let prompt_file = std::env::var_os("OXIDE_EVAL_PROMPTS")
+        let prompt_file = crate::env_var_os("PSSA_EVAL_PROMPTS", "OXIDE_EVAL_PROMPTS")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
         let initial = prompt_file.clone();

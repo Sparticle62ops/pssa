@@ -540,7 +540,7 @@ fn upload_with(
     }
     active(cancel)?;
     let card = format!(
-        "---\ntags:\n- pssa\n- oxide-ai\n---\n\n# PSSA checkpoint\n\nUploaded with the oxide-ai TUI.\n\n- File: `model.{extension}`\n- Checkpoint bytes: {size}\n- SHA-256: `{oid}`\n\nLoad this checkpoint with the matching oxide-ai version.\nTraining dataset, metrics, license and hardware are not inferred; add verified details before sharing.\n"
+        "---\ntags:\n- pssa\n---\n\n# PSSA checkpoint\n\nUploaded with the PSSA TUI.\n\n- File: `model.{extension}`\n- Checkpoint bytes: {size}\n- SHA-256: `{oid}`\n\nLoad this checkpoint with the matching PSSA version.\nTraining dataset, metrics, license and hardware are not inferred; add verified details before sharing.\n"
     );
     let body = commit_body(extension, &oid, size, &card);
     let result = hub.commit(repo, &body)?;

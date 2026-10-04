@@ -1,8 +1,8 @@
 //! Reproducible CPU-only timing probe for the live PSSA model paths.
 //! Run with the same release environment used by the optimization report.
 
-use oxide_ai_pssa::linalg::dot_slice;
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use pssa::linalg::dot_slice;
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 

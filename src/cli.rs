@@ -1349,7 +1349,7 @@ impl CLIHandler {
     }
 
     /// Everything the project can do, on one screen, with the state of the
-    /// working directory next to it. This is what `oxide` alone prints.
+    /// working directory next to it. This is what `pssa` alone prints.
     pub fn print_home() {
         ui::clear_screen();
         ui::logo();
@@ -1385,7 +1385,7 @@ impl CLIHandler {
             ("throughput", "measure frozen-model tokens/sec on a corpus"),
             (
                 "tui",
-                "live dashboard for a piped training run (train ... | oxide tui)",
+                "live dashboard for a piped training run (train ... | pssa tui)",
             ),
             (
                 "gpu-probe",
@@ -1407,9 +1407,9 @@ impl CLIHandler {
         println!(
             "  {} {}",
             ui::dim("try"),
-            ui::bold("oxide train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1")
+            ui::bold("pssa train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1")
         );
-        println!("  {}", ui::dim("oxide help for every flag"));
+        println!("  {}", ui::dim("pssa help for every flag"));
         println!();
     }
 
@@ -1447,7 +1447,7 @@ impl CLIHandler {
             .unwrap_or(1);
         ui::panel_field("device", &format!("cpu, {threads} threads"));
         if checkpoints.is_empty() {
-            ui::panel_field("checkpoints", &ui::dim("none yet, run oxide train"));
+            ui::panel_field("checkpoints", &ui::dim("none yet, run pssa train"));
         } else {
             let shown = checkpoints.len().min(4);
             for (i, (name, size)) in checkpoints.iter().take(shown).enumerate() {
@@ -1472,7 +1472,7 @@ impl CLIHandler {
         ui::panel_bottom();
     }
 
-    /// `oxide status`: the workspace panel on its own, plus what each
+    /// `pssa status`: the workspace panel on its own, plus what each
     /// checkpoint actually contains.
     fn run_status() -> Result<(), String> {
         println!();
@@ -1554,7 +1554,7 @@ impl CLIHandler {
     }
 
     pub fn print_help() {
-        let bin = "oxide_ai_pssa";
+        let bin = "pssa";
         println!();
         println!(
             "  {}  {}",
@@ -1591,7 +1591,7 @@ impl CLIHandler {
             ("throughput", "measure frozen-model tokens/sec on a corpus"),
             (
                 "tui",
-                "live dashboard for a piped training run (train ... | oxide tui)",
+                "live dashboard for a piped training run (train ... | pssa tui)",
             ),
             (
                 "gpu-probe",
@@ -1743,7 +1743,7 @@ impl CLIHandler {
     }
 
     fn print_command_help(command: &str) -> Result<(), String> {
-        let bin = "oxide_ai_pssa";
+        let bin = "pssa";
         let command = Self::canonical_command(command);
         match command {
             "train-transformer" => {
@@ -2469,7 +2469,7 @@ impl CLIHandler {
                 )
             }
             "tui" => crate::tui::run(&args[2..]),
-            _ => Err(format!("unknown command '{}'; run oxide help", args[1])),
+            _ => Err(format!("unknown command '{}'; run pssa help", args[1])),
         }
     }
 }
@@ -2512,7 +2512,7 @@ mod probe_tests {
 /// Bring up a GPU compute device, run a strict GEMM dispatch, and check the
 /// result against the CPU reference implementation without fallback.
 pub fn run_gpu_probe() -> Result<(), String> {
-    println!("=== oxide gpu-probe ===");
+    println!("=== pssa gpu-probe ===");
     let device = match Device::try_gpu() {
         Ok(d) => {
             println!("adapter: GPU compute device acquired");

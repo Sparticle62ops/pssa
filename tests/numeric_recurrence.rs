@@ -1,7 +1,7 @@
 //! Regressions for representable softplus tails in the reference and staged
 //! CPU recurrences. GPU GEMM backends share these host-side recurrence stages.
-use oxide_ai_pssa::gpu_batch;
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use pssa::gpu_batch;
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 
 fn model() -> PSSALayerV2 {
     let mut m = PSSALayerV2::new(

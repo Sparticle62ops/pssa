@@ -489,7 +489,7 @@ mod tests {
     #[test]
     fn remote_paths_never_start_local_samples_and_switching_cancels_stale_work() {
         let path =
-            std::env::temp_dir().join(format!("oxide-preview-remote-{}.pssa", std::process::id()));
+            std::env::temp_dir().join(format!("pssa-preview-remote-{}.pssa", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
         // A sparse file exercises the local budget guard without loading a
         // model. Give it a settled timestamp so the local poll must inspect it.

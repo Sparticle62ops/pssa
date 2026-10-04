@@ -265,7 +265,7 @@ mod tests {
     use super::*;
     #[test]
     fn benchmark_validation_and_paths_are_not_shell_commands() {
-        let dir = std::env::temp_dir().join(format!("oxide-bench-ui-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pssa-bench-ui-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let corpus = dir.join("corpus with spaces.txt");
         std::fs::write(&corpus, "test").unwrap();
@@ -285,7 +285,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn palette_launch_finishes_editing_and_keeps_launched_output() {
-        let dir = std::env::temp_dir().join(format!("oxide-bench-palette-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pssa-bench-palette-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let corpus = dir.join("corpus.txt");
         std::fs::write(&corpus, "fixture").unwrap();

@@ -1,4 +1,4 @@
-use oxide_ai_pssa::{
+use pssa::{
     pssa::{PSSAConfigV2, PSSALayerV2},
     sequence_batch::{Sequence, SequenceBatch},
 };

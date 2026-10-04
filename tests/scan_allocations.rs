@@ -1,6 +1,6 @@
 //! Count all threads, not just the caller, after initializing the reusable Rayon
 //! pool. Keep the original cold-path allocation tests in allocations.rs intact.
-use oxide_ai_pssa::{
+use pssa::{
     gpu_batch,
     pssa::{PSSAConfigV2, PSSALayerV2},
     sequence_batch::{Sequence, SequenceBatch},

@@ -12,7 +12,7 @@
 #   * writes a loss CSV so the curve survives the notebook session
 set -euo pipefail
 
-REPO="${REPO:-https://github.com/Sparticle62ops/oxide-ai.git}"
+REPO="${REPO:-https://github.com/Sparticle62ops/pssa.git}"
 WORK="${WORK:-/kaggle/working}"
 BRANCH="${BRANCH:-main}"
 TOTAL="${TOTAL:-64}"
@@ -37,14 +37,14 @@ cargo --version
 
 echo
 echo "### 1. Update checkout to $BRANCH"
-if [ -d "$WORK/oxide-ai/.git" ]; then
-  cd "$WORK/oxide-ai"
+if [ -d "$WORK/pssa/.git" ]; then
+  cd "$WORK/pssa"
   git fetch --quiet origin "$BRANCH"
   git checkout --quiet -B "$BRANCH" "origin/$BRANCH"
 else
   cd "$WORK"
   git clone --quiet --branch "$BRANCH" "$REPO"
-  cd oxide-ai
+  cd pssa
 fi
 git log --oneline -1
 
@@ -89,7 +89,7 @@ fi
 echo
 echo "### 2. Build (CPU: the transformer baseline has no GPU path)"
 cargo build --release
-HELP_TEXT="$(./target/release/oxide_ai_pssa help train-transformer 2>&1 || true)"
+HELP_TEXT="$(./target/release/pssa help train-transformer 2>&1 || true)"
 case "$HELP_TEXT" in
   *--tokenizer-from*) echo "--tokenizer-from present" ;;
   *) echo "ERROR: this checkout has no train-transformer --tokenizer-from, stopping"; exit 1 ;;
@@ -101,7 +101,7 @@ CLEAN="${CLEAN:-$WORK/corpus/big.clean.txt}"
 if [ "$DATA" = "$BIG" ]; then
   if [ ! -s "$CLEAN" ]; then
     rm -f "$CLEAN"
-    ./target/release/oxide_ai_pssa clean-wikitext "$BIG" -o "$CLEAN"
+    ./target/release/pssa clean-wikitext "$BIG" -o "$CLEAN"
   fi
   if [ -s "$CLEAN" ]; then
     DATA="$CLEAN"
@@ -164,12 +164,12 @@ for i in $(seq "$START" "$TOTAL"); do
     EXTRA=""
     [ -n "$TOKENIZER_CK" ] && EXTRA="--tokenizer-from $TOKENIZER_CK"
     # shellcheck disable=SC2086
-    ./target/release/oxide_ai_pssa train-transformer "$DATA" -o "$OUT" \
+    ./target/release/pssa train-transformer "$DATA" -o "$OUT" \
       --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 \
       --chunk "$CHUNK" --accumulate "$ACC" --total-updates "$TOTAL_UPDATES" \
       --loss-csv "$LOSS_CSV" --loss-every "$LOSS_EVERY" --tokens-seen 0 --no-tui $EXTRA
   else
-    ./target/release/oxide_ai_pssa train-transformer "$DATA" -o "$OUT" \
+    ./target/release/pssa train-transformer "$DATA" -o "$OUT" \
       --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 \
       --chunk "$CHUNK" --accumulate "$ACC" --resume "$PREV" \
       --loss-csv "$LOSS_CSV" --loss-every "$LOSS_EVERY" --no-tui
@@ -179,8 +179,8 @@ done
 
 echo
 echo "### 4. Sample"
-./target/release/oxide_ai_pssa generate-transformer -m "$PREV" -p "The sun is"
-./target/release/oxide_ai_pssa generate-transformer -m "$PREV" -p "Anarchism is"
+./target/release/pssa generate-transformer -m "$PREV" -p "The sun is"
+./target/release/pssa generate-transformer -m "$PREV" -p "Anarchism is"
 
 echo
 echo "### 5. Loss curve"

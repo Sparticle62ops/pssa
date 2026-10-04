@@ -81,7 +81,7 @@ Example single-window pilot, using existing regular CLI flags:
 
 ```sh
 cargo build --release
-BIN=target/release/oxide_ai_pssa
+BIN=target/release/pssa
 CORPUS=data/frozen-clean.txt
 
 # Same corpus, 200k encoded-token window, one pass, chunk 64, accumulation 8.

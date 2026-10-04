@@ -1,5 +1,5 @@
-use oxide_ai_pssa::memory::HyperbolicEpisodicBankV2;
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2, ParamVector};
+use pssa::memory::HyperbolicEpisodicBankV2;
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2, ParamVector};
 
 fn cfg(latent: usize) -> PSSAConfigV2 {
     PSSAConfigV2 {

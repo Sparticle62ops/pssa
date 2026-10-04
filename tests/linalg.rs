@@ -1,4 +1,4 @@
-use oxide_ai_pssa::linalg::{Matrix, Vector, dot_slice, sigmoid, softplus};
+use pssa::linalg::{Matrix, Vector, dot_slice, sigmoid, softplus};
 
 fn fixture(len: usize) -> (Vec<f32>, Vec<f32>) {
     let mut a = Vec::with_capacity(len);

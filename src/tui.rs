@@ -1919,9 +1919,9 @@ fn draw_with_background(
         );
     } else {
         let title = if area.width >= 45 {
-            "PSSA / oxide tui  Ctrl+C quit  Tab tabs  F1 help"
+            "PSSA / pssa tui  Ctrl+C quit  Tab tabs  F1 help"
         } else {
-            "PSSA / oxide tui  F1 help"
+            "PSSA / pssa tui  F1 help"
         };
         f.render_widget(
             Paragraph::new(vec![Line::styled(title, accent()), status_badge(&health)]),
@@ -2052,7 +2052,7 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
             f.render_widget(
                 Paragraph::new(vec![
                     Line::styled("Waiting for feed samples", accent()),
-                    Line::from("Train with --hf-dataset OWNER/NAME --no-tui | oxide_ai_pssa tui"),
+                    Line::from("Train with --hf-dataset OWNER/NAME --no-tui | pssa tui"),
                     Line::from("Older/local logs still work without previews."),
                 ])
                 .wrap(Wrap { trim: false })
@@ -2084,7 +2084,7 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
                 Line::styled("[ awaiting sample ]", accent()),
                 Line::from("Stream HF training into this dashboard:"),
                 Line::from(
-                    "oxide_ai_pssa train --hf-dataset OWNER/NAME --no-tui | oxide_ai_pssa tui",
+                    "pssa train --hf-dataset OWNER/NAME --no-tui | pssa tui",
                 ),
             ],
         );
@@ -2824,7 +2824,7 @@ fn draw_chain(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             " connect a chain ",
             vec![
                 Line::styled("[ waiting for checkpoint files ]", accent()),
-                Line::from("oxide_ai_pssa tui --chain \"path/to/chain\""),
+                Line::from("pssa tui --chain \"path/to/chain\""),
                 Line::from("Use the directory where your run saves checkpoints."),
                 Line::from("Read-only view / existing files stay untouched."),
             ],
@@ -2919,7 +2919,7 @@ fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
                     },
                     accent(),
                 ),
-                Line::from("oxide_ai_pssa train [flags] --no-tui | oxide_ai_pssa tui"),
+                Line::from("pssa train [flags] --no-tui | pssa tui"),
                 Line::from("Fields above show only values reported by the run."),
             ],
         );
@@ -2968,12 +2968,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "--chain" | "-c" => {
                 let value = args.get(i + 1).ok_or_else(|| {
-                    "option '--chain' requires a directory; usage: oxide tui [-c|--chain DIR]"
+                    "option '--chain' requires a directory; usage: pssa tui [-c|--chain DIR]"
                         .to_string()
                 })?;
                 if value.starts_with('-') {
                     return Err(format!(
-                        "option '{}' requires a directory; usage: oxide tui [-c|--chain DIR]",
+                        "option '{}' requires a directory; usage: pssa tui [-c|--chain DIR]",
                         args[i]
                     ));
                 }
@@ -2990,12 +2990,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             "--compare" => {
                 let value = args.get(i + 1).ok_or_else(|| {
-                    "option '--compare' requires a log file; usage: oxide tui [--compare LOG]"
+                    "option '--compare' requires a log file; usage: pssa tui [--compare LOG]"
                         .to_string()
                 })?;
                 if value.starts_with('-') {
                     return Err(
-                        "option '--compare' requires a log file; usage: oxide tui [--compare LOG]"
+                        "option '--compare' requires a log file; usage: pssa tui [--compare LOG]"
                             .to_string(),
                     );
                 }
@@ -3004,7 +3004,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             other => {
                 return Err(format!(
-                    "unknown tui flag '{other}'; usage: oxide tui [-c|--chain DIR] [--compare LOG]"
+                    "unknown tui flag '{other}'; usage: pssa tui [-c|--chain DIR] [--compare LOG]"
                 ));
             }
         }
@@ -3018,7 +3018,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             return run_app(rx, chain_dir, compare_path, chats_dir).map_err(|e| e.to_string());
         }
         println!(
-            "Usage: oxide_ai_pssa tui [-c|--chain DIR] [--compare LOG] [--chats-dir DIR] (interactive TTY required)"
+            "Usage: pssa tui [-c|--chain DIR] [--compare LOG] [--chats-dir DIR] (interactive TTY required)"
         );
         return Ok(());
     }
@@ -3150,6 +3150,46 @@ mod tests {
     }
 
     #[test]
+    fn renamed_environment_precedence() {
+        // A subprocess avoids mutating the environment of parallel tests.
+        const CURRENT: &str = "PSSA_RENAME_FIXTURE";
+        const LEGACY: &str = "OXIDE_RENAME_FIXTURE"; // Legacy fallback fixture.
+        for (current, legacy, expected) in [
+            (None, None, None),
+            (None, Some("legacy"), Some("legacy")),
+            (Some("current"), None, Some("current")),
+            (Some("current"), Some("legacy"), Some("current")),
+            (Some(""), Some("legacy"), Some("")),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "tui::tests::renamed_environment_fixture"])
+                .env_remove(CURRENT)
+                .env_remove(LEGACY)
+                .env_remove("PSSA_RENAME_EXPECTED");
+            for (key, value) in [
+                (CURRENT, current),
+                (LEGACY, legacy),
+                ("PSSA_RENAME_EXPECTED", expected),
+            ] {
+                if let Some(value) = value {
+                    child.env(key, value);
+                }
+            }
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+    }
+
+    #[test]
+    fn renamed_environment_fixture() {
+        assert_eq!(
+            crate::env_var_os("PSSA_RENAME_FIXTURE", "OXIDE_RENAME_FIXTURE"),
+            std::env::var_os("PSSA_RENAME_EXPECTED"),
+        );
+    }
+
+    #[test]
     fn producer_output_round_trips_through_parser() {
         // A child process makes ui::Progress actually write to a pipe, avoiding
         // unstable stdout-capture APIs or a duplicate copy of its format string.
@@ -3163,7 +3203,7 @@ mod tests {
                 "--format",
                 "terse",
             ])
-            .env("OXIDE_TUI_PRODUCER_FIXTURE", "1")
+            .env("PSSA_TUI_PRODUCER_FIXTURE", "1")
             .output()
             .unwrap();
         assert!(
@@ -3186,7 +3226,7 @@ mod tests {
 
     #[test]
     fn ui_producer_fixture() {
-        if std::env::var_os("OXIDE_TUI_PRODUCER_FIXTURE").is_none() {
+        if crate::env_var_os("PSSA_TUI_PRODUCER_FIXTURE", "OXIDE_TUI_PRODUCER_FIXTURE").is_none() {
             return;
         }
         // libtest's single-threaded progress prefix has no trailing newline.

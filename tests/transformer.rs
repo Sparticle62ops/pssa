@@ -1,10 +1,10 @@
-use oxide_ai_pssa::checkpoint;
-use oxide_ai_pssa::cli::{CLIHandler, TrainingOptions};
-use oxide_ai_pssa::dataset::Tokenizer;
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2, ParamMatrix, ParamVector};
-use oxide_ai_pssa::training::{Schedule, chunk_plan};
-use oxide_ai_pssa::transformer::{TransformerConfig, TransformerModel};
-use oxide_ai_pssa::transformer_checkpoint as ck;
+use pssa::checkpoint;
+use pssa::cli::{CLIHandler, TrainingOptions};
+use pssa::dataset::Tokenizer;
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2, ParamMatrix, ParamVector};
+use pssa::training::{Schedule, chunk_plan};
+use pssa::transformer::{TransformerConfig, TransformerModel};
+use pssa::transformer_checkpoint as ck;
 use std::{fs, path::PathBuf, process::Command};
 
 fn tiny() -> TransformerModel {
@@ -27,7 +27,7 @@ fn tiny() -> TransformerModel {
     m
 }
 fn path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("oxide-transformer-{name}-{}", std::process::id()))
+    std::env::temp_dir().join(format!("pssa-transformer-{name}-{}", std::process::id()))
 }
 fn matrices(m: &TransformerModel) -> [&ParamMatrix; 6] {
     [
@@ -438,7 +438,7 @@ fn transformer_legacy_schedule_tails_load_and_invalid_warmup_is_rejected() {
 }
 
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"))
+    Command::new(env!("CARGO_BIN_EXE_pssa"))
         .args(args)
         .env("NO_COLOR", "1")
         .env("RAYON_NUM_THREADS", "2")

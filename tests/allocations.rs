@@ -1,5 +1,5 @@
-use oxide_ai_pssa::gpu_batch;
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use pssa::gpu_batch;
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 

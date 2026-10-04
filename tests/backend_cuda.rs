@@ -1,10 +1,13 @@
 #![cfg(feature = "cuda")]
 
-use oxide_ai_pssa::cuda::CudaContext;
+use pssa::cuda::CudaContext;
 
 #[test]
 fn cuda_initialization_child() {
-    let Ok(expected) = std::env::var("OXIDE_CUDA_CHILD_EXPECT_ERROR") else {
+    let Some(expected) = std::env::var_os("PSSA_CUDA_CHILD_EXPECT_ERROR")
+        .or_else(|| std::env::var_os("OXIDE_CUDA_CHILD_EXPECT_ERROR"))
+        .and_then(|value| value.into_string().ok())
+    else {
         return;
     };
     match CudaContext::init() {
@@ -36,7 +39,7 @@ fn cuda_init_is_fallible_and_strict_shapes_are_checked_if_available() {
     let w: Vec<_> = (0..11 * 7).map(|i| (i % 17) as f32 * -0.0625).collect();
     for scale in [0.125, 0.25] {
         let x: Vec<_> = (0..3 * 5 * 7).map(|i| (i % 13) as f32 * scale).collect();
-        let expected = oxide_ai_pssa::backend::gemm_cpu_reference(&x, &w, 5, 11, 7, 3);
+        let expected = pssa::backend::gemm_cpu_reference(&x, &w, 5, 11, 7, 3);
         let actual = ctx.try_dispatch_gemm(&x, &w, 5, 11, 7, 3).unwrap();
         assert_close(&actual, &expected);
         assert_close(
@@ -50,17 +53,17 @@ fn cuda_init_is_fallible_and_strict_shapes_are_checked_if_available() {
         let b: Vec<_> = (0..7 * 11).map(|i| (i % 23) as f32 * 0.0625).collect();
         assert_close(
             &ctx.try_gemm_nn(&x, &b, 15, 7, 11).unwrap(),
-            &oxide_ai_pssa::backend::gemm_nn_cpu(&x, &b, 15, 7, 11),
+            &pssa::backend::gemm_nn_cpu(&x, &b, 15, 7, 11),
         );
         let b: Vec<_> = (0..15 * 11).map(|i| (i % 23) as f32 * 0.0625).collect();
         assert_close(
             &ctx.try_gemm_tn(&x, &b, 15, 7, 11).unwrap(),
-            &oxide_ai_pssa::backend::gemm_tn_cpu(&x, &b, 15, 7, 11),
+            &pssa::backend::gemm_tn_cpu(&x, &b, 15, 7, 11),
         );
         let mut accumulated = vec![0.25; 7 * 11];
         ctx.try_gemm_tn_accumulate_into(&x, &b, 15, 7, 11, &mut accumulated)
             .unwrap();
-        let expected = oxide_ai_pssa::backend::gemm_tn_cpu(&x, &b, 15, 7, 11);
+        let expected = pssa::backend::gemm_tn_cpu(&x, &b, 15, 7, 11);
         for (actual, product) in accumulated.iter().zip(expected) {
             assert!((actual - (0.25 + product)).abs() < 1e-4);
         }
@@ -85,7 +88,7 @@ fn cuda_missing_driver_symbol_returns_error_in_a_fresh_process() {
     // A loadable but incomplete driver used to pass an availability-only guard,
     // then panic in cudarc's lazy symbol loader. Isolate loader state/env in a
     // subprocess; no unsafe process-global environment mutation in the test.
-    let dir = std::env::temp_dir().join(format!("oxide-cuda-symbol-test-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pssa-cuda-symbol-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("stub.c");
     std::fs::write(
@@ -117,7 +120,7 @@ fn cuda_missing_driver_symbol_returns_error_in_a_fresh_process() {
         .args(["--exact", "cuda_initialization_child", "--nocapture"])
         .env("LD_LIBRARY_PATH", &dir)
         .env(
-            "OXIDE_CUDA_CHILD_EXPECT_ERROR",
+            "PSSA_CUDA_CHILD_EXPECT_ERROR",
             "missing required symbol cuDeviceGet",
         )
         .output()

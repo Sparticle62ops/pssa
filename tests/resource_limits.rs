@@ -1,5 +1,5 @@
 //! Resource limits exercise the real CLI child, not the test process.
-use oxide_ai_pssa::cli::CLIHandler;
+use pssa::cli::CLIHandler;
 use std::{fs, path::PathBuf, process::Command};
 
 #[test]
@@ -18,7 +18,7 @@ fn invalid_limits_fail_before_loading_data_or_checkpoint() {
     ] {
         let error = CLIHandler::parse_and_execute(
             [
-                "oxide",
+                "pssa",
                 "train",
                 "missing corpus",
                 "--resume",
@@ -39,7 +39,7 @@ fn invalid_limits_fail_before_loading_data_or_checkpoint() {
         vec!["--ram-mib"],
         vec!["--threads", "2", "--threads", "3"],
     ] {
-        let mut args: Vec<_> = ["oxide", "train", "missing corpus"]
+        let mut args: Vec<_> = ["pssa", "train", "missing corpus"]
             .into_iter()
             .map(str::to_owned)
             .collect();
@@ -75,7 +75,7 @@ fn limited_cpu_training_preserves_plain_logs_batch_token_caps_and_resume_paths()
         (&limited, true, None),
         (&resumed, true, Some(&limited)),
     ] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pssa"));
         command
             .arg("train")
             .arg(&corpus)
@@ -159,7 +159,7 @@ fn limited_cpu_training_preserves_plain_logs_batch_token_caps_and_resume_paths()
 #[cfg(target_os = "linux")]
 #[test]
 fn missing_prlimit_is_an_error_not_a_silently_ignored_ram_budget() {
-    let output = Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"))
+    let output = Command::new(env!("CARGO_BIN_EXE_pssa"))
         .args([
             "train",
             "missing corpus",
