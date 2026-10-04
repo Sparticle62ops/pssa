@@ -19,7 +19,15 @@ pub(super) const HARDWARE_TAB: usize = 12;
 pub(super) const MATH_TAB: usize = 13;
 pub(super) const DEVICE_TAB: usize = 14;
 pub(super) const LIMITS_TAB: usize = 15;
-pub(super) const TABS: [&str; 16] = [
+pub(super) const BACKUP_TAB: usize = 16;
+pub(super) const LOG_STREAM_TAB: usize = 17;
+pub(super) const NOTIFY_TAB: usize = 18;
+pub(super) const UPDATE_TAB: usize = 19;
+pub(super) const SUPPORT_TAB: usize = 20;
+pub(super) const GITHUB_TAB: usize = 21;
+pub(super) const SWEEP_TAB: usize = 22;
+pub(super) const TIMELINE_TAB: usize = 23;
+pub(super) const TABS: [&str; 24] = [
     "monitor",
     "chain",
     "model",
@@ -36,6 +44,14 @@ pub(super) const TABS: [&str; 16] = [
     "math",
     "devices",
     "limits",
+    "HF backup",
+    "cloud log",
+    "phone ping",
+    "updates",
+    "support",
+    "GitHub",
+    "sweeps",
+    "timeline",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +76,9 @@ pub(super) enum Context {
     Device,
     Limits,
     LimitsEdit,
+    Network,
+    NetworkEdit,
+    Timeline,
 }
 impl Context {
     fn mask(self) -> u32 {
@@ -85,6 +104,9 @@ impl Context {
             DEVICE_TAB => Self::Device,
             LIMITS_TAB if editing => Self::LimitsEdit,
             LIMITS_TAB => Self::Limits,
+            TIMELINE_TAB => Self::Timeline,
+            BACKUP_TAB..=SWEEP_TAB if editing => Self::NetworkEdit,
+            BACKUP_TAB..=SWEEP_TAB => Self::Network,
             _ => Self::Dashboard,
         }
     }
@@ -114,8 +136,12 @@ const DEVICE: u32 = 1 << Context::Device as u32;
 const LIMITS: u32 = 1 << Context::Limits as u32;
 const LIMIT_EDIT: u32 = 1 << Context::LimitsEdit as u32;
 const PAGES: u32 = DASHBOARD | SAMPLE | MATH | DEVICE | LIMITS;
-const BROWSE: u32 = MONITOR | PAGES | SETUP | EXTRA_BROWSE;
-const ALL: u32 = BROWSE | CHAT | EDIT | HF | EXTRA_EDIT | PALETTE | HELP | LIMIT_EDIT;
+const NETWORK: u32 = 1 << Context::Network as u32;
+const NETWORK_EDIT: u32 = 1 << Context::NetworkEdit as u32;
+const TIMELINE: u32 = 1 << Context::Timeline as u32;
+const BROWSE: u32 = MONITOR | PAGES | SETUP | EXTRA_BROWSE | NETWORK | TIMELINE;
+const ALL: u32 =
+    BROWSE | CHAT | EDIT | HF | EXTRA_EDIT | PALETTE | HELP | LIMIT_EDIT | NETWORK_EDIT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
@@ -129,6 +155,7 @@ pub(super) enum Action {
     Setup,
     Hf,
     Extras,
+    Network,
     OpenTab(usize),
     Heatmap,
     Preview,
@@ -190,11 +217,11 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('?'), "?", "Open/close help outside text input; type normally in editors", BROWSE | HELP => ToggleHelp),
     bind!(Char('q'), "q", "Quit outside text input; close help", BROWSE => Quit, HELP => ToggleHelp),
     bind!(Esc, "Esc", "Dashboard/setup: quit; editors: cancel/clear; chat/extras: stop (Kaggle detaches); overlays: close",
-        MONITOR | PAGES | SETUP => Quit, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, PALETTE => Palette, HELP => ToggleHelp),
-    bind!(Left, "Left", "Monitor: pan older; dashboard/extras: previous tab; setup: previous page",
-        MONITOR => Pan(false), PAGES | EXTRA_BROWSE => PreviousTab, SETUP => Setup),
-    bind!(Right, "Right", "Monitor: pan newer; dashboard/extras: next tab; setup: next page",
-        MONITOR => Pan(true), PAGES | EXTRA_BROWSE => NextTab, SETUP => Setup),
+        MONITOR | PAGES | SETUP => Quit, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, NETWORK | NETWORK_EDIT | TIMELINE => Network, PALETTE => Palette, HELP => ToggleHelp),
+    bind!(Left, "Left", "Monitor: pan older; timeline: older checkpoint; dashboard/extras/network: previous tab; setup: previous page",
+        MONITOR => Pan(false), PAGES | EXTRA_BROWSE | NETWORK => PreviousTab, SETUP => Setup, TIMELINE => Network),
+    bind!(Right, "Right", "Monitor: pan newer; timeline: newer checkpoint; dashboard/extras/network: next tab; setup: next page",
+        MONITOR => Pan(true), PAGES | EXTRA_BROWSE | NETWORK => NextTab, SETUP => Setup, TIMELINE => Network),
     bind!(Char('g'), "g", "Monitor: cycle graph view", MONITOR => CycleGraph),
     bind!(Char('1'), "1", "Monitor: loss", MONITOR => Graph(GraphView::Loss)),
     bind!(Char('2'), "2", "Monitor: perplexity", MONITOR => Graph(GraphView::Perplexity)),
@@ -207,44 +234,49 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('='), "=", "Monitor: zoom in", MONITOR => Zoom(true)),
     bind!(Char('-'), "-", "Monitor: zoom out; setup: decrease selected depth/loops", MONITOR => Zoom(false), SETUP => Setup),
     bind!(Char('0'), "0", "Monitor: reset graph navigation", MONITOR => ResetGraph),
-    bind!(Up, "Up", "Setup/runs/benchmark/palette/devices/limits: previous item; math/help: scroll up", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, MATH => MathScroll(-1), HELP => ScrollHelp(-1)),
-    bind!(Down, "Down", "Setup/runs/benchmark/palette/devices/limits: next item; math/help: scroll down", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, MATH => MathScroll(1), HELP => ScrollHelp(1)),
+    bind!(Up, "Up", "Setup/runs/benchmark/palette/devices/limits/network: previous item; math/help: scroll up", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, NETWORK | TIMELINE => Network, MATH => MathScroll(-1), HELP => ScrollHelp(-1)),
+    bind!(Down, "Down", "Setup/runs/benchmark/palette/devices/limits/network: next item; math/help: scroll down", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, NETWORK | TIMELINE => Network, MATH => MathScroll(1), HELP => ScrollHelp(1)),
     bind!(BackTab, "Shift+Tab", "Setup: previous wizard page", SETUP => Setup),
     bind!(F(5), "F5", "Setup: next wizard page", SETUP => Setup),
-    bind!(Char('c'), "c", "Setup: toggle command preview; runs: open checkpoint in chat", SETUP => Setup, RUNS => Extras),
-    bind!(Char('r'), "r", "Memory/runs: refresh saved snapshot/list; devices: refresh runtime availability", MEMORY | RUNS => Extras, DEVICE => Device),
+    bind!(Char('c'), "c", "Setup: command preview; runs/timeline: chat with checkpoint; support: copy SOL address", SETUP => Setup, RUNS => Extras, NETWORK | TIMELINE => Network),
+    bind!(Char('r'), "r", "Memory/runs/devices/network/timeline: refresh or retry (updates retain daily limit)", MEMORY | RUNS => Extras, DEVICE => Device, NETWORK | TIMELINE => Network),
+    bind!(Char('p'), "p", "HF backup: push; cloud log: follow; phone ping: test checkpoint; sweeps: queue grid; GitHub: PR list", NETWORK => Network),
+    bind!(Char('i'), "i", "GitHub: open issue list", NETWORK => Network),
+    bind!(Char('l'), "l", "GitHub: enter masked token login", NETWORK => Network),
+    bind!(Char('o'), "o", "Support/GitHub/updates: open selected link in browser", NETWORK => Network),
     bind!(Char('s'), "s", "Runs: score checkpoint on a held-out file", RUNS => Extras),
     bind!(Char('b'), "b", "Benchmark: run configured matched comparison", BENCHMARK => Extras),
     bind!(Char('y'), "y", "Kaggle preview: confirm upload and launch", KAGGLE_BUSY => Extras),
     bind!(Char('Y'), "Y", "Kaggle preview: confirm upload and launch (uppercase)", KAGGLE_BUSY => Extras),
     bind!(Char('n'), "n", "Kaggle preview: cancel launch", KAGGLE_BUSY => Extras),
     bind!(Char('N'), "N", "Kaggle preview: cancel launch (uppercase)", KAGGLE_BUSY => Extras),
-    bind!(PageUp, "PgUp", "Chat, setup preview, memory, math, help: scroll up", CHAT => Chat, SETUP => Setup, MEMORY => Extras, MATH => MathScroll(-8), HELP => ScrollHelp(-8)),
-    bind!(PageDown, "PgDn", "Chat, setup preview, memory, math, help: scroll down", CHAT => Chat, SETUP => Setup, MEMORY => Extras, MATH => MathScroll(8), HELP => ScrollHelp(8)),
-    bind!(Home, "Home", "Math/help: first line; devices/limits: first field", HELP => HelpTop, MATH => MathTop, DEVICE => Device, LIMITS => Limits),
-    bind!(End, "End", "Chat: follow; math/help: last line; devices/limits: last field", CHAT => Chat, HELP => HelpBottom, MATH => MathBottom, DEVICE => Device, LIMITS => Limits),
-    bind!(Enter, "Enter", "Chat: send; setup: edit/save/start; HF: login; Kaggle: review; runs: monitor/score; benchmark: edit/save; palette: execute; devices/limits: select/edit/apply", CHAT => Chat, SETUP | EDIT => Setup, HF => Hf, KAGGLE_INPUT | RUNS | RUNS_EDIT | BENCHMARK | BENCHMARK_EDIT => Extras, PALETTE => Palette, DEVICE => Device, LIMITS | LIMIT_EDIT => Limits),
+    bind!(PageUp, "PgUp", "Chat, setup preview, memory, math, network, help: scroll up", CHAT => Chat, SETUP => Setup, MEMORY => Extras, NETWORK => Network, MATH => MathScroll(-8), HELP => ScrollHelp(-8)),
+    bind!(PageDown, "PgDn", "Chat, setup preview, memory, math, network, help: scroll down", CHAT => Chat, SETUP => Setup, MEMORY => Extras, NETWORK => Network, MATH => MathScroll(8), HELP => ScrollHelp(8)),
+    bind!(Home, "Home", "Math/help: first line; devices/limits/network: first field; timeline: first checkpoint", HELP => HelpTop, MATH => MathTop, DEVICE => Device, LIMITS => Limits, NETWORK | TIMELINE => Network),
+    bind!(End, "End", "Chat: follow; math/help: last line; devices/limits/network: last field; timeline: last checkpoint", CHAT => Chat, HELP => HelpBottom, MATH => MathBottom, DEVICE => Device, LIMITS => Limits, NETWORK | TIMELINE => Network),
+    bind!(Enter, "Enter", "Chat: send; setup: edit/save/start; HF: login; Kaggle: review; runs: monitor/score; benchmark/network: edit/save/open; palette: execute; devices/limits: select/edit/apply; timeline: prepare resume", CHAT => Chat, SETUP | EDIT => Setup, HF => Hf, KAGGLE_INPUT | RUNS | RUNS_EDIT | BENCHMARK | BENCHMARK_EDIT => Extras, PALETTE => Palette, DEVICE => Device, LIMITS | LIMIT_EDIT => Limits, NETWORK | NETWORK_EDIT | TIMELINE => Network),
     bind!(Char(' '), "Space", "Setup/devices/limits: activate selected field/button; text editors: type space", SETUP => Setup, DEVICE => Device, LIMITS => Limits),
-    bind!(Char('d'), "d", "Limits: reset draft to defaults (Apply to confirm)", LIMITS => Limits),
-    bind!(Backspace, "Backspace", "Text editors/palette: delete last character", CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA_EDIT => Extras, PALETTE => Palette, LIMIT_EDIT => Limits),
+    bind!(Char('d'), "d", "Limits: reset draft; backup/phone ping/updates: toggle; cloud log: stop; sweeps: cancel pending queue", LIMITS => Limits, NETWORK => Network),
+    bind!(Backspace, "Backspace", "Text editors/palette: delete last character", CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA_EDIT => Extras, PALETTE => Palette, LIMIT_EDIT => Limits, NETWORK_EDIT => Network),
     Binding {
         code: Char('u'),
         modifiers: KeyModifiers::CONTROL,
         label: "Ctrl+U",
-        description: "Chat/setup/Kaggle/score/benchmark/limits editor: clear input",
+        description: "Chat/setup/Kaggle/score/benchmark/limits/network editor: clear input",
         routes: &[
             (CHAT, Chat),
             (EDIT, Setup),
             (EXTRA_EDIT, Extras),
             (LIMIT_EDIT, Limits),
+            (NETWORK_EDIT, Network),
         ],
     },
     Binding {
         code: Char('l'),
         modifiers: KeyModifiers::CONTROL,
         label: "Ctrl+L",
-        description: "HF login: log out and remove saved token",
-        routes: &[(HF, Hf)],
+        description: "HF/GitHub login: log out and remove saved token",
+        routes: &[(HF, Hf), (NETWORK | NETWORK_EDIT, Network)],
     },
     Binding {
         code: Char('k'),
@@ -283,6 +315,7 @@ pub(super) fn action(key: KeyEvent, context: Context) -> Option<Action> {
             Context::KaggleInput | Context::RunsEdit | Context::BenchmarkEdit => Some(Extras),
             Context::Palette => Some(Palette),
             Context::LimitsEdit => Some(Limits),
+            Context::NetworkEdit => Some(Network),
             _ => None,
         };
     }
@@ -336,6 +369,73 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
     use std::collections::HashSet;
+
+    #[test]
+    fn network_keys_are_scoped_and_editors_keep_all_printable_input() {
+        for tab in BACKUP_TAB..=SWEEP_TAB {
+            for code in [
+                Up,
+                Down,
+                Enter,
+                Char('p'),
+                Char('r'),
+                Char('d'),
+                Char('o'),
+                Char('l'),
+                Char('i'),
+                Char('c'),
+            ] {
+                assert_eq!(
+                    action(
+                        KeyEvent::new(code, KeyModifiers::NONE),
+                        Context::for_tab(tab, false)
+                    ),
+                    Some(Network)
+                );
+                assert!(
+                    BINDINGS
+                        .iter()
+                        .any(|b| b.code == code && !b.description.is_empty())
+                );
+            }
+            for c in ['q', '?', 'p', 'r', 'd', 'o', 'l', 'i', 'c'] {
+                assert_eq!(
+                    action(
+                        KeyEvent::new(Char(c), KeyModifiers::NONE),
+                        Context::for_tab(tab, true)
+                    ),
+                    Some(Network)
+                );
+            }
+        }
+        for code in [Left, Right, Home, End, Enter, Char('c'), Char('r')] {
+            assert_eq!(
+                action(KeyEvent::new(code, KeyModifiers::NONE), Context::Timeline),
+                Some(Network)
+            );
+        }
+        assert_eq!(
+            action(
+                KeyEvent::new(Char('l'), KeyModifiers::CONTROL),
+                Context::NetworkEdit
+            ),
+            Some(Network)
+        );
+        assert_eq!(
+            action(
+                KeyEvent::new(Char('q'), KeyModifiers::NONE),
+                Context::Network
+            ),
+            Some(Quit)
+        );
+        assert_eq!(
+            action(
+                KeyEvent::new(Char('p'), KeyModifiers::NONE),
+                Context::Monitor
+            ),
+            None
+        );
+    }
 
     #[test]
     fn phase12_routes_preserve_editing_and_every_new_key_is_helped() {
@@ -455,6 +555,44 @@ mod tests {
             (MATH_TAB, "math", Context::Math, Context::Math),
             (DEVICE_TAB, "devices", Context::Device, Context::Device),
             (LIMITS_TAB, "limits", Context::Limits, Context::LimitsEdit),
+            (
+                BACKUP_TAB,
+                "HF backup",
+                Context::Network,
+                Context::NetworkEdit,
+            ),
+            (
+                LOG_STREAM_TAB,
+                "cloud log",
+                Context::Network,
+                Context::NetworkEdit,
+            ),
+            (
+                NOTIFY_TAB,
+                "phone ping",
+                Context::Network,
+                Context::NetworkEdit,
+            ),
+            (
+                UPDATE_TAB,
+                "updates",
+                Context::Network,
+                Context::NetworkEdit,
+            ),
+            (
+                SUPPORT_TAB,
+                "support",
+                Context::Network,
+                Context::NetworkEdit,
+            ),
+            (GITHUB_TAB, "GitHub", Context::Network, Context::NetworkEdit),
+            (SWEEP_TAB, "sweeps", Context::Network, Context::NetworkEdit),
+            (
+                TIMELINE_TAB,
+                "timeline",
+                Context::Timeline,
+                Context::Timeline,
+            ),
         ];
         let mut indices = HashSet::new();
         let mut contexts = vec![Context::Help, Context::Palette];
@@ -466,7 +604,7 @@ mod tests {
             contexts.extend([browse, edit]);
         }
         assert_eq!(indices.len(), TABS.len());
-        // All twenty contexts must retain a distinct bit, including Phase 12
+        // All contexts must retain a distinct bit, including Phase 12
         // scopes beyond u16 and the palette/help scopes not represented by tabs.
         assert_eq!(
             contexts
@@ -474,7 +612,7 @@ mod tests {
                 .fold(0, |mask, context| mask | context.mask()),
             ALL
         );
-        assert_eq!(ALL.count_ones(), 20);
+        assert_eq!(ALL.count_ones(), 23);
         for context in contexts {
             for binding in BINDINGS {
                 let matching: Vec<_> = BINDINGS

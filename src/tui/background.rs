@@ -2,7 +2,7 @@
 use ratatui::{Frame, layout::Rect, style::Color};
 use std::time::Duration;
 
-const REST: (u8, u8, u8) = (10, 25, 17);
+const REST: (u8, u8, u8) = (13, 31, 22);
 const MAX_PRESSED: usize = 64;
 const NEIGHBOURS: [(i32, i32); 7] = [(0, 0), (0, -1), (0, 1), (-1, 0), (-1, 1), (1, -1), (1, 0)];
 type Hex = (i32, i32);
