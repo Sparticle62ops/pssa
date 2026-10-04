@@ -1380,6 +1380,7 @@ impl CLIHandler {
                 "gpu-probe",
                 "check whether a WebGPU compute device is usable",
             ),
+            ("compare", "replay a matched transformer against a PSSA chain"),
         ] {
             ui::panel_row(&format!(
                 "{}{}",
@@ -1585,6 +1586,7 @@ impl CLIHandler {
                 "gpu-probe",
                 "check whether a WebGPU compute device is usable",
             ),
+            ("compare", "replay a matched transformer against a PSSA chain"),
             ("help", "show this message"),
         ] {
             println!("    {:<22}{}", ui::cyan(name), ui::dim(blurb));
@@ -1932,6 +1934,13 @@ impl CLIHandler {
                 println!();
                 println!("Download the train split from Hugging Face as plain text.");
                 println!("Example: {bin} download wikimedia/wikipedia --out data/downloaded.txt");
+            }
+            "compare" => {
+                println!("Usage: {bin} compare DATA --chain-dir DIR --out NEW_DIR [OPTIONS]");
+                println!("Replay an existing PSSA chain with the token/update-matched transformer; score both on unseen tokens.");
+                println!("--links 64 --window 200000 --batch-size 8 --accumulate 1 --eval-tokens 200000");
+                println!("--eval-skip-tokens N --link-plan JSON --loss-every 10000 --seed 42 --warmup-steps 0");
+                println!("Use the ORIGINAL corpus and training settings. See docs/COMPARISON.md.");
             }
             "benchmark" => {
                 println!("Usage: {bin} benchmark [-f|--feature NAME] [-o|--out PATH]");
@@ -2347,6 +2356,26 @@ impl CLIHandler {
                     return Err("gpu-probe takes no options".into());
                 }
                 run_gpu_probe()
+            }
+            "compare" => {
+                let p = Parsed::parse(&args[2..], &["--chain-dir", "--out", "-o", "--links", "--window", "--batch-size", "--accumulate", "--link-plan", "--eval-skip-tokens", "--eval-tokens", "--loss-every", "--seed", "--warmup-steps"])?;
+                if p.positional.len() != 1 { return Err("compare requires exactly one original corpus path".into()); }
+                p.reject_duplicate_aliases(&["--out", "-o"], "output")?;
+                let opts = crate::comparison::ComparisonOptions {
+                    chain_dir: p.string("--chain-dir", "").ok_or("compare requires --chain-dir")?.into(),
+                    out_dir: p.string("--out", "-o").ok_or("compare requires --out NEW_DIR")?.into(),
+                    links: p.usize_nonzero("--links", "", 64)?,
+                    window: p.usize_nonzero("--window", "", 200000)?,
+                    batch_size: p.usize_nonzero("--batch-size", "", 8)?,
+                    accumulate: p.usize_nonzero("--accumulate", "", 1)?,
+                    link_plan: p.string("--link-plan", "").map(str::to_owned),
+                    eval_skip_tokens: p.string("--eval-skip-tokens", "").map(|s|s.parse().map_err(|_|"--eval-skip-tokens must be an unsigned integer")).transpose()?,
+                    eval_tokens: p.usize_nonzero("--eval-tokens", "", 200000)?,
+                    loss_every: p.usize_nonzero("--loss-every", "", 10000)?,
+                    seed: p.string("--seed", "").unwrap_or("42").parse().map_err(|_|"--seed must be an unsigned integer")?,
+                    legacy_warmup: p.required_usize("--warmup-steps", "", 0)?,
+                };
+                crate::comparison::run(&p.positional[0], &opts)
             }
             "benchmark" => {
                 if args.len() == 2 {

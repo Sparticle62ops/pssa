@@ -25,7 +25,7 @@ use std::{
 const MAX_TEXT: usize = 64 * 1024;
 const MAX_CONTEXT: usize = 256 * 1024;
 const MAX_CHAT: u64 = 4 * 1024 * 1024;
-const HELP: &str = "/model [path]  /new  /chats  /open ID  /rename NAME  /delete ID\n/temp F  /top-p F  /top-k N  /max-tokens N  /repetition-penalty F\n/system TEXT  /attach PATH  /copy  /speech  /help\nEnter send • Esc stop • PgUp/PgDn scroll • End follow • Tab tabs • Ctrl+C quit";
+const HELP: &str = "/ab [on|off|a PATH|b PATH]  /model [path]  /new  /chats  /open ID  /rename NAME  /delete ID\n/temp F  /top-p F  /top-k N  /max-tokens N  /repetition-penalty F\n/system TEXT  /attach PATH  /copy  /speech  /help\nEnter send • Esc stop • PgUp/PgDn scroll • End follow • Tab tabs • Ctrl+C quit";
 
 fn clean(text: &str) -> String {
     text.chars()
@@ -276,6 +276,7 @@ pub(super) struct Chat {
     note: String,
     attachments: Vec<(String, String)>,
     job: Option<Job>,
+    ab: super::ab::Comparison,
     // Only speech owns external processes. Join its cancellable worker on quit
     // so a recorder cannot outlive the UI (never join checkpoint loading).
     speech_thread: Option<std::thread::JoinHandle<()>>,
@@ -287,6 +288,19 @@ pub(super) struct Chat {
     model_dir: PathBuf,
 }
 impl Chat {
+    pub(super) fn open_checkpoint(&mut self, path: &Path) {
+        let path_text = path.display().to_string();
+        if path_text.chars().any(char::is_control) {
+            self.note = "Checkpoint paths must not contain control characters.".into();
+            return;
+        }
+        let transformer = path.extension().is_some_and(|e| e == "trfm");
+        if !transformer && self.ab.enabled() {
+            if let Err(e) = self.command("/ab off") { self.note = e; return; }
+        }
+        let cmd = if transformer { "/ab b" } else { "/model" };
+        if let Err(e) = self.command(&format!("{cmd} {path_text}")) { self.note = e; }
+    }
     pub(super) fn new(dir: PathBuf, model_dir: PathBuf) -> Self {
         Self {
             doc: Document::new(String::new()),
@@ -295,6 +309,7 @@ impl Chat {
             note: format!("Select a checkpoint with /model PATH (spaces allowed).\n{HELP}"),
             attachments: Vec::new(),
             job: None,
+            ab: super::ab::Comparison::default(),
             speech_thread: None,
             tokens: 0,
             elapsed: 0.0,
@@ -305,6 +320,9 @@ impl Chat {
         }
     }
     pub(super) fn poll(&mut self) {
+        if let Some(note) = self.ab.poll() {
+            self.note = note;
+        }
         let Some(job) = &self.job else {
             return;
         };
@@ -343,7 +361,7 @@ impl Chat {
         self.store.save(&self.doc)
     }
     fn send(&mut self, text: &str) -> Result<(), String> {
-        if self.doc.model.is_empty() {
+        if self.doc.model.is_empty() && !self.ab.enabled() {
             return Err("Pick a checkpoint first: /model PATH".into());
         }
         let mut text = text.to_owned();
@@ -351,6 +369,22 @@ impl Chat {
             text.push_str(&format!(
                 "\n\n--- attached text: {name} ---\n{body}\n--- end attachment ---"
             ));
+        }
+        if self.ab.enabled() {
+            // Independent comparison turns never append either answer to the
+            // single-chat history or give B a different prompt from A.
+            let system = if self.doc.system.is_empty() {
+                String::new()
+            } else {
+                format!("System: {}\n\n", self.doc.system)
+            };
+            self.ab.start(
+                format!("{system}User: {text}\n\nAssistant:"),
+                &self.doc.config,
+            )?;
+            self.attachments.clear();
+            self.note = "A/B running A then B (one model in RAM). Esc stops; checkpoint loading/current step must finish. Replies are not saved.".into();
+            return Ok(());
         }
         self.doc.messages.push(Message {
             role: "user".into(),
@@ -414,14 +448,23 @@ impl Chat {
     fn command(&mut self, line: &str) -> Result<(), String> {
         let (cmd, arg) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
         let arg = arg.trim();
-        if self.job.is_some() && !matches!(cmd, "/stop" | "/copy" | "/help") {
+        if (self.job.is_some() || self.ab.busy()) && !matches!(cmd, "/stop" | "/copy" | "/help") {
             return Err("Busy; Esc stops the current job first.".into());
+        }
+        if self.ab.enabled()
+            && matches!(
+                cmd,
+                "/model" | "/new" | "/open" | "/rename" | "/delete" | "/chats" | "/copy"
+            )
+        {
+            return Err("A/B replies are temporary; /ab off restores saved single-chat commands. Use /ab a PATH or /ab b PATH to select checkpoints.".into());
         }
         if cmd != "/delete" {
             self.pending_delete = None;
         }
         match cmd {
-            "/help" => self.note = HELP.into(),
+            "/help" => self.note = format!("{HELP}\n{}", super::ab::HELP),
+            "/ab" => self.note = self.ab.command(arg, &self.doc.model)?,
             "/stop" => self.stop(),
             "/model" if arg.is_empty() => {
                 let mut paths = Vec::new();
@@ -604,6 +647,10 @@ impl Chat {
         Ok(())
     }
     fn stop(&mut self) {
+        if self.ab.busy() {
+            self.ab.stop();
+            self.note = "Stopping A/B… waiting for checkpoint loading/current step; partial replies remain visible.".into();
+        }
         if let Some(job) = &self.job {
             job.cancel.store(true, Ordering::Relaxed);
             self.note = "Stopping… partial reply will be saved.".into();
@@ -646,6 +693,9 @@ impl Chat {
     pub(super) fn key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.stop(),
+            KeyCode::PageUp if self.ab.enabled() => self.ab.page(false),
+            KeyCode::PageDown if self.ab.enabled() => self.ab.page(true),
+            KeyCode::End if self.ab.enabled() => self.ab.follow(),
             KeyCode::PageUp => {
                 self.follow = false;
                 self.scroll = self.scroll.saturating_sub(8);
@@ -668,7 +718,7 @@ impl Chat {
                 }
                 let result = if line.starts_with('/') && !line.starts_with("//") {
                     self.command(&line)
-                } else if self.job.is_some() {
+                } else if self.job.is_some() || self.ab.busy() {
                     Err("Busy; Esc stops generation.".into())
                 } else {
                     self.send(
@@ -695,6 +745,11 @@ impl Chat {
     }
     pub(super) fn draw(&mut self, f: &mut ratatui::Frame, area: Rect) {
         if area.is_empty() {
+            return;
+        }
+        if self.ab.enabled() {
+            self.ab
+                .draw(f, area, &self.input, &self.note, &self.doc.config);
             return;
         }
         if area.width < 26 || area.height < 9 {
@@ -886,6 +941,118 @@ mod tests {
             PathBuf::from("missing"),
         )
     }
+    #[test]
+    fn runs_browser_selection_preserves_draft_and_switches_model_modes() {
+        let mut c = fixture();
+        fs::create_dir_all(&c.store.dir).unwrap();
+        let a = c.store.dir.join("selected model.pssa");
+        let b = c.store.dir.join("selected baseline.trfm");
+        fs::write(&a,b"loaded only on send").unwrap(); fs::write(&b,b"loaded only on send").unwrap();
+        c.input = "unfinished draft?".into();
+        c.open_checkpoint(&a); assert_eq!(c.doc.model,a.display().to_string()); assert!(!c.ab.enabled());
+        c.open_checkpoint(&b); assert!(c.ab.enabled()); assert!(!c.ab.busy());
+        c.open_checkpoint(&a); assert!(!c.ab.enabled()); assert_eq!(c.input,"unfinished draft?");
+        fs::remove_dir_all(&c.store.dir).unwrap();
+    }
+    #[test]
+    fn ab_keyboard_paths_shared_prompt_and_return_preserve_single_chat() {
+        let mut c = fixture();
+        fs::create_dir_all(&c.store.dir).unwrap();
+        c.doc.model = "single chat model.pssa".into();
+        c.doc.system = "shared system".into();
+        c.doc.messages.push(Message {
+            role: "user".into(),
+            text: "old single-chat history".into(),
+        });
+        c.save().unwrap();
+        let original = c.doc.value();
+        let saved = fs::read(c.store.path(&c.doc.id).unwrap()).unwrap();
+        let a = c.store.dir.join("compare a.pssa");
+        let b = c.store.dir.join("baseline b.trfm");
+        // Selection must not parse/load a checkpoint on the event thread.
+        fs::write(&a, b"invalid fixture").unwrap();
+        fs::write(&b, b"invalid fixture").unwrap();
+        for line in [
+            format!("/ab a {}", a.display()),
+            format!("/ab b \"{}\"", b.display()),
+        ] {
+            c.input = line;
+            c.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(c.input.is_empty(), "{}", c.note);
+        }
+        assert!(c.ab.enabled());
+        c.attachments
+            .push(("shared.txt".into(), "shared attachment".into()));
+        c.input = "shared question".into();
+        c.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(c.input.is_empty(), "{}", c.note);
+        assert!(c.ab.busy());
+        assert!(c.job.is_none());
+        assert!(c.attachments.is_empty());
+        assert_eq!(c.doc.value(), original);
+        assert!(
+            c.command("/ab off").is_err(),
+            "cannot start a second model while the old worker is alive"
+        );
+        c.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        while c.ab.busy() && Instant::now() < deadline {
+            c.poll();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!c.ab.busy());
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| c.draw(f, f.area())).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(screen.contains("A / PSSA"));
+        assert!(screen.contains("B / transformer"));
+        assert!(screen.contains("shared system"));
+        assert!(screen.contains("shared question"));
+        assert!(screen.contains("shared attachment"));
+        assert!(!screen.contains("old single-chat history"));
+        c.command("/ab off").unwrap();
+        assert!(!c.ab.enabled());
+        assert_eq!(c.doc.value(), original);
+        assert_eq!(fs::read(c.store.path(&c.doc.id).unwrap()).unwrap(), saved);
+        terminal.draw(|f| c.draw(f, f.area())).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(screen.contains("conversation"));
+        assert!(screen.contains("old single-chat history"));
+        fs::remove_dir_all(&c.store.dir).unwrap();
+    }
+
+    #[test]
+    fn ab_missing_selection_keeps_input_and_attachments_and_never_spawns() {
+        let mut c = fixture();
+        c.command("/ab on").unwrap();
+        c.attachments
+            .push(("pending.txt".into(), "attached".into()));
+        c.input = "question".into();
+        c.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(c.input, "question");
+        assert_eq!(c.attachments.len(), 1);
+        assert!(!c.ab.busy());
+        assert!(c.job.is_none());
+        assert!(c.doc.messages.is_empty());
+        assert!(c.note.contains("/ab a PATH"));
+        assert!(!c.store.dir.exists());
+        assert!(c.command("/copy").unwrap_err().contains("/ab off"));
+        c.command("/ab off").unwrap();
+        assert!(c.send("question").unwrap_err().contains("/model PATH"));
+    }
+
     #[test]
     fn json_roundtrip_rename_resume_delete_and_paths() {
         let mut c = fixture();
