@@ -25,7 +25,7 @@ use std::{
 const MAX_TEXT: usize = 64 * 1024;
 const MAX_CONTEXT: usize = 256 * 1024;
 const MAX_CHAT: u64 = 4 * 1024 * 1024;
-const HELP: &str = "/model [path]  /new  /chats  /open ID  /rename NAME  /delete ID\n/temp F  /top-p F  /top-k N  /max-tokens N  /repetition-penalty F\n/system TEXT  /attach PATH  /copy  /speech  /help\nEnter send • Esc stop • PgUp/PgDn scroll • End follow • Tab tabs • Ctrl+C quit";
+const HELP: &str = "/model [path]  /new  /chats  /open ID  /rename NAME  /delete ID\n/temp F (alias /temperature)  /top-p F  /top-k N  /max-tokens N  /repetition-penalty F\n/system TEXT  /attach PATH  /detach  /copy  /speech  /stop  /help\nF1 shows all keyboard controls; //TEXT sends a leading slash.";
 
 fn clean(text: &str) -> String {
     text.chars()
@@ -304,6 +304,12 @@ impl Chat {
             model_dir,
         }
     }
+    // Follow the wizard's output directory without changing the selected model
+    // or discarding the current conversation.
+    pub(super) fn set_model_dir(&mut self, model_dir: PathBuf) {
+        self.model_dir = model_dir;
+    }
+
     pub(super) fn poll(&mut self) {
         let Some(job) = &self.job else {
             return;
@@ -808,9 +814,9 @@ impl Chat {
         );
         f.render_widget(
             Paragraph::new(if area.width >= 70 {
-                "Enter send  Esc stop  PgUp/Dn scroll  Tab tabs  /help controls"
+                "Enter send  Esc stop  Tab tabs  F1 keys  /help commands"
             } else {
-                "Enter send • Esc stop • /help • Tab"
+                "Enter send / F1 keys / Tab tabs"
             })
             .style(ratatui::style::Style::new().fg(NORMAL_GREEN)),
             chunks[3],
@@ -886,6 +892,23 @@ mod tests {
             PathBuf::from("missing"),
         )
     }
+    #[test]
+    fn model_picker_follows_setup_output_without_replacing_conversation() {
+        let mut chat = fixture();
+        let output = chat.store.dir.join("wizard output");
+        fs::create_dir_all(&output).unwrap();
+        let checkpoint = output.join("model.pssa");
+        fs::write(&checkpoint, b"picker lists paths without loading models").unwrap();
+        chat.doc.model = "existing/model.pssa".into();
+        let id = chat.doc.id.clone();
+        chat.set_model_dir(output);
+        chat.command("/model").unwrap();
+        assert!(chat.note.contains(&checkpoint.display().to_string()));
+        assert_eq!(chat.doc.model, "existing/model.pssa");
+        assert_eq!(chat.doc.id, id);
+        fs::remove_dir_all(&chat.store.dir).unwrap();
+    }
+
     #[test]
     fn json_roundtrip_rename_resume_delete_and_paths() {
         let mut c = fixture();

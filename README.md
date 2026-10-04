@@ -472,9 +472,14 @@ press **Tab** to reach **inference**. Existing `chat`/`generate` CLI commands an
   other non-text files display “not supported by this model yet”.
 - **PgUp/PgDn** scroll through wrapped history; **End** follows the latest reply.
   `/copy` requests terminal clipboard access via OSC 52 (the terminal must permit
-  it). `/help` lists controls. **Ctrl+U** clears input; `//text` sends a leading
-  slash. In inference, `q` is text and Esc stops, not quits; **Ctrl+C** quits, or
-  Tab to another tab and use the existing `q` key.
+  it). `/help` lists chat commands; **F1** opens the shared keyboard help.
+  **Ctrl+U** clears input; `//text` sends a leading slash. In inference, `q` and
+  `?` are text and Esc stops, not quits; **Ctrl+C** quits, or Tab to another tab
+  and use the existing `q` key. Outside text input, **?** also opens help.
+
+The tab order is **monitor, chain, model, feed, inference, setup**. The
+[training setup wizard](docs/training-setup.md) launches a separate trainer
+and returns to the monitor; **Tab** switches tabs even while editing a field.
 
 Optional local speech capture (Linux/ALSA) is built with `cargo build --release
 --features speech`. Install an existing local **whisper.cpp** `whisper-cli` (or
