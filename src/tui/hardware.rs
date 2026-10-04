@@ -1,5 +1,5 @@
 //! Throttled read-only host telemetry. OS reads and GPU tools run off the UI.
-use super::{NORMAL_GREEN, SECOND_ACCENT, accent, heatmap, panel, preview::Process};
+use super::{NORMAL_GREEN, SECOND_ACCENT, accent, heatmap, panel, panel_area, preview::Process};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -208,6 +208,7 @@ impl Hardware {
         }
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
+        let area = panel_area(f, area);
         let usage = |v: Option<f64>| {
             v.map_or_else(|| "n/a (need two samples)".into(), |n| format!("{n:.1}%"))
         };

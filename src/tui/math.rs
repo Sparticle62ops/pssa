@@ -1,5 +1,5 @@
 //! Equations are editable content, not another implementation of the model.
-use super::{RunState, SECOND_ACCENT, accent, panel, parse_field, parse_kv};
+use super::{RunState, SECOND_ACCENT, accent, panel, panel_area, parse_field, parse_kv};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -82,6 +82,7 @@ pub(super) struct Math {
 }
 impl Math {
     pub(super) fn draw(&self, f: &mut Frame, area: Rect, state: &RunState) {
+        let area = panel_area(f, area);
         let v = &state.math;
         let n = |value: Option<u64>| value.map_or_else(|| "n/a".into(), |n| n.to_string());
         let mut lines = vec![

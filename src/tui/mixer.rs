@@ -3,7 +3,7 @@
 use super::{
     AMBER, accent,
     library::{self, Entry, Kind, Records, Stats},
-    panel,
+    panel, panel_area,
 };
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -333,6 +333,7 @@ impl Mixer {
         }
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
+        let area = panel_area(f, area);
         let quotas = self.quotas();
         let sum: u64 = self.sources.iter().map(|s| u64::from(s.weight)).sum();
         let mut lines = vec![

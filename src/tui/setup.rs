@@ -2,7 +2,7 @@
 //! slow redraws (or quitting the dashboard) cannot hold up the child process.
 use super::device::DevicePicker;
 use super::{
-    AMBER, BRIGHT_RED, NORMAL_GREEN, RunState, accent, depth_zoom::DepthZoom, panel, ring,
+    AMBER, BRIGHT_RED, NORMAL_GREEN, RunState, accent, depth_zoom::DepthZoom, panel, panel_area, ring,
 };
 use crate::{
     cli::{TrainingBackend, resource_limits::ResourceLimits},
@@ -767,7 +767,11 @@ impl Setup {
                 rows.push(Line::from("Quitting the TUI leaves training running; reopen with tail -f train.log | oxide_ai_pssa tui."));
             }
         }
-        f.render_widget(Paragraph::new(rows).block(panel(" parameters ")), body[0]);
+        let parameters_area = panel_area(f, body[0]);
+        f.render_widget(
+            Paragraph::new(rows).block(panel(" parameters ")),
+            parameters_area,
+        );
         if show_animation {
             let previews = Layout::default()
                 .direction(Direction::Vertical)
@@ -810,11 +814,12 @@ impl Setup {
             .saturating_sub(area.height.saturating_sub(2) as usize)
             .min(u16::MAX as usize) as u16;
         self.command_scroll = self.command_scroll.min(max_scroll);
+        let command_area = panel_area(f, area);
         f.render_widget(
             paragraph
                 .scroll((self.command_scroll, 0))
                 .block(panel(" equivalent CLI / PgUp PgDn ")),
-            area,
+            command_area,
         );
     }
 }

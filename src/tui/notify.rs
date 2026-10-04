@@ -1,7 +1,7 @@
 //! Optional notifications. OFF by default; the only outbound payloads are fixed
 //! checkpoint/finished/died summaries, never log lines, paths or model prompts.
 //! One worker, three coalesced event kinds, bounded timeout, explicit retry only.
-use super::{accent, network, panel};
+use super::{accent, network, panel, panel_area};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
@@ -302,6 +302,7 @@ impl Notify {
         }
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
+        let area = panel_area(f, area);
         let mode = if self.selected == 0 {
             self.input
                 .as_deref()

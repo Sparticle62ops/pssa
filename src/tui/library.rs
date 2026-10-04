@@ -1,5 +1,5 @@
 //! Local catalogue and bounded, off-thread dataset inspection. No weights are loaded.
-use super::{AMBER, SECOND_ACCENT, accent, panel};
+use super::{AMBER, SECOND_ACCENT, accent, panel, panel_area};
 use crate::dataset::Tokenizer;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -583,6 +583,7 @@ impl Library {
         None
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
+        let area = panel_area(f, area);
         let block = panel(" library / local files ");
         let inner = block.inner(area);
         f.render_widget(block, area);

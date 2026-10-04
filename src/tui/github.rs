@@ -2,7 +2,7 @@
 use super::{
     accent,
     network::{self, Http, Web},
-    panel,
+    panel, panel_area,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -382,6 +382,7 @@ impl Github {
         }
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
+        let area = panel_area(f, area);
         let mut lines = vec![
             Line::styled("GITHUB / COMMUNITY / READ ONLY", accent()),
             Line::from(format!(

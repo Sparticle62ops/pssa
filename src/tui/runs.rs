@@ -1,6 +1,6 @@
 //! Bounded run discovery, lazy checkpoint metadata and isolated read-only scoring.
 use super::{
-    RunState, accent, panel,
+    RunState, accent, panel, panel_area,
     process::{Job, clean},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -449,9 +449,10 @@ impl Runs {
                 clean(&e.path.display().to_string())
             )));
         }
+        let runs_area = panel_area(f, chunks[0]);
         f.render_widget(
             Paragraph::new(rows).block(panel(" runs / checkpoints + logs ")),
-            chunks[0],
+            runs_area,
         );
         let mut detail = vec![
             Line::styled(self.description.as_str(), accent()),
@@ -469,11 +470,12 @@ impl Runs {
                 )),
             );
         }
+        let detail_area = panel_area(f, chunks[1]);
         f.render_widget(
             Paragraph::new(detail)
                 .wrap(Wrap { trim: false })
                 .block(panel(" selected run / read-only ")),
-            chunks[1],
+            detail_area,
         );
     }
 }

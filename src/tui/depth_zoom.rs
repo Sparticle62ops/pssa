@@ -1,6 +1,6 @@
 //! A zoom into the Phase 5 neuron, opening into perspective network layers.
 //! No independent clock/thread: setup and idle monitor use the caller's clock.
-use super::{NeuronFrame, draw_neuron_frame, neuron_green, panel, smoothstep};
+use super::{NeuronFrame, draw_neuron_frame, neuron_green, panel, panel_area, smoothstep};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -109,7 +109,8 @@ impl DepthZoom {
         );
         let inner = panel(&title).inner(area);
         if inner.width < 2 || inner.height < 2 {
-            f.render_widget(panel(&title), area);
+            let panel_rect = panel_area(f, area);
+            f.render_widget(panel(&title), panel_rect);
             return;
         }
 
@@ -163,7 +164,8 @@ impl DepthZoom {
         // Canvas only paints occupied braille cells; explicitly erase the
         // temporary source (including its border) before compositing the stack.
         f.render_widget(Clear, area);
-        f.render_widget(canvas, area);
+        let panel_rect = panel_area(f, area);
+        f.render_widget(canvas, panel_rect);
     }
 }
 
@@ -481,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_small_clipped_and_offset_areas_stay_inside_the_panel() {
+    fn test_backend_small_clipped_and_offset_areas_stay_inside_the_panel_shadow_included() {
         let mut zoom = DepthZoom::default();
         let start = zoom.started_at;
         zoom.set_depth(32, start);
@@ -512,10 +514,15 @@ mod tests {
             let visible = area.intersection(buffer.area);
             for y in 0..24 {
                 for x in 0..80 {
-                    if x < visible.x
+                    let shadow = (x == area.right()
+                        && y >= area.y
+                        && y < area.bottom())
+                        || (y == area.bottom() && x >= area.x && x <= area.right());
+                    if (x < visible.x
                         || x >= visible.right()
                         || y < visible.y
-                        || y >= visible.bottom()
+                        || y >= visible.bottom())
+                        && !shadow
                     {
                         assert_eq!(buffer[(x, y)].symbol(), ".", "outside panel at {x},{y}");
                     }

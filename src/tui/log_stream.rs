@@ -1,7 +1,7 @@
 //! Independent cloud/synced-file log viewer, never a replacement for the main
 //! training monitor. One cancellable worker streams into an eight-line queue;
 //! UI history, line size, work per tick and retry delays are bounded.
-use super::{accent, network, panel};
+use super::{accent, network, panel, panel_area};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
@@ -229,6 +229,7 @@ impl LogStream {
         }
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
+        let area = panel_area(f, area);
         let value = self.input.as_deref().unwrap_or(&self.source);
         let shown = if remote(value) {
             "[URL hidden: may contain a private access query]".into()

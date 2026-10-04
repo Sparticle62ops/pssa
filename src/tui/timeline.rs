@@ -1,6 +1,6 @@
 //! Read-only checkpoint history: filenames + bounded recorded logs, never weights.
 //! A single background scan is allowed at a time, including across run switches.
-use super::{AMBER, RunState, accent, checkpoint_sort_key, panel, parse_field, process::clean};
+use super::{AMBER, RunState, accent, checkpoint_sort_key, panel, panel_area, parse_field, process::clean};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
@@ -494,9 +494,10 @@ impl Timeline {
             Constraint::Length(if area.height < 12 { 2 } else { 4 }),
         ])
         .split(area);
+        let timeline_area = panel_area(f, parts[0]);
         let block = panel(" timeline / saved checkpoints ");
-        let inner = block.inner(parts[0]);
-        f.render_widget(block, parts[0]);
+        let inner = block.inner(timeline_area);
+        f.render_widget(block, timeline_area);
         if self.entries.is_empty() {
             f.render_widget(
                 Paragraph::new("No saved checkpoints in this run. r refresh"),
@@ -586,11 +587,12 @@ impl Timeline {
             "Enter prepares setup ONLY; review configuration before START.",
             Style::new().fg(AMBER),
         ));
+        let selected_area = panel_area(f, parts[1]);
         f.render_widget(
             Paragraph::new(rows)
                 .wrap(Wrap { trim: false })
                 .block(panel(" selected checkpoint / read-only ")),
-            parts[1],
+            selected_area,
         );
         f.render_widget(
             Paragraph::new(vec![

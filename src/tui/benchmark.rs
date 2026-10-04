@@ -1,6 +1,6 @@
 //! UI wrapper around the existing, audited token/update-matched `compare` CLI.
 use super::{
-    accent, panel,
+    accent, panel, panel_area,
     process::{Job, clean},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -190,6 +190,7 @@ impl Benchmark {
         }
     }
     pub fn draw(&self, f: &mut ratatui::Frame, area: Rect) {
+        let area = panel_area(f, area);
         let mut lines = vec![
             Line::styled("MATCHED / PSSA vs transformer", accent()),
             Line::from(

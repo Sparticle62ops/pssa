@@ -1,5 +1,5 @@
 //! Read-only community links and the README's exact SOL donation address.
-use super::{accent, network, panel};
+use super::{accent, network, panel, panel_area};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
@@ -77,6 +77,7 @@ impl Support {
         });
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
+        let area = panel_area(f, area);
         let mut lines = vec![
             Line::styled("SUPPORT / PSSA COMMUNITY", accent()),
             Line::from("Up/Down choose / Enter or o open / c copy SOL"),

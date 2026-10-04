@@ -496,14 +496,17 @@ impl Network {
             SUPPORT_TAB => self.support.draw(f, area),
             GITHUB_TAB => self.github.draw(f, area),
             SWEEP_TAB => self.sweep.draw(f, area),
-            TIMELINE_TAB if self.remote_timeline => f.render_widget(
-                ratatui::widgets::Paragraph::new(
-                    "Remote checkpoints unavailable locally / sync the run first",
+            TIMELINE_TAB if self.remote_timeline => {
+                let timeline_area = super::panel_area(f, area);
+                f.render_widget(
+                    ratatui::widgets::Paragraph::new(
+                        "Remote checkpoints unavailable locally / sync the run first",
+                    )
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .block(super::panel(" timeline ")),
+                    timeline_area,
                 )
-                .wrap(ratatui::widgets::Wrap { trim: false })
-                .block(super::panel(" timeline ")),
-                area,
-            ),
+            }
             TIMELINE_TAB => self.timeline.draw(f, area),
             _ => {}
         }

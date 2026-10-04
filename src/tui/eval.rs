@@ -17,7 +17,7 @@
 //! space for BPE continuations. OOV probes remain visible but are not charted.
 //! PSSA uses its checkpoint memory, fresh recurrent carry, and runtime loops=1.
 //! No training, optimizer, memory-write, GPU, or checkpoint-save path is called.
-use super::{AMBER, NORMAL_GREEN, SECOND_ACCENT, accent, panel};
+use super::{AMBER, NORMAL_GREEN, SECOND_ACCENT, accent, panel, panel_area};
 use crate::{
     checkpoint,
     cli::CLIHandler,
@@ -1263,6 +1263,7 @@ impl Eval {
                         .unwrap_or_else(|| "embedded assets/eval_prompts.json".into())
                 )
             });
+        let status_area = panel_area(f, parts[0]);
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(source),
@@ -1271,7 +1272,7 @@ impl Eval {
             .style(accent())
             .wrap(Wrap { trim: false })
             .block(panel(&format!(" AUTO EVAL / {status} "))),
-            parts[0],
+            status_area,
         );
         self.draw_chart(f, parts[1]);
         let selected = self.snapshot.records.get(self.selected);
@@ -1311,8 +1312,9 @@ impl Eval {
             .filter_map(|r| r.mean_nll().map(|n| (r.number as f64, n)))
             .collect();
         if points.is_empty() {
+            let chart_area = panel_area(f, area);
             f.render_widget(Paragraph::new("Reference NLL ↓ better\nWaiting for a fully scoreable fixed suite.\nUnknown words / invalid or oversized checkpoints are skipped.")
-                .style(accent()).wrap(Wrap { trim: true }).block(panel(" quality / checkpoint ")), area);
+                .style(accent()).wrap(Wrap { trim: true }).block(panel(" quality / checkpoint ")), chart_area);
             return;
         }
         let first = points.first().unwrap().0;
@@ -1330,6 +1332,7 @@ impl Eval {
             .graph_type(GraphType::Line)
             .style(Style::new().fg(NORMAL_GREEN))
             .data(&points);
+        let chart_area = panel_area(f, area);
         f.render_widget(
             Chart::new(vec![data])
                 .block(panel(" quality / checkpoint "))
@@ -1345,14 +1348,15 @@ impl Eval {
                         .labels([format!("{min:.2}"), format!("{max:.2}")])
                         .style(accent()),
                 ),
-            area,
+            chart_area,
         );
     }
 
     fn draw_answer(&self, f: &mut Frame, area: Rect, record: Option<&Record>, label: &str) {
         let Some(record) = record else {
+            let answer_area = panel_area(f, area);
             f.render_widget(Paragraph::new("No checkpoint answer yet.\nResults are saved as auto-eval.jsonl next to checkpoints.\nCopy assets/eval_prompts.json to customize prompts and references.")
-                .style(Style::new().fg(SECOND_ACCENT)).wrap(Wrap { trim: false }).block(panel(label)), area);
+                .style(Style::new().fg(SECOND_ACCENT)).wrap(Wrap { trim: false }).block(panel(label)), answer_area);
             return;
         };
         let mut lines = vec![Line::from(format!(
@@ -1392,12 +1396,13 @@ impl Eval {
         } else {
             lines.push(Line::styled(record.note.clone(), Style::new().fg(AMBER)));
         }
+        let answer_area = panel_area(f, area);
         f.render_widget(
             Paragraph::new(lines)
                 .style(accent())
                 .wrap(Wrap { trim: false })
                 .block(panel(label)),
-            area,
+            answer_area,
         );
     }
 }
