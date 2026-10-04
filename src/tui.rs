@@ -4,7 +4,11 @@
 
 mod background;
 mod chat;
+mod depth_zoom;
+mod keybindings;
+mod ring;
 mod session;
+mod setup;
 #[cfg(feature = "speech")]
 mod speech;
 
@@ -23,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-const TABS: [&str; 5] = ["monitor", "chain", "model", "feed", "inference"];
+const TABS: [&str; 6] = ["monitor", "chain", "model", "feed", "inference", "setup"];
 // Five scanlines leave room for the P's stem, both S turns and the A's crossbar.
 const PSSA_LOGO: [&str; 5] = [
     "███    ███   ███   ██ ",
@@ -77,19 +81,6 @@ enum GraphView {
 }
 
 impl GraphView {
-    fn from_key(key: char) -> Option<Self> {
-        match key {
-            '1' => Some(Self::Loss),
-            '2' => Some(Self::Perplexity),
-            '3' => Some(Self::TokensPerSecond),
-            '4' => Some(Self::LearningRate),
-            '5' => Some(Self::Comparison),
-            '6' => Some(Self::All),
-            '7' => Some(Self::Memory),
-            _ => None,
-        }
-    }
-
     fn next(self) -> Self {
         match self {
             Self::Loss => Self::Perplexity,
@@ -119,6 +110,7 @@ struct FeedState {
 
 #[derive(Default)]
 struct RunState {
+    loop_count: usize,
     feed: Option<FeedState>,
     // header card
     corpus: Option<String>,
@@ -223,6 +215,9 @@ impl RunState {
         let line = line.trim();
         if line.is_empty() {
             return;
+        }
+        if let Some(loops) = parse_kv::<usize>(line, "loops=") {
+            self.loop_count = loops.clamp(1, 32);
         }
         self.raw_lines.push(line.to_string());
         if self.raw_lines.len() > 400 {
@@ -896,6 +891,9 @@ fn run_app(
     chats_dir: PathBuf,
 ) -> io::Result<()> {
     let mut chat = chat::Chat::new(chats_dir, chain_dir.clone());
+    let mut setup = setup::Setup::default();
+    let mut help = keybindings::Help::default();
+    let mut training: Option<setup::TrainingRun> = None;
     let (_session, mut terminal) = session::Session::start()?;
     let mut background = HexBackground::default();
     let mut last_frame = Instant::now();
@@ -912,13 +910,15 @@ fn run_app(
     loop {
         // Drain stdin. A completed producer should leave the final dashboard
         // frame visible once, then let the wrapper restore the terminal.
-        loop {
+        while !input_closed {
             match rx.try_recv() {
                 Ok(line) => state.ingest(&line),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     input_closed = true;
-                    state.training_active = false;
+                    if training.is_none() {
+                        state.training_active = false;
+                    }
                     break;
                 }
             }
@@ -934,16 +934,23 @@ fn run_app(
             last_compare_scan = std::time::Instant::now();
         }
 
-        if Instant::now() >= next_frame || input_closed {
+        if Instant::now() >= next_frame || (input_closed && training.is_none()) {
             let now = Instant::now();
             background.advance(now.saturating_duration_since(last_frame));
             last_frame = now;
             chat.poll();
-            terminal
-                .draw(|f| draw_with_background(f, &state, tab, &background, Some(&mut chat)))?;
+            if let Some(run) = &mut training {
+                run.poll(&mut state);
+            }
+            terminal.draw(|f| {
+                draw_with_background(f, &state, tab, &background, Some(&mut chat), Some(&mut setup));
+                if help.open {
+                    help.draw(f);
+                }
+            })?;
             next_frame = Instant::now() + FRAME_INTERVAL;
         }
-        if input_closed {
+        if input_closed && training.is_none() {
             break;
         }
 
@@ -961,57 +968,49 @@ fn run_app(
             }
             if let crossterm::event::Event::Key(key) = event {
                 if key.kind == crossterm::event::KeyEventKind::Press {
-                    if key.code == crossterm::event::KeyCode::Char('c')
-                        && key
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL)
-                    {
-                        break;
-                    }
-                    if tab == 4 && key.code != crossterm::event::KeyCode::Tab {
-                        chat.key(key);
-                        continue;
-                    }
-                    match key.code {
-                        crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
-                            break;
-                        }
-                        crossterm::event::KeyCode::Tab => {
+                    use keybindings::{Action, Context};
+                    let context = if help.open {
+                        Context::Help
+                    } else {
+                        Context::for_tab(tab, setup.editing())
+                    };
+                    match keybindings::action(key, context) {
+                        Some(Action::Quit) => break,
+                        Some(Action::NextTab) => {
                             tab = (tab + 1) % TABS.len();
+                            help.open = false;
                         }
-                        crossterm::event::KeyCode::Left => {
-                            if tab == 0 {
-                                state.pan_graph(false);
-                            } else {
-                                tab = (tab + TABS.len() - 1) % TABS.len();
+                        Some(Action::PreviousTab) => {
+                            tab = (tab + TABS.len() - 1) % TABS.len();
+                        }
+                        Some(Action::ToggleHelp) => {
+                            help.open = !help.open;
+                            help.scroll = 0;
+                        }
+                        Some(Action::ScrollHelp(lines)) => {
+                            help.scroll = help.scroll.saturating_add_signed(lines);
+                        }
+                        Some(Action::HelpTop) => help.scroll = 0,
+                        Some(Action::HelpBottom) => help.scroll = u16::MAX,
+                        Some(Action::Chat) => chat.key(key),
+                        Some(Action::Setup) => {
+                            if setup.key(key)
+                                && let Some(run) = setup.launch(
+                                    state.training_active || training.as_ref().is_some_and(|run| run.active()),
+                                )
+                            {
+                                run.initialize(&mut state);
+                                chat.set_model_dir(state.chain_dir.clone());
+                                training = Some(run);
+                                tab = 0;
                             }
                         }
-                        crossterm::event::KeyCode::Right => {
-                            if tab == 0 {
-                                state.pan_graph(true);
-                            } else {
-                                tab = (tab + 1) % TABS.len();
-                            }
-                        }
-                        crossterm::event::KeyCode::Char('g') => {
-                            if tab == 0 {
-                                state.graph_view = state.graph_view.next();
-                            }
-                        }
-                        crossterm::event::KeyCode::Char(key) => {
-                            if tab == 0 {
-                                if let Some(view) = GraphView::from_key(key) {
-                                    state.graph_view = view;
-                                } else if key == '+' || key == '=' {
-                                    state.zoom_graph(true);
-                                } else if key == '-' {
-                                    state.zoom_graph(false);
-                                } else if key == '0' {
-                                    state.reset_graph_navigation();
-                                }
-                            }
-                        }
-                        _ => {}
+                        Some(Action::Pan(newer)) => state.pan_graph(newer),
+                        Some(Action::CycleGraph) => state.graph_view = state.graph_view.next(),
+                        Some(Action::Graph(view)) => state.graph_view = view,
+                        Some(Action::Zoom(closer)) => state.zoom_graph(closer),
+                        Some(Action::ResetGraph) => state.reset_graph_navigation(),
+                        None => {}
                     }
                 }
             }
@@ -1399,8 +1398,12 @@ fn draw_neuron_animation(f: &mut ratatui::Frame, area: Rect, now: Instant) {
 
 fn draw_neuron_animation_at(f: &mut ratatui::Frame, area: Rect, elapsed: Duration) {
     let frame = neuron_frame_at(elapsed);
-    // Keep the original black canvas, border and geometry; only drop the title.
-    let block = panel("").style(Style::new().bg(Color::Black));
+    draw_neuron_frame(f, area, frame, "");
+}
+
+fn draw_neuron_frame(f: &mut ratatui::Frame, area: Rect, frame: NeuronFrame, title: &str) {
+    // Preserve polish's untitled black canvas and phase 9's reusable renderer.
+    let block = panel(title).style(Style::new().bg(Color::Black));
     let inner = block.inner(area);
     if inner.width < 2 || inner.height < 2 {
         f.render_widget(block, area);
@@ -1554,7 +1557,7 @@ fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64)
 
 #[cfg(test)]
 fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
-    draw_with_background(f, state, tab, &HexBackground::default(), None);
+    draw_with_background(f, state, tab, &HexBackground::default(), None, None);
 }
 
 fn draw_with_background(
@@ -1563,6 +1566,7 @@ fn draw_with_background(
     tab: usize,
     background: &HexBackground,
     chat: Option<&mut chat::Chat>,
+    setup: Option<&mut setup::Setup>,
 ) {
     let area = f.area();
     if area.is_empty() {
@@ -1577,6 +1581,14 @@ fn draw_with_background(
     let health = state.health_status();
     // Do not squeeze bordered widgets into one-cell fragments on tiny screens.
     if area.width < 30 || area.height < 10 {
+        if tab == 5 {
+            if let Some(setup) = setup {
+                setup.draw(f, area);
+            } else {
+                setup::Setup::default().draw(f, area);
+            }
+            return;
+        }
         if tab == 4
             && let Some(chat) = chat
         {
@@ -1614,7 +1626,7 @@ fn draw_with_background(
                 ),
                 status_badge(&health),
                 Line::from(detail),
-                Line::from("q quit / tab switch"),
+                Line::from("q quit / Tab tabs / ? help"),
                 Line::from("Enlarge for full view"),
             ]),
             area,
@@ -1644,23 +1656,27 @@ fn draw_with_background(
             &health,
         );
     } else {
-        let title = if area.width >= 34 {
-            "PSSA / oxide tui  q quit  tab switch"
+        let title = if area.width >= 45 {
+            "PSSA / oxide tui  Ctrl+C quit  Tab tabs  F1 help"
         } else {
-            "PSSA / oxide tui  q quit"
+            "PSSA / oxide tui  F1 help"
         };
         f.render_widget(
             Paragraph::new(vec![Line::styled(title, accent()), status_badge(&health)]),
             header,
         );
     }
+    // Derive the width from the actual labels, padding and separators so adding
+    // a tab cannot silently clip its name or steal space from the controls hint.
+    let tabs_width = (TABS.iter().map(|tab| tab.len() + 2).sum::<usize>()
+        + (TABS.len() - 1) * 3) as u16;
     let nav = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(52), Constraint::Min(0)])
+        .constraints([Constraint::Length(tabs_width), Constraint::Min(0)])
         .split(chunks[1]);
-    if area.width < 52 {
+    if area.width < tabs_width {
         f.render_widget(
-            Paragraph::new(format!(" {} / tab switch", TABS[tab.min(TABS.len() - 1)]))
+            Paragraph::new(format!(" {} / Tab tabs / F1 help", TABS[tab.min(TABS.len() - 1)]))
                 .style(accent()),
             nav[0],
         );
@@ -1681,10 +1697,15 @@ fn draw_with_background(
     }
     if large_title {
         f.render_widget(
-            Paragraph::new(if tab == 4 {
-                "Ctrl+C quit   Tab tabs   /help"
+            Paragraph::new(if nav[1].width < 32 {
+                " F1 help "
             } else {
-                "q quit   tab switch   g/1-7 views   +/- zoom"
+                match tab {
+                    0 => "? help / g/1-7 views / +/- zoom",
+                    4 => "F1 keys / /help commands",
+                    5 => "F1 help / arrows move / Enter edit",
+                    _ => "? help / arrows tabs / q quit",
+                }
             })
             .right_aligned(),
             nav[1],
@@ -1701,6 +1722,13 @@ fn draw_with_background(
                 chat.draw(f, chunks[3]);
             } else {
                 chat::Chat::new(PathBuf::from("chats"), state.chain_dir.clone()).draw(f, chunks[3]);
+            }
+        }
+        5 => {
+            if let Some(setup) = setup {
+                setup.draw(f, chunks[3]);
+            } else {
+                setup::Setup::default().draw(f, chunks[3]);
             }
         }
         _ => draw_feed(f, chunks[3], state),
@@ -2376,7 +2404,15 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             .split(chunks[2]);
         // The same panel animates while waiting for the first progress line:
         // the idle dashboard doubles as the splash, without a blocking delay.
-        draw_neuron_animation(f, bottom[0], now);
+        if state.loop_count > 1 {
+            static RING_START: OnceLock<Instant> = OnceLock::new();
+            ring::draw(
+                f, bottom[0], state.loop_count,
+                RING_START.get_or_init(Instant::now).elapsed(),
+            );
+        } else {
+            draw_neuron_animation(f, bottom[0], now);
+        }
         bottom[1]
     } else {
         // Preserve readable metrics rather than squeezing two tiny panels
@@ -2840,6 +2876,29 @@ mod tests {
         let health = state.health_status();
         assert_eq!(health.level, HealthLevel::Problem);
         assert!(health.label().contains("no progress line"));
+    }
+
+    #[test]
+    fn test_backend_tab_order_is_unique_and_every_label_is_visible() {
+        use ratatui::{Terminal, backend::TestBackend};
+        assert_eq!(TABS, ["monitor", "chain", "model", "feed", "inference", "setup"]);
+        let unique: std::collections::HashSet<_> = TABS.iter().collect();
+        assert_eq!(unique.len(), TABS.len());
+        for tab in 0..TABS.len() {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|f| draw(f, &RunState::default(), tab)).unwrap();
+            let rows: Vec<String> = terminal.backend().buffer().content().chunks(80)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect()).collect();
+            let nav = rows.iter().find(|row| TABS.iter().all(|label| row.contains(label))).unwrap();
+            let mut previous = 0;
+            for label in TABS {
+                assert_eq!(nav.matches(label).count(), 1, "tab {tab}: {nav}");
+                let position = nav.find(label).unwrap();
+                assert!(position >= previous);
+                previous = position + label.len();
+            }
+            assert!(nav.contains("F1 help"), "help must be discoverable: {nav}");
+        }
     }
 
     #[test]
@@ -3528,6 +3587,7 @@ mod tests {
                             "model / configuration",
                             "feed / idle",
                             "conversation",
+                            "parameters",
                         ];
                         assert!(text.contains(expected[tab]));
                     } else if width >= 30 && tab == 0 {
@@ -3630,7 +3690,7 @@ mod tests {
             for tab in 0..TABS.len() {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
-                    .draw(|f| draw_with_background(f, &RunState::default(), tab, &pressed, None))
+                    .draw(|f| draw_with_background(f, &RunState::default(), tab, &pressed, None, None))
                     .unwrap();
                 let buffer = terminal.backend().buffer();
                 let content = HexBackground::content_area(buffer.area);
