@@ -488,13 +488,92 @@ press **Tab** to reach **inference**. Existing `chat`/`generate` CLI commands an
   and use the existing `q` key. Outside text input, **?** also opens help.
 
 The tab order is **monitor, chain, model, feed, inference, setup, HF login,
-Kaggle, memory, runs, benchmark, sample, hardware, math, devices, limits**. The
+Kaggle, memory, runs, benchmark, sample, hardware, math, devices, limits,
+HF backup, cloud log, phone ping, updates, support, GitHub, sweeps, timeline**. The
 [training setup wizard](docs/training-setup.md) launches a separate trainer
 and returns to the monitor; **Tab** switches tabs even while editing a field.
 **Ctrl+K** opens the command palette. All tabs share one **F1 / ?** keyboard
 reference. At 80+ columns the tab strip pages between the original six tabs,
-HF login/extras, and the five new controls when the full strip will not fit;
+HF login/extras, run controls, and two network/community pages when the full strip will not fit;
 below 80 columns it shows the active tab. **F1** lists every keyboard control.
+
+### Backups, cloud logs and community (TUI)
+
+Use **Ctrl+K**, type a tab name, then **Enter**, or cycle with **Tab**.
+**Up/Down** selects a field; **Enter** edits/applies it, **Esc** cancels,
+and **Ctrl+U** clears an editor. These features run only while the TUI is open;
+plain CLI training and non-TTY logging do not start network workers.
+
+- **HF backup:** enter a checkpoint path and an **existing** `owner/repo`, then
+  **p** pushes the checkpoint and a generated model card. Uses the **HF login**
+  credentials; uploading needs a token with write access to that repository.
+  Automatic backup counts new `saved_checkpoint=` events, defaulting to every
+  **3** saves. Edit the interval (**0** disables), or press **d** to toggle.
+  It does not upload checkpoints merely discovered in a historical scan or
+  interpret a remote path as a local file. One bounded-memory worker uploads;
+  while busy, only the newest due checkpoint is queued. Logged-out/offline
+  attempts show a skip status; **r** retries manually. No repository is created.
+  Uploads replace `model.pssa`/`model.trfm` and `README.md` on the repo's `main`
+  branch (previous versions remain in HF history). Basic Git LFS transfer is
+  supported up to 5 GiB; multipart transfers are refused with a status.
+- **Cloud log:** **Enter** a streaming/append-only HTTPS URL or a local file
+  synced from a notebook, then **p** follows it in its own live view. Checkpoint
+  and throughput lines are highlighted. **PgUp/PgDn** scroll, **End** follows
+  live output, **d** pauses, and **r** reconnects. Partial lines survive reconnects;
+  disconnects retry with 1–30-second backoff. History is capped at 400 lines;
+  large HTTP logs need Range support (otherwise use a synced file). URLs stay
+  in memory and are masked because their query strings can contain credentials.
+- **Phone ping:** **OFF by default**. Set mode to `ntfy` with an unguessable
+  ntfy.sh topic, or `webhook` with an HTTPS URL; **d** explicitly enables/disables.
+  Notifications contain only fixed checkpoint/finished/died summaries, never
+  checkpoint paths, logs, prompts or credentials. Subscribe to the topic in
+  the ntfy phone app; public topics are not private unless separately protected.
+  Delivery runs in a bounded worker; the tab retains a bounded delivery log and
+  failure count. **p** sends a test checkpoint event; **r** retries. Generic
+  webhooks receive JSON with `event`, `message` and `source: "pssa"` fields.
+- **Updates:** checks stable releases of `Sparticle62ops/pssa` at most once per
+  24 hours, including failed attempts and manual **r** checks. A newer release
+  shows a small monitor banner. **o** opens the release; **d** toggles checks.
+  This never pulls git, downloads a binary, or builds automatically.
+- **Support:** GitHub, Discord and issue links, plus the exact **SOL** address
+  from [Donate](#donate). **Up/Down**, then **Enter** or **o** opens a link;
+  **c** copies the wallet using an available desktop clipboard helper
+  (`wl-copy`, `xclip`, `pbcopy` or `clip`). Without one, copy the displayed text.
+- **GitHub:** public, read-only browsing of the first 50 open **p** PRs or **i**
+  issues; **r** refreshes, **Up/Down/PgUp/PgDn/Home/End** selects, **o** or
+  **Enter** opens the discussion. **l** opens masked token login; **Ctrl+L**
+  signs out. Reads `GH_TOKEN`, then `GITHUB_TOKEN`, then
+  `~/.cache/pssa/github/token`; entered tokens are verified and saved atomically
+  with Unix mode **0600**, like HF login. Use a minimally scoped read token.
+  No GitHub write endpoints, fork, push or PR-creation actions exist.
+- **Sweeps:** configure the base run in **setup**, leave Resume empty, then edit
+  comma-separated learning rates, latent sizes and batch lanes. Blank grids use
+  the wizard values; **r** copies them, **p** queues the grid (up to 32 trials).
+  Runs use the existing `train` command **one at a time**, waiting for other
+  TUI-owned trainers/benchmarks. Each gets a fresh `sweep-…/trial-NNN` directory
+  with `train.log` and `model.pssa`. Results show measured **training** loss and
+  throughput, not held-out scores. **d** cancels pending trials, never the active
+  child. Quitting leaves that child running but does not launch further trials.
+- **Timeline:** a horizontal view of the current local run's saved checkpoints.
+  **Left/Right** (or **Up/Down**) scrubs, **Home/End** jumps, **r** rescans.
+  Recorded loss/throughput comes from bounded log reads; unavailable history
+  remains `n/a`, not inferred from checkpoint weights. **c** chats with a selected
+  checkpoint; **Enter** fills setup's Resume and a fresh output directory for
+  review—it does **not** launch. Match the checkpoint's shape/chunk and dataset
+  before starting. Sync remote checkpoints/logs locally to use this view.
+
+Backup/notification/update settings live in
+`$XDG_CONFIG_HOME/pssa/tui-network.json` (default
+`~/.config/pssa/tui-network.json`, owner-only on Unix). For example,
+`"updates": {"enabled": false}` disables release checks. Notification topics and
+webhook URLs can be secrets: keep this file private. Set **`PSSA_OFFLINE=1`**
+(or **`HF_HUB_OFFLINE=1`**) before launching the TUI to skip Phase 12c HTTP calls;
+local log following, sweeps and the timeline still work. Explicitly enabled
+uploads/notifications may already have reached their service when disabled or
+when you quit; no background network service survives TUI exit. A piped TUI
+waits at EOF only for opted-in pending uploads/notifications; **q** can leave
+without waiting. With those features off, its normal immediate-EOF behavior
+is unchanged.
 
 ### Live samples, hardware and run controls (TUI)
 

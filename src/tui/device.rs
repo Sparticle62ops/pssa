@@ -302,7 +302,8 @@ impl DevicePicker {
         ])
         .split(area);
         f.render_widget(
-            Paragraph::new(format!("device / selected: {}", self.backend().as_str())).style(accent()),
+            Paragraph::new(format!("device / selected: {}", self.backend().as_str()))
+                .style(accent()),
             parts[0],
         );
         let rows = parts[1].height.saturating_sub(2) as usize;
