@@ -1,9 +1,9 @@
-use oxide_ai_pssa::cli::CLIHandler;
+use pssa::cli::CLIHandler;
 
 #[test]
 fn option_like_missing_value_is_rejected_before_typed_parsing() {
     let error = CLIHandler::parse_and_execute(vec![
-        "oxide_ai_pssa".into(),
+        "pssa".into(),
         "train".into(),
         "--epochs".into(),
         "--bogus".into(),
@@ -42,7 +42,7 @@ fn hf_flags_reject_invalid_or_ambiguous_sources_before_network_access() {
         ),
         (vec!["--hf-dataset"], "requires a value"),
     ] {
-        let mut command = vec!["oxide_ai_pssa".to_string(), "train".to_string()];
+        let mut command = vec!["pssa".to_string(), "train".to_string()];
         command.extend(args.iter().map(|s| s.to_string()));
         let error = CLIHandler::parse_and_execute(command).unwrap_err();
         assert!(error.contains(expected), "{args:?}: {error}");
@@ -51,11 +51,11 @@ fn hf_flags_reject_invalid_or_ambiguous_sources_before_network_access() {
 
 #[test]
 fn cached_hf_training_emits_real_feed_and_matches_local_checkpoint() {
-    use oxide_ai_pssa::{dataset::Tokenizer, training::sequence_plan};
+    use pssa::{dataset::Tokenizer, training::sequence_plan};
     use std::hash::{Hash, Hasher};
     use std::{fs, process::Command};
 
-    let root = std::env::temp_dir().join(format!("oxide-hf-cli-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("pssa-hf-cli-{}", std::process::id()));
     fs::create_dir_all(&root).unwrap();
     // Small, offline cache fixture in /tmp. Keep this key in sync with the
     // versioned on-disk cache contract; no live dataset is needed by tests.
@@ -71,7 +71,7 @@ fn cached_hf_training_emits_real_feed_and_matches_local_checkpoint() {
     fs::write(&local, raw).unwrap();
     let run = |hf: bool| {
         let checkpoint = root.join(if hf { "hf.pssa" } else { "local.pssa" });
-        let mut command = Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pssa"));
         command.arg("train");
         if hf {
             command.args(["--hf-dataset", "fixture/corpus", "--hf-config", "tiny"]);
@@ -106,7 +106,7 @@ fn cached_hf_training_emits_real_feed_and_matches_local_checkpoint() {
                 "-o",
             ])
             .arg(&checkpoint)
-            .env("OXIDE_PSSA_HF_CACHE", &root)
+            .env("PSSA_HF_CACHE", &root)
             .env("RAYON_NUM_THREADS", "1")
             .output()
             .unwrap();
@@ -161,7 +161,7 @@ fn cached_hf_training_emits_real_feed_and_matches_local_checkpoint() {
 #[test]
 fn negative_numeric_option_value_reaches_domain_validation() {
     let error = CLIHandler::parse_and_execute(vec![
-        "oxide_ai_pssa".into(),
+        "pssa".into(),
         "generate".into(),
         "prompt".into(),
         "--temperature".into(),

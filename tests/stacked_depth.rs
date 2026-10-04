@@ -1,6 +1,6 @@
 //! End-to-end finite differences exercise every trainable coordinate of small
 //! depth-two/four models, including populated detached memory and nonzero carry.
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSAContinuousBlockV2, PSSALayerV2};
+use pssa::pssa::{PSSAConfigV2, PSSAContinuousBlockV2, PSSALayerV2};
 
 const IDS: [usize; 3] = [1, 3, 5];
 const TARGETS: [usize; 3] = [3, 5, 7];

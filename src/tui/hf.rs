@@ -21,7 +21,7 @@ use std::{
 
 static SIGNED_OUT: AtomicBool = AtomicBool::new(false);
 static USE_SAVED: AtomicBool = AtomicBool::new(false);
-const CHILD_SIGNED_OUT: &str = "OXIDE_HF_SIGNED_OUT";
+const CHILD_SIGNED_OUT: &str = "PSSA_HF_SIGNED_OUT";
 
 // Pass authentication policy, never credentials, to wizard children. An
 // explicit login must supersede an older inherited HF_TOKEN; logout must also
@@ -41,6 +41,8 @@ fn child_policy(command: &mut std::process::Command, signed_out: bool, use_saved
         command.env(CHILD_SIGNED_OUT, "1");
     } else if use_saved {
         command.env_remove(CHILD_SIGNED_OUT);
+        // Also clear the inherited legacy fallback after an explicit login.
+        command.env_remove("OXIDE_HF_SIGNED_OUT");
     }
 }
 struct Token(String);
@@ -76,7 +78,9 @@ fn resolve(env: Option<String>, path: &Path) -> Result<Option<Token>, String> {
 fn existing() -> Result<Option<Token>, String> {
     let use_saved = USE_SAVED.load(Ordering::Relaxed);
     if SIGNED_OUT.load(Ordering::Relaxed)
-        || (!use_saved && std::env::var_os(CHILD_SIGNED_OUT).is_some_and(|v| v == "1"))
+        || (!use_saved
+            && crate::env_var_os(CHILD_SIGNED_OUT, "OXIDE_HF_SIGNED_OUT")
+                .is_some_and(|v| v == "1"))
     {
         return Ok(None);
     }
@@ -173,7 +177,7 @@ fn request(endpoint: &str, token: Option<&Token>) -> Result<serde_json::Value, S
         .redirects(0)
         .timeout(Duration::from_secs(20))
         .build();
-    let mut req = agent.get(endpoint).set("User-Agent", "oxide-ai/0.5.0");
+    let mut req = agent.get(endpoint).set("User-Agent", "pssa/0.5.0");
     if let Some(token) = token {
         req = req.set("Authorization", &format!("Bearer {}", token.0));
     }
@@ -418,6 +422,7 @@ mod tests {
                 );
             } else if use_saved {
                 assert_eq!(env.get(OsStr::new(CHILD_SIGNED_OUT)), Some(&None));
+                assert_eq!(env.get(OsStr::new("OXIDE_HF_SIGNED_OUT")), Some(&None));
             }
             assert_eq!(command.get_args().count(), 0);
         }

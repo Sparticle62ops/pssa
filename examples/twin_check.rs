@@ -1,9 +1,9 @@
 //! Populated-memory CPU-twin verification. `--gpu` additionally requires strict
 //! hardware execution of every dense forward-stage shape (no CPU fallback).
 //! This is not a claim of end-to-end hardware backward/adjoint verification.
-use oxide_ai_pssa::backend::{Device, GpuDispatch, gemm_cpu_reference};
-use oxide_ai_pssa::gpu_batch::{backward_chunk_batched, forward_train_chunk_batched};
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use pssa::backend::{Device, GpuDispatch, gemm_cpu_reference};
+use pssa::gpu_batch::{backward_chunk_batched, forward_train_chunk_batched};
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 
 fn tiny_cfg() -> PSSAConfigV2 {
     PSSAConfigV2 {

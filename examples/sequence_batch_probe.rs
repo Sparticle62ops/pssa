@@ -1,7 +1,7 @@
 //! Fixed-work CPU training benchmark: eight independent L64 sequences/update.
 //! No tokenizer, I/O or model/workspace construction is timed. Compare medians,
 //! not CI limits. Run with --batch-size 1 (serial baseline) or up to 8 lanes.
-use oxide_ai_pssa::{
+use pssa::{
     gpu_batch,
     pssa::{PSSAConfigV2, PSSALayerV2},
     sequence_batch::{Sequence, SequenceBatch},

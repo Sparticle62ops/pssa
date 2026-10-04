@@ -192,7 +192,7 @@ mod tests {
         actual.vocabulary = tok.ordered_vocabulary().unwrap();
         actual.tokenizer_json = tok.serialized_metadata();
         train_documents(&mut actual, &docs, &opts).unwrap();
-        let dir = std::env::temp_dir().join(format!("oxide-replay-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pssa-replay-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         crate::transformer_checkpoint::save_model(&actual, dir.join("a.trfm")).unwrap();
         crate::transformer_checkpoint::save_model(&expected, dir.join("b.trfm")).unwrap();

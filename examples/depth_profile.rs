@@ -1,5 +1,5 @@
-use oxide_ai_pssa::gpu_batch::{backward_chunk_batched, forward_train_chunk_batched};
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use pssa::gpu_batch::{backward_chunk_batched, forward_train_chunk_batched};
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 use std::time::Instant;
 
 fn model(depth: usize) -> PSSALayerV2 {

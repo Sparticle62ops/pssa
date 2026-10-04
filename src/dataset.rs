@@ -759,7 +759,7 @@ impl DatasetManager {
     }
     fn download_url_raw(url: &str) -> Result<String, String> {
         ureq::get(url)
-            .set("User-Agent", "oxide-ai/0.4.0")
+            .set("User-Agent", "pssa/0.4.0")
             .timeout(std::time::Duration::from_secs(60))
             .call()
             .map_err(|e| format!("HTTP request failed: {e}"))?
@@ -910,17 +910,17 @@ impl DatasetManager {
     }
 
     fn huggingface_cache_path(options: &HuggingFaceDatasetOptions) -> PathBuf {
-        let root = std::env::var_os("OXIDE_PSSA_HF_CACHE")
+        let root = crate::env_var_os("PSSA_HF_CACHE", "OXIDE_PSSA_HF_CACHE")
             .map(PathBuf::from)
             .or_else(|| {
                 std::env::var_os("XDG_CACHE_HOME")
-                    .map(|p| PathBuf::from(p).join("oxide-ai-pssa/huggingface"))
+                    .map(|p| PathBuf::from(p).join("pssa/huggingface"))
             })
             .or_else(|| {
                 std::env::var_os("HOME")
-                    .map(|p| PathBuf::from(p).join(".cache/oxide-ai-pssa/huggingface"))
+                    .map(|p| PathBuf::from(p).join(".cache/pssa/huggingface"))
             })
-            .unwrap_or_else(|| std::env::temp_dir().join("oxide-ai-pssa/huggingface"));
+            .unwrap_or_else(|| std::env::temp_dir().join("pssa/huggingface"));
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         // Invalidate older caches that split one source row across several lines.
         "hf-row-lines-v2".hash(&mut hasher);
@@ -1227,7 +1227,7 @@ mod huggingface_tests {
             let sequence = HF_CACHE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Self(
                 std::env::temp_dir()
-                    .join(format!("oxide-hf-test-{}-{sequence}", std::process::id())),
+                    .join(format!("pssa-hf-test-{}-{sequence}", std::process::id())),
             )
         }
         fn path(&self) -> PathBuf {

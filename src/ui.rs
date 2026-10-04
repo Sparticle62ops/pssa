@@ -1,4 +1,4 @@
-//! Terminal presentation for the oxide command line.
+//! Terminal presentation for the pssa command line.
 //!
 //! Colour, cursor control and screen clearing are emitted only when stdout is
 //! an interactive terminal and `NO_COLOR` is unset, so piped output, CI logs
@@ -149,11 +149,11 @@ pub fn panel_bottom() {
 /// Block-letter wordmark, drawn once at the top of the home screen.
 pub fn logo() {
     const ART: [&str; 5] = [
-        " ██████  ██   ██ ██ ██████  ███████",
-        "██    ██  ██ ██  ██ ██   ██ ██     ",
-        "██    ██   ████  ██ ██   ██ █████  ",
-        "██    ██  ██ ██  ██ ██   ██ ██     ",
-        " ██████  ██   ██ ██ ██████  ███████",
+        "███    ███   ███   ██ ",
+        "█  █  █     █     █  █",
+        "███    ██    ██   ████",
+        "█        █     █  █  █",
+        "█     ███   ███   █  █",
     ];
     println!();
     for line in ART {
@@ -167,7 +167,7 @@ pub fn rule() {
 
 /// The title block printed once at the start of a long command.
 pub fn banner(command: &str, subtitle: &str) {
-    let name = format!("oxide {command}");
+    let name = format!("pssa {command}");
     println!();
     println!("  {}  {}", bold(&cyan(&name)), dim(subtitle));
     println!("  {}", dim(&"─".repeat(width() - 2)));

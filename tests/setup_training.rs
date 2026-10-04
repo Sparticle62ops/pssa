@@ -28,7 +28,7 @@ fn wizard_cli_contract_trains_and_resumes_with_plain_logs() {
     let first = fixture.0.join("first checkpoint.pssa");
     let second = fixture.0.join("resumed checkpoint.pssa");
     for (output, resume) in [(&first, None), (&second, Some(&first))] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pssa"));
         command
             .args(["train", "--data"])
             .arg(format!("file:{}", fixture.0.join("source.txt").display()))
@@ -89,7 +89,7 @@ fn wizard_cli_contract_trains_and_resumes_with_plain_logs() {
 
 #[test]
 fn invalid_backend_is_rejected_before_dataset_loading() {
-    let result = Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"))
+    let result = Command::new(env!("CARGO_BIN_EXE_pssa"))
         .args(["train", "missing-file", "--backend", "tpu", "--no-tui"])
         .output()
         .unwrap();

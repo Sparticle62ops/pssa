@@ -69,7 +69,9 @@ impl Drop for Session {
 mod tests {
     #[test]
     fn terminal_cleanup_fixture() {
-        let Ok(mode) = std::env::var("OXIDE_TUI_CLEANUP_FIXTURE") else {
+        let Some(mode) = crate::env_var_os("PSSA_TUI_CLEANUP_FIXTURE", "OXIDE_TUI_CLEANUP_FIXTURE")
+            .and_then(|value| value.into_string().ok())
+        else {
             return;
         };
         let _session = super::Session::arm();
@@ -95,7 +97,7 @@ mod tests {
                     "tui::session::tests::terminal_cleanup_fixture",
                     "--nocapture",
                 ])
-                .env("OXIDE_TUI_CLEANUP_FIXTURE", mode)
+                .env("PSSA_TUI_CLEANUP_FIXTURE", mode)
                 .output()
                 .unwrap();
             assert_eq!(output.status.success(), mode != "panic");

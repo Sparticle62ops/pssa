@@ -1,7 +1,7 @@
 //! Scalar-oracle regressions for the forward and reverse associative SSM scans.
 //! The oracle deliberately uses PSSALayerV2, not the staged scan helpers.
 
-use oxide_ai_pssa::{
+use pssa::{
     gpu_batch::{backward_chunk_batched, forward_train_chunk_batched},
     pssa::{PSSAConfigV2, PSSALayerV2},
     sequence_batch::{Sequence, SequenceBatch},

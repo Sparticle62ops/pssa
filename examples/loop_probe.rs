@@ -1,4 +1,4 @@
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 fn main() {
     for loops in [1, 2, 4] {
         let cfg = PSSAConfigV2 {

@@ -213,7 +213,7 @@ mod tests {
             ..Default::default()
         };
         let args: Vec<_> = [
-            "oxide",
+            "pssa",
             "train",
             "--ram-mib",
             "512",
@@ -227,7 +227,7 @@ mod tests {
         .map(str::to_owned)
         .collect();
         let command = limits
-            .budget_command(std::path::Path::new("/a path/oxide"), &args)
+            .budget_command(std::path::Path::new("/a path/pssa"), &args)
             .unwrap();
         let actual: Vec<_> = command
             .get_args()
@@ -238,7 +238,7 @@ mod tests {
             [
                 "--as=536870912:536870912",
                 "--",
-                "/a path/oxide",
+                "/a path/pssa",
                 "train",
                 "--resume",
                 "some path's/checkpoint.pssa",

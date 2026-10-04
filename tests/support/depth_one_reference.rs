@@ -1,6 +1,6 @@
 //! Deterministic depth-one fixture recipe, also compiled against unmodified
 //! main 85d9d337875d58c709d5e32703d2f43825185f8e to generate the golden V7 files.
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 
 pub fn model() -> PSSALayerV2 {
     let mut m = PSSALayerV2::new(

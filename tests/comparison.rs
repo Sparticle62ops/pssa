@@ -8,7 +8,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
         let p = std::env::temp_dir().join(format!(
-            "oxide-comparison-{}-{}",
+            "pssa-comparison-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -25,7 +25,7 @@ impl Drop for Scratch {
     }
 }
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"))
+    Command::new(env!("CARGO_BIN_EXE_pssa"))
         .args(args)
         .env("RAYON_NUM_THREADS", "2")
         .output()

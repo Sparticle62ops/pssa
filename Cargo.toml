@@ -1,5 +1,5 @@
 [package]
-name = "oxide_ai_pssa"
+name = "pssa"
 version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"

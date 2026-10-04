@@ -1,4 +1,4 @@
-# Run from the repository root with oxide_ai_pssa on PATH. No credentials needed.
+# Run from the repository root with pssa on PATH. No credentials needed.
 Output docs/img/tui-demo.gif
 Set Shell "bash"
 Set FontSize 16
@@ -7,7 +7,7 @@ Set Height 800
 Set Framerate 15
 Set TypingSpeed 60ms
 Hide
-Type "oxide_ai_pssa tui"
+Type "pssa tui"
 Enter
 Sleep 1s
 Show

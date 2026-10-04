@@ -421,7 +421,7 @@ impl Client {
         let req = self
             .agent
             .request(method, &format!("{}{path}", self.base))
-            .set("User-Agent", "oxide-ai/0.5.0")
+            .set("User-Agent", "pssa/0.5.0")
             .set("Authorization", &self.credentials.authorization);
         let result = match body {
             Some(value) => req
@@ -1071,7 +1071,7 @@ impl Kaggle {
             Line::from("Credentials: KAGGLE_USERNAME + KAGGLE_KEY, else ~/.kaggle/kaggle.json"),
             Line::from("No key is displayed or saved. Keep kaggle.json private (chmod 600)."),
             Line::from("Enter review • Y confirm • N/Esc cancel • Ctrl+U clear • Tab tabs"),
-            Line::from("Run oxide-ai with --no-tui in the notebook for parseable monitor metrics."),
+            Line::from("Run pssa with --no-tui in the notebook for parseable monitor metrics."),
         ];
         if let Some(prepared) = &self.prepared {
             text.extend(prepared.summary.lines().map(|s| Line::from(s.to_owned())));
@@ -1115,7 +1115,7 @@ mod tests {
         fn new() -> Self {
             static SERIAL: AtomicUsize = AtomicUsize::new(0);
             let dir = std::env::temp_dir().join(format!(
-                "oxide-kaggle-{}-{}",
+                "pssa-kaggle-{}-{}",
                 std::process::id(),
                 SERIAL.fetch_add(1, Ordering::Relaxed)
             ));

@@ -7,9 +7,9 @@
 
 use std::time::Instant;
 
-use oxide_ai_pssa::backend::Device;
-use oxide_ai_pssa::gpu_batch::{backward_chunk_batched, forward_train_chunk_batched};
-use oxide_ai_pssa::pssa::{PSSAConfigV2, PSSAContinuousBlockV2, PSSALayerV2};
+use pssa::backend::Device;
+use pssa::gpu_batch::{backward_chunk_batched, forward_train_chunk_batched};
+use pssa::pssa::{PSSAConfigV2, PSSAContinuousBlockV2, PSSALayerV2};
 
 const SEED: u64 = 0x4750_5543_4845_434b;
 const SMALL_STEPS: usize = 3;

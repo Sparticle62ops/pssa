@@ -8,7 +8,7 @@ struct Workspace(PathBuf);
 impl Workspace {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "oxide-wikitext-{}-{}",
+            "pssa-wikitext-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -20,7 +20,7 @@ impl Workspace {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"))
+        Command::new(env!("CARGO_BIN_EXE_pssa"))
             .current_dir(&self.0)
             .args(args)
             .output()

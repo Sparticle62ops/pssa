@@ -25,3 +25,9 @@ pub mod transformer_inference;
 pub mod transformer_training;
 pub mod tui;
 pub mod ui;
+
+/// Fall back to a legacy environment variable only when the current one is
+/// unset. An empty or non-Unicode current value still takes precedence.
+pub(crate) fn env_var_os(name: &str, legacy: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).or_else(|| std::env::var_os(legacy))
+}

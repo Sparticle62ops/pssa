@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn checkpoint_snapshot_reads_real_slots_without_modifying_bytes() {
         let path =
-            std::env::temp_dir().join(format!("oxide-inspector-{}.pssa", std::process::id()));
+            std::env::temp_dir().join(format!("pssa-inspector-{}.pssa", std::process::id()));
         let mut model = crate::pssa::PSSALayerV2::new(
             crate::pssa::PSSAConfigV2 {
                 d_vocab: 3,

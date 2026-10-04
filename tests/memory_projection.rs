@@ -1,4 +1,4 @@
-use oxide_ai_pssa::memory::HyperbolicEpisodicBankV2 as Bank;
+use pssa::memory::HyperbolicEpisodicBankV2 as Bank;
 
 #[test]
 fn finite_extreme_queries_project_strictly_inside_the_ball() {

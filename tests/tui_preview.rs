@@ -1,5 +1,5 @@
 //! Exercise the real read-only preview subprocess and plain-log entry point.
-use oxide_ai_pssa::{
+use pssa::{
     checkpoint,
     dataset::Tokenizer,
     pssa::{PSSAConfigV2, PSSALayerV2},
@@ -33,7 +33,7 @@ fn preview_worker_loads_checkpoint_with_spaces_and_never_writes_it() {
     model.vocabulary = tokenizer.ordered_vocabulary().unwrap();
     checkpoint::save_model(&model, &path).unwrap();
     let before = fs::read(&path).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"))
+    let output = Command::new(env!("CARGO_BIN_EXE_pssa"))
         .args(["tui", "--preview-worker"])
         .arg(&path)
         .arg("2")
@@ -63,7 +63,7 @@ fn preview_worker_loads_checkpoint_with_spaces_and_never_writes_it() {
             .all(|mark| (0.0..=1.0).contains(&mark["probability"].as_f64().unwrap()))
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"))
+    let output = Command::new(env!("CARGO_BIN_EXE_pssa"))
         .args(["tui", "--preview-worker"])
         .arg(&path)
         .arg("1")
@@ -75,7 +75,7 @@ fn preview_worker_loads_checkpoint_with_spaces_and_never_writes_it() {
 
 #[test]
 fn non_tty_tui_still_passes_plain_progress_without_starting_workers() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_oxide_ai_pssa"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pssa"))
         .arg("tui")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

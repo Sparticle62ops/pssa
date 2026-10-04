@@ -643,7 +643,7 @@ mod tests {
         fn new() -> Self {
             static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let dir = std::env::temp_dir().join(format!(
-                "oxide ab {} {}",
+                "pssa ab {} {}",
                 std::process::id(),
                 SERIAL.fetch_add(1, Ordering::Relaxed)
             ));

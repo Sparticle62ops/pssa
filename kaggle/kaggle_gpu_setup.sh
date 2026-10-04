@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Oxide AI on a Kaggle GPU notebook.
+# PSSA on a Kaggle GPU notebook.
 #
 # Usage: create a new Kaggle notebook, set Accelerator to GPU (T4 or P100) and
 # Internet to On, then run this whole file in one cell with:
@@ -10,7 +10,7 @@
 set -euo pipefail
 
 BRANCH="${BRANCH:-main}"
-REPO="${REPO:-https://github.com/Sparticle62ops/oxide-ai.git}"
+REPO="${REPO:-https://github.com/Sparticle62ops/pssa.git}"
 WORK="${WORK:-/kaggle/working}"
 
 echo "### 1. Vulkan driver (wgpu speaks Vulkan, not CUDA directly)"
@@ -40,15 +40,15 @@ rustc --version
 echo
 echo "### 3. Clone and build"
 cd "$WORK"
-rm -rf oxide-ai
+rm -rf pssa
 git clone --quiet --branch "$BRANCH" "$REPO"
-cd oxide-ai
+cd pssa
 cargo build --release --features cuda
 
 echo
 echo "### 4. GPU probe"
 # Passes only if the GPU kernel result matches the CPU reference.
-./target/release/oxide_ai_pssa gpu-probe
+./target/release/pssa gpu-probe
 
 echo
 echo "### 5. Chained training and sample"

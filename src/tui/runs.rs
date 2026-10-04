@@ -484,7 +484,7 @@ mod tests {
     use super::*;
     #[test]
     fn discovery_deduplicates_and_reopens_score_sidecar() {
-        let dir = std::env::temp_dir().join(format!("oxide-runs-ui-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pssa-runs-ui-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join("path with spaces.pssa");
         fs::write(&p, b"fixture").unwrap();
@@ -507,7 +507,7 @@ mod tests {
     }
     #[test]
     fn open_saved_log_restores_monitor_and_missing_history_is_explicit() {
-        let dir = std::env::temp_dir().join(format!("oxide-runs-open-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pssa-runs-open-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("saved checkpoint.pssa");
         fs::write(&path, b"not loaded for history").unwrap();
@@ -542,7 +542,7 @@ mod tests {
     }
     #[test]
     fn scoring_different_checkpoint_formats_keeps_separate_sidecars() {
-        let dir = std::env::temp_dir().join(format!("oxide-runs-scores-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pssa-runs-scores-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         for (ext, ppl) in [("pssa", 8.5), ("trfm", 9.5)] {
             let path = dir.join(format!("model.{ext}"));
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn wizard_output_is_discoverable_and_reopens_train_log() {
-        let dir = std::env::temp_dir().join(format!("oxide-runs-wizard-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pssa-runs-wizard-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("model.pssa");
         fs::write(&path, "not loaded for history").unwrap();

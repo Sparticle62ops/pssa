@@ -1,6 +1,6 @@
 # Training from the TUI
 
-Run `oxide_ai_pssa tui` in a terminal, then press **Tab** to reach **setup**.
+Run `pssa tui` in a terminal, then press **Tab** to reach **setup**.
 The existing command-line training and piped-log monitor remain available.
 
 ## Wizard
@@ -53,7 +53,7 @@ at launch in the monitor; to stop a detached run, use normal OS process controls
 In another terminal, reopen its monitor with:
 
 ```sh
-tail -f 'runs/my run/train.log' | oxide_ai_pssa tui --chain 'runs/my run'
+tail -f 'runs/my run/train.log' | pssa tui --chain 'runs/my run'
 ```
 
 The app stays open after a child finishes so the final status remains visible.

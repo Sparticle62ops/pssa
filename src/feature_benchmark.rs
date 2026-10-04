@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_OUTPUT: &str = "__agent__/feature_results";
-const REPRO_ROOT: &str = "/workspace/oxide-ai";
+const REPRO_ROOT: &str = "/workspace/pssa";
 
 fn benchmark_command(feature: &str) -> String {
     format!(

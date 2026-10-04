@@ -9,10 +9,10 @@ recurrent carry and truncated-backpropagation tape per lane.
 
 ```sh
 # Existing invocations are unchanged; --batch-size 1 is implicit.
-oxide_ai_pssa train corpus.txt -o serial.pssa --chunk 64 --accumulate 8 -e 1
+pssa train corpus.txt -o serial.pssa --chunk 64 --accumulate 8 -e 1
 
 # Up to eight independent documents per microbatch.
-oxide_ai_pssa train corpus.txt -o batched.pssa --chunk 64 --batch-size 8 --accumulate 1 -e 1
+pssa train corpus.txt -o batched.pssa --chunk 64 --batch-size 8 --accumulate 1 -e 1
 ```
 
 - `--chunk` remains the maximum sequence length **per lane**, not batch size
@@ -121,8 +121,8 @@ export CXX=/workspace/bin/zigcc
 export AR=/workspace/bin/ar
 
 cargo build --release
-CARGO_TARGET_DIR=/workspace/oxide-target-test cargo test
-CARGO_TARGET_DIR=/workspace/oxide-target-test cargo test --example sequence_batch_probe
+CARGO_TARGET_DIR=/workspace/pssa-target-test cargo test
+CARGO_TARGET_DIR=/workspace/pssa-target-test cargo test --example sequence_batch_probe
 cargo build --release --example sequence_batch_probe
 
 # Three invocations per batch size, alternating pair order.

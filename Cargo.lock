@@ -1204,22 +1204,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "oxide_ai_pssa"
-version = "0.5.0"
-dependencies = [
- "bytemuck",
- "crossterm",
- "cudarc",
- "pollster",
- "ratatui",
- "rayon",
- "serde_json",
- "tokenizers",
- "ureq",
- "wgpu",
-]
-
-[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1316,6 +1300,22 @@ name = "profiling"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
+
+[[package]]
+name = "pssa"
+version = "0.5.0"
+dependencies = [
+ "bytemuck",
+ "crossterm",
+ "cudarc",
+ "pollster",
+ "ratatui",
+ "rayon",
+ "serde_json",
+ "tokenizers",
+ "ureq",
+ "wgpu",
+]
 
 [[package]]
 name = "quote"
