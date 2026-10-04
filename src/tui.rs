@@ -11,14 +11,19 @@ mod chat;
 mod depth_zoom;
 mod device;
 mod extras;
+mod github;
 mod hardware;
 mod heatmap;
 pub(crate) mod hf;
+mod hf_backup;
 mod inspector;
 mod kaggle;
 mod keybindings;
 mod limits;
+mod log_stream;
 mod math;
+mod network;
+mod notify;
 mod overlay;
 mod preview;
 mod process;
@@ -33,6 +38,10 @@ mod session;
 mod setup;
 #[cfg(feature = "speech")]
 mod speech;
+mod support;
+mod sweep;
+mod timeline;
+mod update;
 
 use crate::ui;
 use background::HexBackground;
@@ -927,6 +936,7 @@ fn run_app(
     let mut training: Option<setup::TrainingRun> = None;
     let mut hf_login = hf::Login::new();
     let mut extras = extras::Extras::new(chain_dir.clone());
+    let mut network = network::Network::new();
     let (_session, mut terminal) = session::Session::start()?;
     let mut background = HexBackground::default();
     let mut last_frame = Instant::now();
@@ -942,11 +952,13 @@ fn run_app(
 
     loop {
         // Drain stdin. A completed producer should leave the final dashboard
-        // frame visible once, then let the wrapper restore the terminal.
+        // frame visible once, then let the wrapper restore the terminal. Opted-in
+        // deliveries may finish after EOF; they never hold up the producer.
         while !input_closed {
             match rx.try_recv() {
                 Ok(line) => {
                     extras.ingest(&line);
+                    network.ingest(&line);
                     state.ingest(&line);
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -954,6 +966,7 @@ fn run_app(
                     input_closed = true;
                     if training.is_none() {
                         extras.eof(&state);
+                        network.stream_eof();
                         state.training_active = false;
                     }
                     break;
@@ -971,20 +984,38 @@ fn run_app(
             last_compare_scan = std::time::Instant::now();
         }
 
-        if Instant::now() >= next_frame || (input_closed && training.is_none()) {
+        if Instant::now() >= next_frame
+            || (input_closed && training.is_none() && !network.deliveries_pending())
+        {
             let now = Instant::now();
             background.advance(now.saturating_duration_since(last_frame));
             last_frame = now;
             chat.poll();
             if let Some(run) = &mut training {
                 let was_active = run.active();
-                run.poll_with(&mut state, |line| extras.ingest(line));
+                run.poll_with(&mut state, |line| {
+                    extras.ingest(line);
+                    network.ingest(line);
+                });
                 if was_active && !run.active() {
                     extras.eof(&state);
+                    network.eof(run.succeeded().unwrap_or(false));
                 }
             }
             hf_login.poll();
-            extras.poll(&mut state, &mut tab, &mut chat);
+            extras.poll_with(&mut state, &mut tab, &mut chat, |line| {
+                network.remote_line(line)
+            });
+            if network.poll(
+                &mut state,
+                tab,
+                &mut training,
+                extras.training_busy(),
+                extras.remote_monitor(),
+            ) {
+                chat.set_model_dir(state.chain_dir.clone());
+                extras.set_chain_dir(state.chain_dir.clone());
+            }
             if extras.take_bell() {
                 use std::io::Write;
                 let _ = io::stdout().write_all(b"\x07");
@@ -1010,6 +1041,7 @@ fn run_app(
                 }
                 local.draw(f, tab);
                 extras.draw(f, &state, tab, &chat);
+                network.draw(f, tab);
                 palette.draw(f);
                 if help.open {
                     help.draw(f);
@@ -1017,7 +1049,7 @@ fn run_app(
             })?;
             next_frame = Instant::now() + FRAME_INTERVAL;
         }
-        if input_closed && training.is_none() {
+        if input_closed && training.is_none() && !network.deliveries_pending() {
             break;
         }
 
@@ -1042,14 +1074,17 @@ fn run_app(
                     } else if palette.open {
                         Context::Palette
                     } else {
-                        extras.context(tab).unwrap_or_else(|| {
-                            let editing = if tab == keybindings::LIMITS_TAB {
-                                state.resource_limits.borrow().editing()
-                            } else {
-                                (tab == 5 && setup.editing()) || local.editing(tab)
-                            };
-                            Context::for_tab(tab, editing)
-                        })
+                        network
+                            .context(tab)
+                            .or_else(|| extras.context(tab))
+                            .unwrap_or_else(|| {
+                                let editing = if tab == keybindings::LIMITS_TAB {
+                                    state.resource_limits.borrow().editing()
+                                } else {
+                                    (tab == 5 && setup.editing()) || local.editing(tab)
+                                };
+                                Context::for_tab(tab, editing)
+                            })
                     };
                     match keybindings::action(key, context) {
                         Some(Action::Quit) => break,
@@ -1074,13 +1109,39 @@ fn run_app(
                             Some(overlay::Action::Tab(next)) => tab = next,
                             Some(overlay::Action::Benchmark) => {
                                 tab = BENCHMARK_TAB;
-                                extras.start_benchmark();
+                                if state.training_active
+                                    || extras.training_busy()
+                                    || training.as_ref().is_some_and(|run| run.active())
+                                {
+                                    network.blocked("A training run is active; wait before starting a benchmark.");
+                                } else {
+                                    extras.start_benchmark();
+                                }
                             }
                             Some(overlay::Action::Quit) => break,
                             None => {}
                         },
                         Some(Action::Hf) => hf_login.key(key),
-                        Some(Action::Extras) => extras.key(key, tab, &state),
+                        Some(Action::Extras) => {
+                            if training.as_ref().is_some_and(|run| run.active())
+                                && ((tab == BENCHMARK_TAB
+                                    && extras.context(tab) == Some(Context::Benchmark)
+                                    && key.code == crossterm::event::KeyCode::Char('b'))
+                                    || (tab == KAGGLE_TAB
+                                        && matches!(
+                                            key.code,
+                                            crossterm::event::KeyCode::Enter
+                                                | crossterm::event::KeyCode::Char('y' | 'Y')
+                                        )))
+                            {
+                                network.blocked(
+                                    "A trainer is still running; wait for its process to exit.",
+                                );
+                            } else {
+                                extras.key(key, tab, &state);
+                            }
+                        }
+                        Some(Action::Network) => network.key(key, &mut tab, &mut setup, &mut chat),
                         Some(Action::ScrollHelp(lines)) => {
                             help.scroll = help.scroll.saturating_add_signed(lines);
                         }
@@ -1121,11 +1182,12 @@ fn run_app(
                             if setup.key(key)
                                 && let Some(run) = setup.launch(
                                     state.training_active
-                                        || extras.remote_busy()
+                                        || extras.training_busy()
                                         || training.as_ref().is_some_and(|run| run.active()),
                                 )
                             {
                                 run.initialize(&mut state);
+                                network.started();
                                 chat.set_model_dir(state.chain_dir.clone());
                                 extras.set_chain_dir(state.chain_dir.clone());
                                 training = Some(run);
@@ -1833,9 +1895,9 @@ fn draw_with_background(
     }
     // Derive the width from the actual labels, padding and separators so adding
     // a tab cannot silently clip its name or steal space from the controls hint.
-    let full_width = TABS.iter().map(|tab| tab.len() + 2).sum::<usize>() + (TABS.len() - 1) * 3;
-    // Keep the original shell, extras, run controls, and local library tools in
-    // complete pages at 80+ columns. Below 80, retain the active-tab fallback.
+    // The complete strip uses compact separators when it fits; otherwise
+    // complete feature groups keep every tab discoverable at 80+ columns.
+    let full_width = TABS.iter().map(|tab| tab.len()).sum::<usize>() + TABS.len() - 1;
     let (first_tab, end_tab) = if usize::from(area.width) < full_width + 9 && f.area().width >= 80 {
         if tab < HF_TAB {
             (0, HF_TAB)
@@ -1843,15 +1905,24 @@ fn draw_with_background(
             (HF_TAB, keybindings::SAMPLE_TAB)
         } else if tab < keybindings::LIBRARY_TAB {
             (keybindings::SAMPLE_TAB, keybindings::LIBRARY_TAB)
+        } else if tab < keybindings::BACKUP_TAB {
+            (keybindings::LIBRARY_TAB, keybindings::BACKUP_TAB)
+        } else if tab < keybindings::SUPPORT_TAB {
+            (keybindings::BACKUP_TAB, keybindings::SUPPORT_TAB)
         } else {
-            (keybindings::LIBRARY_TAB, TABS.len())
+            (keybindings::SUPPORT_TAB, TABS.len())
         }
     } else {
         (0, TABS.len())
     };
     let visible_tabs = &TABS[first_tab..end_tab];
-    let tabs_width = (visible_tabs.iter().map(|tab| tab.len() + 2).sum::<usize>()
-        + (visible_tabs.len() - 1) * 3) as u16;
+    let compact_tabs = first_tab == 0 && end_tab == TABS.len();
+    let tabs_width = if compact_tabs {
+        visible_tabs.iter().map(|tab| tab.len()).sum::<usize>() + visible_tabs.len() - 1
+    } else {
+        visible_tabs.iter().map(|tab| tab.len() + 2).sum::<usize>()
+            + (visible_tabs.len() - 1) * 3
+    } as u16;
     let nav = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(tabs_width), Constraint::Min(0)])
@@ -1875,8 +1946,8 @@ fn draw_with_background(
                         .add_modifier(Modifier::BOLD | Modifier::REVERSED)
                         .remove_modifier(Modifier::DIM),
                 )
-                .divider(" / ")
-                .padding(" ", " "),
+                .divider(if compact_tabs { "·" } else { " / " })
+                .padding(if compact_tabs { "" } else { " " }, if compact_tabs { "" } else { " " }),
             nav[0],
         );
     }
@@ -3118,6 +3189,14 @@ mod tests {
                 "library",
                 "mixer",
                 "eval",
+                "HF backup",
+                "cloud log",
+                "phone ping",
+                "updates",
+                "support",
+                "GitHub",
+                "sweeps",
+                "timeline",
             ]
         );
         let unique: std::collections::HashSet<_> = TABS.iter().collect();
@@ -3180,8 +3259,12 @@ mod tests {
                         &TABS[HF_TAB..keybindings::SAMPLE_TAB]
                     } else if tab < keybindings::LIBRARY_TAB {
                         &TABS[keybindings::SAMPLE_TAB..keybindings::LIBRARY_TAB]
+                    } else if tab < keybindings::BACKUP_TAB {
+                        &TABS[keybindings::LIBRARY_TAB..keybindings::BACKUP_TAB]
+                    } else if tab < keybindings::SUPPORT_TAB {
+                        &TABS[keybindings::BACKUP_TAB..keybindings::SUPPORT_TAB]
                     } else {
-                        &TABS[keybindings::LIBRARY_TAB..]
+                        &TABS[keybindings::SUPPORT_TAB..]
                     };
                     for label in page {
                         assert_eq!(nav.matches(label).count(), 1, "tab {tab} at {width}: {nav}");
@@ -3895,6 +3978,17 @@ mod tests {
                             "math / read-only",
                             "runtime compute",
                             "resource limits",
+                            "library",
+                            "mixer",
+                            "eval",
+                            "HF backup",
+                            "cloud log",
+                            "phone ping",
+                            "updates",
+                            "support",
+                            "GitHub",
+                            "sweeps",
+                            "timeline",
                         ];
                         // These six bodies belong to the shell. Local screens
                         // render afterward and have their own TestBackend tests.

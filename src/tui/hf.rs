@@ -94,6 +94,30 @@ fn existing() -> Result<Option<Token>, String> {
         Err(_) => Ok(None), // public datasets also work without a home directory
     }
 }
+/// Opaque Phase-10 credential for Hub uploads. Resolve only on a worker; the
+/// token never enters upload configuration, UI state, URLs, or diagnostics.
+pub(super) struct HubCredential(Token);
+pub(super) fn hub_credential() -> Result<Option<HubCredential>, String> {
+    existing().map(|token| token.map(HubCredential))
+}
+impl HubCredential {
+    pub(super) fn request(&self, method: &str, endpoint: &str) -> Result<ureq::Request, String> {
+        if SIGNED_OUT.load(Ordering::Relaxed) {
+            return Err("Backup skipped: logged out of Hugging Face".into());
+        }
+        if !endpoint.starts_with("https://huggingface.co/") {
+            return Err("Refusing HF authentication to an untrusted origin".into());
+        }
+        Ok(ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout(Duration::from_secs(120))
+            .timeout_connect(Duration::from_secs(10))
+            .build()
+            .request(method, endpoint)
+            .set("Authorization", &format!("Bearer {}", self.0.0)))
+    }
+}
+
 fn store(path: &Path, token: &Token) -> Result<(), String> {
     let parent = path
         .parent()
@@ -346,6 +370,30 @@ impl Login {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn upload_credentials_are_opaque_and_origin_restricted() {
+        let credential = HubCredential(Token::parse("hf_upload_fixture".into()).unwrap());
+        let request = credential
+            .request(
+                "POST",
+                "https://huggingface.co/api/models/owner/repo/commit/main",
+            )
+            .unwrap();
+        assert_eq!(
+            request.header("Authorization"),
+            Some("Bearer hf_upload_fixture")
+        );
+        for origin in [
+            "https://huggingface.co.evil.test/upload",
+            "https://huggingface.co@evil.test/upload",
+            "http://huggingface.co/upload",
+            "https://storage.example/upload",
+        ] {
+            let error = credential.request("PUT", origin).err().unwrap();
+            assert!(!error.contains("hf_upload_fixture"));
+            assert!(error.contains("untrusted"));
+        }
+    }
     #[test]
     fn wizard_children_inherit_login_policy_without_token_arguments() {
         use std::ffi::OsStr;

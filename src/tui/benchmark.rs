@@ -79,6 +79,9 @@ impl Benchmark {
     pub fn editing(&self) -> bool {
         self.editing
     }
+    pub(super) fn busy(&self) -> bool {
+        self.job.is_some()
+    }
     pub fn start(&mut self) {
         self.start_with(Job::start);
     }

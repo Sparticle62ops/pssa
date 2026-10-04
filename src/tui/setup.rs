@@ -1,10 +1,13 @@
 //! Training wizard. The trainer writes to a log file, never a UI-owned pipe:
 //! slow redraws (or quitting the dashboard) cannot hold up the child process.
+use super::device::DevicePicker;
 use super::{
     AMBER, BRIGHT_RED, NORMAL_GREEN, RunState, accent, depth_zoom::DepthZoom, panel, ring,
 };
-use crate::{cli::{TrainingBackend, resource_limits::ResourceLimits}, dataset::DatasetManager};
-use super::device::DevicePicker;
+use crate::{
+    cli::{TrainingBackend, resource_limits::ResourceLimits},
+    dataset::DatasetManager,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
@@ -213,15 +216,98 @@ impl Setup {
 
     pub(super) fn limits(&self) -> Result<ResourceLimits, String> {
         ResourceLimits::from_inputs([
-            self.value(Threads), self.value(Ram), self.value(Batch), self.value(MaxTokens),
+            self.value(Threads),
+            self.value(Ram),
+            self.value(Batch),
+            self.value(MaxTokens),
         ])
     }
 
     pub(super) fn set_limits(&mut self, limits: ResourceLimits) {
-        for (field, value) in [(Threads, limits.threads), (Ram, limits.ram_mib),
-            (Batch, limits.batch_size), (MaxTokens, limits.max_tokens)] {
+        for (field, value) in [
+            (Threads, limits.threads),
+            (Ram, limits.ram_mib),
+            (Batch, limits.batch_size),
+            (MaxTokens, limits.max_tokens),
+        ] {
             self.values[field as usize] = value.map(|n| n.to_string()).unwrap_or_default();
         }
+    }
+
+    /// Snapshot the wizard's grid defaults and output root without changing it.
+    pub(super) fn sweep_base(&self) -> ([String; 3], PathBuf) {
+        (
+            [
+                self.value(Lr).into(),
+                self.value(Latent).into(),
+                if self.value(Batch).is_empty() {
+                    "1".into()
+                } else {
+                    self.value(Batch).into()
+                },
+            ],
+            PathBuf::from(safe_path(self.value(Output))),
+        )
+    }
+
+    /// Use exactly the wizard validation/CLI path; queued specs freeze the base.
+    pub(super) fn sweep_spec(
+        &self,
+        lr: &str,
+        latent: &str,
+        batch: &str,
+        output: &Path,
+    ) -> Result<RunSpec, String> {
+        if !self.value(Resume).is_empty() {
+            return Err(
+                "Clear Resume in setup before sweeping: checkpoint dimensions override the grid."
+                    .into(),
+            );
+        }
+        if self.value(Output).trim().is_empty() {
+            return Err("Choose a base output directory in setup.".into());
+        }
+        let mut base = Self {
+            values: self.values.clone(),
+            ..Self::default()
+        };
+        for (field, value) in [
+            (Lr, lr),
+            (Latent, latent),
+            (Batch, batch),
+            (Output, output.to_str().ok_or("Output path must be UTF-8")?),
+        ] {
+            base.values[field as usize] = value.into();
+        }
+        base.validate()
+    }
+
+    /// Prepare review only. Never read weights, infer shapes, or launch a child.
+    pub(super) fn prepare_resume(&mut self, path: PathBuf) -> Result<(), String> {
+        let value = path.to_str().ok_or("Checkpoint path must be UTF-8")?;
+        if value.chars().any(char::is_control) || !path.is_file() {
+            return Err(
+                "Resume checkpoint must be an existing file without control characters".into(),
+            );
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        self.values[Resume as usize] = value.into();
+        self.values[Output as usize] = path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(format!("resume-{stamp}-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        self.page = 3;
+        self.selected = 1;
+        self.edit = None;
+        self.command_only = false;
+        self.error = false;
+        self.message = "Resume prepared, NOT started. Match checkpoint shape/chunk in setup; review dataset, output and limits before START.".into();
+        Ok(())
     }
 
     fn cycle_choice(&mut self, field: Field) {
@@ -491,8 +577,12 @@ impl Setup {
             if transformer && matches!(field, Latent | State | Depth | Loops | Backend) { continue; }
             push(flag, self.value(field).into());
         }
-        for (field, flag) in [(MaxTokens, "--max-tokens"), (Batch, "--batch-size"),
-            (Threads, "--threads"), (Ram, "--ram-mib")] {
+        for (field, flag) in [
+            (MaxTokens, "--max-tokens"),
+            (Batch, "--batch-size"),
+            (Threads, "--threads"),
+            (Ram, "--ram-mib"),
+        ] {
             if !self.value(field).is_empty() {
                 push(flag, self.value(field).into());
             }
@@ -764,13 +854,29 @@ fn quote(value: &str) -> String {
     }
 }
 
-struct RunSpec {
+pub(super) struct RunSpec {
     args: Vec<String>,
     output: PathBuf,
     loops: usize,
 }
 
 impl RunSpec {
+    pub(super) fn launch(self, busy: bool) -> Result<TrainingRun, String> {
+        if busy {
+            return Err("A local or remote training run is active".into());
+        }
+        for name in ["model.pssa", "train.log"] {
+            if self.output.join(name).symlink_metadata().is_ok() {
+                return Err(format!(
+                    "{} already exists; refusing to overwrite",
+                    self.output.join(name).display()
+                ));
+            }
+        }
+        let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+        self.start(&executable)
+    }
+
     fn start(self, executable: &Path) -> Result<TrainingRun, String> {
         fs::create_dir_all(&self.output)
             .map_err(|e| format!("Cannot create output directory: {e}"))?;
@@ -829,6 +935,17 @@ pub(super) struct TrainingRun {
 }
 
 impl TrainingRun {
+    pub(super) fn output_dir(&self) -> &Path {
+        &self.output
+    }
+
+    /// None until exit AND durable-log draining have both completed.
+    pub(super) fn succeeded(&self) -> Option<bool> {
+        self.status
+            .filter(|_| self.reported)
+            .map(|status| status.success())
+    }
+
     pub(super) fn initialize(&self, state: &mut RunState) {
         let comparison_series = std::mem::take(&mut state.comparison_series);
         let comparison_label = state.comparison_label.take();
@@ -1006,7 +1123,9 @@ mod tests {
         let mut header = b"TRFM".to_vec();
         header.extend(1u16.to_le_bytes());
         header.resize(22, 0);
-        for n in [2048u64, 32, 4, 64, 8] { header.extend(n.to_le_bytes()); }
+        for n in [2048u64, 32, 4, 64, 8] {
+            header.extend(n.to_le_bytes());
+        }
         fs::write(&resume, header).unwrap();
         setup.set_resume(resume.clone());
         assert_eq!(setup.value(Resume), resume.to_str().unwrap());
@@ -1019,6 +1138,50 @@ mod tests {
             assert!(!args.iter().any(|s| s == flag));
         }
         assert!(setup.command().contains("model.trfm"));
+    }
+
+    #[test]
+    fn sweep_specs_use_wizard_validation_and_preserve_argument_boundaries() {
+        let fixture = Fixture::new();
+        let mut setup = fixture.setup();
+        let original = setup.args();
+        let output = fixture.0.join("sweep output/trial-001");
+        let spec = setup.sweep_spec("0.002", "64", "2", &output).unwrap();
+        for (flag, value) in [("--lr", "0.002"), ("--latent", "64"), ("--batch-size", "2")] {
+            let index = spec.args.iter().position(|arg| arg == flag).unwrap();
+            assert_eq!(spec.args[index + 1], value);
+        }
+        let index = spec.args.iter().position(|arg| arg == "--out").unwrap();
+        assert_eq!(Path::new(&spec.args[index + 1]), output.join("model.pssa"));
+        assert_eq!(setup.args(), original, "the base wizard is not mutated");
+        assert!(spec.launch(true).is_err());
+        assert!(!output.exists(), "busy launch does not create output or spawn");
+        let spec = setup.sweep_spec("0.002", "64", "2", &output).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        fs::write(output.join("train.log"), "keep this log").unwrap();
+        assert!(spec.launch(false).is_err(), "recheck reservations at launch time");
+        assert_eq!(fs::read_to_string(output.join("train.log")).unwrap(), "keep this log");
+        setup.values[Resume as usize] = "checkpoint.pssa".into();
+        assert!(setup.sweep_spec("0.002", "64", "2", &output).is_err());
+    }
+
+    #[test]
+    fn timeline_resume_prepares_review_without_loading_or_starting_checkpoint() {
+        let fixture = Fixture::new();
+        let mut setup = fixture.setup();
+        let path = fixture.0.join("checkpoint with spaces.pssa");
+        fs::write(&path, "not checkpoint bytes; never load in timeline/setup").unwrap();
+        setup.prepare_resume(path.clone()).unwrap();
+        assert_eq!(setup.value(Resume), path.to_str().unwrap());
+        assert_eq!(setup.page, 3);
+        assert_eq!(setup.selected, 1);
+        assert!(!Path::new(setup.value(Output)).exists());
+        assert!(setup.message.contains("NOT started"));
+        assert!(setup.validate().is_ok());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not checkpoint bytes; never load in timeline/setup");
+        let index = setup.args().iter().position(|arg| arg == "--resume").unwrap();
+        assert_eq!(setup.args()[index + 1], path.to_str().unwrap());
+        assert!(setup.prepare_resume(fixture.0.join("missing.pssa")).is_err());
     }
 
     #[test]
@@ -1104,18 +1267,27 @@ mod tests {
         let fixture = Fixture::new();
         let mut setup = fixture.setup();
         for flag in ["--threads", "--ram-mib", "--batch-size", "--max-tokens"] {
-            assert!(!setup.args().iter().any(|arg| arg == flag), "default added {flag}");
+            assert!(
+                !setup.args().iter().any(|arg| arg == flag),
+                "default added {flag}"
+            );
         }
         setup.set_backend(TrainingBackend::Cpu);
         let limits = ResourceLimits {
-            threads: Some(2), ram_mib: cfg!(target_os = "linux").then_some(2048),
-            batch_size: Some(3), max_tokens: Some(77),
+            threads: Some(2),
+            ram_mib: cfg!(target_os = "linux").then_some(2048),
+            batch_size: Some(3),
+            max_tokens: Some(77),
         };
         setup.set_limits(limits);
         assert_eq!(setup.limits().unwrap(), limits);
         let spec = setup.validate().unwrap();
-        for (flag, expected) in [("--threads", "2"), ("--batch-size", "3"),
-            ("--max-tokens", "77"), ("--backend", "cpu")] {
+        for (flag, expected) in [
+            ("--threads", "2"),
+            ("--batch-size", "3"),
+            ("--max-tokens", "77"),
+            ("--backend", "cpu"),
+        ] {
             let index = spec.args.iter().position(|arg| arg == flag).unwrap();
             assert_eq!(spec.args[index + 1], expected);
             assert_eq!(spec.args.iter().filter(|arg| *arg == flag).count(), 1);
@@ -1367,6 +1539,7 @@ mod tests {
         let mut state = RunState::default();
         run.initialize(&mut state);
         assert!(run.active());
+        assert_eq!(run.succeeded(), None);
         assert_eq!(state.loop_count, 3);
         // Wait WITHOUT draining any output: the trainer must not need the UI.
         #[cfg(target_os = "linux")]
@@ -1392,6 +1565,11 @@ mod tests {
             run.active(),
             "completion must wait for the entire durable log to drain"
         );
+        assert_eq!(
+            run.succeeded(),
+            None,
+            "sweeps must still wait after child exit"
+        );
         assert!(run.pending.len() <= 65_536, "bound unterminated lines");
         let deadline = Instant::now() + Duration::from_secs(5);
         while run.active() && Instant::now() < deadline {
@@ -1410,6 +1588,7 @@ mod tests {
         );
         assert!(!run.active());
         assert!(!state.training_active);
+        assert_eq!(run.succeeded(), Some(true));
         assert_eq!(state.live_loss, Some(4.0));
         assert!(
             state
