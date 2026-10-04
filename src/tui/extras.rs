@@ -44,6 +44,9 @@ impl Extras {
     pub fn remote_busy(&self) -> bool {
         self.kaggle.is_busy()
     }
+    pub(super) fn training_busy(&self) -> bool {
+        self.remote_busy() || self.benchmark.busy()
+    }
     pub fn ingest(&mut self, line: &str) {
         if line.contains("progress_schema=") {
             self.inspector = Inspector::default();
@@ -83,7 +86,17 @@ impl Extras {
         }
         self.alerts.notify(ok, message);
     }
+    #[cfg(test)]
     pub fn poll(&mut self, state: &mut RunState, tab: &mut usize, chat: &mut Chat) {
+        self.poll_with(state, tab, chat, |_| {});
+    }
+    pub(super) fn poll_with(
+        &mut self,
+        state: &mut RunState,
+        tab: &mut usize,
+        chat: &mut Chat,
+        mut remote_line: impl FnMut(&str),
+    ) {
         let remote = self.kaggle.poll();
         let mut finished = Vec::new();
         while let Some(event) = self.kaggle.take_event() {
@@ -94,6 +107,7 @@ impl Extras {
             }
         }
         for line in remote {
+            remote_line(&line);
             self.ingest(&line);
             state.ingest(&line);
         }
@@ -155,8 +169,7 @@ impl Extras {
     pub fn key(&mut self, key: KeyEvent, tab: usize, state: &RunState) {
         match tab {
             KAGGLE_TAB => {
-                if state.training_active
-                    && !self.remote_monitor
+                if (state.training_active && !self.remote_monitor || self.benchmark.busy())
                     && matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'Y'))
                 {
                     self.alerts.notify(
@@ -175,6 +188,16 @@ impl Extras {
                 }
             },
             RUNS_TAB => self.runs.key(key),
+            BENCHMARK_TAB
+                if (state.training_active || self.remote_busy())
+                    && !self.benchmark.editing()
+                    && key.code == KeyCode::Char('b') =>
+            {
+                self.alerts.notify(
+                    false,
+                    "A training run is active; wait before starting a benchmark.",
+                );
+            }
             BENCHMARK_TAB => self.benchmark.key(key),
             _ => {}
         }
