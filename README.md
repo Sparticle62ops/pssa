@@ -429,6 +429,7 @@ Commands:
 | `download <repo>` | Pull a Hugging Face dataset to a local file. |
 | `clean-wikitext INPUT -o OUTPUT` | Stream-clean a raw WikiText file into a new UTF-8 corpus. |
 | `benchmark` | End-to-end smoke test or feature benchmark. |
+| `compare` | Replay an existing PSSA chain with a token/update-matched transformer and score both on held-out tokens. |
 | `tui` | Open the dashboard and local checkpoint chat, or view piped training output. |
 | `gpu-probe` | Check whether a WebGPU compute device is usable. |
 | `help` | Print command and option help, including examples. |
@@ -442,6 +443,15 @@ rate, memory occupancy, and checkpoint events. To view a piped log interactively
 oxide_ai_pssa train data/downloaded.txt -o chain/ck01.pssa --max-tokens 200000 -e 1 --no-tui \\
   | oxide_ai_pssa tui --chain chain
 ```
+
+### Project dashboard extras (TUI)
+
+`Ctrl+K` opens the command palette; `?` (or `F1` while typing) opens key help.
+Tab to Kaggle launch/log monitoring, the read-only plastic memory inspector,
+past runs and scoring, or the one-key matched benchmark. In inference, `/ab a PATH`
+and `/ab b PATH` compare PSSA/transformer replies side by side. See
+[the extras guide](docs/TUI-EXTRAS.md) for setup, telemetry limits, alerts, and the
+[VHS GIF recording tape](docs/tui-demo.tape).
 
 ### Local inference chat (TUI)
 

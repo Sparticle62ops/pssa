@@ -123,8 +123,10 @@ For example, the PSSA commands corresponding to the current Kaggle defaults are:
 ```
 
 Continue with `skip=(link-1)*200000`. `compare` produces the transformer's CSV
-automatically. To train it manually with identical lane grouping, the existing
-`train-transformer` command now accepts `--batch-size` too (default remains 1).
+automatically. The `compare` replay adapter executes larger PSSA lane plans
+serially before each shared transformer update. The standalone `train-transformer`
+command remains batch-size 1; its existing training behavior is unchanged. Use
+`compare`, not a batch-one manual run, to replay a multi-lane chain.
 
 ```csv
 tokens_seen,updates,loss,tokens_per_second

@@ -7,7 +7,8 @@ use crate::dataset::DatasetManager;
 use crate::evaluation::{self, EvaluationSlice};
 use crate::training::{Schedule, sequence_plan};
 use crate::transformer::{TransformerConfig, TransformerModel};
-use crate::{transformer_checkpoint, transformer_training};
+use crate::transformer_checkpoint;
+use crate::tui::benchmark_replay::{documents_from_encoded, train_documents};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -148,7 +149,7 @@ pub fn run(data: &str, opts: &ComparisonOptions) -> Result<(), String> {
         {
             return Err(format!("chain link {} changes tokenizer or shape; provide one consistent chain", index + 1));
         }
-        let docs = crate::training::documents_from_encoded(&encoded, Some(w.size), w.skip)?;
+        let docs = documents_from_encoded(&encoded, Some(w.size), w.skip)?;
         let plan = sequence_plan(&docs, first.cfg.chunk_len, w.batch)?;
         let targets = docs.iter().map(|d| d.len() - 1).sum::<usize>();
         let options = TrainingOptions {
@@ -209,9 +210,9 @@ pub fn run(data: &str, opts: &ComparisonOptions) -> Result<(), String> {
     for (i, mut link) in links.into_iter().enumerate() {
         link.options.loss_csv = Some(path_string(&curve)?.to_owned());
         link.options.tokens_seen = Some(cumulative_targets);
-        let docs = crate::training::documents_from_encoded(&encoded, link.options.max_tokens, link.options.skip_tokens)?;
+        let docs = documents_from_encoded(&encoded, link.options.max_tokens, link.options.skip_tokens)?;
         println!("comparison_train link={}", i + 1);
-        transformer_training::train_documents(&mut baseline, &docs, &link.options)?;
+        train_documents(&mut baseline, &docs, &link.options)?;
         if baseline.step_counter != link.end_steps { return Err("internal comparison update mismatch".into()); }
         // Preserve the source's legacy metadata absence too: an old checkpoint
         // without warmup must not accidentally gain a reinterpreted schedule.

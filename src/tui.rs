@@ -4,6 +4,16 @@
 
 mod background;
 mod chat;
+mod ab;
+mod alerts;
+mod benchmark;
+pub(crate) mod benchmark_replay;
+mod extras;
+mod inspector;
+mod kaggle;
+mod overlay;
+mod process;
+mod runs;
 pub(crate) mod hf;
 mod session;
 #[cfg(feature = "speech")]
@@ -24,7 +34,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-const TABS: [&str; 6] = ["monitor", "chain", "model", "feed", "inference", "HF login"];
+const TABS: [&str; 10] = ["monitor", "chain", "model", "feed", "inference", "HF login", "Kaggle", "memory", "runs", "benchmark"];
 const PSSA_LOGO: [&str; 3] = [
     "███  ████  ████   ███",
     "█ █  █     █      █ █",
@@ -891,6 +901,7 @@ fn run_app(
 ) -> io::Result<()> {
     let mut chat = chat::Chat::new(chats_dir, chain_dir.clone());
     let mut hf_login = hf::Login::new();
+    let mut extras = extras::Extras::new(chain_dir.clone());
     let (_session, mut terminal) = session::Session::start()?;
     let mut background = HexBackground::default();
     let mut last_frame = Instant::now();
@@ -909,10 +920,11 @@ fn run_app(
         // frame visible once, then let the wrapper restore the terminal.
         loop {
             match rx.try_recv() {
-                Ok(line) => state.ingest(&line),
+                Ok(line) => { extras.ingest(&line); state.ingest(&line); },
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     input_closed = true;
+                    extras.eof(&state);
                     state.training_active = false;
                     break;
                 }
@@ -935,9 +947,16 @@ fn run_app(
             last_frame = now;
             chat.poll();
             hf_login.poll();
+            extras.poll(&mut state, &mut tab, &mut chat);
+            if extras.take_bell() {
+                use std::io::Write;
+                let _ = io::stdout().write_all(b"\x07");
+                let _ = io::stdout().flush();
+            }
             terminal.draw(|f| {
                 draw_with_background(f, &state, tab, &background, Some(&mut chat));
                 if tab == 5 { hf_login.draw(f, feature_area(f.area())); }
+                extras.draw(f, &state, tab);
             })?;
             next_frame = Instant::now() + FRAME_INTERVAL;
         }
@@ -966,6 +985,9 @@ fn run_app(
                     {
                         break;
                     }
+                    let (handled, quit) = extras.key(key, &mut tab);
+                    if quit { break; }
+                    if handled { continue; }
                     if tab == 5 && key.code != crossterm::event::KeyCode::Tab {
                         hf_login.key(key);
                         continue;
@@ -1604,7 +1626,7 @@ fn draw_with_background(
                 chat::Chat::new(PathBuf::from("chats"), state.chain_dir.clone()).draw(f, chunks[3]);
             }
         }
-        5 => {}, // rendered by the independent HF login module
+        5..=9 => {}, // rendered by independent feature modules
         _ => draw_feed(f, chunks[3], state),
     }
 }
@@ -3082,6 +3104,10 @@ mod tests {
                             "feed / idle",
                             "conversation",
                             "HF login",
+                            "Kaggle",
+                            "memory",
+                            "runs",
+                            "benchmark",
                         ];
                         assert!(text.contains(expected[tab]));
                     } else {
