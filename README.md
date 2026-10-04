@@ -429,6 +429,7 @@ Commands:
 | `download <repo>` | Pull a Hugging Face dataset to a local file. |
 | `clean-wikitext INPUT -o OUTPUT` | Stream-clean a raw WikiText file into a new UTF-8 corpus. |
 | `benchmark` | End-to-end smoke test or feature benchmark. |
+| `compare` | Replay an existing PSSA chain with a token/update-matched transformer and score both on held-out tokens. |
 | `tui` | Open the dashboard and local checkpoint chat, or view piped training output. |
 | `gpu-probe` | Check whether a WebGPU compute device is usable. |
 | `help` | Print command and option help, including examples. |
@@ -442,6 +443,15 @@ rate, memory occupancy, and checkpoint events. To view a piped log interactively
 oxide_ai_pssa train data/downloaded.txt -o chain/ck01.pssa --max-tokens 200000 -e 1 --no-tui \\
   | oxide_ai_pssa tui --chain chain
 ```
+
+### Project dashboard extras (TUI)
+
+`Ctrl+K` opens the command palette; `?` (or `F1` while typing) opens key help.
+Tab to Kaggle launch/log monitoring, the read-only plastic memory inspector,
+past runs and scoring, or the one-key matched benchmark. In inference, `/ab a PATH`
+and `/ab b PATH` compare PSSA/transformer replies side by side. See
+[the extras guide](docs/TUI-EXTRAS.md) for setup, telemetry limits, alerts, and the
+[VHS GIF recording tape](docs/tui-demo.tape).
 
 ### Local inference chat (TUI)
 
@@ -477,9 +487,12 @@ press **Tab** to reach **inference**. Existing `chat`/`generate` CLI commands an
   `?` are text and Esc stops, not quits; **Ctrl+C** quits, or Tab to another tab
   and use the existing `q` key. Outside text input, **?** also opens help.
 
-The tab order is **monitor, chain, model, feed, inference, setup**. The
+The tab order is **monitor, chain, model, feed, inference, setup, HF login,
+Kaggle, memory, runs, benchmark**. The
 [training setup wizard](docs/training-setup.md) launches a separate trainer
 and returns to the monitor; **Tab** switches tabs even while editing a field.
+**Ctrl+K** opens the command palette. All tabs share one **F1 / ?** keyboard
+reference; narrow terminals show the selected tab instead of clipping the tab bar.
 
 Optional local speech capture (Linux/ALSA) is built with `cargo build --release
 --features speech`. Install an existing local **whisper.cpp** `whisper-cli` (or
@@ -606,7 +619,20 @@ Set `OXIDE_PSSA_HF_CACHE` to a writable cache directory (for example
 cache lives under `$XDG_CACHE_HOME/oxide-ai-pssa/huggingface` or
 `~/.cache/oxide-ai-pssa/huggingface`. Cached data can be reused offline; delete its
 cache file to refresh it. Choose a configuration explicitly when discovery reports
-multiple choices. Gated/private dataset login is not part of this phase.
+multiple choices.
+
+For private/gated datasets, open **HF login** with Tab in `oxide_ai_pssa tui`.
+Enter a read token (masked) and press **Enter**: the app verifies the account with
+HF's `whoami-v2` API and atomically saves `~/.cache/huggingface/token` with mode
+`0600`. Existing `HF_TOKEN` credentials take precedence over that file on startup;
+plain CLI downloads use the same credentials as a Bearer header. No token is
+shown in logs or errors. **Esc** clears entry; **Ctrl+L** logs out and removes the
+saved file. Explicit login/logout also applies to subsequently wizard-launched
+trainers, without passing tokens in command arguments. Already-running trainers
+keep their credentials. Also unset `HF_TOKEN` in your parent shell to sign out
+future independently launched CLI runs. Login does not grant gated access:
+request/accept access on the dataset's Hugging Face page and wait for approval.
+Logout does not remove already downloaded dataset caches.
 
 HF runs add percent-encoded `feed_*` fields to the existing throttled progress
 lines (at most every five seconds when piped, plus first/final updates). These

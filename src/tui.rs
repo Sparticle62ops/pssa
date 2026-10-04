@@ -2,11 +2,22 @@
 //! read-only; inference conversations are saved separately in the chats directory.
 //! Piped non-TTY output remains plain logging.
 
+mod ab;
+mod alerts;
 mod background;
+mod benchmark;
+pub(crate) mod benchmark_replay;
 mod chat;
 mod depth_zoom;
+mod extras;
+pub(crate) mod hf;
+mod inspector;
+mod kaggle;
 mod keybindings;
+mod overlay;
+mod process;
 mod ring;
+mod runs;
 mod session;
 mod setup;
 #[cfg(feature = "speech")]
@@ -27,7 +38,24 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-const TABS: [&str; 6] = ["monitor", "chain", "model", "feed", "inference", "setup"];
+const TABS: [&str; 11] = [
+    "monitor",
+    "chain",
+    "model",
+    "feed",
+    "inference",
+    "setup",
+    "HF login",
+    "Kaggle",
+    "memory",
+    "runs",
+    "benchmark",
+];
+const HF_TAB: usize = 6;
+const KAGGLE_TAB: usize = 7;
+const MEMORY_TAB: usize = 8;
+const RUNS_TAB: usize = 9;
+const BENCHMARK_TAB: usize = 10;
 // Five scanlines leave room for the P's stem, both S turns and the A's crossbar.
 const PSSA_LOGO: [&str; 5] = [
     "███    ███   ███   ██ ",
@@ -893,7 +921,10 @@ fn run_app(
     let mut chat = chat::Chat::new(chats_dir, chain_dir.clone());
     let mut setup = setup::Setup::default();
     let mut help = keybindings::Help::default();
+    let mut palette = overlay::Overlay::default();
     let mut training: Option<setup::TrainingRun> = None;
+    let mut hf_login = hf::Login::new();
+    let mut extras = extras::Extras::new(chain_dir.clone());
     let (_session, mut terminal) = session::Session::start()?;
     let mut background = HexBackground::default();
     let mut last_frame = Instant::now();
@@ -912,18 +943,22 @@ fn run_app(
         // frame visible once, then let the wrapper restore the terminal.
         while !input_closed {
             match rx.try_recv() {
-                Ok(line) => state.ingest(&line),
+                Ok(line) => {
+                    extras.ingest(&line);
+                    state.ingest(&line);
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     input_closed = true;
                     if training.is_none() {
+                        extras.eof(&state);
                         state.training_active = false;
                     }
                     break;
                 }
             }
         }
-        if last_chain_scan.elapsed() > Duration::from_secs(5) {
+        if !extras.remote_monitor() && last_chain_scan.elapsed() > Duration::from_secs(5) {
             state.refresh_chain();
             last_chain_scan = std::time::Instant::now();
         }
@@ -940,10 +975,33 @@ fn run_app(
             last_frame = now;
             chat.poll();
             if let Some(run) = &mut training {
-                run.poll(&mut state);
+                let was_active = run.active();
+                run.poll_with(&mut state, |line| extras.ingest(line));
+                if was_active && !run.active() {
+                    extras.eof(&state);
+                }
+            }
+            hf_login.poll();
+            extras.poll(&mut state, &mut tab, &mut chat);
+            if extras.take_bell() {
+                use std::io::Write;
+                let _ = io::stdout().write_all(b"\x07");
+                let _ = io::stdout().flush();
             }
             terminal.draw(|f| {
-                draw_with_background(f, &state, tab, &background, Some(&mut chat), Some(&mut setup));
+                draw_with_background(
+                    f,
+                    &state,
+                    tab,
+                    &background,
+                    Some(&mut chat),
+                    Some(&mut setup),
+                );
+                if tab == HF_TAB {
+                    hf_login.draw(f, feature_area(f.area()));
+                }
+                extras.draw(f, &state, tab);
+                palette.draw(f);
                 if help.open {
                     help.draw(f);
                 }
@@ -971,12 +1029,17 @@ fn run_app(
                     use keybindings::{Action, Context};
                     let context = if help.open {
                         Context::Help
+                    } else if palette.open {
+                        Context::Palette
                     } else {
-                        Context::for_tab(tab, setup.editing())
+                        extras
+                            .context(tab)
+                            .unwrap_or_else(|| Context::for_tab(tab, setup.editing()))
                     };
                     match keybindings::action(key, context) {
                         Some(Action::Quit) => break,
                         Some(Action::NextTab) => {
+                            palette.open = false;
                             tab = (tab + 1) % TABS.len();
                             help.open = false;
                         }
@@ -984,9 +1047,25 @@ fn run_app(
                             tab = (tab + TABS.len() - 1) % TABS.len();
                         }
                         Some(Action::ToggleHelp) => {
+                            palette.open = false;
                             help.open = !help.open;
                             help.scroll = 0;
                         }
+                        Some(Action::TogglePalette) => {
+                            help.open = false;
+                            palette.toggle();
+                        }
+                        Some(Action::Palette) => match palette.key(key) {
+                            Some(overlay::Action::Tab(next)) => tab = next,
+                            Some(overlay::Action::Benchmark) => {
+                                tab = BENCHMARK_TAB;
+                                extras.start_benchmark();
+                            }
+                            Some(overlay::Action::Quit) => break,
+                            None => {}
+                        },
+                        Some(Action::Hf) => hf_login.key(key),
+                        Some(Action::Extras) => extras.key(key, tab, &state),
                         Some(Action::ScrollHelp(lines)) => {
                             help.scroll = help.scroll.saturating_add_signed(lines);
                         }
@@ -996,11 +1075,14 @@ fn run_app(
                         Some(Action::Setup) => {
                             if setup.key(key)
                                 && let Some(run) = setup.launch(
-                                    state.training_active || training.as_ref().is_some_and(|run| run.active()),
+                                    state.training_active
+                                        || extras.remote_busy()
+                                        || training.as_ref().is_some_and(|run| run.active()),
                                 )
                             {
                                 run.initialize(&mut state);
                                 chat.set_model_dir(state.chain_dir.clone());
+                                extras.set_chain_dir(state.chain_dir.clone());
                                 training = Some(run);
                                 tab = 0;
                             }
@@ -1555,6 +1637,25 @@ fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64)
     }
 }
 
+// The additive feature tabs use the same content rectangle as the shell.
+fn feature_area(screen: Rect) -> Rect {
+    let area = HexBackground::content_area(screen);
+    if area.width < 30 || area.height < 10 {
+        return area;
+    }
+    let header = if screen.width >= 80 && screen.height >= 22 {
+        7
+    } else {
+        5
+    };
+    Rect::new(
+        area.x,
+        area.y + header,
+        area.width,
+        area.height.saturating_sub(header),
+    )
+}
+
 #[cfg(test)]
 fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
     draw_with_background(f, state, tab, &HexBackground::default(), None, None);
@@ -1668,16 +1769,19 @@ fn draw_with_background(
     }
     // Derive the width from the actual labels, padding and separators so adding
     // a tab cannot silently clip its name or steal space from the controls hint.
-    let tabs_width = (TABS.iter().map(|tab| tab.len() + 2).sum::<usize>()
-        + (TABS.len() - 1) * 3) as u16;
+    let tabs_width =
+        (TABS.iter().map(|tab| tab.len() + 2).sum::<usize>() + (TABS.len() - 1) * 3) as u16;
     let nav = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(tabs_width), Constraint::Min(0)])
         .split(chunks[1]);
     if area.width < tabs_width {
         f.render_widget(
-            Paragraph::new(format!(" {} / Tab tabs / F1 help", TABS[tab.min(TABS.len() - 1)]))
-                .style(accent()),
+            Paragraph::new(format!(
+                " {} / Tab tabs / F1 help",
+                TABS[tab.min(TABS.len() - 1)]
+            ))
+            .style(accent()),
             nav[0],
         );
     } else {
@@ -1704,6 +1808,7 @@ fn draw_with_background(
                     0 => "? help / g/1-7 views / +/- zoom",
                     4 => "F1 keys / /help commands",
                     5 => "F1 help / arrows move / Enter edit",
+                    HF_TAB..=BENCHMARK_TAB => "F1 help / Ctrl+K palette",
                     _ => "? help / arrows tabs / q quit",
                 }
             })
@@ -1731,6 +1836,7 @@ fn draw_with_background(
                 setup::Setup::default().draw(f, chunks[3]);
             }
         }
+        HF_TAB..=BENCHMARK_TAB => {} // rendered by independent feature modules
         _ => draw_feed(f, chunks[3], state),
     }
 }
@@ -2407,7 +2513,9 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         if state.loop_count > 1 {
             static RING_START: OnceLock<Instant> = OnceLock::new();
             ring::draw(
-                f, bottom[0], state.loop_count,
+                f,
+                bottom[0],
+                state.loop_count,
                 RING_START.get_or_init(Instant::now).elapsed(),
             );
         } else {
@@ -2803,6 +2911,8 @@ mod tests {
         if std::env::var_os("OXIDE_TUI_PRODUCER_FIXTURE").is_none() {
             return;
         }
+        // libtest's single-threaded progress prefix has no trailing newline.
+        println!();
         ui::field("corpus", "/tmp/producer corpus.txt");
         ui::field("width", "256");
         ui::panel_field("wall time", "14m 09s");
@@ -2881,15 +2991,40 @@ mod tests {
     #[test]
     fn test_backend_tab_order_is_unique_and_every_label_is_visible() {
         use ratatui::{Terminal, backend::TestBackend};
-        assert_eq!(TABS, ["monitor", "chain", "model", "feed", "inference", "setup"]);
+        assert_eq!(
+            TABS,
+            [
+                "monitor",
+                "chain",
+                "model",
+                "feed",
+                "inference",
+                "setup",
+                "HF login",
+                "Kaggle",
+                "memory",
+                "runs",
+                "benchmark"
+            ]
+        );
         let unique: std::collections::HashSet<_> = TABS.iter().collect();
         assert_eq!(unique.len(), TABS.len());
         for tab in 0..TABS.len() {
-            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-            terminal.draw(|f| draw(f, &RunState::default(), tab)).unwrap();
-            let rows: Vec<String> = terminal.backend().buffer().content().chunks(80)
-                .map(|row| row.iter().map(|cell| cell.symbol()).collect()).collect();
-            let nav = rows.iter().find(|row| TABS.iter().all(|label| row.contains(label))).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(240, 24)).unwrap();
+            terminal
+                .draw(|f| draw(f, &RunState::default(), tab))
+                .unwrap();
+            let rows: Vec<String> = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(240)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+                .collect();
+            let nav = rows
+                .iter()
+                .find(|row| TABS.iter().all(|label| row.contains(label)))
+                .unwrap();
             let mut previous = 0;
             for label in TABS {
                 assert_eq!(nav.matches(label).count(), 1, "tab {tab}: {nav}");
@@ -2897,7 +3032,24 @@ mod tests {
                 assert!(position >= previous);
                 previous = position + label.len();
             }
-            assert!(nav.contains("F1 help"), "help must be discoverable: {nav}");
+            assert!(nav.contains("help"), "help must be discoverable: {nav}");
+            for width in [79, 80, 120] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                terminal
+                    .draw(|f| draw(f, &RunState::default(), tab))
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(
+                    text.contains(&format!("{} / Tab tabs / F1 help", TABS[tab])),
+                    "compact navigation must show selected tab {tab} at {width}"
+                );
+            }
         }
     }
 
@@ -2926,9 +3078,7 @@ mod tests {
         };
         // Wide layouts now have a one-row background gutter.
         assert!(row(1).contains("███"));
-        assert!(row(6).contains("monitor"));
-        assert!(row(6).contains("chain"));
-        assert!(row(6).contains("model"));
+        assert!(row(6).contains("model / Tab tabs / F1 help"));
         assert!(!row(6).contains("modelt"));
         assert!(row(7).contains("╌"));
         assert!(row(1).contains("┌"));
@@ -3041,8 +3191,15 @@ mod tests {
             terminal.draw(|f| draw(f, &RunState::default(), 3)).unwrap();
             let buffer = terminal.backend().buffer();
             let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
-            for expected in ["Waiting for feed samples", "--hf-dataset OWNER/NAME", "--no-tui"] {
-                assert!(text.contains(expected), "{width} columns missing {expected}");
+            for expected in [
+                "Waiting for feed samples",
+                "--hf-dataset OWNER/NAME",
+                "--no-tui",
+            ] {
+                assert!(
+                    text.contains(expected),
+                    "{width} columns missing {expected}"
+                );
             }
             assert_eq!(buffer[(0, 11)].symbol(), "└");
             assert_eq!(buffer[(width - 1, 11)].symbol(), "┘");
@@ -3588,6 +3745,11 @@ mod tests {
                             "feed / idle",
                             "conversation",
                             "parameters",
+                            "HF login",
+                            "Kaggle",
+                            "memory",
+                            "runs",
+                            "benchmark",
                         ];
                         assert!(text.contains(expected[tab]));
                     } else if width >= 30 && tab == 0 {
@@ -3690,7 +3852,9 @@ mod tests {
             for tab in 0..TABS.len() {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
-                    .draw(|f| draw_with_background(f, &RunState::default(), tab, &pressed, None, None))
+                    .draw(|f| {
+                        draw_with_background(f, &RunState::default(), tab, &pressed, None, None)
+                    })
                     .unwrap();
                 let buffer = terminal.backend().buffer();
                 let content = HexBackground::content_area(buffer.area);
