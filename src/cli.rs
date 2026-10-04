@@ -1,5 +1,6 @@
 mod backend_choice;
 pub use backend_choice::TrainingBackend;
+pub mod resource_limits;
 
 use crate::backend::{Device, gemm_cpu_reference};
 use crate::checkpoint::{self, CheckpointFormat};
@@ -1766,6 +1767,8 @@ impl CLIHandler {
                     "  --loss-csv PATH --loss-every N (10000)  append target-token loss curve"
                 );
                 println!("  --tokens-seen N  required when starting a new curve on resume");
+                println!("  --threads N     opt-in Rayon pool size; default unchanged");
+                println!("  --ram-mib N     Linux prlimit address-space budget, not RSS/VRAM");
                 println!("  --no-tui         disable cursor updates; keep plain progress logs");
                 println!(
                     "Omit --tokenizer-from on resume; identical chunk/accumulation flags give identical updates."
@@ -1799,6 +1802,8 @@ impl CLIHandler {
                 );
                 println!("      --state <N>               recurrent state width (default: 16)");
                 println!("      --backend <NAME>          auto (default), cpu, webgpu, cuda (feature required)");
+                println!("      --threads <N>             opt-in Rayon pool size (default unchanged)");
+                println!("      --ram-mib <N>             Linux prlimit address-space budget, NOT RSS/VRAM");
                 println!("      --key <N>                 memory key width (default: 32)");
                 println!("      --memory <N>              memory capacity (default: 512)");
                 println!("      --chunk <N>               training chunk length (default: 64)");
@@ -2078,6 +2083,8 @@ impl CLIHandler {
                     "--loss-every",
                     "--tokens-seen",
                     "--no-tui",
+                    "--threads",
+                    "--ram-mib",
                 ];
                 if baseline {
                     allowed.retain(|x| !["--latent", "--state", "--key", "--memory"].contains(x));
@@ -2086,6 +2093,17 @@ impl CLIHandler {
                     allowed.extend(["--batch-size", "--depth", "--loops", "--backend"]);
                 }
                 let p = Parsed::parse(&args[2..], &allowed)?;
+                for flag in ["--threads", "--ram-mib"] {
+                    if p.string(flag, "") == Some("") {
+                        return Err(format!("{flag} must be a positive integer"));
+                    }
+                }
+                let limits = resource_limits::ResourceLimits::from_inputs([
+                    p.string("--threads", "").unwrap_or(""),
+                    p.string("--ram-mib", "").unwrap_or(""),
+                    p.string("--batch-size", "").unwrap_or(""),
+                    p.string("--max-tokens", "").unwrap_or(""),
+                ])?;
                 if baseline && p.string("--hf-dataset", "").is_some() {
                     return Err("--hf-dataset is supported by train, not train-transformer".into());
                 }
@@ -2119,6 +2137,12 @@ impl CLIHandler {
                     "data/model.pssa"
                 };
                 let out = p.string("--out", "-o").unwrap_or(default_out);
+                // Validate flags, then apply the process budget before any model
+                // or resume allocation. Without limits the old path is unchanged.
+                if limits.ram_mib.is_some() {
+                    Self::common_options(&p)?;
+                    limits.apply_process_budget(&args)?;
+                }
                 if baseline {
                     let mut opts = Self::common_options(&p)?;
                     if let Some(path) = &opts.resume {
@@ -2149,14 +2173,14 @@ impl CLIHandler {
                             ));
                         }
                     }
-                    crate::transformer_training::run_training(
+                    limits.run(|| crate::transformer_training::run_training(
                         &data,
                         &opts,
                         out,
                         p.string("--tokenizer-from", ""),
-                    )
+                    ))
                 } else {
-                    Self::run_training(&data, &Self::options(&p)?, out)
+                    limits.run(|| Self::run_training(&data, &Self::options(&p)?, out))
                 }
             }
             "generate" | "generate-transformer" => {

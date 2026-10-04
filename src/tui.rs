@@ -5,6 +5,12 @@
 mod background;
 mod chat;
 mod depth_zoom;
+mod device;
+mod hardware;
+mod heatmap;
+mod limits;
+mod math;
+mod preview;
 mod keybindings;
 mod ring;
 mod session;
@@ -27,7 +33,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-const TABS: [&str; 6] = ["monitor", "chain", "model", "feed", "inference", "setup"];
+use keybindings::TABS;
 // Five scanlines leave room for the P's stem, both S turns and the A's crossbar.
 const PSSA_LOGO: [&str; 5] = [
     "███    ███   ███   ██ ",
@@ -110,6 +116,12 @@ struct FeedState {
 
 #[derive(Default)]
 struct RunState {
+    preview: preview::Preview,
+    hardware: hardware::Hardware,
+    math: math::Values,
+    math_view: math::Math,
+    device_picker: std::cell::RefCell<device::DevicePicker>,
+    resource_limits: std::cell::RefCell<limits::Limits>,
     loop_count: usize,
     feed: Option<FeedState>,
     // header card
@@ -216,6 +228,7 @@ impl RunState {
         if line.is_empty() {
             return;
         }
+        self.math.ingest(line);
         if let Some(loops) = parse_kv::<usize>(line, "loops=") {
             self.loop_count = loops.clamp(1, 32);
         }
@@ -942,6 +955,9 @@ fn run_app(
             if let Some(run) = &mut training {
                 run.poll(&mut state);
             }
+            let checkpoint = preview::Preview::candidate(&state);
+            state.preview.poll(checkpoint, state.loop_count);
+            state.hardware.poll(tab == keybindings::HARDWARE_TAB);
             terminal.draw(|f| {
                 draw_with_background(f, &state, tab, &background, Some(&mut chat), Some(&mut setup));
                 if help.open {
@@ -969,8 +985,11 @@ fn run_app(
             if let crossterm::event::Event::Key(key) = event {
                 if key.kind == crossterm::event::KeyEventKind::Press {
                     use keybindings::{Action, Context};
+                    let old_tab = tab;
                     let context = if help.open {
                         Context::Help
+                    } else if tab == keybindings::LIMITS_TAB && state.resource_limits.borrow().editing() {
+                        Context::LimitsEdit
                     } else {
                         Context::for_tab(tab, setup.editing())
                     };
@@ -992,6 +1011,21 @@ fn run_app(
                         }
                         Some(Action::HelpTop) => help.scroll = 0,
                         Some(Action::HelpBottom) => help.scroll = u16::MAX,
+                        Some(Action::OpenTab(next)) => { tab = next; help.open = false; }
+                        Some(Action::Device) => {
+                            if let Some(backend) = state.device_picker.borrow_mut().key(key) { setup.set_backend(backend); }
+                        }
+                        Some(Action::Limits) => {
+                            if let Some(limits) = state.resource_limits.borrow_mut().key(key) { setup.set_limits(limits); }
+                        }
+                        Some(Action::Heatmap) => {
+                            if tab == 4 { chat.heatmap = !chat.heatmap; }
+                            else { state.preview.heatmap = !state.preview.heatmap; }
+                        }
+                        Some(Action::Preview) => state.preview.toggle(),
+                        Some(Action::MathScroll(lines)) => state.math_view.scroll.set(state.math_view.scroll.get().saturating_add_signed(lines)),
+                        Some(Action::MathTop) => state.math_view.scroll.set(0),
+                        Some(Action::MathBottom) => state.math_view.scroll.set(u16::MAX),
                         Some(Action::Chat) => chat.key(key),
                         Some(Action::Setup) => {
                             if setup.key(key)
@@ -1011,6 +1045,18 @@ fn run_app(
                         Some(Action::Zoom(closer)) => state.zoom_graph(closer),
                         Some(Action::ResetGraph) => state.reset_graph_navigation(),
                         None => {}
+                    }
+                    if tab != old_tab {
+                        if tab == keybindings::DEVICE_TAB {
+                            let mut picker = state.device_picker.borrow_mut();
+                            picker.set_backend(setup.backend());
+                            picker.ensure_probe();
+                        } else if tab == keybindings::LIMITS_TAB {
+                            if let Ok(limits) = setup.limits() {
+                                let applied = state.resource_limits.borrow().applied();
+                                if limits != applied { state.resource_limits.borrow_mut().set_limits(limits); }
+                            }
+                        }
                     }
                 }
             }
@@ -1596,6 +1642,11 @@ fn draw_with_background(
             return;
         }
         let detail = match tab {
+            keybindings::SAMPLE_TAB => state.preview.note.clone(),
+            keybindings::HARDWARE_TAB => "CPU / RAM / GPU telemetry / enlarge for detail".into(),
+            keybindings::MATH_TAB => "PSSA equations / live dimensions / enlarge to read".into(),
+            keybindings::DEVICE_TAB => "CPU / CUDA / WebGPU / Enter selects".into(),
+            keybindings::LIMITS_TAB => "Threads / RAM / batch / tokens / Enter edits".into(),
             0 => format!(
                 "{:.0}%  loss {:.4}",
                 state.progress_pct.unwrap_or(0.0),
@@ -1668,8 +1719,13 @@ fn draw_with_background(
     }
     // Derive the width from the actual labels, padding and separators so adding
     // a tab cannot silently clip its name or steal space from the controls hint.
-    let tabs_width = (TABS.iter().map(|tab| tab.len() + 2).sum::<usize>()
-        + (TABS.len() - 1) * 3) as u16;
+    let full_width = TABS.iter().map(|tab| tab.len() + 2).sum::<usize>() + (TABS.len() - 1) * 3;
+    let first_tab = if usize::from(area.width) < full_width && tab >= 6 { 6 } else { 0 };
+    let visible_tabs = if usize::from(area.width) < full_width && f.area().width >= 80 {
+        if first_tab == 0 { &TABS[..6] } else { &TABS[6..] }
+    } else { &TABS[..] };
+    let tabs_width = (visible_tabs.iter().map(|tab| tab.len() + 2).sum::<usize>()
+        + (visible_tabs.len() - 1) * 3) as u16;
     let nav = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(tabs_width), Constraint::Min(0)])
@@ -1682,8 +1738,8 @@ fn draw_with_background(
         );
     } else {
         f.render_widget(
-            Tabs::new(TABS)
-                .select(tab)
+            Tabs::new(visible_tabs.iter().copied())
+                .select(tab.saturating_sub(first_tab))
                 .style(accent().add_modifier(Modifier::DIM))
                 .highlight_style(
                     accent()
@@ -1701,10 +1757,10 @@ fn draw_with_background(
                 " F1 help "
             } else {
                 match tab {
-                    0 => "? help / g/1-7 views / +/- zoom",
-                    4 => "F1 keys / /help commands",
+                    0 => "F1 help / g/1-7 views / +/- zoom",
+                    4 => "F1 help / /help commands",
                     5 => "F1 help / arrows move / Enter edit",
-                    _ => "? help / arrows tabs / q quit",
+                    _ => "F1 help / arrows tabs / q quit",
                 }
             })
             .right_aligned(),
@@ -1714,6 +1770,11 @@ fn draw_with_background(
     f.render_widget(Paragraph::new(divider(area.width)), chunks[2]);
 
     match tab {
+        keybindings::SAMPLE_TAB => state.preview.draw(f, chunks[3], false),
+        keybindings::HARDWARE_TAB => state.hardware.draw(f, chunks[3]),
+        keybindings::MATH_TAB => state.math_view.draw(f, chunks[3], state),
+        keybindings::DEVICE_TAB => state.device_picker.borrow_mut().draw(f, chunks[3]),
+        keybindings::LIMITS_TAB => state.resource_limits.borrow_mut().draw(f, chunks[3]),
         0 => draw_monitor(f, chunks[3], state),
         1 => draw_chain(f, chunks[3], state),
         2 => draw_model(f, chunks[3], state),
@@ -2296,6 +2357,11 @@ fn draw_memory_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
 }
 
 fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
+    let area = if area.height >= 18 {
+        let sections = Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).split(area);
+        state.preview.draw(f, sections[1], true);
+        sections[0]
+    } else { area };
     // Prefer the metrics to a squashed graph on short terminals. Each visible
     // panel retains at least one content row and a complete top/bottom border.
     let show_graph = area.height >= 14;
@@ -2572,6 +2638,11 @@ fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
+    if args.first().is_some_and(|s| s == "--preview-worker") {
+        if args.len() != 3 { return Err("internal preview expects checkpoint and loops".into()); }
+        let loops = args[2].parse::<usize>().ok().filter(|n| (1..=32).contains(n)).ok_or("invalid preview loops")?;
+        return preview::worker(&args[1], loops);
+    }
     // Keep the default useful on a local checkout; Kaggle callers can pass
     // their mounted chain explicitly (the training scripts already do).
     let mut chain_dir = PathBuf::from("chain");
@@ -2881,13 +2952,14 @@ mod tests {
     #[test]
     fn test_backend_tab_order_is_unique_and_every_label_is_visible() {
         use ratatui::{Terminal, backend::TestBackend};
-        assert_eq!(TABS, ["monitor", "chain", "model", "feed", "inference", "setup"]);
+        assert_eq!(&TABS[..6], &["monitor", "chain", "model", "feed", "inference", "setup"]);
+        assert_eq!(&TABS[6..], &["sample", "hardware", "math", "devices", "limits"]);
         let unique: std::collections::HashSet<_> = TABS.iter().collect();
         assert_eq!(unique.len(), TABS.len());
         for tab in 0..TABS.len() {
-            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
             terminal.draw(|f| draw(f, &RunState::default(), tab)).unwrap();
-            let rows: Vec<String> = terminal.backend().buffer().content().chunks(80)
+            let rows: Vec<String> = terminal.backend().buffer().content().chunks(180)
                 .map(|row| row.iter().map(|cell| cell.symbol()).collect()).collect();
             let nav = rows.iter().find(|row| TABS.iter().all(|label| row.contains(label))).unwrap();
             let mut previous = 0;
@@ -3588,6 +3660,11 @@ mod tests {
                             "feed / idle",
                             "conversation",
                             "parameters",
+                            "live sample",
+                            "hardware",
+                            "math / read-only",
+                            "runtime compute",
+                            "resource limits",
                         ];
                         assert!(text.contains(expected[tab]));
                     } else if width >= 30 && tab == 0 {

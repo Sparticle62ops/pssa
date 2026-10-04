@@ -3,7 +3,8 @@
 use super::{
     AMBER, BRIGHT_RED, NORMAL_GREEN, RunState, accent, depth_zoom::DepthZoom, panel, ring,
 };
-use crate::{cli::TrainingBackend, dataset::DatasetManager};
+use crate::{cli::{TrainingBackend, resource_limits::ResourceLimits}, dataset::DatasetManager};
+use super::device::DevicePicker;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
@@ -42,9 +43,12 @@ enum Field {
     Output,
     Resume,
     Backend,
+    Batch,
+    Threads,
+    Ram,
 }
 use Field::*;
-const LABELS: [&str; 19] = [
+const LABELS: [&str; 22] = [
     "Source",
     "Dataset",
     "HF config (optional)",
@@ -64,17 +68,21 @@ const LABELS: [&str; 19] = [
     "Output directory",
     "Resume (optional)",
     "Backend",
+    "Max batch lanes",
+    "Threads (optional)",
+    "RAM MiB (optional)",
 ];
 const PAGES: [&str; 4] = ["1 dataset", "2 model", "3 training", "4 review / launch"];
 const FIELDS: [&[Field]; 4] = [
     &[Source, Dataset, HfConfig, HfSplit, HfField],
     &[Latent, State, Vocab, Depth, Loops],
-    &[Lr, Epochs, MaxTokens, Seed, Chunk, Accumulate],
-    &[Output, Resume, Backend],
+    &[Lr, Epochs, MaxTokens, Seed, Chunk, Accumulate, Batch],
+    &[Output, Resume, Backend, Threads, Ram],
 ];
 
 pub(super) struct Setup {
-    values: [String; 19],
+    values: [String; 22],
+    devices: DevicePicker,
     page: usize,
     selected: usize,
     edit: Option<String>,
@@ -109,8 +117,12 @@ impl Default for Setup {
                 "runs/new-run",
                 "",
                 "auto",
+                "",
+                "",
+                "",
             ]
             .map(str::to_owned),
+            devices: DevicePicker::default(),
             page: 0,
             selected: 0,
             edit: None,
@@ -158,11 +170,39 @@ impl Setup {
         }
     }
 
+    pub(super) fn set_backend(&mut self, backend: TrainingBackend) {
+        self.values[Backend as usize] = backend.as_str().into();
+        self.devices.set_backend(backend);
+    }
+
+    pub(super) fn backend(&self) -> TrainingBackend {
+        TrainingBackend::parse(self.value(Backend)).unwrap_or_default()
+    }
+
+    pub(super) fn limits(&self) -> Result<ResourceLimits, String> {
+        ResourceLimits::from_inputs([
+            self.value(Threads), self.value(Ram), self.value(Batch), self.value(MaxTokens),
+        ])
+    }
+
+    pub(super) fn set_limits(&mut self, limits: ResourceLimits) {
+        for (field, value) in [(Threads, limits.threads), (Ram, limits.ram_mib),
+            (Batch, limits.batch_size), (MaxTokens, limits.max_tokens)] {
+            self.values[field as usize] = value.map(|n| n.to_string()).unwrap_or_default();
+        }
+    }
+
     fn cycle_choice(&mut self, field: Field) {
+        if field == Backend {
+            self.devices.ensure_probe();
+            let next = self.devices.next_backend(self.backend());
+            self.set_backend(next);
+            self.message = self.devices.status(next).into();
+            self.error = false;
+            return;
+        }
         let choices: &[&str] = match field {
             Source => &["local", "hf"],
-            Backend if cfg!(feature = "cuda") => &["auto", "cpu", "webgpu", "cuda"],
-            Backend => &["auto", "cpu", "webgpu"],
             _ => return,
         };
         let index = choices
@@ -249,7 +289,15 @@ impl Setup {
             }
             KeyCode::Enter | KeyCode::Char(' ') => match self.focused() {
                 Some(field @ (Source | Backend)) => self.cycle_choice(field),
-                Some(field) => self.edit = Some(self.value(field).to_owned()),
+                Some(field) => {
+                    self.edit = Some(self.value(field).to_owned());
+                    match field {
+                        Threads => self.message = "Threads may change last-digit reduction rounding; blank keeps defaults.".into(),
+                        Ram => self.message = "Linux prlimit address-space cap, NOT RSS/VRAM; too low can abort the child.".into(),
+                        Batch => self.message = "Independent lanes (--batch-size), NOT a VRAM quota; blank = 1.".into(),
+                        _ => {}
+                    }
+                }
                 None if self.page < 3 => {
                     self.page += 1;
                     self.selected = 0;
@@ -257,6 +305,9 @@ impl Setup {
                 None => return true,
             },
             _ => {}
+        }
+        if self.page == 3 {
+            self.devices.ensure_probe();
         }
         false
     }
@@ -341,6 +392,7 @@ impl Setup {
             return Err("Learning rate must be a finite positive number".into());
         }
         TrainingBackend::parse(self.value(Backend))?;
+        self.limits()?;
         if !self.value(Resume).is_empty() {
             let path = Path::new(self.value(Resume));
             if !path.is_file() {
@@ -402,8 +454,11 @@ impl Setup {
         ] {
             push(flag, self.value(field).into());
         }
-        if !self.value(MaxTokens).is_empty() {
-            push("--max-tokens", self.value(MaxTokens).into());
+        for (field, flag) in [(MaxTokens, "--max-tokens"), (Batch, "--batch-size"),
+            (Threads, "--threads"), (Ram, "--ram-mib")] {
+            if !self.value(field).is_empty() {
+                push(flag, self.value(field).into());
+            }
         }
         if !self.value(Resume).is_empty() {
             push("--resume", safe_path(self.value(Resume)));
@@ -461,6 +516,7 @@ impl Setup {
     }
 
     pub(super) fn draw(&mut self, f: &mut Frame, area: Rect) {
+        self.devices.poll();
         if area.is_empty() {
             return;
         }
@@ -567,8 +623,8 @@ impl Setup {
                 match self.page {
                     0 => "HF is cached by the CLI. Local files must be UTF-8.",
                     1 => "Depth = stacked nets. Loops = repeated passes. +/- changes either.",
-                    2 => "Blank max tokens = no cap. Large sizes can exhaust RAM.",
-                    _ => "New directory: model.pssa + train.log (no overwrites).",
+                    2 => "Blank tokens = no cap; blank batch = 1. Batch is not a VRAM cap.",
+                    _ => "Blank limits = unchanged. RAM = Linux address space, NOT RSS/VRAM.",
                 },
                 Style::new().fg(AMBER),
             ));
@@ -576,8 +632,9 @@ impl Setup {
                 rows.push(Line::from(
                     "Resume: shape/chunk must match; the child validates the checkpoint.",
                 ));
+                rows.push(Line::from(self.devices.status(self.backend()).to_owned()));
                 rows.push(Line::from(
-                    "Auto keeps GPU/CPU fallback. Forced backends fail if unavailable.",
+                    "Threads can change reduction rounding; tiny RAM budgets may abort the child.",
                 ));
                 rows.push(Line::from("Quitting the TUI leaves training running; reopen with tail -f train.log | oxide_ai_pssa tui."));
             }
@@ -901,6 +958,12 @@ mod tests {
             (Epochs, "1000001"),
             (Chunk, "65537"),
             (Accumulate, "0"),
+            (Threads, "0"),
+            (Threads, "65537"),
+            (Ram, "0"),
+            (Ram, "184467440737095516160"),
+            (Batch, "65537"),
+            (Batch, "0"),
             (Lr, "NaN"),
             (Lr, "inf"),
             (Lr, "-1"),
@@ -957,6 +1020,34 @@ mod tests {
         assert!(setup.launch(false).is_none());
         assert!(setup.message.contains("already exists"));
         assert_eq!(fs::read_to_string(log).unwrap(), "existing training log");
+    }
+
+    #[test]
+    fn optional_limits_and_device_selection_reach_real_cli_flags() {
+        let fixture = Fixture::new();
+        let mut setup = fixture.setup();
+        for flag in ["--threads", "--ram-mib", "--batch-size", "--max-tokens"] {
+            assert!(!setup.args().iter().any(|arg| arg == flag), "default added {flag}");
+        }
+        setup.set_backend(TrainingBackend::Cpu);
+        let limits = ResourceLimits {
+            threads: Some(2), ram_mib: cfg!(target_os = "linux").then_some(2048),
+            batch_size: Some(3), max_tokens: Some(77),
+        };
+        setup.set_limits(limits);
+        assert_eq!(setup.limits().unwrap(), limits);
+        let spec = setup.validate().unwrap();
+        for (flag, expected) in [("--threads", "2"), ("--batch-size", "3"),
+            ("--max-tokens", "77"), ("--backend", "cpu")] {
+            let index = spec.args.iter().position(|arg| arg == flag).unwrap();
+            assert_eq!(spec.args[index + 1], expected);
+            assert_eq!(spec.args.iter().filter(|arg| *arg == flag).count(), 1);
+        }
+        if cfg!(target_os = "linux") {
+            assert!(setup.command().contains("--ram-mib 2048"));
+        }
+        setup.set_limits(ResourceLimits::default());
+        assert_eq!(setup.limits().unwrap(), ResourceLimits::default());
     }
 
     #[test]
