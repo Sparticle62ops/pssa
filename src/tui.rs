@@ -9,12 +9,18 @@ mod benchmark;
 pub(crate) mod benchmark_replay;
 mod chat;
 mod depth_zoom;
+mod device;
 mod extras;
+mod hardware;
+mod heatmap;
 pub(crate) mod hf;
 mod inspector;
 mod kaggle;
 mod keybindings;
+mod limits;
+mod math;
 mod overlay;
+mod preview;
 mod process;
 mod ring;
 mod runs;
@@ -38,24 +44,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-const TABS: [&str; 11] = [
-    "monitor",
-    "chain",
-    "model",
-    "feed",
-    "inference",
-    "setup",
-    "HF login",
-    "Kaggle",
-    "memory",
-    "runs",
-    "benchmark",
-];
-const HF_TAB: usize = 6;
-const KAGGLE_TAB: usize = 7;
-const MEMORY_TAB: usize = 8;
-const RUNS_TAB: usize = 9;
-const BENCHMARK_TAB: usize = 10;
+use keybindings::{BENCHMARK_TAB, HF_TAB, KAGGLE_TAB, MEMORY_TAB, RUNS_TAB, TABS};
 // Five scanlines leave room for the P's stem, both S turns and the A's crossbar.
 const PSSA_LOGO: [&str; 5] = [
     "███    ███   ███   ██ ",
@@ -138,6 +127,12 @@ struct FeedState {
 
 #[derive(Default)]
 struct RunState {
+    preview: preview::Preview,
+    hardware: hardware::Hardware,
+    math: math::Values,
+    math_view: math::Math,
+    device_picker: std::cell::RefCell<device::DevicePicker>,
+    resource_limits: std::cell::RefCell<limits::Limits>,
     loop_count: usize,
     feed: Option<FeedState>,
     // header card
@@ -244,6 +239,7 @@ impl RunState {
         if line.is_empty() {
             return;
         }
+        self.math.ingest(line);
         if let Some(loops) = parse_kv::<usize>(line, "loops=") {
             self.loop_count = loops.clamp(1, 32);
         }
@@ -988,6 +984,11 @@ fn run_app(
                 let _ = io::stdout().write_all(b"\x07");
                 let _ = io::stdout().flush();
             }
+            let checkpoint = preview::Preview::candidate(&state);
+            state
+                .preview
+                .poll(checkpoint, state.loop_count, extras.remote_monitor());
+            state.hardware.poll(tab == keybindings::HARDWARE_TAB);
             terminal.draw(|f| {
                 draw_with_background(
                     f,
@@ -1027,14 +1028,20 @@ fn run_app(
             if let crossterm::event::Event::Key(key) = event {
                 if key.kind == crossterm::event::KeyEventKind::Press {
                     use keybindings::{Action, Context};
+                    let old_tab = tab;
                     let context = if help.open {
                         Context::Help
                     } else if palette.open {
                         Context::Palette
                     } else {
-                        extras
-                            .context(tab)
-                            .unwrap_or_else(|| Context::for_tab(tab, setup.editing()))
+                        extras.context(tab).unwrap_or_else(|| {
+                            let editing = if tab == keybindings::LIMITS_TAB {
+                                state.resource_limits.borrow().editing()
+                            } else {
+                                setup.editing()
+                            };
+                            Context::for_tab(tab, editing)
+                        })
                     };
                     match keybindings::action(key, context) {
                         Some(Action::Quit) => break,
@@ -1071,6 +1078,35 @@ fn run_app(
                         }
                         Some(Action::HelpTop) => help.scroll = 0,
                         Some(Action::HelpBottom) => help.scroll = u16::MAX,
+                        Some(Action::OpenTab(next)) => {
+                            tab = next;
+                            help.open = false;
+                            palette.open = false;
+                        }
+                        Some(Action::Device) => {
+                            if let Some(backend) = state.device_picker.borrow_mut().key(key) {
+                                setup.set_backend(backend);
+                            }
+                        }
+                        Some(Action::Limits) => {
+                            if let Some(limits) = state.resource_limits.borrow_mut().key(key) {
+                                setup.set_limits(limits);
+                            }
+                        }
+                        Some(Action::Heatmap) => {
+                            if tab == 4 {
+                                chat.heatmap = !chat.heatmap;
+                            } else {
+                                state.preview.heatmap = !state.preview.heatmap;
+                            }
+                        }
+                        Some(Action::Preview) => state.preview.toggle(),
+                        Some(Action::MathScroll(lines)) => state
+                            .math_view
+                            .scroll
+                            .set(state.math_view.scroll.get().saturating_add_signed(lines)),
+                        Some(Action::MathTop) => state.math_view.scroll.set(0),
+                        Some(Action::MathBottom) => state.math_view.scroll.set(u16::MAX),
                         Some(Action::Chat) => chat.key(key),
                         Some(Action::Setup) => {
                             if setup.key(key)
@@ -1093,6 +1129,20 @@ fn run_app(
                         Some(Action::Zoom(closer)) => state.zoom_graph(closer),
                         Some(Action::ResetGraph) => state.reset_graph_navigation(),
                         None => {}
+                    }
+                    if tab != old_tab {
+                        if tab == keybindings::DEVICE_TAB {
+                            let mut picker = state.device_picker.borrow_mut();
+                            picker.set_backend(setup.backend());
+                            picker.ensure_probe();
+                        } else if tab == keybindings::LIMITS_TAB {
+                            if let Ok(limits) = setup.limits() {
+                                let applied = state.resource_limits.borrow().applied();
+                                if limits != applied {
+                                    state.resource_limits.borrow_mut().set_limits(limits);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1697,6 +1747,11 @@ fn draw_with_background(
             return;
         }
         let detail = match tab {
+            keybindings::SAMPLE_TAB => state.preview.note.clone(),
+            keybindings::HARDWARE_TAB => "CPU / RAM / GPU telemetry / enlarge for detail".into(),
+            keybindings::MATH_TAB => "PSSA equations / live dimensions / enlarge to read".into(),
+            keybindings::DEVICE_TAB => "CPU / CUDA / WebGPU / Enter selects".into(),
+            keybindings::LIMITS_TAB => "Threads / RAM / batch / tokens / Enter edits".into(),
             0 => format!(
                 "{:.0}%  loss {:.4}",
                 state.progress_pct.unwrap_or(0.0),
@@ -1769,8 +1824,23 @@ fn draw_with_background(
     }
     // Derive the width from the actual labels, padding and separators so adding
     // a tab cannot silently clip its name or steal space from the controls hint.
-    let tabs_width =
-        (TABS.iter().map(|tab| tab.len() + 2).sum::<usize>() + (TABS.len() - 1) * 3) as u16;
+    let full_width = TABS.iter().map(|tab| tab.len() + 2).sum::<usize>() + (TABS.len() - 1) * 3;
+    // Keep the original shell, Phase 10/11 extras, and Phase 12 controls in
+    // complete pages at 80+ columns. Below 80, retain the active-tab fallback.
+    let (first_tab, end_tab) = if usize::from(area.width) < full_width + 9 && f.area().width >= 80 {
+        if tab < HF_TAB {
+            (0, HF_TAB)
+        } else if tab < keybindings::SAMPLE_TAB {
+            (HF_TAB, keybindings::SAMPLE_TAB)
+        } else {
+            (keybindings::SAMPLE_TAB, TABS.len())
+        }
+    } else {
+        (0, TABS.len())
+    };
+    let visible_tabs = &TABS[first_tab..end_tab];
+    let tabs_width = (visible_tabs.iter().map(|tab| tab.len() + 2).sum::<usize>()
+        + (visible_tabs.len() - 1) * 3) as u16;
     let nav = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(tabs_width), Constraint::Min(0)])
@@ -1786,8 +1856,8 @@ fn draw_with_background(
         );
     } else {
         f.render_widget(
-            Tabs::new(TABS)
-                .select(tab)
+            Tabs::new(visible_tabs.iter().copied())
+                .select(tab.saturating_sub(first_tab))
                 .style(accent().add_modifier(Modifier::DIM))
                 .highlight_style(
                     accent()
@@ -1805,11 +1875,11 @@ fn draw_with_background(
                 " F1 help "
             } else {
                 match tab {
-                    0 => "? help / g/1-7 views / +/- zoom",
-                    4 => "F1 keys / /help commands",
+                    0 => "F1 help / g/1-7 views / +/- zoom",
+                    4 => "F1 help / /help commands",
                     5 => "F1 help / arrows move / Enter edit",
                     HF_TAB..=BENCHMARK_TAB => "F1 help / Ctrl+K palette",
-                    _ => "? help / arrows tabs / q quit",
+                    _ => "F1 help / arrows tabs / q quit",
                 }
             })
             .right_aligned(),
@@ -1819,6 +1889,11 @@ fn draw_with_background(
     f.render_widget(Paragraph::new(divider(area.width)), chunks[2]);
 
     match tab {
+        keybindings::SAMPLE_TAB => state.preview.draw(f, chunks[3], false),
+        keybindings::HARDWARE_TAB => state.hardware.draw(f, chunks[3]),
+        keybindings::MATH_TAB => state.math_view.draw(f, chunks[3], state),
+        keybindings::DEVICE_TAB => state.device_picker.borrow_mut().draw(f, chunks[3]),
+        keybindings::LIMITS_TAB => state.resource_limits.borrow_mut().draw(f, chunks[3]),
         0 => draw_monitor(f, chunks[3], state),
         1 => draw_chain(f, chunks[3], state),
         2 => draw_model(f, chunks[3], state),
@@ -2402,6 +2477,13 @@ fn draw_memory_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
 }
 
 fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
+    let area = if area.height >= 18 {
+        let sections = Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).split(area);
+        state.preview.draw(f, sections[1], true);
+        sections[0]
+    } else {
+        area
+    };
     // Prefer the metrics to a squashed graph on short terminals. Each visible
     // panel retains at least one content row and a complete top/bottom border.
     let show_graph = area.height >= 14;
@@ -2680,6 +2762,17 @@ fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
+    if args.first().is_some_and(|s| s == "--preview-worker") {
+        if args.len() != 3 {
+            return Err("internal preview expects checkpoint and loops".into());
+        }
+        let loops = args[2]
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=32).contains(n))
+            .ok_or("invalid preview loops")?;
+        return preview::worker(&args[1], loops);
+    }
     // Keep the default useful on a local checkout; Kaggle callers can pass
     // their mounted chain explicitly (the training scripts already do).
     let mut chain_dir = PathBuf::from("chain");
@@ -3004,7 +3097,12 @@ mod tests {
                 "Kaggle",
                 "memory",
                 "runs",
-                "benchmark"
+                "benchmark",
+                "sample",
+                "hardware",
+                "math",
+                "devices",
+                "limits",
             ]
         );
         let unique: std::collections::HashSet<_> = TABS.iter().collect();
@@ -3045,10 +3143,34 @@ mod tests {
                     .iter()
                     .map(|cell| cell.symbol())
                     .collect();
-                assert!(
-                    text.contains(&format!("{} / Tab tabs / F1 help", TABS[tab])),
-                    "compact navigation must show selected tab {tab} at {width}"
-                );
+                if width < 80 {
+                    assert!(
+                        text.contains(&format!("{} / Tab tabs / F1 help", TABS[tab])),
+                        "compact navigation must show selected tab {tab} at {width}"
+                    );
+                } else {
+                    let nav: String = terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .chunks(width as usize)
+                        .nth(6)
+                        .unwrap()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    let page = if tab < HF_TAB {
+                        &TABS[..HF_TAB]
+                    } else if tab < keybindings::SAMPLE_TAB {
+                        &TABS[HF_TAB..keybindings::SAMPLE_TAB]
+                    } else {
+                        &TABS[keybindings::SAMPLE_TAB..]
+                    };
+                    for label in page {
+                        assert_eq!(nav.matches(label).count(), 1, "tab {tab} at {width}: {nav}");
+                    }
+                    assert!(nav.contains("F1 help"), "tab {tab} at {width}: {nav}");
+                }
             }
         }
     }
@@ -3078,7 +3200,8 @@ mod tests {
         };
         // Wide layouts now have a one-row background gutter.
         assert!(row(1).contains("███"));
-        assert!(row(6).contains("model / Tab tabs / F1 help"));
+        assert!(row(6).contains("model"));
+        assert!(row(6).contains("F1 help"));
         assert!(!row(6).contains("modelt"));
         assert!(row(7).contains("╌"));
         assert!(row(1).contains("┌"));
@@ -3750,6 +3873,11 @@ mod tests {
                             "memory",
                             "runs",
                             "benchmark",
+                            "live sample",
+                            "hardware",
+                            "math / read-only",
+                            "runtime compute",
+                            "resource limits",
                         ];
                         assert!(text.contains(expected[tab]));
                     } else if width >= 30 && tab == 0 {

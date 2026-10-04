@@ -488,11 +488,72 @@ press **Tab** to reach **inference**. Existing `chat`/`generate` CLI commands an
   and use the existing `q` key. Outside text input, **?** also opens help.
 
 The tab order is **monitor, chain, model, feed, inference, setup, HF login,
-Kaggle, memory, runs, benchmark**. The
+Kaggle, memory, runs, benchmark, sample, hardware, math, devices, limits**. The
 [training setup wizard](docs/training-setup.md) launches a separate trainer
 and returns to the monitor; **Tab** switches tabs even while editing a field.
 **Ctrl+K** opens the command palette. All tabs share one **F1 / ?** keyboard
-reference; narrow terminals show the selected tab instead of clipping the tab bar.
+reference. At 80+ columns the tab strip pages between the original six tabs,
+HF login/extras, and the five new controls when the full strip will not fit;
+below 80 columns it shows the active tab. **F1** lists every keyboard control.
+
+### Live samples, hardware and run controls (TUI)
+
+- **Sample (F12):** the monitor includes a compact live sample when there is room;
+  the full sample tab works on narrow terminals. A changed saved PSSA checkpoint
+  is sampled at most once a minute in a separate CPU process: one Rayon thread,
+  low priority via `nice` when available, up to 32 tokens and a 20-second timeout.
+  **F7** pauses/resumes it. Loading/generation never waits on the trainer or UI,
+  and no checkpoint is modified. Before the first save, a placeholder is shown.
+  Remote Kaggle checkpoints are not sampled; their paths are never loaded as
+  local files. The preview does not create extra checkpoints: a single training invocation
+  currently saves at completion, while resumed/chain runs expose earlier saves.
+  Checkpoints over 128 MiB or insufficient available RAM are skipped to protect
+  the run; Linux `prlimit`, when installed, also caps the worker's address space
+  at 512 MiB. Failures retain the previous sample with an explanatory status.
+- **Confidence heatmap (F6 in inference, monitor or sample):** generated text is
+  colored red below 10%, amber from 10% to below 50%, and CRT green from 50%.
+  The legend describes **raw model softmax probability**, including the unknown
+  token, before temperature, top-k/top-p and repetition penalty—not confidence
+  after sampling filters. The toggle does not affect generation. New saved chats
+  retain scores; older chats show `n/a`. BPE tokens that share a decoded UTF-8
+  character share their minimum probability color rather than splitting bytes.
+- **Hardware (F8):** host-wide CPU usage/history, per-core bars when space permits,
+  and RAM used/total come from Linux `/proc`. If `nvidia-smi` is available, the
+  panel also shows GPU names, VRAM, utilization, temperature, power and driver.
+  Sampling is asynchronous and throttled to two seconds; unsupported counters
+  show `n/a`. Without NVIDIA telemetry, real WebGPU adapter names are shown with
+  `n/a` counters; backend availability is in the devices screen.
+- **Devices (F9):** **Up/Down**, then **Enter** selects an available backend for
+  the next wizard run; **r** refreshes runtime discovery. The wizard's Backend
+  field cycles the same available choices. CPU, automatic fallback, CUDA
+  (requires a CUDA-enabled binary and driver), and real WebGPU adapters are
+  distinguished; software adapters are excluded. Selection uses the existing
+  `--backend` flag: CUDA visible device 0 or WebGPU's preferred adapter. Other
+  adapters are informational, not a promise of per-index selection. Active jobs
+  and chat are unchanged; unsupported accelerators are labelled explicitly.
+- **Limits (F10):** edit threads, RAM MiB, maximum batch lanes and corpus tokens,
+  then select **Apply**. **d** resets the draft; blank fields preserve defaults.
+  These values also appear in setup and its equivalent CLI command. `--threads`
+  creates a local Rayon pool; changing thread count may change the last few
+  digits through reduction order. `--ram-mib` requires Linux `prlimit` and caps
+  **virtual address space**, not RSS or VRAM; GPU mappings also count and a budget
+  that is too low can abort the training child. Batch lanes and corpus tokens
+  use the existing `--batch-size` and `--max-tokens` flags (not per-epoch tokens,
+  a GPU memory quota, or chat generation limits). No limits change an active run.
+- **Math (F11):** scroll with **Up/Down**, **PgUp/PgDn**, **Home/End** through the
+  state recurrence, memory slots, refractory writes, plastic adapter, MLP,
+  depth/loops and loss. Equations and source references live in
+  [`assets/math.md`](assets/math.md). Dimensions, reported parameter count,
+  occupancy and learning rate follow the open run; unreported values stay `n/a`.
+  Per-token dense MACs are an explicitly labelled forward-only estimate, not
+  measured throughput or total training FLOPs.
+
+For example, the optional CLI limits can also be used without the TUI:
+
+```bash
+oxide_ai_pssa train science --backend cpu --threads 2 --ram-mib 2048 \
+  --batch-size 1 --max-tokens 20000 --no-tui -o runs/limited.pssa
+```
 
 Optional local speech capture (Linux/ALSA) is built with `cargo build --release
 --features speech`. Install an existing local **whisper.cpp** `whisper-cli` (or
