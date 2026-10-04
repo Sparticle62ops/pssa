@@ -601,7 +601,18 @@ Set `OXIDE_PSSA_HF_CACHE` to a writable cache directory (for example
 cache lives under `$XDG_CACHE_HOME/oxide-ai-pssa/huggingface` or
 `~/.cache/oxide-ai-pssa/huggingface`. Cached data can be reused offline; delete its
 cache file to refresh it. Choose a configuration explicitly when discovery reports
-multiple choices. Gated/private dataset login is not part of this phase.
+multiple choices.
+
+For private/gated datasets, open **HF login** with Tab in `oxide_ai_pssa tui`.
+Enter a read token (masked) and press **Enter**: the app verifies the account with
+HF's `whoami-v2` API and atomically saves `~/.cache/huggingface/token` with mode
+`0600`. Existing `HF_TOKEN` credentials take precedence over that file on startup;
+plain CLI downloads use the same credentials as a Bearer header. No token is
+shown in logs or errors. **Esc** clears entry; **Ctrl+L** logs out and removes the
+saved file. Logout ignores `HF_TOKEN` for this process only: also unset it in your
+parent shell to sign out future CLI runs. Login does not grant gated access:
+request/accept access on the dataset's Hugging Face page and wait for approval.
+Logout does not remove already downloaded dataset caches.
 
 HF runs add percent-encoded `feed_*` fields to the existing throttled progress
 lines (at most every five seconds when piped, plus first/final updates). These
