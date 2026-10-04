@@ -275,7 +275,7 @@ impl MemoryView {
     }
 
     fn draw_strengths(&self, f: &mut Frame, area: Rect, snapshot: &MemorySnapshot) {
-        let area = panel_area(f, area);
+        // Nested panels have no shadow: their rects abut the enclosing border.
         let block = panel(" strongest slots / per layer ");
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -301,7 +301,7 @@ impl MemoryView {
     }
 
     fn draw_history(&self, f: &mut Frame, area: Rect) {
-        let area = panel_area(f, area);
+        // Like the strengths panel, keep all painting inside this nested rect.
         let block = panel(" recent tokens / strongest slot ");
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -563,6 +563,33 @@ mod tests {
             assert_eq!(buffer[(width - 1, 0)].symbol(), "┐");
             assert_eq!(buffer[(0, height - 1)].symbol(), "└");
             assert_eq!(buffer[(width - 1, height - 1)].symbol(), "┘");
+        }
+    }
+
+    #[test]
+    fn nested_panels_keep_the_enclosing_right_border_closed() {
+        let view = view();
+        for (width, height) in [(120, 40), (80, 24)] {
+            for inset in [0, 1] {
+                let area = Rect::new(inset, inset, width - 2 * inset, height - 2 * inset);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| view.draw(f, area)).unwrap();
+                let buffer = terminal.backend().buffer();
+                for y in area.y..area.bottom() {
+                    let expected = if y == area.y {
+                        "┐"
+                    } else if y == area.bottom() - 1 {
+                        "┘"
+                    } else {
+                        "│"
+                    };
+                    assert_eq!(
+                        buffer[(area.right() - 1, y)].symbol(),
+                        expected,
+                        "{width}x{height}, inset {inset}, right border row {y}"
+                    );
+                }
+            }
         }
     }
 
