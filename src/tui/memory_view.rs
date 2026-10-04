@@ -1,6 +1,6 @@
 //! Read-only chat telemetry: copied retrieval weights, never a second retrieval.
 //! Only the latest full snapshot is retained; history stores 64 token summaries.
-use super::{AMBER, BRIGHT_RED, SECOND_ACCENT, accent, panel};
+use super::{AMBER, BRIGHT_RED, SECOND_ACCENT, accent, panel, panel_area};
 use crate::{dataset::Tokenizer, pssa::PSSALayerV2};
 use ratatui::{
     Frame,
@@ -158,6 +158,7 @@ impl MemoryView {
         if area.is_empty() {
             return;
         }
+        let area = panel_area(f, area);
         let block = panel(" live memory / read-only ");
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -274,6 +275,7 @@ impl MemoryView {
     }
 
     fn draw_strengths(&self, f: &mut Frame, area: Rect, snapshot: &MemorySnapshot) {
+        let area = panel_area(f, area);
         let block = panel(" strongest slots / per layer ");
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -299,6 +301,7 @@ impl MemoryView {
     }
 
     fn draw_history(&self, f: &mut Frame, area: Rect) {
+        let area = panel_area(f, area);
         let block = panel(" recent tokens / strongest slot ");
         let inner = block.inner(area);
         f.render_widget(block, area);

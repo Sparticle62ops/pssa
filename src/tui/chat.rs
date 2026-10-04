@@ -3,7 +3,7 @@ use super::{
     AMBER, NORMAL_GREEN, accent,
     heatmap::{self, TokenMark},
     memory_view::{MemorySnapshot, MemoryView},
-    panel,
+    panel, panel_area,
 };
 use crate::{
     cli::CLIHandler,
@@ -912,7 +912,8 @@ impl Chat {
                 ratatui::style::Style::new().fg(AMBER),
             ));
         }
-        let inner = panel(" conversation ").inner(chunks[1]);
+        let conversation_area = panel_area(f, chunks[1]);
+        let inner = panel(" conversation ").inner(conversation_area);
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         // Ratatui measures wrapped display lines (including wide Unicode), not bytes.
         let total = paragraph.line_count(inner.width).min(u16::MAX as usize) as u16;
@@ -926,7 +927,7 @@ impl Chat {
             paragraph
                 .scroll((self.scroll, 0))
                 .block(panel(" conversation ")),
-            chunks[1],
+            conversation_area,
         );
         let title = format!(" input • {} attachment(s) ", self.attachments.len());
         let input = clean(&self.input);
@@ -938,13 +939,14 @@ impl Chat {
             .into_iter()
             .rev()
             .collect::<String>();
+        let input_area = panel_area(f, chunks[2]);
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("> ", accent()),
                 Span::raw(tail),
             ]))
             .block(panel(&title)),
-            chunks[2],
+            input_area,
         );
         f.render_widget(
             Paragraph::new(if area.width >= 70 {

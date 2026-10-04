@@ -1,7 +1,7 @@
 //! Runtime backend picker. Discovery runs once on demand, away from rendering.
 //! The existing backend APIs bind CUDA visible device 0 / WebGPU's preferred
 //! adapter. Other adapters are informational, never falsely offered as bindings.
-use super::{AMBER, SECOND_ACCENT, accent, panel};
+use super::{AMBER, SECOND_ACCENT, accent, panel, panel_area};
 use crate::{cli::TrainingBackend, ui};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -331,9 +331,10 @@ impl DevicePicker {
                 )
             })
             .collect();
+        let panel_rect = panel_area(f, parts[1]);
         f.render_widget(
             Paragraph::new(lines).block(panel(" runtime compute / software GPUs skipped ")),
-            parts[1],
+            panel_rect,
         );
         let detail = &self.entries[self.selected].detail;
         f.render_widget(

@@ -13,7 +13,7 @@
 //! and src/kaggle/api/kaggle_api_extended.py in that repository. Live SSE may
 //! be unavailable on older deployments; an explicit error is shown, not fake
 //! progress. No remote service access is needed by the tests below.
-use super::{accent, panel, process::clean};
+use super::{accent, panel, panel_area, process::clean};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -1076,11 +1076,12 @@ impl Kaggle {
         if let Some(prepared) = &self.prepared {
             text.extend(prepared.summary.lines().map(|s| Line::from(s.to_owned())));
         }
+        let launch_area = panel_area(f, sections[0]);
         f.render_widget(
             Paragraph::new(text)
                 .wrap(Wrap { trim: false })
                 .block(panel(" Kaggle launch ")),
-            sections[0],
+            launch_area,
         );
         let visible = sections[1].height.saturating_sub(2) as usize;
         let logs: Vec<Line<'_>> = self
@@ -1089,9 +1090,10 @@ impl Kaggle {
             .skip(self.history.len().saturating_sub(visible))
             .map(|s| Line::from(s.as_str()))
             .collect();
+        let log_area = panel_area(f, sections[1]);
         f.render_widget(
             Paragraph::new(logs).block(panel(" Kaggle live log (bounded tail) ")),
-            sections[1],
+            log_area,
         );
     }
 }

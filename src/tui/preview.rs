@@ -1,7 +1,7 @@
 //! Read-only checkpoint sampling in a bounded, low-priority CPU child.
 //! No model loads, token generation, or pipe waits occur on the UI/trainer thread.
 use super::{
-    RunState, accent,
+    RunState, accent, panel_area,
     heatmap::{self, TokenMark},
     panel,
 };
@@ -320,6 +320,7 @@ impl Preview {
         Ok(())
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect, compact: bool) {
+        let area = panel_area(f, area);
         let mut lines = if compact {
             Vec::new()
         } else {

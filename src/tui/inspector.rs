@@ -1,5 +1,5 @@
 //! Read-only plastic memory telemetry. Never infer a write from a feed sample.
-use super::{RunState, accent, panel, parse_kv, process::clean};
+use super::{RunState, accent, panel, panel_area, parse_kv, process::clean};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -202,6 +202,7 @@ impl Inspector {
             .unwrap_or((0, 0));
         let chunks = Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).split(area);
         let history: Vec<_> = self.history.iter().copied().collect();
+        let sparkline_area = panel_area(f, chunks[0]);
         f.render_widget(
             Sparkline::default()
                 .data(&history)
@@ -210,7 +211,7 @@ impl Inspector {
                 .block(panel(&format!(
                     " plastic memory / {used}/{capacity} slots "
                 ))),
-            chunks[0],
+            sparkline_area,
         );
         let content = if area.width >= 80 {
             let columns =
@@ -284,12 +285,13 @@ impl Inspector {
                 )));
             }
         }
+        let content_area = panel_area(f, content);
         f.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .scroll((self.scroll, 0))
                 .block(panel(" memory inspector / read-only ")),
-            content,
+            content_area,
         );
     }
 }

@@ -1,5 +1,5 @@
 //! Optional limits for the next training child, not the dashboard process.
-use super::{AMBER, BRIGHT_RED, SECOND_ACCENT, accent, panel};
+use super::{AMBER, BRIGHT_RED, SECOND_ACCENT, accent, panel, panel_area};
 use crate::cli::resource_limits::ResourceLimits;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -164,19 +164,21 @@ impl Limits {
                 },
             ));
         }
+        let values_area = panel_area(f, parts[1]);
         f.render_widget(
             Paragraph::new(rows).block(panel(" next run / blank keeps defaults ")),
-            parts[1],
+            values_area,
         );
         let mut args = Vec::new();
         self.applied.append_args(&mut args);
+        let semantics_area = panel_area(f, parts[2]);
         f.render_widget(Paragraph::new(vec![
             Line::styled("Threads: local Rayon pool. Changing reduction order may change the last digits.", Style::new().fg(AMBER)),
             Line::from("RAM: Linux prlimit hard address-space (RLIMIT_AS) budget; NOT RSS or VRAM. Too low may abort the child; GPU mappings also count. Other OSes reject it."),
             Line::from("Batch lanes use --batch-size (default 1); not a VRAM cap. Tokens cap the corpus, not each epoch or inference reply."),
             Line::from("No CPU throttling, affinity, or GPU VRAM quota. In-process chat is not RAM-limited."),
             Line::styled(format!("Applied CLI: {}", if args.is_empty() { "(no extra flags)".into() } else { args.join(" ") }), Style::new().fg(SECOND_ACCENT)),
-        ]).wrap(Wrap { trim: false }).block(panel(" enforcement / semantics ")), parts[2]);
+        ]).wrap(Wrap { trim: false }).block(panel(" enforcement / semantics ")), semantics_area);
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(

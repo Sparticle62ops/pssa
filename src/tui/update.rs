@@ -2,7 +2,7 @@
 use super::{
     accent,
     network::{self, Http, Web},
-    panel,
+    panel, panel_area,
 };
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -275,6 +275,7 @@ impl Update {
         }
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
+        let area = panel_area(f, area);
         f.render_widget(Paragraph::new(vec![
             Line::styled("UPDATES / STABLE RELEASES", accent()),
             Line::from(format!("Installed: {VERSION}")),

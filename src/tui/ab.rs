@@ -4,7 +4,7 @@
 //! model cache or second worker: two large models must never coexist just to show
 //! their replies side by side. Cancellation is cooperative; loading and a single
 //! forward pass cannot be interrupted, and the UI never joins this worker.
-use super::{AMBER, accent, panel};
+use super::{AMBER, accent, panel, panel_area};
 use crate::{
     cli::CLIHandler,
     dataset::{Tokenizer, TokenizerKind},
@@ -387,9 +387,15 @@ impl Comparison {
             ]),
             chunks[0],
         );
-        let columns = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[1]);
-        for (index, column) in columns.iter().copied().enumerate() {
+        let gap = if super::shadow::enabled(f.area()) { 1 } else { 0 };
+        let columns = Layout::horizontal([
+            Constraint::Percentage(50),
+            Constraint::Length(gap),
+            Constraint::Percentage(50),
+        ])
+        .split(chunks[1]);
+        for (index, column) in columns.iter().copied().step_by(2).enumerate() {
+            let column = panel_area(f, column);
             let side = &self.sides[index];
             let kind = if self.models[index].ends_with(".trfm") {
                 "transformer"
@@ -450,9 +456,10 @@ impl Comparison {
             .into_iter()
             .rev()
             .collect();
+        let prompt_area = panel_area(f, chunks[3]);
         f.render_widget(
             Paragraph::new(format!("> {tail}")).block(panel(" shared prompt / command ")),
-            chunks[3],
+            prompt_area,
         );
         f.render_widget(
             Paragraph::new("Enter send • Esc stop • PgUp/Dn • End follow • /ab off • /help")

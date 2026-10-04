@@ -1,6 +1,6 @@
 //! Shared-network recurrence: one electric lap for each selected pass.
 //! The caller supplies its UI clock, so idle monitor and setup stay in sync.
-use super::{draw_neuron_frame, neuron_frame_at, neuron_green, panel};
+use super::{draw_neuron_frame, neuron_frame_at, neuron_green, panel, panel_area};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -72,6 +72,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, loops: usize, elapsed: Duration) {
         draw_neuron_frame(f, area, neuron_frame_at(elapsed), &title);
         return;
     }
+    let area = panel_area(f, area);
     let inner = panel(&title).inner(area);
     if inner.width < 2 || inner.height < 2 {
         f.render_widget(panel(&title), area);
@@ -276,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_small_and_offset_areas_do_not_escape_the_panel() {
+    fn test_backend_small_and_offset_areas_do_not_escape_the_panel_shadow_included() {
         for (width, height) in [(0, 0), (1, 1), (2, 2), (3, 8), (9, 3), (12, 5), (8, 30)] {
             for loops in [1, 2, 32] {
                 for elapsed in [Duration::ZERO, LAP / 3, Duration::MAX] {
@@ -306,10 +307,15 @@ mod tests {
             let visible = area.intersection(buffer.area);
             for y in 0..24 {
                 for x in 0..80 {
-                    if x < visible.x
+                    let shadow = (x == area.right()
+                        && y >= area.y
+                        && y < area.bottom())
+                        || (y == area.bottom() && x >= area.x && x <= area.right());
+                    if (x < visible.x
                         || x >= visible.right()
                         || y < visible.y
-                        || y >= visible.bottom()
+                        || y >= visible.bottom())
+                        && !shadow
                     {
                         assert_eq!(buffer[(x, y)].symbol(), ".", "outside panel at {x},{y}");
                     }

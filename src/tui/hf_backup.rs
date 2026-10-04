@@ -2,7 +2,7 @@
 //! NEW canonical save event, never for progress snapshots/resume/file scans.
 //! All checkpoint reads, hashing and HTTP run on one worker; busy automatic jobs
 //! coalesce to the latest checkpoint. No worker is joined by the UI.
-use super::{accent, hf, network, panel};
+use super::{accent, hf, network, panel, panel_area};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
@@ -273,6 +273,7 @@ impl Backup {
         }
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
+        let area = panel_area(f, area);
         let mut lines = vec![Line::styled("HF HUB / checkpoint backup", accent())];
         for (i, (name, value)) in [
             ("Checkpoint", self.path.clone()),

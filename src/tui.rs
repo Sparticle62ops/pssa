@@ -35,6 +35,7 @@ mod memory_view;
 mod ring;
 mod runs;
 mod session;
+mod shadow;
 mod setup;
 #[cfg(feature = "speech")]
 mod speech;
@@ -1250,6 +1251,15 @@ fn panel(title: &str) -> Block<'_> {
         .title(Line::styled(title, accent().add_modifier(Modifier::BOLD)))
 }
 
+/// Paint a panel's one-cell offset shadow before returning its original rect.
+/// On narrow terminals and with NO_COLOR this is an exact no-op, preserving
+/// the long-standing compact layout.
+fn panel_area(f: &mut ratatui::Frame, area: Rect) -> Rect {
+    let frame_area = f.area();
+    shadow::paint(f, area, frame_area, shadow::color(PANEL_BG));
+    area
+}
+
 fn divider(width: u16) -> Line<'static> {
     Line::styled("╌".repeat(width.into()), Style::new().fg(SECOND_ACCENT))
 }
@@ -1279,6 +1289,7 @@ fn status_badge(health: &HealthStatus) -> Line<'static> {
 }
 
 fn draw_header_stats(f: &mut ratatui::Frame, area: Rect, state: &RunState, health: &HealthStatus) {
+    let area = panel_area(f, area);
     // Give a health reason the whole border title instead of truncating it
     // behind the telemetry label at the 80-column breakpoint.
     let title = health
@@ -1374,6 +1385,7 @@ fn loss_trace(state: &RunState) -> String {
 // Empty states are instrument cards, not invented run data. A dim dot grid
 // occupies only unused rows below the hints, never behind readable text.
 fn draw_info_card(f: &mut ratatui::Frame, area: Rect, title: &str, lines: Vec<Line<'_>>) {
+    let area = panel_area(f, area);
     let block = panel(title)
         .style(Style::new().bg(INSET_BG))
         .border_style(Style::new().fg(SECOND_ACCENT));
@@ -1394,11 +1406,32 @@ fn draw_info_card(f: &mut ratatui::Frame, area: Rect, title: &str, lines: Vec<Li
     }
 }
 
-fn card_pair(area: Rect) -> std::rc::Rc<[Rect]> {
+fn card_pair(f: &ratatui::Frame, area: Rect) -> std::rc::Rc<[Rect]> {
+    let gap = if shadow::enabled(f.area()) { 1 } else { 0 };
     if area.width >= 70 {
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area)
+        let usable = area.width.saturating_sub(gap);
+        let left = usable / 2;
+        std::rc::Rc::from([
+            Rect::new(area.x, area.y, left, area.height),
+            Rect::new(
+                area.x.saturating_add(left).saturating_add(gap),
+                area.y,
+                usable.saturating_sub(left),
+                area.height,
+            ),
+        ])
     } else {
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area)
+        let usable = area.height.saturating_sub(gap);
+        let top = usable / 2;
+        std::rc::Rc::from([
+            Rect::new(area.x, area.y, area.width, top),
+            Rect::new(
+                area.x,
+                area.y.saturating_add(top).saturating_add(gap),
+                area.width,
+                usable.saturating_sub(top),
+            ),
+        ])
     }
 }
 
@@ -1605,6 +1638,7 @@ fn draw_neuron_animation_at(f: &mut ratatui::Frame, area: Rect, elapsed: Duratio
 }
 
 fn draw_neuron_frame(f: &mut ratatui::Frame, area: Rect, frame: NeuronFrame, title: &str) {
+    let area = panel_area(f, area);
     // Preserve polish's untitled black canvas and phase 9's reusable renderer.
     let block = panel(title).style(Style::new().bg(Color::Black));
     let inner = block.inner(area);
@@ -1708,6 +1742,7 @@ fn progress_label(state: &RunState, pct: f64, width: u16) -> String {
 }
 
 fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64) {
+    let area = panel_area(f, area);
     let block = panel(" progress ");
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2013,6 +2048,7 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
         // Preserve the wrapped connection hint rather than squeezing empty
         // cards into border-only fragments on short terminals.
         if area.height < 10 {
+            let idle_area = panel_area(f, area);
             f.render_widget(
                 Paragraph::new(vec![
                     Line::styled("Waiting for feed samples", accent()),
@@ -2021,11 +2057,12 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
                 ])
                 .wrap(Wrap { trim: false })
                 .block(panel(" feed / idle ")),
-                area,
+                idle_area,
             );
             return;
         }
         let sections = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).split(area);
+        let summary_area = panel_area(f, sections[0]);
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled("Waiting for feed samples", accent()),
@@ -2036,9 +2073,9 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
                 ),
             ])
             .block(panel(" feed / idle ")),
-            sections[0],
+            summary_area,
         );
-        let cards = card_pair(sections[1]);
+        let cards = card_pair(f, sections[1]);
         draw_info_card(
             f,
             cards[0],
@@ -2064,6 +2101,7 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
         return;
     };
     if area.height < 9 {
+        let feed_area = panel_area(f, area);
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(&feed.dataset, accent()),
@@ -2074,11 +2112,12 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
                 Line::from(feed.snippet.as_str()),
             ])
             .block(panel(" feed ")),
-            area,
+            feed_area,
         );
         return;
     }
     let sections = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).split(area);
+    let summary_area = panel_area(f, sections[0]);
     f.render_widget(
         Paragraph::new(vec![
             Line::styled(
@@ -2098,11 +2137,12 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
             ),
         ])
         .block(panel(" dataset feed ")),
-        sections[0],
+        summary_area,
     );
+    let panel_area = panel_area(f, sections[1]);
     let block = panel(" shredder / text -> token ids ");
-    let inner = block.inner(sections[1]);
-    f.render_widget(block, sections[1]);
+    let inner = block.inner(panel_area);
+    f.render_widget(block, panel_area);
     if inner.width == 0 || inner.height < 2 {
         return;
     }
@@ -2284,9 +2324,10 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
     }
     let (start, end) = state.visible_graph_range();
     if end == 0 {
+        let waiting_area = panel_area(f, area);
         f.render_widget(
-            Paragraph::new("Waiting for progress samples...").block(panel(" graph / waiting ")),
-            area,
+            Paragraph::new("Waiting for progress samples").block(panel(" graph / waiting ")),
+            waiting_area,
         );
         return;
     }
@@ -2496,6 +2537,7 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
             title = format!(" graph / comparison / {label} ");
         }
     }
+    let chart_area = panel_area(f, area);
     let chart = Chart::new(datasets)
         .block(panel(&title))
         .legend_position(Some(LegendPosition::TopRight))
@@ -2521,7 +2563,7 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
                     format!("{:.3}", y_bounds[1]),
                 ]),
         );
-    f.render_widget(chart, area);
+    f.render_widget(chart, chart_area);
 }
 
 fn draw_memory_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
@@ -2550,18 +2592,34 @@ fn draw_memory_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         "not reported".to_string()
     };
     let title = format!(" memory / Poincare disk / occupancy only ({occupancy_label}) ");
+    let chart_area = panel_area(f, area);
     let chart = Chart::new(disk_points)
         .block(panel(&title))
         .legend_position(Some(LegendPosition::TopRight))
         .x_axis(Axis::default().bounds([-1.1, 1.1]).labels(["-1", "0", "1"]))
         .y_axis(Axis::default().bounds([-1.1, 1.1]).labels(["-1", "0", "1"]));
-    f.render_widget(chart, area);
+    f.render_widget(chart, chart_area);
 }
 
 fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     let area = if area.height >= 18 {
-        let sections = Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).split(area);
-        state.preview.draw(f, sections[1], true);
+        let gap = if shadow::enabled(f.area()) && area.height >= 21 {
+            1
+        } else {
+            0
+        };
+        let sections = if gap == 0 {
+            Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).split(area)
+        } else {
+            Layout::vertical([
+                Constraint::Min(0),
+                Constraint::Length(gap),
+                Constraint::Length(5),
+            ])
+            .split(area)
+        };
+        let preview_index = if gap == 0 { 1 } else { 2 };
+        state.preview.draw(f, sections[preview_index], true);
         sections[0]
     } else {
         area
@@ -2569,9 +2627,13 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     // Prefer the metrics to a squashed graph on short terminals. Each visible
     // panel retains at least one content row and a complete top/bottom border.
     let show_graph = area.height >= 14;
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    let gap = if shadow::enabled(f.area()) && area.height >= 21 {
+        1
+    } else {
+        0
+    };
+    let chunks = if gap == 0 {
+        Layout::vertical([
             Constraint::Length(4),
             Constraint::Min(if show_graph { 6 } else { 0 }),
             Constraint::Length(if show_graph {
@@ -2580,7 +2642,23 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
                 area.height.saturating_sub(4)
             }),
         ])
-        .split(area);
+        .split(area)
+    } else {
+        Layout::vertical([
+            Constraint::Length(4),
+            Constraint::Length(gap),
+            Constraint::Min(if show_graph { 6 } else { 0 }),
+            Constraint::Length(gap),
+            Constraint::Length(if show_graph {
+                9
+            } else {
+                area.height.saturating_sub(4)
+            }),
+        ])
+        .split(area)
+    };
+    let graph_index = if gap == 0 { 1 } else { 2 };
+    let metrics_index = if gap == 0 { 2 } else { 4 };
 
     let health = state.health_status();
     let health_style = Style::new().fg(health.color()).add_modifier(Modifier::BOLD);
@@ -2599,7 +2677,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         .unwrap_or_else(|| "-".into());
 
     if show_graph {
-        draw_graph(f, chunks[1], state, now);
+        draw_graph(f, chunks[graph_index], state, now);
     }
 
     let memory = match (state.memory_used, state.memory_capacity) {
@@ -2664,14 +2742,21 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     ];
     // The decorative gutter must not change the existing wide-screen
     // breakpoint or the neuron panel's requested width.
-    let metrics_area = if f.area().width >= 80 && chunks[2].height >= 5 {
-        let bottom = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
+    let metrics_area = if f.area().width >= 80 && chunks[graph_index].height >= 5 {
+        let bottom = if gap == 0 {
+            Layout::horizontal([
                 Constraint::Length((f.area().width / 4).clamp(30, 48)),
                 Constraint::Min(0),
             ])
-            .split(chunks[2]);
+            .split(chunks[metrics_index])
+        } else {
+            Layout::horizontal([
+                Constraint::Length((f.area().width / 4).clamp(30, 48)),
+                Constraint::Length(gap),
+                Constraint::Min(0),
+            ])
+            .split(chunks[metrics_index])
+        };
         // The same panel animates while waiting for the first progress line:
         // the idle dashboard doubles as the splash, without a blocking delay.
         if state.loop_count > 1 {
@@ -2685,12 +2770,14 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         } else {
             draw_neuron_animation(f, bottom[0], now);
         }
-        bottom[1]
+        let metrics_index = if gap == 0 { 1 } else { 2 };
+        bottom[metrics_index]
     } else {
         // Preserve readable metrics rather than squeezing two tiny panels
         // side by side on a narrow or very short terminal.
-        chunks[2]
+        chunks[metrics_index]
     };
+    let metrics_area = panel_area(f, metrics_area);
     f.render_widget(
         Paragraph::new(lines).block(panel(if show_graph {
             " run metrics "
@@ -2707,13 +2794,20 @@ fn draw_chain(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         divider(area.width.saturating_sub(2)),
     ];
     if state.checkpoints.is_empty() && area.height >= 10 {
-        let sections = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).split(area);
+        let gap = if shadow::enabled(f.area()) { 1 } else { 0 };
+        let sections = Layout::vertical([
+            Constraint::Length(5),
+            Constraint::Length(gap),
+            Constraint::Min(0),
+        ])
+        .split(area);
         rows.push(Line::styled("No checkpoint files found yet.", accent()));
+        let summary_area = panel_area(f, sections[0]);
         f.render_widget(
             Paragraph::new(rows).block(panel(" chain / checkpoints ")),
-            sections[0],
+            summary_area,
         );
-        let cards = card_pair(sections[1]);
+        let cards = card_pair(f, sections[2]);
         draw_info_card(
             f,
             cards[0],
@@ -2758,11 +2852,12 @@ fn draw_chain(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
                 }),
         );
     }
+    let chain_area = panel_area(f, area);
     f.render_widget(
         Paragraph::new(rows)
             .wrap(Wrap { trim: false })
             .block(panel(" chain / checkpoints ")),
-        area,
+        chain_area,
     );
 }
 
@@ -2789,21 +2884,28 @@ fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         .line_count(area.width.saturating_sub(2).max(1))
         .saturating_add(2)
         .min(usize::from(area.height)) as u16;
+    let gap = if shadow::enabled(f.area()) && area.height >= 22 {
+        1
+    } else {
+        0
+    };
     let sections = Layout::vertical([
         Constraint::Length(if area.height.saturating_sub(required) >= 6 {
             required
         } else {
             area.height
         }),
+        Constraint::Length(gap),
         Constraint::Min(0),
     ])
     .split(area);
+    let configuration_area = panel_area(f, sections[0]);
     f.render_widget(
         configuration.block(panel(" model / configuration ")),
-        sections[0],
+        configuration_area,
     );
-    if sections[1].height >= 6 {
-        let cards = card_pair(sections[1]);
+    if sections[2].height >= 6 {
+        let cards = card_pair(f, sections[2]);
         draw_info_card(
             f,
             cards[0],

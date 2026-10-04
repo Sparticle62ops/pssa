@@ -1,7 +1,7 @@
 //! Small, sequential grids over the wizard's existing `train` command.
 //! The shell owns/polls the child. Dropping pending work never touches a trainer.
 use super::{
-    AMBER, RunState, accent, panel,
+    AMBER, RunState, accent, panel, panel_area,
     process::clean,
     setup::{RunSpec, Setup, TrainingRun},
 };
@@ -334,9 +334,10 @@ impl Sweep {
         fields.push(Line::from(
             "Comma-separated grids / blank = wizard value / 32 runs max",
         ));
+        let base_area = panel_area(f, parts[0]);
         f.render_widget(
             Paragraph::new(fields).block(panel(" sweep / wizard base ")),
-            parts[0],
+            base_area,
         );
         let mut rows = vec![Line::styled(
             if compact {
@@ -385,9 +386,10 @@ impl Sweep {
                 },
             ));
         }
+        let results_area = panel_area(f, parts[1]);
         f.render_widget(
             Paragraph::new(rows).block(panel(" results / training only ")),
-            parts[1],
+            results_area,
         );
         let mut footer = vec![Line::styled(
             if self.editing() {
