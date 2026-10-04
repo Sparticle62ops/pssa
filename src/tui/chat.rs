@@ -2,6 +2,7 @@
 use super::{
     AMBER, NORMAL_GREEN, accent,
     heatmap::{self, TokenMark},
+    memory_view::{MemorySnapshot, MemoryView},
     panel,
 };
 use crate::{
@@ -272,6 +273,7 @@ struct Progress {
     tokens: usize,
     done: Option<Result<(), String>>,
     speech: bool,
+    memory: Option<MemoryView>,
 }
 struct Job {
     progress: Arc<Mutex<Progress>>,
@@ -302,6 +304,7 @@ pub(super) struct Chat {
     pending_delete: Option<String>,
     model_dir: PathBuf,
     pub(super) heatmap: bool,
+    memory: MemoryView,
 }
 impl Chat {
     pub(super) fn open_checkpoint(&mut self, path: &Path) {
@@ -339,12 +342,18 @@ impl Chat {
             pending_delete: None,
             model_dir,
             heatmap: false,
+            memory: MemoryView::default(),
         }
     }
     // Follow the wizard's output directory without changing the selected model
     // or discarding the current conversation.
     pub(super) fn set_model_dir(&mut self, model_dir: PathBuf) {
         self.model_dir = model_dir;
+    }
+
+    /// Latest read-only retrieval snapshot, retained when generation finishes.
+    pub(super) fn memory_view(&self) -> &MemoryView {
+        &self.memory
     }
 
     pub(super) fn poll(&mut self) {
@@ -357,6 +366,15 @@ impl Chat {
         self.elapsed = job.started.elapsed().as_secs_f64();
         let mut p = job.progress.lock().unwrap_or_else(|e| e.into_inner());
         self.tokens = p.tokens;
+        if let Some(memory) = &p.memory
+            && memory.latest().map(|snapshot| snapshot.generated_tokens)
+                != self
+                    .memory
+                    .latest()
+                    .map(|snapshot| snapshot.generated_tokens)
+        {
+            self.memory.clone_from(memory);
+        }
         if !p.speech
             && let Some(last) = self.doc.messages.last_mut()
         {
@@ -439,17 +457,34 @@ impl Chat {
         });
         let model = self.doc.model.clone();
         let cfg = InferenceConfig { ..self.doc.config };
-        let progress = Arc::new(Mutex::new(Progress::default()));
+        self.memory = MemoryView::new(&model);
+        let progress = Arc::new(Mutex::new(Progress {
+            memory: Some(self.memory.clone()),
+            ..Progress::default()
+        }));
         let cancel = Arc::new(AtomicBool::new(false));
         let (p, c) = (progress.clone(), cancel.clone());
         std::thread::spawn(move || {
             let result = (|| {
+                if Path::new(&model).extension().is_some_and(|e| e.eq_ignore_ascii_case("trfm")) {
+                    let text = crate::transformer_inference::generate_controlled(
+                        &model, &prompt, &cfg,
+                        &mut |text, tokens| {
+                            let mut p = p.lock().unwrap_or_else(|e| e.into_inner());
+                            p.text = text.to_owned();
+                            p.tokens = tokens;
+                        },
+                        &|| c.load(Ordering::Relaxed),
+                    )?;
+                    p.lock().unwrap_or_else(|e| e.into_inner()).text = text;
+                    return Ok(());
+                }
                 let (mut model, tok) = CLIHandler::load_for_inference(&model, None)?;
                 if c.load(Ordering::Relaxed) {
                     return Ok(());
                 }
                 let text = PSSAInferenceEngine::try_new(&mut model, &tok)?
-                    .try_generate_chat_turn_scored(
+                    .try_generate_chat_turn_scored_observed(
                         &prompt,
                         &cfg,
                         |text, tokens, probability| {
@@ -459,6 +494,17 @@ impl Chat {
                             p.tokens = tokens;
                         },
                         || c.load(Ordering::Relaxed),
+                        |count, query, selected, model| {
+                            // Copy before locking: rendering only sees owned telemetry,
+                            // never a live model borrow or a second retrieval operation.
+                            let snapshot =
+                                MemorySnapshot::capture(count, query, selected, &tok, model);
+                            if let Some(memory) =
+                                &mut p.lock().unwrap_or_else(|e| e.into_inner()).memory
+                            {
+                                memory.record(snapshot);
+                            }
+                        },
                     )?;
                 p.lock().unwrap_or_else(|e| e.into_inner()).text = text;
                 Ok(())
@@ -504,7 +550,7 @@ impl Chat {
                     if let Ok(entries) = fs::read_dir(dir) {
                         for entry in entries.flatten() {
                             let p = entry.path();
-                            if p.extension().is_some_and(|e| e == "pssa") {
+                            if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pssa") || e.eq_ignore_ascii_case("trfm")) {
                                 paths.push(p.display().to_string());
                             }
                         }
@@ -513,7 +559,7 @@ impl Chat {
                 paths.sort();
                 paths.dedup();
                 self.note = format!(
-                    "Pick with /model PATH (PSSA checkpoints; paths may contain spaces)\n{}",
+                    "Pick with /model PATH (PSSA/TRFM checkpoints; paths may contain spaces)\n{}",
                     paths.join("\n")
                 );
             }
@@ -522,12 +568,14 @@ impl Chat {
                     return Err("checkpoint path is not a file".into());
                 }
                 self.doc.model = arg.into();
+                self.memory = MemoryView::new(arg);
                 self.save()?;
                 self.note = format!("Checkpoint selected: {arg}. Loaded when you send.");
             }
             "/new" => {
                 self.save()?;
                 self.doc = Document::new(self.doc.model.clone());
+                self.memory = MemoryView::new(&self.doc.model);
                 self.attachments.clear();
                 self.tokens = 0;
                 self.elapsed = 0.0;
@@ -542,6 +590,7 @@ impl Chat {
                 let doc = self.store.load(arg)?;
                 self.save()?;
                 self.doc = doc;
+                self.memory = MemoryView::new(&self.doc.model);
                 self.attachments.clear();
                 self.tokens = 0;
                 self.elapsed = 0.0;
@@ -570,6 +619,7 @@ impl Chat {
                     self.pending_delete = None;
                     if self.doc.id == arg {
                         self.doc = Document::new(self.doc.model.clone());
+                        self.memory = MemoryView::new(&self.doc.model);
                         self.attachments.clear();
                     }
                     self.note = "Chat deleted.".into();
@@ -1319,8 +1369,23 @@ mod tests {
         );
         model.vocabulary = tokenizer.ordered_vocabulary().unwrap();
         model.unembed_w.data.fill(0.0);
+        model.memory.insert(&[0.1, 0.2], &[0.4, 0.2, -0.3, 0.6]);
+        model.memory.insert(&[-0.3, 0.4], &[0.1, -0.2, 0.5, 0.7]);
         let path = c.store.dir.join("tiny checkpoint.pssa");
         checkpoint::save_model(&model, &path).unwrap();
+        let checkpoint_before = fs::read(&path).unwrap();
+        let baseline = PSSAInferenceEngine::new(&mut model, &tokenizer)
+            .try_generate_chat_turn_controlled(
+                "User: hello world\n\nAssistant:",
+                &InferenceConfig {
+                    temperature: 0.0,
+                    max_new_tokens: 4,
+                    ..Default::default()
+                },
+                |_, _| {},
+                || false,
+            )
+            .unwrap();
         c.command(&format!("/model {}", path.display())).unwrap();
         c.command("/temp 0").unwrap();
         c.command("/max-tokens 4").unwrap();
@@ -1333,9 +1398,37 @@ mod tests {
         assert!(c.job.is_none(), "worker did not finish");
         assert_eq!(c.tokens, 4);
         assert_eq!(c.doc.messages[1].text, "hello hello hello hello");
+        assert_eq!(c.doc.messages[1].text, baseline);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            checkpoint_before,
+            "chat must not rewrite checkpoint bytes"
+        );
+        let snapshot = c
+            .memory_view()
+            .latest()
+            .expect("worker publishes memory observations");
+        assert_eq!(snapshot.generated_tokens, 4);
+        assert_eq!(snapshot.generated_token_id, 1);
+        assert_eq!(snapshot.query_token_id, 1);
+        assert_eq!(
+            snapshot.layers[0].weights,
+            model.inf_mem_weights[..model.memory.count]
+        );
+        assert_eq!(snapshot.layers[0].capacity, model.memory.capacity);
+        let saved = c.doc.value();
+        assert!(
+            saved.get("memory").is_none(),
+            "runtime observation is not chat/checkpoint state"
+        );
         let id = c.doc.id.clone();
         c.command("/new").unwrap();
+        assert!(c.memory_view().latest().is_none());
         c.command(&format!("/open {id}")).unwrap();
+        assert!(
+            c.memory_view().latest().is_none(),
+            "saved chats do not invent live observations"
+        );
         assert_eq!(c.doc.messages.len(), 2);
         assert!(
             c.doc

@@ -18,6 +18,7 @@ pub(super) struct Extras {
     benchmark: Benchmark,
     alerts: Alerts,
     remote_monitor: bool,
+    memory_live: bool,
 }
 impl Extras {
     pub fn new(chain: PathBuf) -> Self {
@@ -28,6 +29,7 @@ impl Extras {
             benchmark: Benchmark::new(chain),
             alerts: Alerts::default(),
             remote_monitor: false,
+            memory_live: false,
         }
     }
     pub fn set_chain_dir(&mut self, chain: PathBuf) {
@@ -101,7 +103,7 @@ impl Extras {
         // Remote paths are not local checkpoint files. Still collect streamed
         // occupancy/snippets, but never load a coincidentally matching path.
         self.inspector
-            .poll(state, *tab == MEMORY_TAB && !self.remote_monitor);
+            .poll(state, *tab == MEMORY_TAB && !self.remote_monitor && !self.memory_live);
         self.runs.poll(*tab == RUNS_TAB);
         if let Some(action) = self.runs.action.take() {
             match action {
@@ -165,17 +167,29 @@ impl Extras {
                     self.kaggle.key(key);
                 }
             }
-            MEMORY_TAB => self.inspector.key(key),
+            MEMORY_TAB => {
+                if key.code == KeyCode::Char('v') {
+                    self.memory_live = !self.memory_live;
+                } else if !self.memory_live {
+                    self.inspector.key(key);
+                }
+            },
             RUNS_TAB => self.runs.key(key),
             BENCHMARK_TAB => self.benchmark.key(key),
             _ => {}
         }
     }
-    pub fn draw(&mut self, f: &mut ratatui::Frame, state: &RunState, tab: usize) {
+    pub fn draw(&mut self, f: &mut ratatui::Frame, state: &RunState, tab: usize, _chat: &Chat) {
         let area = super::feature_area(f.area());
         match tab {
             KAGGLE_TAB => self.kaggle.draw(f, area),
-            MEMORY_TAB => self.inspector.draw(f, area, state),
+            MEMORY_TAB => {
+                if self.memory_live {
+                    _chat.memory_view().draw(f, area);
+                } else {
+                    self.inspector.draw(f, area, state);
+                }
+            },
             RUNS_TAB => self.runs.draw(f, area),
             BENCHMARK_TAB => self.benchmark.draw(f, area),
             _ => {}
@@ -252,6 +266,7 @@ mod tests {
     fn all_extras_render_without_overwriting_shell_at_all_sizes() {
         let mut extras = Extras::new("missing-chain".into());
         let state = RunState::default();
+        let chat = Chat::new("unused-chats".into(), "missing-chain".into());
         for (w, h) in [(160, 40), (120, 32), (79, 24), (24, 8), (1, 1)] {
             let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
             for tab in KAGGLE_TAB..=BENCHMARK_TAB {
@@ -259,7 +274,7 @@ mod tests {
                 let shell = t.backend().buffer().clone();
                 t.draw(|f| {
                     super::super::draw(f, &state, tab);
-                    extras.draw(f, &state, tab);
+                    extras.draw(f, &state, tab, &chat);
                 })
                 .unwrap();
                 let content = super::super::feature_area(ratatui::layout::Rect::new(0, 0, w, h));

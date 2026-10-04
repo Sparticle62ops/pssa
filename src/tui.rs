@@ -22,6 +22,11 @@ mod math;
 mod overlay;
 mod preview;
 mod process;
+mod library;
+mod local;
+mod mixer;
+mod eval;
+mod memory_view;
 mod ring;
 mod runs;
 mod session;
@@ -916,6 +921,7 @@ fn run_app(
 ) -> io::Result<()> {
     let mut chat = chat::Chat::new(chats_dir, chain_dir.clone());
     let mut setup = setup::Setup::default();
+    let mut local = local::Local::new(chain_dir.clone());
     let mut help = keybindings::Help::default();
     let mut palette = overlay::Overlay::default();
     let mut training: Option<setup::TrainingRun> = None;
@@ -989,6 +995,7 @@ fn run_app(
                 .preview
                 .poll(checkpoint, state.loop_count, extras.remote_monitor());
             state.hardware.poll(tab == keybindings::HARDWARE_TAB);
+            local.poll(&mut setup, &state, extras.remote_monitor());
             terminal.draw(|f| {
                 draw_with_background(
                     f,
@@ -1001,7 +1008,8 @@ fn run_app(
                 if tab == HF_TAB {
                     hf_login.draw(f, feature_area(f.area()));
                 }
-                extras.draw(f, &state, tab);
+                local.draw(f, tab);
+                extras.draw(f, &state, tab, &chat);
                 palette.draw(f);
                 if help.open {
                     help.draw(f);
@@ -1038,7 +1046,7 @@ fn run_app(
                             let editing = if tab == keybindings::LIMITS_TAB {
                                 state.resource_limits.borrow().editing()
                             } else {
-                                setup.editing()
+                                (tab == 5 && setup.editing()) || local.editing(tab)
                             };
                             Context::for_tab(tab, editing)
                         })
@@ -1108,6 +1116,7 @@ fn run_app(
                         Some(Action::MathTop) => state.math_view.scroll.set(0),
                         Some(Action::MathBottom) => state.math_view.scroll.set(u16::MAX),
                         Some(Action::Chat) => chat.key(key),
+                        Some(Action::Local) => local.key(&mut tab, key, &mut chat, &mut setup),
                         Some(Action::Setup) => {
                             if setup.key(key)
                                 && let Some(run) = setup.launch(
@@ -1825,15 +1834,17 @@ fn draw_with_background(
     // Derive the width from the actual labels, padding and separators so adding
     // a tab cannot silently clip its name or steal space from the controls hint.
     let full_width = TABS.iter().map(|tab| tab.len() + 2).sum::<usize>() + (TABS.len() - 1) * 3;
-    // Keep the original shell, Phase 10/11 extras, and Phase 12 controls in
+    // Keep the original shell, extras, run controls, and local library tools in
     // complete pages at 80+ columns. Below 80, retain the active-tab fallback.
     let (first_tab, end_tab) = if usize::from(area.width) < full_width + 9 && f.area().width >= 80 {
         if tab < HF_TAB {
             (0, HF_TAB)
         } else if tab < keybindings::SAMPLE_TAB {
             (HF_TAB, keybindings::SAMPLE_TAB)
+        } else if tab < keybindings::LIBRARY_TAB {
+            (keybindings::SAMPLE_TAB, keybindings::LIBRARY_TAB)
         } else {
-            (keybindings::SAMPLE_TAB, TABS.len())
+            (keybindings::LIBRARY_TAB, TABS.len())
         }
     } else {
         (0, TABS.len())
@@ -1911,7 +1922,7 @@ fn draw_with_background(
                 setup::Setup::default().draw(f, chunks[3]);
             }
         }
-        HF_TAB..=BENCHMARK_TAB => {} // rendered by independent feature modules
+        HF_TAB.. => {} // rendered by independent feature modules after the shell
         _ => draw_feed(f, chunks[3], state),
     }
 }
@@ -2773,6 +2784,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .ok_or("invalid preview loops")?;
         return preview::worker(&args[1], loops);
     }
+    if let Some(result) = eval::run_worker(args) { return result; }
     // Keep the default useful on a local checkout; Kaggle callers can pass
     // their mounted chain explicitly (the training scripts already do).
     let mut chain_dir = PathBuf::from("chain");
@@ -3103,12 +3115,15 @@ mod tests {
                 "math",
                 "devices",
                 "limits",
+                "library",
+                "mixer",
+                "eval",
             ]
         );
         let unique: std::collections::HashSet<_> = TABS.iter().collect();
         assert_eq!(unique.len(), TABS.len());
         for tab in 0..TABS.len() {
-            let mut terminal = Terminal::new(TestBackend::new(240, 24)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(300, 24)).unwrap();
             terminal
                 .draw(|f| draw(f, &RunState::default(), tab))
                 .unwrap();
@@ -3116,7 +3131,7 @@ mod tests {
                 .backend()
                 .buffer()
                 .content()
-                .chunks(240)
+                .chunks(300)
                 .map(|row| row.iter().map(|cell| cell.symbol()).collect())
                 .collect();
             let nav = rows
@@ -3163,8 +3178,10 @@ mod tests {
                         &TABS[..HF_TAB]
                     } else if tab < keybindings::SAMPLE_TAB {
                         &TABS[HF_TAB..keybindings::SAMPLE_TAB]
+                    } else if tab < keybindings::LIBRARY_TAB {
+                        &TABS[keybindings::SAMPLE_TAB..keybindings::LIBRARY_TAB]
                     } else {
-                        &TABS[keybindings::SAMPLE_TAB..]
+                        &TABS[keybindings::LIBRARY_TAB..]
                     };
                     for label in page {
                         assert_eq!(nav.matches(label).count(), 1, "tab {tab} at {width}: {nav}");
@@ -3879,7 +3896,11 @@ mod tests {
                             "runtime compute",
                             "resource limits",
                         ];
-                        assert!(text.contains(expected[tab]));
+                        // These six bodies belong to the shell. Local screens
+                        // render afterward and have their own TestBackend tests.
+                        if let Some(expected) = expected.get(tab) {
+                            assert!(text.contains(*expected));
+                        }
                     } else if width >= 30 && tab == 0 {
                         let buffer = terminal.backend().buffer();
                         let metrics_row = buffer
