@@ -3437,15 +3437,6 @@ mod tests {
                     }
                 }
             }
-            // Visible with --nocapture for an actual rendered-logo inspection.
-            for y in origin.y..origin.y + 5 {
-                println!(
-                    "{}",
-                    (origin.x..origin.x + 22)
-                        .map(|x| buffer[(x, y)].symbol())
-                        .collect::<String>()
-                );
-            }
         }
     }
 
