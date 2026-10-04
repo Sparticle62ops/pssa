@@ -121,6 +121,7 @@ impl SequenceBatch {
         m.bwd_g_xnorm.resize(rows * d, 0.0);
         m.bwd_g_ysm.resize(rows * d, 0.0);
         m.bwd_g_query_euc.resize(rows * k, 0.0);
+        m.bwd_g_query_pnc.resize(rows * k, 0.0);
         m.bwd_g_logits.resize(rows * v, 0.0);
         m.bwd_g_mlp.resize(rows * 2 * d, 0.0);
         let lanes = (0..batch_size)

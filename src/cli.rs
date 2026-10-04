@@ -1214,6 +1214,7 @@ impl CLIHandler {
             .chain(model.extra_blocks.iter())
             .map(|block| block.adapters.len())
             .sum::<usize>();
+        let effective_loops = model.loops();
         let mut engine = PSSAInferenceEngine::try_new(&mut model, &tokenizer)?;
         let mut temp = temp;
         println!("interactive: /exit  /info  /temp <value>");
@@ -1236,6 +1237,7 @@ impl CLIHandler {
                 println!("model: {model_path}");
                 println!("memory slots: {memory_slots}");
                 println!("adapters: {adapter_count}");
+                println!("loops: {effective_loops}");
                 continue;
             }
             let mut words = p.split_whitespace();

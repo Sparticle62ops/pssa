@@ -495,8 +495,10 @@ pub struct PSSAContinuousBlockV2 {
     pub bwd_g_ad_down: Vec<f32>,
     pub bwd_g_xnorm: Vec<f32>,
     pub bwd_g_ysm: Vec<f32>,
-    /// Packed per-token query adjoints used by the CUDA backward GEMMs.
+    /// Packed per-token Euclidean query adjoints used by backward GEMMs.
     pub bwd_g_query_euc: Vec<f32>,
+    /// Per-token Poincare query adjoints for parallel memory VJPs.
+    pub bwd_g_query_pnc: Vec<f32>,
     pub bwd_g_logits: Vec<f32>,
     pub bwd_g_mlp: Vec<f32>,
 
@@ -645,6 +647,7 @@ impl PSSAContinuousBlockV2 {
             bwd_g_xnorm: vec![0.0; chunk_len * d_m],
             bwd_g_ysm: vec![0.0; chunk_len * d_m],
             bwd_g_query_euc: vec![0.0; chunk_len * d_k],
+            bwd_g_query_pnc: vec![0.0; chunk_len * d_k],
             bwd_g_logits: vec![0.0; chunk_len * d_v],
             bwd_g_mlp: vec![0.0; chunk_len * d_mlp],
             ssm_scan_a: vec![0.0; scan_len * state_width],
