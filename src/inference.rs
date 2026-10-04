@@ -191,6 +191,7 @@ impl<'a> PSSAInferenceEngine<'a> {
                 }
             },
             || false,
+            |_, _, _, _| {},
         )
     }
 
@@ -217,21 +218,52 @@ impl<'a> PSSAInferenceEngine<'a> {
             cfg,
             |out, _, count| callback(out, count),
             cancelled,
+            |_, _, _, _| {},
         )
     }
 
-    // `delta` preserves legacy word-token / decoded-BPE-segment callbacks, while
-    // `out` and `count` expose progress even when a token has no decoded text yet.
-    fn try_generate_chat_turn_impl<F, C>(
+    /// Controlled generation with an optional read-only view of the existing
+    /// retrieval scratch buffers. No extra forward pass or sampling is done.
+    /// The observer receives (generated count, query/input ID, selected ID, model)
+    /// once per generated token, not for prefill or the final BPE text flush.
+    /// Weights belong to the input that predicted the selected token; with loops
+    /// enabled, scratch buffers hold the final pass of each layer.
+    pub(crate) fn try_generate_chat_turn_observed<F, C, O>(
         &mut self,
         prompt: &str,
         cfg: &InferenceConfig,
         mut callback: F,
         cancelled: C,
+        observer: O,
+    ) -> Result<String, String>
+    where
+        F: FnMut(&str, usize),
+        C: Fn() -> bool,
+        O: FnMut(usize, usize, usize, &PSSALayerV2),
+    {
+        self.try_generate_chat_turn_impl(
+            prompt,
+            cfg,
+            |out, _, count| callback(out, count),
+            cancelled,
+            observer,
+        )
+    }
+
+    // `delta` preserves legacy word-token / decoded-BPE-segment callbacks, while
+    // `out` and `count` expose progress even when a token has no decoded text yet.
+    fn try_generate_chat_turn_impl<F, C, O>(
+        &mut self,
+        prompt: &str,
+        cfg: &InferenceConfig,
+        mut callback: F,
+        cancelled: C,
+        mut observer: O,
     ) -> Result<String, String>
     where
         F: FnMut(&str, Option<&str>, usize),
         C: Fn() -> bool,
+        O: FnMut(usize, usize, usize, &PSSALayerV2),
     {
         Self::validate(cfg)?;
         let prompt_ids = self.tokenizer.try_encode(prompt, true)?;
@@ -293,6 +325,12 @@ impl<'a> PSSAInferenceEngine<'a> {
                         }
                         out.push_str(token);
                     }
+                    observer(
+                        step + 1,
+                        generated_ids[generated_ids.len() - 2],
+                        selected,
+                        self.model,
+                    );
                     callback(&out, Some(token), step + 1);
                     if matches!(token.as_str(), "." | "?" | "!") {
                         sentence_count += 1;
@@ -367,6 +405,12 @@ impl<'a> PSSAInferenceEngine<'a> {
                         }
                     }
                     let delta = (out.len() > begin).then_some(&out[begin..]);
+                    observer(
+                        step + 1,
+                        generated_ids[generated_ids.len() - 2],
+                        selected,
+                        self.model,
+                    );
                     callback(&out, delta, step + 1);
                 }
                 // A byte-level token stream may end in the middle of a UTF-8
@@ -644,6 +688,160 @@ mod tests {
                 .try_generate_chat_turn_controlled(prompt, &cfg, |_, _| {}, || false)
                 .unwrap_err();
             assert_eq!(controlled, legacy);
+        }
+    }
+
+    #[test]
+    fn memory_observer_preserves_sampling_output_and_exact_retrieval_state() {
+        fn populated(tokenizer: &Tokenizer, depth: usize, loops: usize) -> PSSALayerV2 {
+            let mut model = PSSALayerV2::new_with_depth_and_loops(
+                PSSAConfigV2 {
+                    d_vocab: tokenizer.vocab_size,
+                    d_latent: 4,
+                    d_state: 2,
+                    d_mem_key: 2,
+                    mem_capacity: 3,
+                    chunk_len: 2,
+                    ..Default::default()
+                },
+                23,
+                depth,
+                loops,
+            );
+            model.vocabulary = tokenizer.ordered_vocabulary().unwrap();
+            model.tokenizer_json = tokenizer.serialized_metadata();
+            for block in std::iter::once(&mut model.block).chain(&mut model.extra_blocks) {
+                block.memory.insert(&[0.1, 0.2], &[0.3, -0.5, 0.7, 0.1]);
+                block.memory.insert(&[-0.3, 0.4], &[-0.1, 0.4, 0.6, -0.2]);
+                // The unused tail is not a valid occupied-slot strength.
+                block.inf_mem_weights[2] = -123.0;
+            }
+            model
+        }
+        fn runtime_bits(model: &PSSALayerV2) -> Vec<u32> {
+            let mut carry = vec![0.0; model.recurrent_state_len()];
+            model.copy_recurrent_state_to(&mut carry);
+            let mut bits: Vec<_> = carry.iter().map(|v| v.to_bits()).collect();
+            bits.extend(model.inf_features.iter().map(|v| v.to_bits()));
+            for block in std::iter::once(&model.block).chain(&model.extra_blocks) {
+                for values in [
+                    &block.inf_mem_weights,
+                    &block.inf_q_pnc,
+                    &block.inf_m_val,
+                    &block.inf_z_final,
+                ] {
+                    bits.extend(values.iter().map(|v| v.to_bits()));
+                }
+            }
+            bits
+        }
+        for tokenizer in [word_tokenizer("word"), bpe_tokenizer(0xc3)] {
+            for (depth, loops) in [(1, 1), (2, 3)] {
+                let cfg = InferenceConfig {
+                    max_new_tokens: 5,
+                    ..Default::default()
+                };
+                let mut baseline = populated(&tokenizer, depth, loops);
+                let mut observed = populated(&tokenizer, depth, loops);
+                let mut replay = populated(&tokenizer, depth, loops);
+                let banks: Vec<_> = std::iter::once(&observed.block)
+                    .chain(&observed.extra_blocks)
+                    .map(|b| b.memory.clone())
+                    .collect();
+                let prompt_ids = tokenizer.try_encode("prompt prompt", true).unwrap();
+                let mut logits = vec![0.0; tokenizer.vocab_size];
+                replay.reset_recurrent_state();
+                for &id in &prompt_ids {
+                    replay.forward_inference(id, &mut logits);
+                }
+                let mut baseline_progress = Vec::new();
+                let mut baseline_engine = PSSAInferenceEngine::new(&mut baseline, &tokenizer);
+                let expected = baseline_engine
+                    .try_generate_chat_turn_controlled(
+                        "prompt prompt",
+                        &cfg,
+                        |text, count| baseline_progress.push((text.to_owned(), count)),
+                        || false,
+                    )
+                    .unwrap();
+                let rng = baseline_engine.rng.state;
+                let mut observed_progress = Vec::new();
+                let mut seen = 0;
+                let mut last_id = *prompt_ids.last().unwrap();
+                let mut observed_engine = PSSAInferenceEngine::new(&mut observed, &tokenizer);
+                let actual = observed_engine
+                    .try_generate_chat_turn_observed(
+                        "prompt prompt",
+                        &cfg,
+                        |text, count| observed_progress.push((text.to_owned(), count)),
+                        || false,
+                        |count, query_id, selected_id, model| {
+                            seen += 1;
+                            assert_eq!(count, seen);
+                            assert_eq!(query_id, last_id);
+                            if count > 1 {
+                                replay.forward_inference(query_id, &mut logits);
+                            }
+                            assert_eq!(runtime_bits(model), runtime_bits(&replay));
+                            for (block, bank) in std::iter::once(&model.block)
+                                .chain(&model.extra_blocks)
+                                .zip(&banks)
+                            {
+                                assert_eq!(&block.memory, bank);
+                            }
+                            last_id = selected_id;
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    observed_engine.rng.state, rng,
+                    "observation must not consume RNG"
+                );
+                assert_eq!(actual, expected);
+                assert_eq!(observed_progress, baseline_progress);
+                assert_eq!(seen, baseline_progress.last().unwrap().1);
+                assert_eq!(runtime_bits(&observed), runtime_bits(&baseline));
+                assert_eq!(observed.step_counter, baseline.step_counter);
+            }
+        }
+    }
+
+    #[test]
+    fn memory_observer_skips_prefill_and_bpe_flush_and_respects_cancellation() {
+        let tokenizer = bpe_tokenizer(0xc3);
+        let mut model = tiny_model(&tokenizer);
+        let count = Cell::new(0);
+        let mut observed = Vec::new();
+        let mut progress = Vec::new();
+        let out = PSSAInferenceEngine::new(&mut model, &tokenizer)
+            .try_generate_chat_turn_observed(
+                "a",
+                &greedy(10),
+                |text, tokens| {
+                    count.set(tokens);
+                    progress.push((text.to_owned(), tokens));
+                },
+                || count.get() == 1,
+                |tokens, _, selected, model| {
+                    observed.push((tokens, selected));
+                    assert_eq!(model.memory.count, 0);
+                },
+            )
+            .unwrap();
+        assert_eq!(out, "�");
+        assert_eq!(observed, [(1, 1)]);
+        assert_eq!(progress, [(String::new(), 1), ("�".into(), 1)]);
+        for max_new_tokens in [0, 3] {
+            let out = PSSAInferenceEngine::new(&mut model, &tokenizer)
+                .try_generate_chat_turn_observed(
+                    "a",
+                    &greedy(max_new_tokens),
+                    |_, _| panic!("no output"),
+                    || max_new_tokens > 0,
+                    |_, _, _, _| panic!("no observation without a generated token"),
+                )
+                .unwrap();
+            assert_eq!(out, "");
         }
     }
 

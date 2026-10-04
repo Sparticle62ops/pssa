@@ -9,6 +9,12 @@ use ratatui::{
     widgets::{Clear, Paragraph, Wrap},
 };
 
+pub(super) const TABS: [&str; 10] = ["monitor", "chain", "model", "feed", "inference", "setup", "library", "mixer", "eval", "memory"];
+pub(super) const LIBRARY_TAB: usize = 6;
+pub(super) const MIXER_TAB: usize = 7;
+pub(super) const EVAL_TAB: usize = 8;
+pub(super) const MEMORY_TAB: usize = 9;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Context {
     Monitor,
@@ -16,10 +22,15 @@ pub(super) enum Context {
     Chat,
     Setup,
     SetupEdit,
+    Library,
+    LibraryEdit,
+    Mixer,
+    Eval,
+    EvalEdit,
     Help,
 }
 impl Context {
-    fn mask(self) -> u8 {
+    fn mask(self) -> u16 {
         1 << self as u8
     }
 
@@ -29,19 +40,29 @@ impl Context {
             4 => Self::Chat,
             5 if editing => Self::SetupEdit,
             5 => Self::Setup,
+            LIBRARY_TAB if editing => Self::LibraryEdit,
+            LIBRARY_TAB => Self::Library,
+            MIXER_TAB => Self::Mixer,
+            EVAL_TAB if editing => Self::EvalEdit,
+            EVAL_TAB => Self::Eval,
             _ => Self::Dashboard,
         }
     }
 }
 
-const MONITOR: u8 = 1 << Context::Monitor as u8;
-const DASHBOARD: u8 = 1 << Context::Dashboard as u8;
-const CHAT: u8 = 1 << Context::Chat as u8;
-const SETUP: u8 = 1 << Context::Setup as u8;
-const EDIT: u8 = 1 << Context::SetupEdit as u8;
-const HELP: u8 = 1 << Context::Help as u8;
-const BROWSE: u8 = MONITOR | DASHBOARD | SETUP;
-const ALL: u8 = BROWSE | CHAT | EDIT | HELP;
+const MONITOR: u16 = 1 << Context::Monitor as u8;
+const DASHBOARD: u16 = 1 << Context::Dashboard as u8;
+const CHAT: u16 = 1 << Context::Chat as u8;
+const SETUP: u16 = 1 << Context::Setup as u8;
+const EDIT: u16 = 1 << Context::SetupEdit as u8;
+const LIBRARY: u16 = 1 << Context::Library as u8;
+const LIBRARY_EDIT: u16 = 1 << Context::LibraryEdit as u8;
+const MIXER: u16 = 1 << Context::Mixer as u8;
+const EVAL: u16 = 1 << Context::Eval as u8;
+const EVAL_EDIT: u16 = 1 << Context::EvalEdit as u8;
+const HELP: u16 = 1 << Context::Help as u8;
+const BROWSE: u16 = MONITOR | DASHBOARD | SETUP | LIBRARY | MIXER | EVAL;
+const ALL: u16 = BROWSE | CHAT | EDIT | LIBRARY_EDIT | EVAL_EDIT | HELP;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
@@ -51,6 +72,7 @@ pub(super) enum Action {
     ToggleHelp,
     Chat,
     Setup,
+    Local,
     Pan(bool),
     CycleGraph,
     Graph(GraphView),
@@ -66,7 +88,7 @@ struct Binding {
     modifiers: KeyModifiers,
     label: &'static str,
     description: &'static str,
-    routes: &'static [(u8, Action)],
+    routes: &'static [(u16, Action)],
 }
 
 macro_rules! bind {
@@ -97,11 +119,11 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('?'), "?", "Open/close help outside text input; type normally in editors", BROWSE | HELP => ToggleHelp),
     bind!(Char('q'), "q", "Quit outside text input; close help", BROWSE => Quit, HELP => ToggleHelp),
     bind!(Esc, "Esc", "Quit dashboard/setup; cancel edit; stop chat; close help",
-        BROWSE => Quit, CHAT => Chat, EDIT => Setup, HELP => ToggleHelp),
+        BROWSE => Quit, CHAT => Chat, EDIT => Setup, LIBRARY_EDIT | EVAL_EDIT => Local, HELP => ToggleHelp),
     bind!(Left, "Left", "Monitor: pan older; dashboard: previous tab; setup: previous page",
-        MONITOR => Pan(false), DASHBOARD => PreviousTab, SETUP => Setup),
+        MONITOR => Pan(false), DASHBOARD | LIBRARY | MIXER | EVAL => PreviousTab, SETUP => Setup),
     bind!(Right, "Right", "Monitor: pan newer; dashboard: next tab; setup: next page",
-        MONITOR => Pan(true), DASHBOARD => NextTab, SETUP => Setup),
+        MONITOR => Pan(true), DASHBOARD | LIBRARY | MIXER | EVAL => NextTab, SETUP => Setup),
     bind!(Char('g'), "g", "Monitor: cycle graph view", MONITOR => CycleGraph),
     bind!(Char('1'), "1", "Monitor: loss", MONITOR => Graph(GraphView::Loss)),
     bind!(Char('2'), "2", "Monitor: perplexity", MONITOR => Graph(GraphView::Perplexity)),
@@ -110,28 +132,35 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('5'), "5", "Monitor: comparison", MONITOR => Graph(GraphView::Comparison)),
     bind!(Char('6'), "6", "Monitor: all metrics", MONITOR => Graph(GraphView::All)),
     bind!(Char('7'), "7", "Monitor: memory", MONITOR => Graph(GraphView::Memory)),
-    bind!(Char('+'), "+", "Monitor: zoom in; setup: increase selected depth/loops", MONITOR => Zoom(true), SETUP => Setup),
-    bind!(Char('='), "=", "Monitor: zoom in", MONITOR => Zoom(true)),
-    bind!(Char('-'), "-", "Monitor: zoom out; setup: decrease selected depth/loops", MONITOR => Zoom(false), SETUP => Setup),
+    bind!(Char('+'), "+", "Monitor: zoom in; setup: increase depth/loops; mixer: increase share", MONITOR => Zoom(true), SETUP => Setup, MIXER => Local),
+    bind!(Char('='), "=", "Monitor: zoom in; mixer: increase share", MONITOR => Zoom(true), MIXER => Local),
+    bind!(Char('-'), "-", "Monitor: zoom out; setup: decrease depth/loops; mixer: decrease share", MONITOR => Zoom(false), SETUP => Setup, MIXER => Local),
     bind!(Char('0'), "0", "Monitor: reset graph navigation", MONITOR => ResetGraph),
-    bind!(Up, "Up", "Setup: previous field / preview scroll up; help: scroll up", SETUP => Setup, HELP => ScrollHelp(-1)),
-    bind!(Down, "Down", "Setup: next field / preview scroll down; help: scroll down", SETUP => Setup, HELP => ScrollHelp(1)),
+    bind!(Up, "Up", "Setup: previous field; library/mixer/eval: previous item; help: up", SETUP => Setup, LIBRARY | MIXER | EVAL => Local, HELP => ScrollHelp(-1)),
+    bind!(Down, "Down", "Setup: next field; library/mixer/eval: next item; help: down", SETUP => Setup, LIBRARY | MIXER | EVAL => Local, HELP => ScrollHelp(1)),
     bind!(BackTab, "Shift+Tab", "Setup: previous wizard page", SETUP => Setup),
     bind!(F(5), "F5", "Setup: next wizard page", SETUP => Setup),
-    bind!(Char('c'), "c", "Setup: toggle full command preview", SETUP => Setup),
-    bind!(PageUp, "PgUp", "Chat, setup command preview, help: scroll up", CHAT => Chat, SETUP => Setup, HELP => ScrollHelp(-8)),
-    bind!(PageDown, "PgDn", "Chat, setup command preview, help: scroll down", CHAT => Chat, SETUP => Setup, HELP => ScrollHelp(8)),
+    bind!(Char('c'), "c", "Setup: command preview; library: chat with checkpoint", SETUP => Setup, LIBRARY => Local),
+    bind!(Char('m'), "m", "Library: edit models folder", LIBRARY => Local),
+    bind!(Char('d'), "d", "Library: edit datasets folder", LIBRARY => Local),
+    bind!(Char('r'), "r", "Library: rescan files; eval: reload prompt suite", LIBRARY | EVAL => Local),
+    bind!(Char('p'), "p", "Eval: edit prompt file (empty restores built-in suite)", EVAL => Local),
+    bind!(Char('a'), "a", "Eval: pause/resume background checkpoint evaluation", EVAL => Local),
+    bind!(Char('u'), "u", "Library: fill Setup Resume from selected checkpoint", LIBRARY => Local),
+    bind!(Char('t'), "t", "Library: fill Setup Dataset (converts JSONL/Parquet off-thread)", LIBRARY => Local),
+    bind!(PageUp, "PgUp", "Chat/setup/help: scroll up; eval: previous prompt", CHAT => Chat, SETUP => Setup, EVAL => Local, HELP => ScrollHelp(-8)),
+    bind!(PageDown, "PgDn", "Chat/setup/help: scroll down; eval: next prompt", CHAT => Chat, SETUP => Setup, EVAL => Local, HELP => ScrollHelp(8)),
     bind!(Home, "Home", "Help: first line", HELP => HelpTop),
     bind!(End, "End", "Chat: follow latest output; help: last line", CHAT => Chat, HELP => HelpBottom),
-    bind!(Enter, "Enter", "Chat: send/command; setup: activate/edit/save (launch only on start button)", CHAT => Chat, SETUP | EDIT => Setup),
+    bind!(Enter, "Enter", "Chat: send; setup: activate/save; library: stats/save; mixer: export; eval: save", CHAT => Chat, SETUP | EDIT => Setup, LIBRARY | LIBRARY_EDIT | MIXER | EVAL | EVAL_EDIT => Local),
     bind!(Char(' '), "Space", "Setup: activate/edit selected field or button; editors: type a space", SETUP => Setup),
-    bind!(Backspace, "Backspace", "Chat/setup editor: delete last character", CHAT => Chat, EDIT => Setup),
+    bind!(Backspace, "Backspace", "Text editors: delete last character", CHAT => Chat, EDIT => Setup, LIBRARY_EDIT | EVAL_EDIT => Local),
     Binding {
         code: Char('u'),
         modifiers: KeyModifiers::CONTROL,
         label: "Ctrl+U",
-        description: "Chat/setup editor: clear input",
-        routes: &[(CHAT, Chat), (EDIT, Setup)],
+        description: "Text editors: clear input",
+        routes: &[(CHAT, Chat), (EDIT, Setup), (LIBRARY_EDIT | EVAL_EDIT, Local)],
     },
 ];
 
@@ -159,6 +188,7 @@ pub(super) fn action(key: KeyEvent, context: Context) -> Option<Action> {
         return match context {
             Context::Chat => Some(Chat),
             Context::SetupEdit => Some(Setup),
+            Context::LibraryEdit | Context::EvalEdit => Some(Local),
             _ => None,
         };
     }
@@ -189,7 +219,7 @@ impl Help {
             .map(|binding| Line::from(format!("{:<10} {}", binding.label, binding.description)))
             .collect();
         lines.push(Line::from(
-            "Other printable characters type into chat/setup editors. Chat slash commands: /help.",
+            "Other printable characters type into chat/setup/folder/prompt editors. Chat slash commands: /help.",
         ));
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         let max = paragraph
@@ -275,7 +305,7 @@ mod tests {
 
     #[test]
     fn editors_keep_text_and_scoped_shortcuts_do_not_leak() {
-        for (context, expected) in [(Context::Chat, Chat), (Context::SetupEdit, Setup)] {
+        for (context, expected) in [(Context::Chat, Chat), (Context::SetupEdit, Setup), (Context::LibraryEdit, Local), (Context::EvalEdit, Local)] {
             for c in ['?', 'q', 'c', 'g', '1', '+', '-'] {
                 assert_eq!(
                     action(KeyEvent::new(Char(c), KeyModifiers::NONE), context),
