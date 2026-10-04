@@ -19,7 +19,10 @@ pub(super) const HARDWARE_TAB: usize = 12;
 pub(super) const MATH_TAB: usize = 13;
 pub(super) const DEVICE_TAB: usize = 14;
 pub(super) const LIMITS_TAB: usize = 15;
-pub(super) const TABS: [&str; 16] = [
+pub(super) const LIBRARY_TAB: usize = 16;
+pub(super) const MIXER_TAB: usize = 17;
+pub(super) const EVAL_TAB: usize = 18;
+pub(super) const TABS: [&str; 19] = [
     "monitor",
     "chain",
     "model",
@@ -36,6 +39,9 @@ pub(super) const TABS: [&str; 16] = [
     "math",
     "devices",
     "limits",
+    "library",
+    "mixer",
+    "eval",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +60,11 @@ pub(super) enum Context {
     Benchmark,
     BenchmarkEdit,
     Palette,
+    Library,
+    LibraryEdit,
+    Mixer,
+    Eval,
+    EvalEdit,
     Help,
     Sample,
     Math,
@@ -85,6 +96,11 @@ impl Context {
             DEVICE_TAB => Self::Device,
             LIMITS_TAB if editing => Self::LimitsEdit,
             LIMITS_TAB => Self::Limits,
+            LIBRARY_TAB if editing => Self::LibraryEdit,
+            LIBRARY_TAB => Self::Library,
+            MIXER_TAB => Self::Mixer,
+            EVAL_TAB if editing => Self::EvalEdit,
+            EVAL_TAB => Self::Eval,
             _ => Self::Dashboard,
         }
     }
@@ -114,8 +130,15 @@ const DEVICE: u32 = 1 << Context::Device as u32;
 const LIMITS: u32 = 1 << Context::Limits as u32;
 const LIMIT_EDIT: u32 = 1 << Context::LimitsEdit as u32;
 const PAGES: u32 = DASHBOARD | SAMPLE | MATH | DEVICE | LIMITS;
-const BROWSE: u32 = MONITOR | PAGES | SETUP | EXTRA_BROWSE;
-const ALL: u32 = BROWSE | CHAT | EDIT | HF | EXTRA_EDIT | PALETTE | HELP | LIMIT_EDIT;
+const LIBRARY: u32 = 1 << Context::Library as u32;
+const LIBRARY_EDIT: u32 = 1 << Context::LibraryEdit as u32;
+const MIXER: u32 = 1 << Context::Mixer as u32;
+const EVAL: u32 = 1 << Context::Eval as u32;
+const EVAL_EDIT: u32 = 1 << Context::EvalEdit as u32;
+const LOCAL_BROWSE: u32 = LIBRARY | MIXER | EVAL;
+const LOCAL_EDIT: u32 = LIBRARY_EDIT | EVAL_EDIT;
+const BROWSE: u32 = MONITOR | PAGES | SETUP | EXTRA_BROWSE | LOCAL_BROWSE;
+const ALL: u32 = BROWSE | CHAT | EDIT | HF | EXTRA_EDIT | PALETTE | HELP | LIMIT_EDIT | LOCAL_EDIT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
@@ -137,6 +160,7 @@ pub(super) enum Action {
     MathBottom,
     Device,
     Limits,
+    Local,
     Pan(bool),
     CycleGraph,
     Graph(GraphView),
@@ -189,12 +213,12 @@ const BINDINGS: &[Binding] = &[
     bind!(F(1), "F1", "Open/close help, including inside text input", ALL => ToggleHelp),
     bind!(Char('?'), "?", "Open/close help outside text input; type normally in editors", BROWSE | HELP => ToggleHelp),
     bind!(Char('q'), "q", "Quit outside text input; close help", BROWSE => Quit, HELP => ToggleHelp),
-    bind!(Esc, "Esc", "Dashboard/setup: quit; editors: cancel/clear; chat/extras: stop (Kaggle detaches); overlays: close",
-        MONITOR | PAGES | SETUP => Quit, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, PALETTE => Palette, HELP => ToggleHelp),
-    bind!(Left, "Left", "Monitor: pan older; dashboard/extras: previous tab; setup: previous page",
-        MONITOR => Pan(false), PAGES | EXTRA_BROWSE => PreviousTab, SETUP => Setup),
-    bind!(Right, "Right", "Monitor: pan newer; dashboard/extras: next tab; setup: next page",
-        MONITOR => Pan(true), PAGES | EXTRA_BROWSE => NextTab, SETUP => Setup),
+    bind!(Esc, "Esc", "Dashboard/setup/library/mixer/eval: quit; editors: cancel/clear; chat/extras: stop (Kaggle detaches); overlays: close",
+        MONITOR | PAGES | SETUP | LOCAL_BROWSE => Quit, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, PALETTE => Palette, HELP => ToggleHelp),
+    bind!(Left, "Left", "Monitor: pan older; other browse tabs: previous tab; setup: previous page",
+        MONITOR => Pan(false), PAGES | EXTRA_BROWSE | LOCAL_BROWSE => PreviousTab, SETUP => Setup),
+    bind!(Right, "Right", "Monitor: pan newer; other browse tabs: next tab; setup: next page",
+        MONITOR => Pan(true), PAGES | EXTRA_BROWSE | LOCAL_BROWSE => NextTab, SETUP => Setup),
     bind!(Char('g'), "g", "Monitor: cycle graph view", MONITOR => CycleGraph),
     bind!(Char('1'), "1", "Monitor: loss", MONITOR => Graph(GraphView::Loss)),
     bind!(Char('2'), "2", "Monitor: perplexity", MONITOR => Graph(GraphView::Perplexity)),
@@ -203,40 +227,47 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('5'), "5", "Monitor: comparison", MONITOR => Graph(GraphView::Comparison)),
     bind!(Char('6'), "6", "Monitor: all metrics", MONITOR => Graph(GraphView::All)),
     bind!(Char('7'), "7", "Monitor: memory", MONITOR => Graph(GraphView::Memory)),
-    bind!(Char('+'), "+", "Monitor: zoom in; setup: increase selected depth/loops", MONITOR => Zoom(true), SETUP => Setup),
-    bind!(Char('='), "=", "Monitor: zoom in", MONITOR => Zoom(true)),
-    bind!(Char('-'), "-", "Monitor: zoom out; setup: decrease selected depth/loops", MONITOR => Zoom(false), SETUP => Setup),
+    bind!(Char('+'), "+", "Monitor: zoom in; setup: increase depth/loops; mixer: increase share", MONITOR => Zoom(true), SETUP => Setup, MIXER => Local),
+    bind!(Char('='), "=", "Monitor: zoom in; mixer: increase share", MONITOR => Zoom(true), MIXER => Local),
+    bind!(Char('-'), "-", "Monitor: zoom out; setup: decrease depth/loops; mixer: decrease share", MONITOR => Zoom(false), SETUP => Setup, MIXER => Local),
     bind!(Char('0'), "0", "Monitor: reset graph navigation", MONITOR => ResetGraph),
-    bind!(Up, "Up", "Setup/runs/benchmark/palette/devices/limits: previous item; math/help: scroll up", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, MATH => MathScroll(-1), HELP => ScrollHelp(-1)),
-    bind!(Down, "Down", "Setup/runs/benchmark/palette/devices/limits: next item; math/help: scroll down", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, MATH => MathScroll(1), HELP => ScrollHelp(1)),
+    bind!(Up, "Up", "Setup/runs/benchmark/palette/devices/limits/library/mixer/eval: previous item; math/help: scroll up", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, MATH => MathScroll(-1), HELP => ScrollHelp(-1)),
+    bind!(Down, "Down", "Setup/runs/benchmark/palette/devices/limits/library/mixer/eval: next item; math/help: scroll down", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, MATH => MathScroll(1), HELP => ScrollHelp(1)),
     bind!(BackTab, "Shift+Tab", "Setup: previous wizard page", SETUP => Setup),
     bind!(F(5), "F5", "Setup: next wizard page", SETUP => Setup),
-    bind!(Char('c'), "c", "Setup: toggle command preview; runs: open checkpoint in chat", SETUP => Setup, RUNS => Extras),
-    bind!(Char('r'), "r", "Memory/runs: refresh saved snapshot/list; devices: refresh runtime availability", MEMORY | RUNS => Extras, DEVICE => Device),
+    bind!(Char('c'), "c", "Setup: command preview; runs/library: open checkpoint in chat", SETUP => Setup, RUNS => Extras, LIBRARY => Local),
+    bind!(Char('r'), "r", "Memory/runs: refresh snapshot/list; devices: refresh availability; library: rescan; eval: reload prompts", MEMORY | RUNS => Extras, DEVICE => Device, LIBRARY | EVAL => Local),
+    bind!(Char('v'), "v", "Memory: switch checkpoint inspector / live chat retrieval", MEMORY => Extras),
     bind!(Char('s'), "s", "Runs: score checkpoint on a held-out file", RUNS => Extras),
     bind!(Char('b'), "b", "Benchmark: run configured matched comparison", BENCHMARK => Extras),
     bind!(Char('y'), "y", "Kaggle preview: confirm upload and launch", KAGGLE_BUSY => Extras),
     bind!(Char('Y'), "Y", "Kaggle preview: confirm upload and launch (uppercase)", KAGGLE_BUSY => Extras),
     bind!(Char('n'), "n", "Kaggle preview: cancel launch", KAGGLE_BUSY => Extras),
     bind!(Char('N'), "N", "Kaggle preview: cancel launch (uppercase)", KAGGLE_BUSY => Extras),
-    bind!(PageUp, "PgUp", "Chat, setup preview, memory, math, help: scroll up", CHAT => Chat, SETUP => Setup, MEMORY => Extras, MATH => MathScroll(-8), HELP => ScrollHelp(-8)),
-    bind!(PageDown, "PgDn", "Chat, setup preview, memory, math, help: scroll down", CHAT => Chat, SETUP => Setup, MEMORY => Extras, MATH => MathScroll(8), HELP => ScrollHelp(8)),
+    bind!(Char('m'), "m", "Library: edit models folder", LIBRARY => Local),
+    bind!(Char('d'), "d", "Limits: reset draft (Apply to confirm); library: edit datasets folder", LIMITS => Limits, LIBRARY => Local),
+    bind!(Char('p'), "p", "Eval: edit prompt file (empty restores built-in suite)", EVAL => Local),
+    bind!(Char('a'), "a", "Eval: pause/resume background checkpoint evaluation", EVAL => Local),
+    bind!(Char('u'), "u", "Library: fill Setup Resume from selected checkpoint", LIBRARY => Local),
+    bind!(Char('t'), "t", "Library: fill Setup Dataset (converts JSONL/Parquet off-thread)", LIBRARY => Local),
+    bind!(PageUp, "PgUp", "Chat/setup preview/memory snapshot/math/help: scroll up; eval: previous prompt", CHAT => Chat, SETUP => Setup, MEMORY => Extras, MATH => MathScroll(-8), EVAL => Local, HELP => ScrollHelp(-8)),
+    bind!(PageDown, "PgDn", "Chat/setup preview/memory snapshot/math/help: scroll down; eval: next prompt", CHAT => Chat, SETUP => Setup, MEMORY => Extras, MATH => MathScroll(8), EVAL => Local, HELP => ScrollHelp(8)),
     bind!(Home, "Home", "Math/help: first line; devices/limits: first field", HELP => HelpTop, MATH => MathTop, DEVICE => Device, LIMITS => Limits),
     bind!(End, "End", "Chat: follow; math/help: last line; devices/limits: last field", CHAT => Chat, HELP => HelpBottom, MATH => MathBottom, DEVICE => Device, LIMITS => Limits),
-    bind!(Enter, "Enter", "Chat: send; setup: edit/save/start; HF: login; Kaggle: review; runs: monitor/score; benchmark: edit/save; palette: execute; devices/limits: select/edit/apply", CHAT => Chat, SETUP | EDIT => Setup, HF => Hf, KAGGLE_INPUT | RUNS | RUNS_EDIT | BENCHMARK | BENCHMARK_EDIT => Extras, PALETTE => Palette, DEVICE => Device, LIMITS | LIMIT_EDIT => Limits),
+    bind!(Enter, "Enter", "Chat: send; setup: edit/save/start; HF: login; Kaggle: review; runs: monitor/score; benchmark: edit/save; palette: execute; devices/limits: select/edit/apply; library: stats/save; mixer: export; eval: save", CHAT => Chat, SETUP | EDIT => Setup, HF => Hf, KAGGLE_INPUT | RUNS | RUNS_EDIT | BENCHMARK | BENCHMARK_EDIT => Extras, PALETTE => Palette, DEVICE => Device, LIMITS | LIMIT_EDIT => Limits, LOCAL_BROWSE | LOCAL_EDIT => Local),
     bind!(Char(' '), "Space", "Setup/devices/limits: activate selected field/button; text editors: type space", SETUP => Setup, DEVICE => Device, LIMITS => Limits),
-    bind!(Char('d'), "d", "Limits: reset draft to defaults (Apply to confirm)", LIMITS => Limits),
-    bind!(Backspace, "Backspace", "Text editors/palette: delete last character", CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA_EDIT => Extras, PALETTE => Palette, LIMIT_EDIT => Limits),
+    bind!(Backspace, "Backspace", "Text editors/palette: delete last character", CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA_EDIT => Extras, PALETTE => Palette, LIMIT_EDIT => Limits, LOCAL_EDIT => Local),
     Binding {
         code: Char('u'),
         modifiers: KeyModifiers::CONTROL,
         label: "Ctrl+U",
-        description: "Chat/setup/Kaggle/score/benchmark/limits editor: clear input",
+        description: "Chat/setup/Kaggle/score/benchmark/limits/library/eval editor: clear input",
         routes: &[
             (CHAT, Chat),
             (EDIT, Setup),
             (EXTRA_EDIT, Extras),
             (LIMIT_EDIT, Limits),
+            (LOCAL_EDIT, Local),
         ],
     },
     Binding {
@@ -283,6 +314,7 @@ pub(super) fn action(key: KeyEvent, context: Context) -> Option<Action> {
             Context::KaggleInput | Context::RunsEdit | Context::BenchmarkEdit => Some(Extras),
             Context::Palette => Some(Palette),
             Context::LimitsEdit => Some(Limits),
+            Context::LibraryEdit | Context::EvalEdit => Some(Local),
             _ => None,
         };
     }
@@ -313,7 +345,7 @@ impl Help {
             .map(|binding| Line::from(format!("{:<10} {}", binding.label, binding.description)))
             .collect();
         lines.push(Line::from(
-            "Other printable characters type into editors/palette, not shortcuts; limits accept digits. BPE byte groups share their minimum confidence color. Chat and A/B slash commands: /help.",
+            "Other printable characters type into editors/palette, including library folders and eval prompts; limits accept digits. BPE byte groups share their minimum confidence color. Chat and A/B slash commands: /help.",
         ));
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         let max = paragraph
@@ -455,6 +487,9 @@ mod tests {
             (MATH_TAB, "math", Context::Math, Context::Math),
             (DEVICE_TAB, "devices", Context::Device, Context::Device),
             (LIMITS_TAB, "limits", Context::Limits, Context::LimitsEdit),
+            (LIBRARY_TAB, "library", Context::Library, Context::LibraryEdit),
+            (MIXER_TAB, "mixer", Context::Mixer, Context::Mixer),
+            (EVAL_TAB, "eval", Context::Eval, Context::EvalEdit),
         ];
         let mut indices = HashSet::new();
         let mut contexts = vec![Context::Help, Context::Palette];
@@ -466,15 +501,15 @@ mod tests {
             contexts.extend([browse, edit]);
         }
         assert_eq!(indices.len(), TABS.len());
-        // All twenty contexts must retain a distinct bit, including Phase 12
-        // scopes beyond u16 and the palette/help scopes not represented by tabs.
+        // Every context retains a distinct bit, including the palette/help
+        // scopes not represented by tabs.
         assert_eq!(
             contexts
                 .iter()
                 .fold(0, |mask, context| mask | context.mask()),
             ALL
         );
-        assert_eq!(ALL.count_ones(), 20);
+        assert_eq!(ALL.count_ones(), 25);
         for context in contexts {
             for binding in BINDINGS {
                 let matching: Vec<_> = BINDINGS
@@ -527,7 +562,7 @@ mod tests {
                 vec![Char('y'), Char('Y'), Char('n'), Char('N'), Esc],
                 Extras,
             ),
-            (Context::Memory, vec![Char('r'), PageUp, PageDown], Extras),
+            (Context::Memory, vec![Char('r'), Char('v'), PageUp, PageDown], Extras),
             (
                 Context::Runs,
                 vec![Up, Down, Enter, Char('c'), Char('s'), Char('r'), Esc],
@@ -595,6 +630,9 @@ mod tests {
             (Context::RunsEdit, Extras),
             (Context::BenchmarkEdit, Extras),
             (Context::Palette, Palette),
+            (Context::LimitsEdit, Limits),
+            (Context::LibraryEdit, Local),
+            (Context::EvalEdit, Local),
         ] {
             for c in ['?', 'q', 'c', 'g', '1', '+', '-'] {
                 assert_eq!(

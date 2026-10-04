@@ -137,6 +137,38 @@ impl Default for Setup {
 }
 
 impl Setup {
+    pub(super) fn set_dataset(&mut self, path: PathBuf) {
+        self.values[Source as usize] = "local".into();
+        self.values[Dataset as usize] = path.to_string_lossy().into_owned();
+        self.page = 0;
+        self.selected = 1;
+        self.edit = None;
+        self.message = "Library/mixer dataset selected; review before launch.".into();
+        self.error = false;
+    }
+
+    pub(super) fn set_resume(&mut self, path: PathBuf) {
+        self.values[Resume as usize] = path.to_string_lossy().into_owned();
+        self.page = 3;
+        self.selected = 1;
+        self.edit = None;
+        for (label, value) in super::local::resume_hints(&path) {
+            if let Some(index) = LABELS.iter().position(|s| *s == label) {
+                self.values[index] = value;
+            }
+        }
+        self.message = "Resume selected; verify shape, chunk and schedule. TRFM uses CPU baseline; PSSA-only fields are ignored for TRFM.".into();
+        self.error = false;
+    }
+
+    fn transformer_resume(&self) -> bool {
+        Path::new(self.value(Resume)).extension().is_some_and(|e| e.eq_ignore_ascii_case("trfm"))
+    }
+
+    fn checkpoint_name(&self) -> &'static str {
+        if self.transformer_resume() { "model.trfm" } else { "model.pssa" }
+    }
+
     fn value(&self, field: Field) -> &str {
         &self.values[field as usize]
     }
@@ -393,6 +425,9 @@ impl Setup {
         }
         TrainingBackend::parse(self.value(Backend))?;
         self.limits()?;
+        if self.transformer_resume() && self.value(Source) != "local" {
+            return Err("Transformer resume requires a local dataset".into());
+        }
         if !self.value(Resume).is_empty() {
             let path = Path::new(self.value(Resume));
             if !path.is_file() {
@@ -408,7 +443,7 @@ impl Setup {
         if path.exists() && !path.is_dir() {
             return Err("Output must be a directory, not a file".into());
         }
-        for name in ["model.pssa", "train.log"] {
+        for name in [self.checkpoint_name(), "train.log"] {
             if path.join(name).symlink_metadata().is_ok() {
                 return Err(format!(
                     "{} already exists; choose a new output directory",
@@ -424,7 +459,8 @@ impl Setup {
     }
 
     fn args(&self) -> Vec<String> {
-        let mut args = vec!["train".into()];
+        let transformer = self.transformer_resume();
+        let mut args = vec![if transformer { "train-transformer" } else { "train" }.into()];
         let mut push = |flag: &str, value: String| {
             args.extend([flag.to_owned(), value]);
         };
@@ -452,6 +488,7 @@ impl Setup {
             (Accumulate, "--accumulate"),
             (Backend, "--backend"),
         ] {
+            if transformer && matches!(field, Latent | State | Depth | Loops | Backend) { continue; }
             push(flag, self.value(field).into());
         }
         for (field, flag) in [(MaxTokens, "--max-tokens"), (Batch, "--batch-size"),
@@ -466,7 +503,7 @@ impl Setup {
         push(
             "--out",
             Path::new(&safe_path(self.value(Output)))
-                .join("model.pssa")
+                .join(self.checkpoint_name())
                 .to_string_lossy()
                 .into_owned(),
         );
@@ -477,7 +514,7 @@ impl Setup {
     fn command(&self) -> String {
         let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("oxide_ai_pssa"));
         let output = safe_path(self.value(Output));
-        let checkpoint = Path::new(&output).join("model.pssa");
+        let checkpoint = Path::new(&output).join(self.checkpoint_name());
         format!(
             "mkdir -p -- {} && test ! -e {} && test ! -L {} && (set -C; {} {} > {} 2>&1 < /dev/null)",
             quote(&output),
@@ -763,6 +800,7 @@ impl RunSpec {
         })();
         match spawn {
             Ok((child, log)) => Ok(TrainingRun {
+                checkpoint_name: if self.args.first().is_some_and(|s| s == "train-transformer") { "model.trfm" } else { "model.pssa" },
                 child,
                 log,
                 pending: Vec::new(),
@@ -780,6 +818,7 @@ impl RunSpec {
 }
 
 pub(super) struct TrainingRun {
+    checkpoint_name: &'static str,
     child: Child,
     log: File,
     pending: Vec<u8>,
@@ -800,7 +839,7 @@ impl TrainingRun {
             last_progress_at: Some(Instant::now()),
             checkpoint_target: Some(
                 self.output
-                    .join("model.pssa")
+                    .join(self.checkpoint_name)
                     .to_string_lossy()
                     .into_owned(),
             ),
@@ -953,6 +992,33 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    #[test]
+    fn library_picks_fill_wizard_and_transformer_resume_uses_existing_cli() {
+        let fixture = Fixture::new();
+        let mut setup = fixture.setup();
+        let dataset = fixture.0.join("source file.txt");
+        setup.set_dataset(dataset.clone());
+        assert_eq!(setup.value(Dataset), dataset.to_str().unwrap());
+        assert_eq!(setup.value(Source), "local");
+        let resume = fixture.0.join("checkpoint name.trfm");
+        let mut header = b"TRFM".to_vec();
+        header.extend(1u16.to_le_bytes());
+        header.resize(22, 0);
+        for n in [2048u64, 32, 4, 64, 8] { header.extend(n.to_le_bytes()); }
+        fs::write(&resume, header).unwrap();
+        setup.set_resume(resume.clone());
+        assert_eq!(setup.value(Resume), resume.to_str().unwrap());
+        assert_eq!(setup.value(Chunk), "8");
+        let args = setup.validate().unwrap().args;
+        assert_eq!(args[0], "train-transformer");
+        assert!(args.windows(2).any(|w| w == ["--resume", resume.to_str().unwrap()]));
+        assert!(args.windows(2).any(|w| w[0] == "--out" && w[1].ends_with("model.trfm")));
+        for flag in ["--latent", "--state", "--depth", "--loops", "--backend"] {
+            assert!(!args.iter().any(|s| s == flag));
+        }
+        assert!(setup.command().contains("model.trfm"));
     }
 
     #[test]
