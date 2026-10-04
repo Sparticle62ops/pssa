@@ -16,11 +16,20 @@ pub(super) enum Context {
     Chat,
     Setup,
     SetupEdit,
+    HfInput,
+    KaggleInput,
+    KaggleBusy,
+    Memory,
+    Runs,
+    RunsEdit,
+    Benchmark,
+    BenchmarkEdit,
+    Palette,
     Help,
 }
 impl Context {
-    fn mask(self) -> u8 {
-        1 << self as u8
+    fn mask(self) -> u32 {
+        1 << self as u32
     }
 
     pub(super) fn for_tab(tab: usize, editing: bool) -> Self {
@@ -29,19 +38,39 @@ impl Context {
             4 => Self::Chat,
             5 if editing => Self::SetupEdit,
             5 => Self::Setup,
+            super::HF_TAB => Self::HfInput,
+            super::KAGGLE_TAB if editing => Self::KaggleInput,
+            super::KAGGLE_TAB => Self::KaggleBusy,
+            super::MEMORY_TAB => Self::Memory,
+            super::RUNS_TAB if editing => Self::RunsEdit,
+            super::RUNS_TAB => Self::Runs,
+            super::BENCHMARK_TAB if editing => Self::BenchmarkEdit,
+            super::BENCHMARK_TAB => Self::Benchmark,
             _ => Self::Dashboard,
         }
     }
 }
 
-const MONITOR: u8 = 1 << Context::Monitor as u8;
-const DASHBOARD: u8 = 1 << Context::Dashboard as u8;
-const CHAT: u8 = 1 << Context::Chat as u8;
-const SETUP: u8 = 1 << Context::Setup as u8;
-const EDIT: u8 = 1 << Context::SetupEdit as u8;
-const HELP: u8 = 1 << Context::Help as u8;
-const BROWSE: u8 = MONITOR | DASHBOARD | SETUP;
-const ALL: u8 = BROWSE | CHAT | EDIT | HELP;
+const MONITOR: u32 = 1 << Context::Monitor as u32;
+const DASHBOARD: u32 = 1 << Context::Dashboard as u32;
+const CHAT: u32 = 1 << Context::Chat as u32;
+const SETUP: u32 = 1 << Context::Setup as u32;
+const EDIT: u32 = 1 << Context::SetupEdit as u32;
+const HF: u32 = 1 << Context::HfInput as u32;
+const KAGGLE_INPUT: u32 = 1 << Context::KaggleInput as u32;
+const KAGGLE_BUSY: u32 = 1 << Context::KaggleBusy as u32;
+const MEMORY: u32 = 1 << Context::Memory as u32;
+const RUNS: u32 = 1 << Context::Runs as u32;
+const RUNS_EDIT: u32 = 1 << Context::RunsEdit as u32;
+const BENCHMARK: u32 = 1 << Context::Benchmark as u32;
+const BENCHMARK_EDIT: u32 = 1 << Context::BenchmarkEdit as u32;
+const PALETTE: u32 = 1 << Context::Palette as u32;
+const HELP: u32 = 1 << Context::Help as u32;
+const EXTRA_EDIT: u32 = KAGGLE_INPUT | RUNS_EDIT | BENCHMARK_EDIT;
+const EXTRA_BROWSE: u32 = KAGGLE_BUSY | MEMORY | RUNS | BENCHMARK;
+const EXTRA: u32 = EXTRA_EDIT | EXTRA_BROWSE;
+const BROWSE: u32 = MONITOR | DASHBOARD | SETUP | EXTRA_BROWSE;
+const ALL: u32 = BROWSE | CHAT | EDIT | HF | EXTRA_EDIT | PALETTE | HELP;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
@@ -49,8 +78,12 @@ pub(super) enum Action {
     NextTab,
     PreviousTab,
     ToggleHelp,
+    TogglePalette,
+    Palette,
     Chat,
     Setup,
+    Hf,
+    Extras,
     Pan(bool),
     CycleGraph,
     Graph(GraphView),
@@ -66,7 +99,7 @@ struct Binding {
     modifiers: KeyModifiers,
     label: &'static str,
     description: &'static str,
-    routes: &'static [(u8, Action)],
+    routes: &'static [(u32, Action)],
 }
 
 macro_rules! bind {
@@ -96,12 +129,12 @@ const BINDINGS: &[Binding] = &[
     bind!(F(1), "F1", "Open/close help, including inside text input", ALL => ToggleHelp),
     bind!(Char('?'), "?", "Open/close help outside text input; type normally in editors", BROWSE | HELP => ToggleHelp),
     bind!(Char('q'), "q", "Quit outside text input; close help", BROWSE => Quit, HELP => ToggleHelp),
-    bind!(Esc, "Esc", "Quit dashboard/setup; cancel edit; stop chat; close help",
-        BROWSE => Quit, CHAT => Chat, EDIT => Setup, HELP => ToggleHelp),
-    bind!(Left, "Left", "Monitor: pan older; dashboard: previous tab; setup: previous page",
-        MONITOR => Pan(false), DASHBOARD => PreviousTab, SETUP => Setup),
-    bind!(Right, "Right", "Monitor: pan newer; dashboard: next tab; setup: next page",
-        MONITOR => Pan(true), DASHBOARD => NextTab, SETUP => Setup),
+    bind!(Esc, "Esc", "Dashboard/setup: quit; editors: cancel/clear; chat/extras: stop (Kaggle detaches); overlays: close",
+        MONITOR | DASHBOARD | SETUP => Quit, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, PALETTE => Palette, HELP => ToggleHelp),
+    bind!(Left, "Left", "Monitor: pan older; dashboard/extras: previous tab; setup: previous page",
+        MONITOR => Pan(false), DASHBOARD | EXTRA_BROWSE => PreviousTab, SETUP => Setup),
+    bind!(Right, "Right", "Monitor: pan newer; dashboard/extras: next tab; setup: next page",
+        MONITOR => Pan(true), DASHBOARD | EXTRA_BROWSE => NextTab, SETUP => Setup),
     bind!(Char('g'), "g", "Monitor: cycle graph view", MONITOR => CycleGraph),
     bind!(Char('1'), "1", "Monitor: loss", MONITOR => Graph(GraphView::Loss)),
     bind!(Char('2'), "2", "Monitor: perplexity", MONITOR => Graph(GraphView::Perplexity)),
@@ -114,24 +147,45 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('='), "=", "Monitor: zoom in", MONITOR => Zoom(true)),
     bind!(Char('-'), "-", "Monitor: zoom out; setup: decrease selected depth/loops", MONITOR => Zoom(false), SETUP => Setup),
     bind!(Char('0'), "0", "Monitor: reset graph navigation", MONITOR => ResetGraph),
-    bind!(Up, "Up", "Setup: previous field / preview scroll up; help: scroll up", SETUP => Setup, HELP => ScrollHelp(-1)),
-    bind!(Down, "Down", "Setup: next field / preview scroll down; help: scroll down", SETUP => Setup, HELP => ScrollHelp(1)),
+    bind!(Up, "Up", "Setup/runs/benchmark/palette: previous item; help/preview: scroll up", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, HELP => ScrollHelp(-1)),
+    bind!(Down, "Down", "Setup/runs/benchmark/palette: next item; help/preview: scroll down", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, HELP => ScrollHelp(1)),
     bind!(BackTab, "Shift+Tab", "Setup: previous wizard page", SETUP => Setup),
     bind!(F(5), "F5", "Setup: next wizard page", SETUP => Setup),
-    bind!(Char('c'), "c", "Setup: toggle full command preview", SETUP => Setup),
-    bind!(PageUp, "PgUp", "Chat, setup command preview, help: scroll up", CHAT => Chat, SETUP => Setup, HELP => ScrollHelp(-8)),
-    bind!(PageDown, "PgDn", "Chat, setup command preview, help: scroll down", CHAT => Chat, SETUP => Setup, HELP => ScrollHelp(8)),
+    bind!(Char('c'), "c", "Setup: toggle command preview; runs: open checkpoint in chat", SETUP => Setup, RUNS => Extras),
+    bind!(Char('r'), "r", "Memory/runs: refresh saved snapshot/list", MEMORY | RUNS => Extras),
+    bind!(Char('s'), "s", "Runs: score checkpoint on a held-out file", RUNS => Extras),
+    bind!(Char('b'), "b", "Benchmark: run configured matched comparison", BENCHMARK => Extras),
+    bind!(Char('y'), "y", "Kaggle preview: confirm upload and launch", KAGGLE_BUSY => Extras),
+    bind!(Char('Y'), "Y", "Kaggle preview: confirm upload and launch (uppercase)", KAGGLE_BUSY => Extras),
+    bind!(Char('n'), "n", "Kaggle preview: cancel launch", KAGGLE_BUSY => Extras),
+    bind!(Char('N'), "N", "Kaggle preview: cancel launch (uppercase)", KAGGLE_BUSY => Extras),
+    bind!(PageUp, "PgUp", "Chat, setup preview, memory, help: scroll up", CHAT => Chat, SETUP => Setup, MEMORY => Extras, HELP => ScrollHelp(-8)),
+    bind!(PageDown, "PgDn", "Chat, setup preview, memory, help: scroll down", CHAT => Chat, SETUP => Setup, MEMORY => Extras, HELP => ScrollHelp(8)),
     bind!(Home, "Home", "Help: first line", HELP => HelpTop),
     bind!(End, "End", "Chat: follow latest output; help: last line", CHAT => Chat, HELP => HelpBottom),
-    bind!(Enter, "Enter", "Chat: send/command; setup: activate/edit/save (launch only on start button)", CHAT => Chat, SETUP | EDIT => Setup),
-    bind!(Char(' '), "Space", "Setup: activate/edit selected field or button; editors: type a space", SETUP => Setup),
-    bind!(Backspace, "Backspace", "Chat/setup editor: delete last character", CHAT => Chat, EDIT => Setup),
+    bind!(Enter, "Enter", "Chat: send; setup: edit/save/start button; HF: login; Kaggle: review; runs: monitor/score; benchmark: edit/save; palette: execute", CHAT => Chat, SETUP | EDIT => Setup, HF => Hf, KAGGLE_INPUT | RUNS | RUNS_EDIT | BENCHMARK | BENCHMARK_EDIT => Extras, PALETTE => Palette),
+    bind!(Char(' '), "Space", "Setup: activate selected field/button; editors: type a space", SETUP => Setup),
+    bind!(Backspace, "Backspace", "Text editors/palette: delete last character", CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA_EDIT => Extras, PALETTE => Palette),
     Binding {
         code: Char('u'),
         modifiers: KeyModifiers::CONTROL,
         label: "Ctrl+U",
-        description: "Chat/setup editor: clear input",
-        routes: &[(CHAT, Chat), (EDIT, Setup)],
+        description: "Chat/setup/Kaggle/score/benchmark editor: clear input",
+        routes: &[(CHAT, Chat), (EDIT, Setup), (EXTRA_EDIT, Extras)],
+    },
+    Binding {
+        code: Char('l'),
+        modifiers: KeyModifiers::CONTROL,
+        label: "Ctrl+L",
+        description: "HF login: log out and remove saved token",
+        routes: &[(HF, Hf)],
+    },
+    Binding {
+        code: Char('k'),
+        modifiers: KeyModifiers::CONTROL,
+        label: "Ctrl+K",
+        description: "Open/close command palette (all tabs and editors)",
+        routes: &[(ALL, TogglePalette)],
     },
 ];
 
@@ -159,6 +213,9 @@ pub(super) fn action(key: KeyEvent, context: Context) -> Option<Action> {
         return match context {
             Context::Chat => Some(Chat),
             Context::SetupEdit => Some(Setup),
+            Context::HfInput => Some(Hf),
+            Context::KaggleInput | Context::RunsEdit | Context::BenchmarkEdit => Some(Extras),
+            Context::Palette => Some(Palette),
             _ => None,
         };
     }
@@ -189,7 +246,7 @@ impl Help {
             .map(|binding| Line::from(format!("{:<10} {}", binding.label, binding.description)))
             .collect();
         lines.push(Line::from(
-            "Other printable characters type into chat/setup editors. Chat slash commands: /help.",
+            "Other printable characters type into editors/palette, not shortcuts. Chat and A/B slash commands: /help.",
         ));
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         let max = paragraph
@@ -274,8 +331,84 @@ mod tests {
     }
 
     #[test]
+    fn phase_ten_eleven_controls_are_registered_without_global_shadowing() {
+        for (context, codes, expected) in [
+            (Context::HfInput, vec![Enter, Esc, Backspace], Hf),
+            (Context::KaggleInput, vec![Enter, Esc, Backspace], Extras),
+            (
+                Context::KaggleBusy,
+                vec![Char('y'), Char('Y'), Char('n'), Char('N'), Esc],
+                Extras,
+            ),
+            (Context::Memory, vec![Char('r'), PageUp, PageDown], Extras),
+            (
+                Context::Runs,
+                vec![Up, Down, Enter, Char('c'), Char('s'), Char('r'), Esc],
+                Extras,
+            ),
+            (Context::RunsEdit, vec![Enter, Esc, Backspace], Extras),
+            (
+                Context::Benchmark,
+                vec![Up, Down, Enter, Char('b'), Esc],
+                Extras,
+            ),
+            (Context::BenchmarkEdit, vec![Enter, Esc, Backspace], Extras),
+            (
+                Context::Palette,
+                vec![Up, Down, Enter, Esc, Backspace],
+                Palette,
+            ),
+        ] {
+            for code in codes {
+                assert_eq!(
+                    action(KeyEvent::new(code, KeyModifiers::NONE), context),
+                    Some(expected),
+                    "{context:?}: {code:?}"
+                );
+            }
+            for (code, modifiers, expected) in [
+                (Tab, KeyModifiers::NONE, NextTab),
+                (F(1), KeyModifiers::NONE, ToggleHelp),
+                (Char('k'), KeyModifiers::CONTROL, TogglePalette),
+                (Char('c'), KeyModifiers::CONTROL, Quit),
+            ] {
+                assert_eq!(
+                    action(KeyEvent::new(code, modifiers), context),
+                    Some(expected),
+                    "{context:?}"
+                );
+            }
+        }
+        assert_eq!(
+            action(
+                KeyEvent::new(Char('l'), KeyModifiers::CONTROL),
+                Context::HfInput
+            ),
+            Some(Hf)
+        );
+        for context in [
+            Context::KaggleInput,
+            Context::RunsEdit,
+            Context::BenchmarkEdit,
+        ] {
+            assert_eq!(
+                action(KeyEvent::new(Char('u'), KeyModifiers::CONTROL), context),
+                Some(Extras)
+            );
+        }
+    }
+
+    #[test]
     fn editors_keep_text_and_scoped_shortcuts_do_not_leak() {
-        for (context, expected) in [(Context::Chat, Chat), (Context::SetupEdit, Setup)] {
+        for (context, expected) in [
+            (Context::Chat, Chat),
+            (Context::SetupEdit, Setup),
+            (Context::HfInput, Hf),
+            (Context::KaggleInput, Extras),
+            (Context::RunsEdit, Extras),
+            (Context::BenchmarkEdit, Extras),
+            (Context::Palette, Palette),
+        ] {
             for c in ['?', 'q', 'c', 'g', '1', '+', '-'] {
                 assert_eq!(
                     action(KeyEvent::new(Char(c), KeyModifiers::NONE), context),
@@ -366,7 +499,7 @@ mod tests {
     #[test]
     fn help_renders_each_key_once_and_scrolls_on_narrow_terminals() {
         let mut help = Help::default();
-        let mut terminal = Terminal::new(TestBackend::new(120, 80)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 120)).unwrap();
         terminal.draw(|f| help.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
         let rows: Vec<String> = buffer

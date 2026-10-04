@@ -470,7 +470,8 @@ impl Setup {
                 .split(area);
             self.draw_command(f, parts[0]);
             f.render_widget(
-                Paragraph::new("c back / PgUp PgDn scroll\nTab tabs / ? help / q quit").style(accent()),
+                Paragraph::new("c back / PgUp PgDn scroll\nTab tabs / ? help / q quit")
+                    .style(accent()),
                 parts[1],
             );
             return;
@@ -693,6 +694,7 @@ impl RunSpec {
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log.try_clone()?))
                 .stderr(Stdio::from(log));
+            super::hf::configure_child(&mut command);
             // Keep terminal job-control signals from reaching a detached run.
             // No pre_exec hook or extra dependency is needed for this on Unix.
             #[cfg(unix)]
@@ -767,7 +769,12 @@ impl TrainingRun {
 
     /// Bounded tail work on each UI tick. Log bytes are durable even if the UI
     /// cannot keep up, and no trainer thread waits for the dashboard to drain.
+    #[cfg(test)]
     pub(super) fn poll(&mut self, state: &mut RunState) {
+        self.poll_with(state, |_| {});
+    }
+
+    pub(super) fn poll_with(&mut self, state: &mut RunState, mut ingest: impl FnMut(&str)) {
         if self.reported {
             return;
         }
@@ -790,7 +797,9 @@ impl TrainingRun {
                 Ok(n) => {
                     for &byte in &buffer[..n] {
                         if byte == b'\n' {
-                            state.ingest(&String::from_utf8_lossy(&self.pending));
+                            let line = String::from_utf8_lossy(&self.pending);
+                            state.ingest(&line);
+                            ingest(&line);
                             self.pending.clear();
                         } else if self.pending.len() < 65_536 {
                             self.pending.push(byte);
@@ -806,7 +815,9 @@ impl TrainingRun {
         }
         if let Some(status) = self.status.filter(|_| at_end) {
             if !self.pending.is_empty() {
-                state.ingest(&String::from_utf8_lossy(&self.pending));
+                let line = String::from_utf8_lossy(&self.pending);
+                state.ingest(&line);
+                ingest(&line);
                 self.pending.clear();
             }
             state.training_active = false;
@@ -1218,7 +1229,8 @@ mod tests {
             );
         }
         assert!(run.child.wait().unwrap().success());
-        run.poll(&mut state);
+        let mut telemetry = Vec::new();
+        run.poll_with(&mut state, |line| telemetry.push(line.to_owned()));
         assert!(
             run.active(),
             "completion must wait for the entire durable log to drain"
@@ -1226,8 +1238,19 @@ mod tests {
         assert!(run.pending.len() <= 65_536, "bound unterminated lines");
         let deadline = Instant::now() + Duration::from_secs(5);
         while run.active() && Instant::now() < deadline {
-            run.poll(&mut state);
+            run.poll_with(&mut state, |line| telemetry.push(line.to_owned()));
         }
+        assert!(
+            telemetry
+                .iter()
+                .any(|line| line.contains("tokens_per_second=100")),
+            "wizard telemetry must also reach extras/alerts"
+        );
+        assert!(
+            telemetry
+                .iter()
+                .any(|line| line.contains("final unterminated log line"))
+        );
         assert!(!run.active());
         assert!(!state.training_active);
         assert_eq!(state.live_loss, Some(4.0));

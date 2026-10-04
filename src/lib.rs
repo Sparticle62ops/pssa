@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod backend;
 pub mod checkpoint;
 pub mod cli;
+pub mod comparison;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod dataset;
