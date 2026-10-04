@@ -24,11 +24,18 @@ use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 const TABS: [&str; 5] = ["monitor", "chain", "model", "feed", "inference"];
-const PSSA_LOGO: [&str; 3] = [
-    "███  ████  ████   ███",
-    "█ █  █     █      █ █",
-    "███  ████  ████   ███",
+// Five scanlines leave room for the P's stem, both S turns and the A's crossbar.
+const PSSA_LOGO: [&str; 5] = [
+    "███    ███   ███   ██ ",
+    "█  █  █     █     █  █",
+    "███    ██    ██   ████",
+    "█        █     █  █  █",
+    "█     ███   ███   █  █",
 ];
+const PANEL_BG: Color = Color::Rgb(0x07, 0x12, 0x10);
+const INSET_BG: Color = Color::Rgb(0x09, 0x14, 0x1a);
+const SECOND_ACCENT: Color = Color::Rgb(0x57, 0x82, 0x91);
+const GRID_COLOR: Color = Color::Rgb(0x19, 0x30, 0x35);
 const NORMAL_GREEN: Color = Color::Rgb(0x39, 0xe0, 0x7a);
 const AMBER: Color = Color::Rgb(0xff, 0xbf, 0x00);
 const BRIGHT_RED: Color = Color::Rgb(0xff, 0x2f, 0x3f);
@@ -1035,16 +1042,14 @@ fn accent() -> Style {
 
 fn panel(title: &str) -> Block<'_> {
     Block::default()
+        .style(Style::new().bg(PANEL_BG))
         .borders(Borders::ALL)
         .border_style(accent().add_modifier(Modifier::DIM))
         .title(Line::styled(title, accent().add_modifier(Modifier::BOLD)))
 }
 
 fn divider(width: u16) -> Line<'static> {
-    Line::styled(
-        "╌".repeat(width.into()),
-        accent().add_modifier(Modifier::DIM),
-    )
+    Line::styled("╌".repeat(width.into()), Style::new().fg(SECOND_ACCENT))
 }
 
 fn status_badge(health: &HealthStatus) -> Line<'static> {
@@ -1069,6 +1074,130 @@ fn status_badge(health: &HealthStatus) -> Line<'static> {
         ));
     }
     Line::from(spans)
+}
+
+fn draw_header_stats(f: &mut ratatui::Frame, area: Rect, state: &RunState, health: &HealthStatus) {
+    // Give a health reason the whole border title instead of truncating it
+    // behind the telemetry label at the 80-column breakpoint.
+    let title = health
+        .reason
+        .as_ref()
+        .map(|reason| format!(" {reason} "))
+        .unwrap_or_else(|| " live telemetry ".into());
+    let block = panel("")
+        .style(Style::new().bg(INSET_BG))
+        .border_style(Style::new().fg(SECOND_ACCENT))
+        .title(Line::styled(title, Style::new().fg(health.color())));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let done = state
+        .updates_done
+        .or(state.optimizer_updates)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".into());
+    let total = state
+        .updates_total
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".into());
+    let badge = HealthStatus {
+        level: health.level,
+        reason: None,
+        normal_label: health.normal_label,
+    };
+    let mut status = status_badge(&badge);
+    status
+        .spans
+        .push(Span::styled(format!("  step {done}/{total}"), accent()));
+    let loss = state
+        .live_loss
+        .or(state.epoch_loss)
+        .map(|v| format!("{v:.4}"))
+        .unwrap_or_else(|| "-".into());
+    let speed = state
+        .tok_s
+        .map(|v| format!("{v:.0}"))
+        .unwrap_or_else(|| "-".into());
+    let eta = state.eta.as_deref().unwrap_or("-");
+    f.render_widget(
+        Paragraph::new(vec![
+            status,
+            Line::from(vec![
+                Span::styled("loss ", Style::new().fg(SECOND_ACCENT)),
+                Span::styled(loss, Style::new().fg(health.color())),
+                Span::styled(format!("  tok/s {speed}"), accent()),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("ETA {eta}  "), accent()),
+                Span::styled(
+                    format!("loss {}", loss_trace(state)),
+                    Style::new().fg(SECOND_ACCENT),
+                ),
+            ]),
+        ]),
+        inner,
+    );
+}
+
+fn loss_trace(state: &RunState) -> String {
+    // Bounded to twelve real samples; missing/invalid data is a gap, not zero.
+    let values = &state.loss_series[state.loss_series.len().saturating_sub(12)..];
+    if values.is_empty() {
+        return "············".into();
+    }
+    let min = values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    let max = values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let bars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    values
+        .iter()
+        .map(|v| {
+            if !v.is_finite() {
+                '·'
+            } else if max == min {
+                bars[3]
+            } else {
+                bars[(((v - min) / (max - min)) * 7.0).round().clamp(0.0, 7.0) as usize]
+            }
+        })
+        .collect()
+}
+
+// Empty states are instrument cards, not invented run data. A dim dot grid
+// occupies only unused rows below the hints, never behind readable text.
+fn draw_info_card(f: &mut ratatui::Frame, area: Rect, title: &str, lines: Vec<Line<'_>>) {
+    let block = panel(title)
+        .style(Style::new().bg(INSET_BG))
+        .border_style(Style::new().fg(SECOND_ACCENT));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let rows = paragraph
+        .line_count(inner.width)
+        .min(usize::from(inner.height)) as u16;
+    f.render_widget(paragraph, Rect::new(inner.x, inner.y, inner.width, rows));
+    for y in (inner.y + rows + 1..inner.bottom()).step_by(2) {
+        for x in (inner.x + 1..inner.right()).step_by(4) {
+            f.buffer_mut()[(x, y)].set_symbol("·").set_fg(GRID_COLOR);
+        }
+    }
+}
+
+fn card_pair(area: Rect) -> std::rc::Rc<[Rect]> {
+    if area.width >= 70 {
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area)
+    } else {
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area)
+    }
 }
 
 fn progress_gradient(index: u16, width: u16) -> Color {
@@ -1262,19 +1391,6 @@ fn neuron_green(intensity: f64) -> Color {
     )
 }
 
-fn neuron_title(frame: NeuronFrame) -> &'static str {
-    // Keep the collapsed endpoint and the next cycle's seed visually
-    // identical: the title is part of the panel, so changing it at the seam
-    // would make the loop flash even though both frames contain one dot.
-    if frame.collapsed || frame.growth < 0.02 {
-        " neuron / dot / next cycle "
-    } else if frame.network_alpha < 0.98 {
-        " neuron / collapsing net "
-    } else {
-        " neuron / growing braille net "
-    }
-}
-
 fn draw_neuron_animation(f: &mut ratatui::Frame, area: Rect, now: Instant) {
     static ANIMATION_START: OnceLock<Instant> = OnceLock::new();
     let started = *ANIMATION_START.get_or_init(Instant::now);
@@ -1283,10 +1399,11 @@ fn draw_neuron_animation(f: &mut ratatui::Frame, area: Rect, now: Instant) {
 
 fn draw_neuron_animation_at(f: &mut ratatui::Frame, area: Rect, elapsed: Duration) {
     let frame = neuron_frame_at(elapsed);
-    let title = neuron_title(frame);
-    let inner = panel(title).inner(area);
+    // Keep the original black canvas, border and geometry; only drop the title.
+    let block = panel("").style(Style::new().bg(Color::Black));
+    let inner = block.inner(area);
     if inner.width < 2 || inner.height < 2 {
-        f.render_widget(panel(title), area);
+        f.render_widget(block, area);
         return;
     }
     // No topology work is needed for the seed-only part of the cycle or a
@@ -1308,7 +1425,7 @@ fn draw_neuron_animation_at(f: &mut ratatui::Frame, area: Rect, elapsed: Duratio
         )
     });
     let canvas = Canvas::default()
-        .block(panel(title))
+        .block(block)
         .marker(Marker::Braille)
         .background_color(Color::Black)
         .x_bounds([-aspect, aspect])
@@ -1508,25 +1625,23 @@ fn draw_with_background(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(if large_title { 5 } else { 3 }),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
         ])
         .split(area);
     let header = chunks[0];
-    if area.width >= 40 {
+    if large_title {
         f.render_widget(
             Paragraph::new(PSSA_LOGO.map(|row| Line::styled(row, accent())).to_vec()),
-            Rect::new(header.x, header.y, 24, 3),
+            Rect::new(header.x, header.y, 24, 5),
         );
-        f.render_widget(
-            Paragraph::new(status_badge(&health)).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::new().fg(health.color())),
-            ),
-            Rect::new(header.x + 24, header.y, header.width - 24, 3),
+        draw_header_stats(
+            f,
+            Rect::new(header.x + 24, header.y, header.width - 24, 5),
+            state,
+            &health,
         );
     } else {
         let title = if area.width >= 34 {
@@ -1604,15 +1719,56 @@ fn draw_feed(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
 
 fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: Duration) {
     let Some(feed) = state.feed.as_ref() else {
+        // Preserve the wrapped connection hint rather than squeezing empty
+        // cards into border-only fragments on short terminals.
+        if area.height < 10 {
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::styled("Waiting for feed samples", accent()),
+                    Line::from("Train with --hf-dataset OWNER/NAME --no-tui | oxide_ai_pssa tui"),
+                    Line::from("Older/local logs still work without previews."),
+                ])
+                .wrap(Wrap { trim: false })
+                .block(panel(" feed / idle ")),
+                area,
+            );
+            return;
+        }
+        let sections = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).split(area);
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled("Waiting for feed samples", accent()),
-                Line::from("Train with --hf-dataset OWNER/NAME --no-tui | oxide_ai_pssa tui"),
-                Line::from("Older/local logs remain supported; no sample metadata is available."),
+                Line::from("dataset -   rows -   tokens -"),
+                Line::styled(
+                    "No sample metadata in this log yet.",
+                    Style::new().fg(SECOND_ACCENT),
+                ),
             ])
-            .wrap(Wrap { trim: false })
             .block(panel(" feed / idle ")),
-            area,
+            sections[0],
+        );
+        let cards = card_pair(sections[1]);
+        draw_info_card(
+            f,
+            cards[0],
+            " 01 / source text ",
+            vec![
+                Line::styled("[ awaiting sample ]", accent()),
+                Line::from("Stream HF training into this dashboard:"),
+                Line::from(
+                    "oxide_ai_pssa train --hf-dataset OWNER/NAME --no-tui | oxide_ai_pssa tui",
+                ),
+            ],
+        );
+        draw_info_card(
+            f,
+            cards[1],
+            " 02 / token strips ",
+            vec![
+                Line::styled("text -> shredder -> token ids", accent()),
+                Line::from("Rows, tokens and the latest snippet appear when reported."),
+                Line::from("Older/local logs still work without previews."),
+            ],
         );
         return;
     };
@@ -2242,7 +2398,37 @@ fn draw_chain(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         Line::from(format!("directory  {}", state.chain_dir.display())),
         divider(area.width.saturating_sub(2)),
     ];
-    if state.checkpoints.is_empty() {
+    if state.checkpoints.is_empty() && area.height >= 10 {
+        let sections = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).split(area);
+        rows.push(Line::styled("No checkpoint files found yet.", accent()));
+        f.render_widget(
+            Paragraph::new(rows).block(panel(" chain / checkpoints ")),
+            sections[0],
+        );
+        let cards = card_pair(sections[1]);
+        draw_info_card(
+            f,
+            cards[0],
+            " checkpoint index / 0 files ",
+            vec![
+                Line::styled("FILE                 LOSS", Style::new().fg(SECOND_ACCENT)),
+                Line::from("-                    -"),
+                Line::from("Saved checkpoints will appear here automatically."),
+            ],
+        );
+        draw_info_card(
+            f,
+            cards[1],
+            " connect a chain ",
+            vec![
+                Line::styled("[ waiting for checkpoint files ]", accent()),
+                Line::from("oxide_ai_pssa tui --chain \"path/to/chain\""),
+                Line::from("Use the directory where your run saves checkpoints."),
+                Line::from("Read-only view / existing files stay untouched."),
+            ],
+        );
+        return;
+    } else if state.checkpoints.is_empty() {
         rows.push(Line::from("No checkpoint files found yet."));
     } else {
         let last = state.checkpoints.len().saturating_sub(1);
@@ -2285,16 +2471,68 @@ fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         ("schedule", &state.schedule),
     ] {
         lines.push(Line::from(vec![
-            Span::styled(format!("{label:<14}"), accent()),
+            Span::styled(format!("{label:<14}"), Style::new().fg(SECOND_ACCENT)),
             Span::raw(value.as_deref().unwrap_or("not reported")),
         ]));
     }
+    // Long corpus paths and schedules take priority over the hint cards.
+    let configuration = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let required = configuration
+        .line_count(area.width.saturating_sub(2).max(1))
+        .saturating_add(2)
+        .min(usize::from(area.height)) as u16;
+    let sections = Layout::vertical([
+        Constraint::Length(if area.height.saturating_sub(required) >= 6 {
+            required
+        } else {
+            area.height
+        }),
+        Constraint::Min(0),
+    ])
+    .split(area);
     f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(panel(" model / configuration ")),
-        area,
+        configuration.block(panel(" model / configuration ")),
+        sections[0],
     );
+    if sections[1].height >= 6 {
+        let cards = card_pair(sections[1]);
+        draw_info_card(
+            f,
+            cards[0],
+            " log connection ",
+            vec![
+                Line::styled(
+                    if state.corpus.is_some() || state.width.is_some() {
+                        "[ configuration received ]"
+                    } else {
+                        "[ awaiting training banner ]"
+                    },
+                    accent(),
+                ),
+                Line::from("oxide_ai_pssa train [flags] --no-tui | oxide_ai_pssa tui"),
+                Line::from("Fields above show only values reported by the run."),
+            ],
+        );
+        draw_info_card(
+            f,
+            cards[1],
+            " run context ",
+            vec![
+                Line::from(format!(
+                    "resume  {}",
+                    state.resumed_from.as_deref().unwrap_or("not reported")
+                )),
+                Line::from(format!(
+                    "saved   {}",
+                    state.last_checkpoint.as_deref().unwrap_or("not reported")
+                )),
+                Line::styled(
+                    "Read-only / no model or checkpoint changes",
+                    Style::new().fg(SECOND_ACCENT),
+                ),
+            ],
+        );
+    }
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -2493,8 +2731,16 @@ mod tests {
     fn producer_output_round_trips_through_parser() {
         // A child process makes ui::Progress actually write to a pipe, avoiding
         // unstable stdout-capture APIs or a duplicate copy of its format string.
+        // Terse output keeps the serial harness's test-name prefix off the first
+        // producer line when RUST_TEST_THREADS=1 is inherited by the child.
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tui::tests::ui_producer_fixture", "--nocapture"])
+            .args([
+                "--exact",
+                "tui::tests::ui_producer_fixture",
+                "--nocapture",
+                "--format",
+                "terse",
+            ])
             .env("OXIDE_TUI_PRODUCER_FIXTURE", "1")
             .output()
             .unwrap();
@@ -2621,14 +2867,231 @@ mod tests {
         };
         // Wide layouts now have a one-row background gutter.
         assert!(row(1).contains("███"));
-        assert!(row(4).contains("monitor"));
-        assert!(row(4).contains("chain"));
-        assert!(row(4).contains("model"));
-        assert!(!row(4).contains("modelt"));
-        assert!(row(5).contains("╌"));
+        assert!(row(6).contains("monitor"));
+        assert!(row(6).contains("chain"));
+        assert!(row(6).contains("model"));
+        assert!(!row(6).contains("modelt"));
+        assert!(row(7).contains("╌"));
         assert!(row(1).contains("┌"));
-        assert!(row(3).contains("└"));
+        assert!(row(5).contains("└"));
         assert!(row(2).contains("[ TRAINING ]"));
+    }
+
+    #[test]
+    fn test_backend_logo_has_distinct_p_s_s_a_strokes() {
+        use ratatui::{Terminal, backend::TestBackend};
+        // Independent pixel masks catch the old OCCO-like glyphs, not merely
+        // whether the renderer copied the PSSA_LOGO constant into the buffer.
+        let letters = [
+            ["1110", "1001", "1110", "1000", "1000"], // P: open lower bowl + stem
+            ["0111", "1000", "0110", "0001", "1110"], // S: opposite turns
+            ["0111", "1000", "0110", "0001", "1110"],
+            ["0110", "1001", "1111", "1001", "1001"], // A: crossbar + legs
+        ];
+        for (width, height) in [(80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| draw(f, &RunState::default(), 2)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let origin = HexBackground::content_area(buffer.area);
+            for (letter, rows) in letters.iter().enumerate() {
+                for (y, mask) in rows.iter().enumerate() {
+                    for (x, pixel) in mask.chars().enumerate() {
+                        let cell =
+                            &buffer[(origin.x + (letter * 6 + x) as u16, origin.y + y as u16)];
+                        assert_eq!(cell.symbol(), if pixel == '1' { "█" } else { " " });
+                        assert_eq!(cell.fg, NORMAL_GREEN);
+                    }
+                }
+            }
+            // Visible with --nocapture for an actual rendered-logo inspection.
+            for y in origin.y..origin.y + 5 {
+                println!(
+                    "{}",
+                    (origin.x..origin.x + 22)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_backend_header_shows_live_stats_on_every_tab_and_missing_values() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut state = RunState::default();
+        for (step, loss) in [(1, 4.0), (2, 3.0), (3, 2.0)] {
+            state.ingest(&format!("training {step}/10 (30%) loss={loss} tokens_per_second=125 optimizer_updates={step} updates_total=10 eta=2h 14m 09s"));
+        }
+        for (width, height) in [(80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for tab in 0..TABS.len() {
+                terminal.draw(|f| draw(f, &state, tab)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let area = HexBackground::content_area(buffer.area);
+                let header: String = (area.y..area.y + 5)
+                    .flat_map(|y| (area.x + 24..area.right()).map(move |x| buffer[(x, y)].symbol()))
+                    .collect();
+                for expected in [
+                    "[ TRAINING ]",
+                    "step 3/10",
+                    "loss 2.0000",
+                    "tok/s 125",
+                    "ETA 2h 14m 09s",
+                    "█▅▁",
+                ] {
+                    assert!(header.contains(expected), "missing {expected}: {header}");
+                }
+            }
+            terminal.draw(|f| draw(f, &RunState::default(), 2)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+            for expected in ["step -/-", "loss -", "tok/s -", "ETA -", "············"] {
+                assert!(text.contains(expected));
+            }
+        }
+        // Invalid measurements do not become a plausible zero-valued trace.
+        state.loss_series = vec![f64::NAN, 2.0, f64::INFINITY];
+        assert_eq!(loss_trace(&state), "·▄·");
+    }
+
+    #[test]
+    fn test_backend_header_prioritizes_health_reason_on_non_monitor_tabs() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut state = RunState::default();
+        state.ingest("training 1/3 (33%) loss=4.0 tokens_per_second=100 eta=2s");
+        state.ingest("training 2/3 (67%) loss=7.0 tokens_per_second=100 eta=1s");
+        let reason = state.health_status().reason.unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        for tab in 1..TABS.len() {
+            terminal.draw(|f| draw(f, &state, tab)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let area = HexBackground::content_area(buffer.area);
+            let title: String = (area.x + 24..area.right())
+                .map(|x| buffer[(x, area.y)].symbol())
+                .collect();
+            assert!(title.contains(&reason), "clipped health reason: {title}");
+            assert!(buffer.content().iter().any(|c| c.fg == BRIGHT_RED));
+        }
+    }
+
+    #[test]
+    fn test_backend_compact_empty_feed_keeps_wrapped_connection_hint() {
+        use ratatui::{Terminal, backend::TestBackend};
+        for width in [60, 79] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            terminal.draw(|f| draw(f, &RunState::default(), 3)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+            for expected in ["Waiting for feed samples", "--hf-dataset OWNER/NAME", "--no-tui"] {
+                assert!(text.contains(expected), "{width} columns missing {expected}");
+            }
+            assert_eq!(buffer[(0, 11)].symbol(), "└");
+            assert_eq!(buffer[(width - 1, 11)].symbol(), "┘");
+            assert!(!text.contains("source text"));
+        }
+    }
+
+    #[test]
+    fn test_backend_empty_tabs_have_cards_hints_and_two_tinted_surfaces() {
+        use ratatui::{Terminal, backend::TestBackend};
+        for (tab, labels) in [
+            (
+                1,
+                [
+                    "chain / checkpoints",
+                    "checkpoint index",
+                    "connect a chain",
+                    "--chain",
+                ],
+            ),
+            (
+                2,
+                [
+                    "model / configuration",
+                    "log connection",
+                    "run context",
+                    "--no-tui",
+                ],
+            ),
+            (
+                3,
+                ["feed / idle", "source text", "token strips", "--hf-dataset"],
+            ),
+        ] {
+            for (width, height) in [(80, 24), (120, 40)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| draw(f, &RunState::default(), tab))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+                for label in labels {
+                    assert!(text.contains(label), "{width}x{height} missing {label}");
+                }
+                for color in [PANEL_BG, INSET_BG] {
+                    assert!(buffer.content().iter().any(|c| c.bg == color));
+                }
+                assert!(buffer.content().iter().any(|c| c.fg == SECOND_ACCENT));
+                assert!(!buffer.content().iter().any(|c| c.fg == BRIGHT_RED));
+                if height >= 40 {
+                    assert!(
+                        buffer
+                            .content()
+                            .iter()
+                            .any(|c| c.symbol() == "·" && c.fg == GRID_COLOR)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_backend_populated_chain_and_model_keep_reported_values() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut state = RunState::default();
+        state.chain_dir = PathBuf::from("my chain");
+        state.checkpoints = vec![
+            ("ck01.pssa".into(), Some(3.25)),
+            ("ck02.pssa".into(), Some(2.5)),
+        ];
+        state.ingest("width 128 latent / 64 state");
+        state.ingest("corpus local corpus.txt");
+        state.resumed_from = Some("my chain/ck01.pssa".into());
+        for (tab, values) in [
+            (
+                1,
+                [
+                    "my chain",
+                    "ck01.pssa",
+                    "3.2500",
+                    "ck02.pssa",
+                    "2.5000  (latest)",
+                ],
+            ),
+            (
+                2,
+                [
+                    "128 latent / 64 state",
+                    "local corpus.txt",
+                    "configuration received",
+                    "my chain/ck01.pssa",
+                    "not reported",
+                ],
+            ),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|f| draw(f, &state, tab)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            for value in values {
+                assert!(text.contains(value), "missing {value}");
+            }
+        }
     }
 
     #[test]
@@ -2794,7 +3257,6 @@ mod tests {
         assert_eq!(next.phase, 0.0);
         assert_eq!(next.scale, first.scale);
         assert_eq!(next.network_alpha, first.network_alpha);
-        assert_eq!(neuron_title(settled), neuron_title(next));
         assert_ne!(
             neuron_network(first.cycle + 1)[1].x,
             neuron_network(first.cycle)[1].x
@@ -2865,7 +3327,10 @@ mod tests {
                 .unwrap();
             let buffer = terminal.backend().buffer();
             let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
-            assert!(text.contains("neuron /"));
+            assert!(!text.contains("neuron"));
+            for x in 1..51 {
+                assert_eq!(buffer[(x, 0)].symbol(), "─", "plain, untitled border");
+            }
             assert!(buffer.content().iter().any(|cell| {
                 cell.symbol()
                     .chars()
@@ -3038,8 +3503,9 @@ mod tests {
                         .collect();
                     assert!(text.contains(TABS[tab]));
                     if width >= 80 {
-                        assert_eq!(text.contains("neuron /"), tab == 0);
+                        assert!(!text.contains("neuron /"));
                         if tab == 0 {
+                            assert!(braille_pixels(terminal.backend().buffer()) >= 5);
                             let row = terminal
                                 .backend()
                                 .buffer()
@@ -3049,7 +3515,7 @@ mod tests {
                                     row.iter()
                                         .map(|c| c.symbol())
                                         .collect::<String>()
-                                        .contains("neuron /")
+                                        .contains("run metrics")
                                 })
                                 .unwrap();
                             let left = row.iter().position(|c| c.symbol() == "┌").unwrap();
@@ -3064,11 +3530,24 @@ mod tests {
                             "conversation",
                         ];
                         assert!(text.contains(expected[tab]));
-                    } else {
-                        assert!(
-                            !text.contains("neuron /"),
+                    } else if width >= 30 && tab == 0 {
+                        let buffer = terminal.backend().buffer();
+                        let metrics_row = buffer
+                            .content()
+                            .chunks(width as usize)
+                            .find(|row| {
+                                row.iter()
+                                    .map(|c| c.symbol())
+                                    .collect::<String>()
+                                    .contains("run metrics")
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            metrics_row[0].symbol(),
+                            "┌",
                             "narrow metrics retain full width"
                         );
+                        assert_eq!(metrics_row[width as usize - 1].symbol(), "┐");
                     }
                 }
             }
