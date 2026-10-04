@@ -400,6 +400,7 @@ pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
         ("bwd_g_xnorm", lm),
         ("bwd_g_ysm", lm),
         ("bwd_g_query_euc", lk),
+        ("bwd_g_query_pnc", lk),
         ("bwd_g_mlp", l_two_m),
         ("ssm_scan_a", scan_ms),
         ("ssm_scan_b", scan_ms),
