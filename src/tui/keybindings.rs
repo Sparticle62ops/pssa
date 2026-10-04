@@ -9,6 +9,13 @@ use ratatui::{
     widgets::{Clear, Paragraph, Wrap},
 };
 
+pub(super) const SAMPLE_TAB: usize = 6;
+pub(super) const HARDWARE_TAB: usize = 7;
+pub(super) const MATH_TAB: usize = 8;
+pub(super) const DEVICE_TAB: usize = 9;
+pub(super) const LIMITS_TAB: usize = 10;
+pub(super) const TABS: [&str; 11] = ["monitor", "chain", "model", "feed", "inference", "setup", "sample", "hardware", "math", "devices", "limits"];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Context {
     Monitor,
@@ -17,9 +24,14 @@ pub(super) enum Context {
     Setup,
     SetupEdit,
     Help,
+    Sample,
+    Math,
+    Device,
+    Limits,
+    LimitsEdit,
 }
 impl Context {
-    fn mask(self) -> u8 {
+    fn mask(self) -> u16 {
         1 << self as u8
     }
 
@@ -29,19 +41,29 @@ impl Context {
             4 => Self::Chat,
             5 if editing => Self::SetupEdit,
             5 => Self::Setup,
+            SAMPLE_TAB => Self::Sample,
+            MATH_TAB => Self::Math,
+            DEVICE_TAB => Self::Device,
+            LIMITS_TAB => Self::Limits,
             _ => Self::Dashboard,
         }
     }
 }
 
-const MONITOR: u8 = 1 << Context::Monitor as u8;
-const DASHBOARD: u8 = 1 << Context::Dashboard as u8;
-const CHAT: u8 = 1 << Context::Chat as u8;
-const SETUP: u8 = 1 << Context::Setup as u8;
-const EDIT: u8 = 1 << Context::SetupEdit as u8;
-const HELP: u8 = 1 << Context::Help as u8;
-const BROWSE: u8 = MONITOR | DASHBOARD | SETUP;
-const ALL: u8 = BROWSE | CHAT | EDIT | HELP;
+const MONITOR: u16 = 1 << Context::Monitor as u8;
+const DASHBOARD: u16 = 1 << Context::Dashboard as u8;
+const CHAT: u16 = 1 << Context::Chat as u8;
+const SETUP: u16 = 1 << Context::Setup as u8;
+const EDIT: u16 = 1 << Context::SetupEdit as u8;
+const HELP: u16 = 1 << Context::Help as u8;
+const SAMPLE: u16 = 1 << Context::Sample as u8;
+const MATH: u16 = 1 << Context::Math as u8;
+const DEVICE: u16 = 1 << Context::Device as u8;
+const LIMITS: u16 = 1 << Context::Limits as u8;
+const LIMIT_EDIT: u16 = 1 << Context::LimitsEdit as u8;
+const PAGES: u16 = DASHBOARD | SAMPLE | MATH | DEVICE | LIMITS;
+const BROWSE: u16 = MONITOR | PAGES | SETUP;
+const ALL: u16 = BROWSE | CHAT | EDIT | HELP | LIMIT_EDIT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
@@ -51,6 +73,14 @@ pub(super) enum Action {
     ToggleHelp,
     Chat,
     Setup,
+    OpenTab(usize),
+    Heatmap,
+    Preview,
+    MathScroll(i16),
+    MathTop,
+    MathBottom,
+    Device,
+    Limits,
     Pan(bool),
     CycleGraph,
     Graph(GraphView),
@@ -66,7 +96,7 @@ struct Binding {
     modifiers: KeyModifiers,
     label: &'static str,
     description: &'static str,
-    routes: &'static [(u8, Action)],
+    routes: &'static [(u16, Action)],
 }
 
 macro_rules! bind {
@@ -93,15 +123,22 @@ const BINDINGS: &[Binding] = &[
         routes: &[(ALL, Quit)],
     },
     bind!(Tab, "Tab", "Next application tab (also while editing)", ALL => NextTab),
+    bind!(F(6), "F6", "Chat / monitor / sample: toggle raw token confidence heatmap", CHAT | MONITOR | SAMPLE => Heatmap),
+    bind!(F(7), "F7", "Monitor / sample: pause or resume live checkpoint preview", MONITOR | SAMPLE => Preview),
+    bind!(F(8), "F8", "Open hardware telemetry", ALL => OpenTab(HARDWARE_TAB)),
+    bind!(F(9), "F9", "Open training device picker", ALL => OpenTab(DEVICE_TAB)),
+    bind!(F(10), "F10", "Open resource limits for the next run", ALL => OpenTab(LIMITS_TAB)),
+    bind!(F(11), "F11", "Open live PSSA math reference", ALL => OpenTab(MATH_TAB)),
+    bind!(F(12), "F12", "Open full checkpoint sample", ALL => OpenTab(SAMPLE_TAB)),
     bind!(F(1), "F1", "Open/close help, including inside text input", ALL => ToggleHelp),
     bind!(Char('?'), "?", "Open/close help outside text input; type normally in editors", BROWSE | HELP => ToggleHelp),
     bind!(Char('q'), "q", "Quit outside text input; close help", BROWSE => Quit, HELP => ToggleHelp),
     bind!(Esc, "Esc", "Quit dashboard/setup; cancel edit; stop chat; close help",
-        BROWSE => Quit, CHAT => Chat, EDIT => Setup, HELP => ToggleHelp),
+        BROWSE => Quit, CHAT => Chat, EDIT => Setup, LIMIT_EDIT => Limits, HELP => ToggleHelp),
     bind!(Left, "Left", "Monitor: pan older; dashboard: previous tab; setup: previous page",
-        MONITOR => Pan(false), DASHBOARD => PreviousTab, SETUP => Setup),
+        MONITOR => Pan(false), PAGES => PreviousTab, SETUP => Setup),
     bind!(Right, "Right", "Monitor: pan newer; dashboard: next tab; setup: next page",
-        MONITOR => Pan(true), DASHBOARD => NextTab, SETUP => Setup),
+        MONITOR => Pan(true), PAGES => NextTab, SETUP => Setup),
     bind!(Char('g'), "g", "Monitor: cycle graph view", MONITOR => CycleGraph),
     bind!(Char('1'), "1", "Monitor: loss", MONITOR => Graph(GraphView::Loss)),
     bind!(Char('2'), "2", "Monitor: perplexity", MONITOR => Graph(GraphView::Perplexity)),
@@ -114,24 +151,26 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('='), "=", "Monitor: zoom in", MONITOR => Zoom(true)),
     bind!(Char('-'), "-", "Monitor: zoom out; setup: decrease selected depth/loops", MONITOR => Zoom(false), SETUP => Setup),
     bind!(Char('0'), "0", "Monitor: reset graph navigation", MONITOR => ResetGraph),
-    bind!(Up, "Up", "Setup: previous field / preview scroll up; help: scroll up", SETUP => Setup, HELP => ScrollHelp(-1)),
-    bind!(Down, "Down", "Setup: next field / preview scroll down; help: scroll down", SETUP => Setup, HELP => ScrollHelp(1)),
+    bind!(Up, "Up", "Setup/devices/limits: previous field; math/help: scroll up", SETUP => Setup, HELP => ScrollHelp(-1), MATH => MathScroll(-1), DEVICE => Device, LIMITS => Limits),
+    bind!(Down, "Down", "Setup/devices/limits: next field; math/help: scroll down", SETUP => Setup, HELP => ScrollHelp(1), MATH => MathScroll(1), DEVICE => Device, LIMITS => Limits),
     bind!(BackTab, "Shift+Tab", "Setup: previous wizard page", SETUP => Setup),
     bind!(F(5), "F5", "Setup: next wizard page", SETUP => Setup),
     bind!(Char('c'), "c", "Setup: toggle full command preview", SETUP => Setup),
-    bind!(PageUp, "PgUp", "Chat, setup command preview, help: scroll up", CHAT => Chat, SETUP => Setup, HELP => ScrollHelp(-8)),
-    bind!(PageDown, "PgDn", "Chat, setup command preview, help: scroll down", CHAT => Chat, SETUP => Setup, HELP => ScrollHelp(8)),
-    bind!(Home, "Home", "Help: first line", HELP => HelpTop),
-    bind!(End, "End", "Chat: follow latest output; help: last line", CHAT => Chat, HELP => HelpBottom),
-    bind!(Enter, "Enter", "Chat: send/command; setup: activate/edit/save (launch only on start button)", CHAT => Chat, SETUP | EDIT => Setup),
-    bind!(Char(' '), "Space", "Setup: activate/edit selected field or button; editors: type a space", SETUP => Setup),
-    bind!(Backspace, "Backspace", "Chat/setup editor: delete last character", CHAT => Chat, EDIT => Setup),
+    bind!(PageUp, "PgUp", "Chat, setup command preview, math, help: scroll up", CHAT => Chat, SETUP => Setup, HELP => ScrollHelp(-8), MATH => MathScroll(-8)),
+    bind!(PageDown, "PgDn", "Chat, setup command preview, math, help: scroll down", CHAT => Chat, SETUP => Setup, HELP => ScrollHelp(8), MATH => MathScroll(8)),
+    bind!(Home, "Home", "Math/help: first line; devices/limits: first field", HELP => HelpTop, MATH => MathTop, DEVICE => Device, LIMITS => Limits),
+    bind!(End, "End", "Chat: follow; math/help: last line; devices/limits: last field", CHAT => Chat, HELP => HelpBottom, MATH => MathBottom, DEVICE => Device, LIMITS => Limits),
+    bind!(Enter, "Enter", "Chat: send; setup: edit/save/start; devices/limits: select/edit", CHAT => Chat, SETUP | EDIT => Setup, DEVICE => Device, LIMITS | LIMIT_EDIT => Limits),
+    bind!(Char(' '), "Space", "Setup/devices/limits: activate selected field; editors: type space", SETUP => Setup, DEVICE => Device, LIMITS => Limits),
+    bind!(Char('r'), "r", "Devices: refresh runtime availability", DEVICE => Device),
+    bind!(Char('d'), "d", "Limits: reset draft to defaults (Apply to confirm)", LIMITS => Limits),
+    bind!(Backspace, "Backspace", "Chat/setup/limits editor: delete last character", CHAT => Chat, EDIT => Setup, LIMIT_EDIT => Limits),
     Binding {
         code: Char('u'),
         modifiers: KeyModifiers::CONTROL,
         label: "Ctrl+U",
-        description: "Chat/setup editor: clear input",
-        routes: &[(CHAT, Chat), (EDIT, Setup)],
+        description: "Chat/setup/limits editor: clear input",
+        routes: &[(CHAT, Chat), (EDIT, Setup), (LIMIT_EDIT, Limits)],
     },
 ];
 
@@ -159,6 +198,7 @@ pub(super) fn action(key: KeyEvent, context: Context) -> Option<Action> {
         return match context {
             Context::Chat => Some(Chat),
             Context::SetupEdit => Some(Setup),
+            Context::LimitsEdit => Some(Limits),
             _ => None,
         };
     }
@@ -189,7 +229,7 @@ impl Help {
             .map(|binding| Line::from(format!("{:<10} {}", binding.label, binding.description)))
             .collect();
         lines.push(Line::from(
-            "Other printable characters type into chat/setup editors. Chat slash commands: /help.",
+            "Printable characters type into chat/setup editors; limits accept digits. Chat commands: /help. BPE byte groups share their minimum confidence color.",
         ));
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         let max = paragraph
@@ -212,6 +252,26 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
     use std::collections::HashSet;
+
+    #[test]
+    fn phase12_routes_preserve_editing_and_every_new_key_is_helped() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for context in [Context::Monitor, Context::Chat, Context::Sample] {
+            assert_eq!(action(key(F(6)), context), Some(Heatmap));
+        }
+        for context in [Context::SetupEdit, Context::LimitsEdit] {
+            assert_eq!(action(key(F(6)), context), None);
+            assert_eq!(action(key(F(9)), context), Some(OpenTab(DEVICE_TAB)));
+        }
+        assert_eq!(action(key(Char('2')), Context::LimitsEdit), Some(Limits));
+        assert_eq!(action(key(Esc), Context::LimitsEdit), Some(Limits));
+        assert_eq!(action(key(Char('d')), Context::Limits), Some(Limits));
+        assert_eq!(action(key(Char('r')), Context::Device), Some(Device));
+        assert_eq!(action(key(PageDown), Context::Math), Some(MathScroll(8)));
+        for code in [F(6), F(7), F(8), F(9), F(10), F(11), F(12)] {
+            assert!(BINDINGS.iter().any(|b| b.code == code && !b.description.is_empty()));
+        }
+    }
 
     #[test]
     fn no_duplicate_keybindings_across_tabs_and_global_keys() {

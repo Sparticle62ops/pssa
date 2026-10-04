@@ -1,5 +1,5 @@
 //! Local chat UI. Checkpoints are read-only; chat documents are separate JSON files.
-use super::{AMBER, NORMAL_GREEN, accent, panel};
+use super::{AMBER, NORMAL_GREEN, accent, panel, heatmap::{self, TokenMark}};
 use crate::{
     cli::CLIHandler,
     inference::{InferenceConfig, PSSAInferenceEngine},
@@ -37,6 +37,7 @@ fn clean(text: &str) -> String {
 struct Message {
     role: String,
     text: String,
+    confidence: Vec<TokenMark>,
 }
 
 struct Document {
@@ -71,7 +72,7 @@ impl Document {
     fn value(&self) -> Value {
         json!({"version":1,"id":self.id,"name":self.name,"model":self.model,"system":self.system,
             "settings":{"temperature":self.config.temperature,"top_p":self.config.top_p,"top_k":self.config.top_k,"max_tokens":self.config.max_new_tokens,"repetition_penalty":self.config.repetition_penalty},
-            "messages":self.messages.iter().map(|m|json!({"role":m.role,"text":m.text})).collect::<Vec<_>>()})
+            "messages":self.messages.iter().map(|m|json!({"role":m.role,"text":m.text,"confidence":heatmap::to_json(&m.confidence)})).collect::<Vec<_>>()})
     }
     fn parse(v: Value) -> Result<Self, String> {
         fn text(v: &Value, k: &str) -> Result<String, String> {
@@ -110,10 +111,15 @@ impl Document {
                 if !matches!(role.as_str(), "user" | "assistant") {
                     return Err("invalid message role".into());
                 }
-                Ok(Message {
-                    role,
-                    text: text(m, "text")?,
-                })
+                let body = text(m, "text")?;
+                let confidence: Vec<TokenMark> = match m.get("confidence") {
+                    Some(v) => heatmap::from_json(v)?,
+                    None => Vec::new(), // Existing saved chats have no probabilities.
+                };
+                if !heatmap::valid(&body, &confidence) {
+                    return Err("invalid token confidence boundaries".into());
+                }
+                Ok(Message { role, text: body, confidence })
             })
             .collect::<Result<Vec<_>, String>>()?;
         let doc = Self {
@@ -253,6 +259,7 @@ impl Store {
 
 #[derive(Default)]
 struct Progress {
+    confidence: Vec<TokenMark>,
     text: String,
     tokens: usize,
     done: Option<Result<(), String>>,
@@ -285,6 +292,7 @@ pub(super) struct Chat {
     follow: bool,
     pending_delete: Option<String>,
     model_dir: PathBuf,
+    pub(super) heatmap: bool,
 }
 impl Chat {
     pub(super) fn new(dir: PathBuf, model_dir: PathBuf) -> Self {
@@ -302,6 +310,7 @@ impl Chat {
             follow: true,
             pending_delete: None,
             model_dir,
+            heatmap: false,
         }
     }
     // Follow the wizard's output directory without changing the selected model
@@ -321,6 +330,7 @@ impl Chat {
             && let Some(last) = self.doc.messages.last_mut()
         {
             last.text.clone_from(&p.text);
+            last.confidence.clone_from(&p.confidence);
         }
         let Some(result) = p.done.take() else {
             return;
@@ -361,6 +371,7 @@ impl Chat {
         self.doc.messages.push(Message {
             role: "user".into(),
             text,
+            confidence: Vec::new(),
         });
         let prompt = match self.doc.context() {
             Ok(p) => p,
@@ -377,6 +388,7 @@ impl Chat {
         self.doc.messages.push(Message {
             role: "assistant".into(),
             text: String::new(),
+            confidence: Vec::new(),
         });
         let model = self.doc.model.clone();
         let cfg = InferenceConfig { ..self.doc.config };
@@ -390,11 +402,12 @@ impl Chat {
                     return Ok(());
                 }
                 let text = PSSAInferenceEngine::try_new(&mut model, &tok)?
-                    .try_generate_chat_turn_controlled(
+                    .try_generate_chat_turn_scored(
                         &prompt,
                         &cfg,
-                        |text, tokens| {
+                        |text, tokens, probability| {
                             let mut p = p.lock().unwrap_or_else(|e| e.into_inner());
+                            heatmap::record(&mut p.confidence, text, tokens, probability);
                             p.text = text.to_owned();
                             p.tokens = tokens;
                         },
@@ -733,7 +746,7 @@ impl Chat {
             self.rate()
         );
         let chunks = Layout::vertical([
-            Constraint::Length(if area.width < 65 { 4 } else { 3 }),
+            Constraint::Length(if area.width < 65 { 5 } else { 4 }),
             Constraint::Min(3),
             Constraint::Length(3),
             Constraint::Length(1),
@@ -748,6 +761,7 @@ impl Chat {
                 )),
                 Line::from(settings),
                 Line::styled(status, accent()),
+                heatmap::legend(self.heatmap),
             ]),
             chunks[0],
         );
@@ -767,9 +781,8 @@ impl Chat {
                 },
                 accent(),
             ));
-            for l in clean(&message.text).lines() {
-                lines.push(Line::from(l.to_owned()));
-            }
+            lines.extend(heatmap::lines(&message.text, &message.confidence,
+                self.heatmap && message.role == "assistant"));
             lines.push(Line::from(""));
         }
         for l in clean(&self.note).lines() {
@@ -841,6 +854,7 @@ impl Drop for Chat {
             if !progress.speech {
                 if let Some(last) = self.doc.messages.last_mut() {
                     last.text.clone_from(&progress.text);
+                    last.confidence.clone_from(&progress.confidence);
                 }
                 if let Err(error) = self.store.save(&self.doc) {
                     eprintln!("{error}");
@@ -910,6 +924,35 @@ mod tests {
     }
 
     #[test]
+    fn confidence_survives_save_resume_and_old_chats_remain_readable() {
+        let mut c = fixture();
+        c.doc.messages.push(Message { role: "assistant".into(), text: "low high".into(),
+            confidence: vec![TokenMark { end: 4, probability: 0.01 }, TokenMark { end: 8, probability: 0.9 }] });
+        c.save().unwrap();
+        let loaded = c.store.load(&c.doc.id).unwrap();
+        assert_eq!(loaded.messages[0].confidence.len(), 2);
+        assert_eq!(loaded.messages[0].confidence[1].probability, 0.9);
+        let mut old = c.doc.value();
+        old["messages"][0].as_object_mut().unwrap().remove("confidence");
+        assert!(Document::parse(old).unwrap().messages[0].confidence.is_empty());
+        c.heatmap = true;
+        c.note.clear();
+        for width in [120, 79, 40] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|f| c.draw(f, f.area())).unwrap();
+            let cells = terminal.backend().buffer().content();
+            assert!(cells.iter().any(|cell| cell.symbol() == "h" && cell.fg == NORMAL_GREEN));
+            let text: String = cells.iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("F6 heatmap"));
+            assert!(text.contains("low high"));
+        }
+        let mut invalid = c.doc.value();
+        invalid["messages"][0]["confidence"][0]["end"] = json!(9999);
+        assert!(Document::parse(invalid).is_err());
+        fs::remove_dir_all(&c.store.dir).unwrap();
+    }
+
+    #[test]
     fn json_roundtrip_rename_resume_delete_and_paths() {
         let mut c = fixture();
         c.doc.model = "path with spaces/model.pssa".into();
@@ -917,6 +960,7 @@ mod tests {
         c.doc.messages.push(Message {
             role: "user".into(),
             text: "hello".into(),
+            confidence: Vec::new(),
         });
         c.command("/temp 0.25").unwrap();
         c.command("/rename unicode 世界").unwrap();
@@ -943,6 +987,7 @@ mod tests {
         c.doc.messages.push(Message {
             role: "assistant".into(),
             text: String::new(),
+            confidence: Vec::new(),
         });
         let cancel = Arc::new(AtomicBool::new(false));
         c.job = Some(Job {
@@ -1096,6 +1141,7 @@ mod tests {
         c.doc.messages.push(Message {
             role: "assistant".into(),
             text: (0..80).map(|n| format!("reply {n} 世界\n")).collect(),
+            confidence: Vec::new(),
         });
         c.tokens = 23;
         c.elapsed = 2.0;
