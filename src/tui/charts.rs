@@ -70,7 +70,8 @@ pub(super) fn number(value: f64) -> String {
     }
 }
 
-/// Round outwards to a useful domain; include room above/below a flat trace.
+/// Fit the visible observations, with 5% breathing room on each side.
+/// Tick rounding is separate: it must not turn a small change into a flat trace.
 pub(super) fn bounds(values: impl Iterator<Item = f64>) -> [f64; 2] {
     let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
     for value in values.filter(|v| v.is_finite()) {
@@ -80,24 +81,29 @@ pub(super) fn bounds(values: impl Iterator<Item = f64>) -> [f64; 2] {
     if !low.is_finite() {
         return [0.0, 1.0];
     }
-    let pad = ((high - low) * 0.06).max(high.abs() * 0.01).max(1e-9);
-    let rough = (high - low + 2.0 * pad) / 2.0;
-    let power = 10.0_f64.powf(rough.log10().floor());
-    let step = [1.0, 2.0, 2.5, 5.0, 10.0]
-        .into_iter()
-        .find(|n| *n * power >= rough)
-        .unwrap_or(10.0)
-        * power;
-    [
-        ((low - pad) / step).floor() * step,
-        ((high + pad) / step).ceil() * step,
-    ]
+    let pad = if low == high {
+        (low.abs() * 0.05).max(1e-9)
+    } else {
+        ((high - low) * 0.05).max(f64::EPSILON * low.abs().max(high.abs()))
+    };
+    [low - pad, high + pad]
 }
 
 pub(super) fn domain(points: &[(f64, f64)]) -> [f64; 2] {
-    let first = points.first().map_or(0.0, |p| p.0);
-    let last = points.last().map_or(first + 2.0, |p| p.0);
-    [first, last.max(first + 2.0)]
+    let (low, high) = points
+        .iter()
+        .map(|p| p.0)
+        .filter(|x| x.is_finite())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), x| {
+            (low.min(x), high.max(x))
+        });
+    if !low.is_finite() {
+        [0.0, 2.0]
+    } else if low == high {
+        [low - 1.0, high + 1.0]
+    } else {
+        [low, high]
+    }
 }
 
 fn ticks(bounds: [f64; 2]) -> Vec<String> {
@@ -121,6 +127,62 @@ fn ticks(bounds: [f64; 2]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Use Canvas/Painter's sub-pixel-to-row mapping, not label indices.
+fn tick_row(value: f64, bounds: [f64; 2], height: u16) -> u16 {
+    let dot = ((bounds[1] - value) * f64::from(height * 4 - 1) / (bounds[1] - bounds[0])) as u16;
+    (dot / 4).min(height - 1)
+}
+
+/// Three to five round-valued ticks inside the fitted bounds. Prefer uniform
+/// steps; on short plots, omit colliding labels rather than losing the scale.
+/// All labels share a precision and use the same projection as the line.
+fn y_ticks(bounds: [f64; 2], height: u16) -> Vec<(f64, String)> {
+    let range = bounds[1] - bounds[0];
+    let power = 10.0_f64.powf((range / 4.0).log10().floor());
+    let mut best = Vec::new();
+    let mut best_score = (false, 0);
+    // Prefer familiar 1/2/2.5/5 steps when equally many labels fit. The
+    // remaining steps fill awkward narrow ranges without expanding the bounds.
+    for multiplier in [1.0, 2.0, 2.5, 5.0, 10.0, 1.5, 3.0, 4.0, 6.0, 8.0] {
+        let step = power * multiplier;
+        let first = (bounds[0] / step).ceil();
+        let last = (bounds[1] / step).floor();
+        let count = (last - first + 1.0).max(0.0) as usize;
+        if !(3..=5).contains(&count) {
+            continue;
+        }
+        let mut values: Vec<_> = (0..count).map(|i| (first + i as f64) * step).collect();
+        values.dedup_by_key(|value| tick_row(*value, bounds, height));
+        let score = (values.len() == count, values.len());
+        if values.len() < 3 || score <= best_score {
+            continue;
+        }
+        best_score = score;
+        let magnitude = bounds[0].abs().max(bounds[1].abs());
+        let scientific = magnitude < 0.01 || (magnitude >= 1_000_000.0 && step >= magnitude * 0.01);
+        let scientific_digits = (magnitude / step).log10().ceil().clamp(2.0, 15.0) as usize;
+        let digits = (0..=15)
+            .find(|&d| {
+                let scaled = step * 10.0_f64.powi(d);
+                scaled >= 1.0 && (scaled - scaled.round()).abs() < 1e-6
+            })
+            .unwrap_or(15) as usize;
+        best = values
+            .into_iter()
+            .map(|value| {
+                let value = if value == 0.0 { 0.0 } else { value };
+                let label = if scientific {
+                    format!("{value:.scientific_digits$e}")
+                } else {
+                    format!("{value:.digits$}")
+                };
+                (value, label)
+            })
+            .collect();
+    }
+    best
 }
 
 pub(super) fn draw(f: &mut Frame, area: Rect, plot: Plot<'_>, series: &[Series<'_>]) {
@@ -166,8 +228,24 @@ pub(super) fn draw_labeled(
         );
         return;
     }
-    let y_labels = y_labels.unwrap_or_else(|| ticks(plot.y_bounds));
-    let label_width = y_labels.iter().map(|s| s.len()).max().unwrap_or(0) as u16;
+    let y_labels = y_labels.map_or_else(
+        || y_ticks(plot.y_bounds, inner.height - 2),
+        |labels| {
+            let intervals = labels.len().saturating_sub(1).max(1) as f64;
+            labels
+                .into_iter()
+                .enumerate()
+                .map(|(i, label)| {
+                    (
+                        plot.y_bounds[0]
+                            + (plot.y_bounds[1] - plot.y_bounds[0]) * i as f64 / intervals,
+                        label,
+                    )
+                })
+                .collect()
+        },
+    );
+    let label_width = y_labels.iter().map(|(_, s)| s.len()).max().unwrap_or(0) as u16;
     let gutter = label_width.min(inner.width / 3) + 1;
     // Reserve separate rows for the axis stroke and its labels, never data.
     let graph = Rect::new(
@@ -186,14 +264,16 @@ pub(super) fn draw_labeled(
         buffer[(x, axis_y)].set_symbol("─").set_style(accent());
     }
     buffer[(axis_x, axis_y)].set_symbol("└").set_style(accent());
-    for (i, label) in y_labels.iter().enumerate() {
-        // Anchor the endpoints to the actual data rows; rounding can differ
-        // by at most one terminal row at the midpoint of an even height.
-        let offset = i as u16 * (graph.height - 1) / y_labels.len().saturating_sub(1).max(1) as u16;
+    for (value, label) in &y_labels {
         Line::styled(label.as_str(), accent())
             .right_aligned()
             .render(
-                Rect::new(inner.x, graph.bottom() - 1 - offset, gutter - 1, 1),
+                Rect::new(
+                    inner.x,
+                    graph.y + tick_row(*value, plot.y_bounds, graph.height),
+                    gutter - 1,
+                    1,
+                ),
                 buffer,
             );
     }
@@ -225,12 +305,34 @@ pub(super) fn draw_labeled(
                         });
                         if !s.scatter {
                             for pair in run.windows(2) {
-                                ctx.draw(&DenseLine {
+                                ctx.draw(&ThinLine {
                                     from: pair[0],
                                     to: pair[1],
                                     color: s.color,
                                 });
                             }
+                        }
+                    }
+                    // Sparse observations should read as measurements joined
+                    // by slopes, not a continuous stream (e.g. checkpoints).
+                    if !s.scatter
+                        && s.points
+                            .iter()
+                            .filter(|p| p.0.is_finite() && p.1.is_finite())
+                            .count()
+                            <= 8
+                    {
+                        for &point in s
+                            .points
+                            .iter()
+                            .filter(|p| p.0.is_finite() && p.1.is_finite())
+                        {
+                            ctx.draw(&PointMarker {
+                                point,
+                                color: s.color,
+                                x_bounds: plot.x_bounds,
+                                y_bounds: plot.y_bounds,
+                            });
                         }
                     }
                     ctx.layer();
@@ -262,7 +364,10 @@ fn draw_x_labels(buffer: &mut Buffer, graph: Rect, name: &str, labels: &[String]
             .max_by_key(|(_, width)| *width)
             .unwrap_or((graph.x, 0))
     };
-    if gap(&positions).1 < name.len() as u16 {
+    if labels[1] == labels[0]
+        || labels[1] == labels[2]
+        || gap(&positions).1 < name.len() as u16
+    {
         positions.remove(1);
     }
     let (start, width) = gap(&positions);
@@ -281,41 +386,68 @@ fn draw_x_labels(buffer: &mut Buffer, graph: Rect, name: &str, labels: &[String]
     }
 }
 
-/// A two-dot-weight braille stroke. Fill each column's vertical interval to
-/// the previous column, rather than leaving a diagonal chain of single dots.
-/// Scatter points remain points, and callers split missing observations first.
-struct DenseLine {
+/// A connected, one-sub-pixel Bresenham stroke in braille dot coordinates.
+/// Never hold the previous sample or thicken the stroke within a text cell.
+struct ThinLine {
     from: (f64, f64),
     to: (f64, f64),
     color: Color,
 }
 
-impl Shape for DenseLine {
+impl Shape for ThinLine {
     fn draw(&self, painter: &mut Painter) {
-        let Some((mut x1, mut y1)) = painter.get_point(self.from.0, self.from.1) else {
+        let Some((x1, y1)) = painter.get_point(self.from.0, self.from.1) else {
             return;
         };
-        let Some((mut x2, mut y2)) = painter.get_point(self.to.0, self.to.1) else {
+        let Some((x2, y2)) = painter.get_point(self.to.0, self.to.1) else {
             return;
         };
-        if x1 > x2 {
-            std::mem::swap(&mut x1, &mut x2);
-            std::mem::swap(&mut y1, &mut y2);
-        }
-        let mut previous = y1;
-        for x in x1..=x2 {
-            let y = if x1 == x2 {
-                y2
-            } else {
-                (y1 as f64 + (y2 as f64 - y1 as f64) * (x - x1) as f64 / (x2 - x1) as f64).round()
-                    as usize
-            };
-            for dot_y in previous.min(y)..=previous.max(y) {
-                painter.paint(x, dot_y, self.color);
-                // Pair within the same cell, including at the canvas edges.
-                painter.paint(x, dot_y ^ 1, self.color);
+        let (mut x, mut y) = (x1 as i32, y1 as i32);
+        let (end_x, end_y) = (x2 as i32, y2 as i32);
+        let dx = (end_x - x).abs();
+        let dy = -(end_y - y).abs();
+        let sx = if x < end_x { 1 } else { -1 };
+        let sy = if y < end_y { 1 } else { -1 };
+        let mut error = dx + dy;
+        loop {
+            painter.paint(x as usize, y as usize, self.color);
+            if x == end_x && y == end_y {
+                break;
             }
-            previous = y;
+            let twice_error = 2 * error;
+            if twice_error >= dy {
+                error += dy;
+                x += sx;
+            }
+            if twice_error <= dx {
+                error += dx;
+                y += sy;
+            }
+        }
+    }
+}
+
+/// A small cross only at sparse observations, clipped even at canvas edges.
+struct PointMarker {
+    point: (f64, f64),
+    color: Color,
+    x_bounds: [f64; 2],
+    y_bounds: [f64; 2],
+}
+
+impl Shape for PointMarker {
+    fn draw(&self, painter: &mut Painter) {
+        let Some((x, y)) = painter.get_point(self.point.0, self.point.1) else {
+            return;
+        };
+        let Some((max_x, max_y)) = painter.get_point(self.x_bounds[1], self.y_bounds[0]) else {
+            return;
+        };
+        for (dx, dy) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let (x, y) = (x as i32 + dx, y as i32 + dy);
+            if x >= 0 && y >= 0 && x <= max_x as i32 && y <= max_y as i32 {
+                painter.paint(x as usize, y as usize, self.color);
+            }
         }
     }
 }
@@ -363,7 +495,7 @@ pub(super) fn sparkline(values: &[f64], width: usize) -> String {
                     color: NORMAL_GREEN,
                 });
                 for pair in run.windows(2) {
-                    ctx.draw(&DenseLine {
+                    ctx.draw(&ThinLine {
                         from: pair[0],
                         to: pair[1],
                         color: NORMAL_GREEN,
@@ -508,12 +640,205 @@ mod tests {
         }
     }
 
+    fn graph_rect(buffer: &Buffer, area: Rect) -> Rect {
+        let axis_y = area.bottom() - 3;
+        let axis_x = (area.x + 1..area.right() - 1)
+            .find(|&x| buffer[(x, axis_y)].symbol() == "└")
+            .expect("plot axis");
+        Rect::new(
+            axis_x + 1,
+            area.y + 1,
+            area.right() - axis_x - 2,
+            area.height - 4,
+        )
+    }
+
+    fn dots(buffer: &Buffer, graph: Rect) -> std::collections::BTreeSet<(u16, u16)> {
+        let mut dots = std::collections::BTreeSet::new();
+        for x in 0..graph.width * 2 {
+            for y in 0..graph.height * 4 {
+                let ch = buffer[(graph.x + x / 2, graph.y + y / 4)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap();
+                let mask = [[1, 2, 4, 64], [8, 16, 32, 128]][x as usize % 2][y as usize % 4];
+                if ('\u{2800}'..='\u{28ff}').contains(&ch) && (ch as u32 - 0x2800) & mask != 0 {
+                    dots.insert((x, y));
+                }
+            }
+        }
+        dots
+    }
+
     #[test]
-    fn loss_ticks_are_even_and_labels_stay_outside_data() {
+    fn fitted_ticks_match_data_rows_at_both_sizes() {
         for (w, h) in [(120, 40), (80, 24), (48, 18)] {
-            for height in [8, 9, 12] {
+            for height in [7, 8, 9, 12] {
+                for data in [
+                    [3.9, 6.0],
+                    [40.0, 403.0],
+                    [6.3006, 6.3011],
+                    [-0.7, -0.3],
+                    [0.28, 0.72],
+                    [0.0001, 0.0004],
+                    [912.0, 1343.0],
+                    [-351.263608, -350.91351],
+                    [16.686176, 16.689383],
+                    [3.0, 3.0],
+                    [0.0, 0.0],
+                ] {
+                    let y_bounds = bounds(data.into_iter());
+                    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                    // Offset the panel too: labels must use plot-relative rows.
+                    let area = Rect::new(2, 3, w - 4, height);
+                    terminal
+                        .draw(|f| {
+                            draw(
+                                f,
+                                area,
+                                Plot {
+                                    title: " trend ",
+                                    caption: "Lower is better",
+                                    x: "training step",
+                                    y: "loss",
+                                    integer_x: true,
+                                    x_bounds: [1.0, 150.0],
+                                    y_bounds,
+                                },
+                                &[Series::line(
+                                    "measured",
+                                    &[(1.0, data[1]), (150.0, data[0])],
+                                    NORMAL_GREEN,
+                                )],
+                            )
+                        })
+                        .unwrap();
+                    let b = terminal.backend().buffer();
+                    let graph = graph_rect(b, area);
+                    let mut labels = Vec::new();
+                    for y in graph.y..graph.bottom() {
+                        let label = (area.x + 1..graph.x - 1)
+                            .map(|x| b[(x, y)].symbol())
+                            .collect::<String>();
+                        if !label.trim().is_empty() {
+                            let value = label.trim().parse::<f64>().expect("numeric y tick");
+                            let expected_dot = ((y_bounds[1] - value)
+                                * f64::from(graph.height * 4 - 1)
+                                / (y_bounds[1] - y_bounds[0]))
+                                as u16;
+                            assert_eq!(
+                                y,
+                                graph.y + expected_dot / 4,
+                                "misplaced {label} in {y_bounds:?}"
+                            );
+                            assert!(!label.ends_with(' '), "ticks must share a right edge");
+                            labels.push((y, value));
+                        }
+                        for x in graph.x..graph.right() {
+                            let symbol = b[(x, y)].symbol();
+                            assert!(
+                                symbol == " "
+                                    || symbol
+                                        .chars()
+                                        .all(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+                                "text over data: {symbol}"
+                            );
+                        }
+                    }
+                    assert!(
+                        (3..=5).contains(&labels.len()),
+                        "{y_bounds:?}, height {height}: {labels:?}"
+                    );
+                    assert!(
+                        labels
+                            .windows(2)
+                            .all(|p| p[0].0 < p[1].0 && p[0].1 > p[1].1)
+                    );
+                    for y in area.y + 1..area.bottom() - 1 {
+                        for x in area.x + 1..area.right() - 1 {
+                            assert_eq!(b[(x, y)].bg, PANEL_BG, "plot must match its panel");
+                        }
+                    }
+                    assert_eq!(b[(area.right() - 1, area.bottom() - 1)].symbol(), "┘");
+                    assert_plot(
+                        b,
+                        area,
+                        &["loss", "measured", "training step", "Lower is better"],
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn strokes_are_one_dot_thick_and_connected_in_all_directions() {
+        for (width, height) in [(3, 5), (20, 2)] {
+            for (from, to) in [
+                ((0.0, 0.0), (1.0, 1.0)),
+                ((1.0, 1.0), (0.0, 0.0)),
+                ((0.0, 1.0), (1.0, 0.0)),
+                ((1.0, 0.0), (0.0, 1.0)),
+                ((0.0, 0.0), (0.0, 1.0)),
+                ((0.0, 1.0), (0.0, 0.0)),
+                ((0.0, 0.0), (1.0, 0.0)),
+                ((1.0, 0.0), (0.0, 0.0)),
+                ((0.0, 0.0), (0.0, 0.0)),
+            ] {
+                let area = Rect::new(0, 0, width, height);
+                let mut b = Buffer::empty(area);
+                Canvas::default()
+                    .marker(Marker::Braille)
+                    .x_bounds([0.0, 1.0])
+                    .y_bounds([0.0, 1.0])
+                    .paint(|ctx| {
+                        ctx.draw(&ThinLine {
+                            from,
+                            to,
+                            color: NORMAL_GREEN,
+                        })
+                    })
+                    .render(area, &mut b);
+                let pixels = dots(&b, area);
+                let project = |(x, y): (f64, f64)| {
+                    (
+                        (x * f64::from(width * 2 - 1)) as u16,
+                        ((1.0 - y) * f64::from(height * 4 - 1)) as u16,
+                    )
+                };
+                let (a, z) = (project(from), project(to));
+                assert!(pixels.contains(&a) && pixels.contains(&z));
+                let (dx, dy) = (a.0.abs_diff(z.0), a.1.abs_diff(z.1));
+                assert_eq!(
+                    pixels.len(),
+                    usize::from(dx.max(dy)) + 1,
+                    "thick stroke {from:?} -> {to:?}"
+                );
+                let mut ordered: Vec<_> = pixels.into_iter().collect();
+                if dy > dx {
+                    ordered.sort_by_key(|p| (p.1, p.0));
+                }
+                assert!(
+                    ordered
+                        .windows(2)
+                        .all(|p| p[0].0.abs_diff(p[1].0) <= 1 && p[0].1.abs_diff(p[1].1) <= 1),
+                    "disconnected stroke"
+                );
+            }
+        }
+        assert!(
+            sparkline(&[4.0, 4.0], 20)
+                .chars()
+                .all(|c| (c as u32 - 0x2800).count_ones() == 2)
+        );
+    }
+
+    #[test]
+    fn linear_ramp_is_monotone_without_held_samples_at_both_sizes() {
+        for (w, h, height) in [(120, 40, 12), (80, 24, 8)] {
+            for descending in [false, true] {
+                let values = if descending { [6.0, 3.9] } else { [3.9, 6.0] };
                 let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-                // Offset the panel too: labels must use plot-relative rows.
                 let area = Rect::new(2, 3, w - 4, height);
                 terminal
                     .draw(|f| {
@@ -521,136 +846,156 @@ mod tests {
                             f,
                             area,
                             Plot {
-                                title: " trend ",
+                                title: " ramp ",
                                 caption: "Lower is better",
                                 x: "training step",
                                 y: "loss",
                                 integer_x: true,
-                                x_bounds: [1.0, 150.0],
-                                y_bounds: [2.0, 6.0],
+                                x_bounds: [0.0, 100.0],
+                                y_bounds: bounds(values.into_iter()),
                             },
                             &[Series::line(
-                                "measured",
-                                &[(1.0, 6.0), (150.0, 2.0)],
+                                "loss",
+                                &[(0.0, values[0]), (100.0, values[1])],
                                 NORMAL_GREEN,
                             )],
                         )
                     })
                     .unwrap();
                 let b = terminal.backend().buffer();
-                let row = |y| {
-                    (area.x..area.right())
-                        .map(|x| b[(x, y)].symbol())
-                        .collect::<String>()
-                };
-                let top = area.y + 1;
-                let bottom = area.bottom() - 4;
-                let middle = bottom - (bottom - top) / 2;
-                for (y, label) in [(top, "6.0"), (middle, "4.0"), (bottom, "2.0")] {
+                let graph = graph_rect(b, area);
+                assert_eq!(graph.height, if h == 40 { 8 } else { 4 });
+                let pixels = dots(b, graph);
+                let mut ys = Vec::new();
+                // Exclude the endpoint marker radius, not the connecting line.
+                for x in 2..graph.width * 2 - 2 {
+                    let column: Vec<_> = pixels.iter().filter(|p| p.0 == x).map(|p| p.1).collect();
                     assert_eq!(
-                        (area.x + 1..area.x + 4)
-                            .map(|x| b[(x, y)].symbol())
-                            .collect::<String>(),
-                        label
+                        column.len(),
+                        1,
+                        "expected one-dot line at x={x}: {column:?}"
                     );
+                    ys.push(column[0]);
                 }
-                assert!((middle - top).abs_diff(bottom - middle) <= 1);
-                assert!(row(area.y).contains("loss"));
-                assert!(row(area.y).contains("measured"));
-                let labels = row(area.bottom() - 2);
-                let tokens: Vec<_> = labels
-                    .split(|c: char| c.is_whitespace() || c == '│')
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                for label in ["1", "76", "150", "training", "step"] {
-                    assert!(tokens.contains(&label), "missing {label}: {labels}");
-                }
-                assert!(!labels.contains('.'), "fractional training step: {labels}");
-                for y in top..=bottom {
-                    for x in area.x + 5..area.right() - 1 {
-                        let cell = &b[(x, y)];
-                        assert!(
-                            cell.symbol() == " "
-                                || cell
-                                    .symbol()
-                                    .chars()
-                                    .all(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
-                            "text over data: {}",
-                            row(y)
-                        );
-                    }
-                }
-                // The high endpoint occupies the first data cell, not a title.
-                assert!(
-                    b[(area.x + 5, top)]
-                        .symbol()
-                        .chars()
-                        .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
-                );
-                for y in top..area.bottom() - 1 {
-                    for x in area.x + 1..area.right() - 1 {
-                        assert_eq!(b[(x, y)].bg, PANEL_BG, "plot must match its panel");
-                    }
+                assert!(ys.windows(2).all(|p| if descending {
+                    p[0] <= p[1]
+                } else {
+                    p[0] >= p[1]
+                }));
+                let mut run = 1;
+                let span = ys.first().unwrap().abs_diff(*ys.last().unwrap());
+                let expected_step = (graph.width * 2 - 1).div_ceil(span);
+                for pair in ys.windows(2) {
+                    run = if pair[0] == pair[1] { run + 1 } else { 1 };
+                    assert!(
+                        run <= expected_step,
+                        "plateau of {run} dots exceeds {expected_step}"
+                    );
                 }
             }
         }
     }
 
     #[test]
-    fn dense_strokes_fill_vertical_gaps_and_give_flat_traces_weight() {
-        for values in [&[4.0, 4.0][..], &[4.0, 1.0], &[1.0, 4.0]] {
-            let line = sparkline(values, 20);
-            assert!(
-                line.chars().all(|c| (c as u32 - 0x2800).count_ones() >= 4),
-                "faint trace: {line}"
-            );
-        }
-        // Exercise steep and vertical strokes, both directions, at dot resolution.
-        for (from, to) in [
-            ((0.0, 0.0), (1.0, 1.0)),
-            ((1.0, 1.0), (0.0, 0.0)),
-            ((0.0, 0.0), (0.0, 1.0)),
-        ] {
-            let area = Rect::new(0, 0, 3, 5);
-            let mut b = Buffer::empty(area);
-            Canvas::default()
-                .marker(Marker::Braille)
-                .x_bounds([0.0, 1.0])
-                .y_bounds([0.0, 1.0])
-                .paint(|ctx| {
-                    ctx.draw(&DenseLine {
-                        from,
-                        to,
-                        color: NORMAL_GREEN,
-                    })
+    fn three_checkpoints_have_markers_and_sloped_segments_not_a_spike() {
+        let points = [(1.0, 6.0), (2.0, 1.8), (3.0, 0.77)];
+        let y_bounds = bounds(points.iter().map(|p| p.1));
+        for (w, h, height) in [(120, 40, 13), (80, 24, 8)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let area = Rect::new(2, 3, w - 4, height);
+            terminal
+                .draw(|f| {
+                    draw(
+                        f,
+                        area,
+                        Plot {
+                            title: " quality / checkpoint ",
+                            caption: "Lower = less surprise",
+                            x: "checkpoint",
+                            y: "reference loss",
+                            integer_x: true,
+                            x_bounds: domain(&points),
+                            y_bounds,
+                        },
+                        &[Series::line("reference loss", &points, NORMAL_GREEN)],
+                    )
                 })
-                .render(area, &mut b);
-            let mut previous: Option<Vec<usize>> = None;
-            for x in 0..area.width * 2 {
-                let mut dots = Vec::new();
-                for y in 0..area.height * 4 {
-                    let ch = b[(x / 2, y / 4)].symbol().chars().next().unwrap();
-                    let mask = [[1, 2, 4, 64], [8, 16, 32, 128]][x as usize % 2][y as usize % 4];
-                    if ch != ' ' && (ch as u32 - 0x2800) & mask != 0 {
-                        dots.push(y as usize);
+                .unwrap();
+            let b = terminal.backend().buffer();
+            let graph = graph_rect(b, area);
+            let pixels = dots(b, graph);
+            let projected: Vec<_> = points
+                .iter()
+                .map(|&(x, y)| {
+                    (
+                        ((x - 1.0) * f64::from(graph.width * 2 - 1) / 2.0) as u16,
+                        ((y_bounds[1] - y) * f64::from(graph.height * 4 - 1)
+                            / (y_bounds[1] - y_bounds[0])) as u16,
+                    )
+                })
+                .collect();
+            for &(x, y) in &projected {
+                for (dx, dy) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let (x, y) = (i32::from(x) + dx, i32::from(y) + dy);
+                    if x >= 0
+                        && x < i32::from(graph.width * 2)
+                        && y >= 0
+                        && y < i32::from(graph.height * 4)
+                    {
+                        assert!(
+                            pixels.contains(&(x as u16, y as u16)),
+                            "missing point marker at {x},{y}"
+                        );
                     }
                 }
-                if dots.is_empty() {
-                    continue;
-                }
-                assert!(dots.len() >= 2);
-                assert!(
-                    dots.windows(2).all(|pair| pair[1] == pair[0] + 1),
-                    "gap in stroke: {dots:?}"
-                );
-                if let Some(prior) = &previous {
+            }
+            for pair in projected.windows(2) {
+                let (a, z) = (pair[0], pair[1]);
+                for x in a.0 + 2..z.0 - 1 {
+                    let ys: Vec<_> = pixels.iter().filter(|p| p.0 == x).map(|p| p.1).collect();
+                    assert_eq!(ys.len(), 1, "thick/disconnected segment at {x}: {ys:?}");
+                    let expected = f64::from(a.1)
+                        + f64::from(z.1 - a.1) * f64::from(x - a.0) / f64::from(z.0 - a.0);
                     assert!(
-                        dots.iter().any(|y| prior.contains(y)),
-                        "disconnected columns"
+                        (f64::from(ys[0]) - expected).abs() <= 0.5 + 1e-9,
+                        "held sample at {x}: {ys:?} vs {expected}"
                     );
                 }
-                previous = Some(dots);
             }
+        }
+    }
+
+    #[test]
+    fn two_checkpoints_do_not_repeat_a_rounded_middle_x_tick() {
+        let points = [(1.0, 2.0), (2.0, 1.0)];
+        for (w, h) in [(120, 40), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let area = Rect::new(2, 3, w - 4, if h == 40 { 12 } else { 8 });
+            terminal
+                .draw(|f| {
+                    draw(
+                        f,
+                        area,
+                        Plot {
+                            title: " two checkpoints ",
+                            caption: "Lower is better",
+                            x: "checkpoint",
+                            y: "loss",
+                            integer_x: true,
+                            x_bounds: domain(&points),
+                            y_bounds: bounds(points.iter().map(|p| p.1)),
+                        },
+                        &[Series::line("loss", &points, NORMAL_GREEN)],
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let graph = graph_rect(buffer, area);
+            let row: String = (graph.x..graph.right())
+                .map(|x| buffer[(x, graph.bottom() + 1)].symbol())
+                .collect();
+            let labels: Vec<_> = row.split_whitespace().collect();
+            assert_eq!(labels, ["1", "checkpoint", "2"]);
         }
     }
 
@@ -715,6 +1060,14 @@ mod tests {
             ["1000000", "1000100", "1000200"]
         );
         assert_eq!(bounds(std::iter::empty()), [0.0, 1.0]);
+        let fitted = bounds([3.9, f64::NAN, 6.0, f64::INFINITY].into_iter());
+        assert!((fitted[0] - 3.795).abs() < 1e-12);
+        assert!((fitted[1] - 6.105).abs() < 1e-12);
+        assert_eq!(domain(&[(1.0, 6.0), (2.0, 4.0)]), [1.0, 2.0]);
+        assert_eq!(
+            domain(&[(3.0, 1.0), (1.0, 6.0), (2.0, 4.0)]),
+            [1.0, 3.0]
+        );
         let flat_ticks = ticks(bounds([3.0, 3.0].into_iter()));
         assert!(flat_ticks.windows(2).all(|pair| pair[0] != pair[1]));
         for v in [0.0, 3.0, 0.00025] {

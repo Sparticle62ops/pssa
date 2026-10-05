@@ -1829,6 +1829,53 @@ fn feature_area(screen: Rect) -> Rect {
     )
 }
 
+/// Measure the rendered data region, not the panel allocation. Also check the
+/// entire chart border so adjacent panels/shadows cannot silently erase it.
+#[cfg(test)]
+fn assert_chart_rows(buffer: &ratatui::buffer::Buffer, title: &str, minimum: u16) {
+    for top in buffer.area.y..buffer.area.bottom() {
+        for left in buffer.area.x..buffer.area.right() {
+            if buffer[(left, top)].symbol() != "┌" {
+                continue;
+            }
+            let Some(right) =
+                (left + 1..buffer.area.right()).find(|&x| buffer[(x, top)].symbol() == "┐")
+            else {
+                continue;
+            };
+            let heading: String = (left..=right).map(|x| buffer[(x, top)].symbol()).collect();
+            if !heading.contains(title) {
+                continue;
+            }
+            let bottom = (top + 1..buffer.area.bottom())
+                .find(|&y| buffer[(left, y)].symbol() == "└")
+                .expect("chart bottom border must stay in the screen");
+            assert_eq!(buffer[(right, bottom)].symbol(), "┘", "{title}");
+            for y in top + 1..bottom {
+                assert_eq!(buffer[(left, y)].symbol(), "│", "{title}: left border");
+                assert_eq!(buffer[(right, y)].symbol(), "│", "{title}: right border");
+            }
+            let axis = (top + 1..bottom)
+                .find(|&y| {
+                    (left + 1..right - 1).any(|x| {
+                        buffer[(x, y)].symbol() == "└"
+                            && (x + 1..right).all(|xx| buffer[(xx, y)].symbol() == "─")
+                    })
+                })
+                .expect("chart must have a separate x-axis stroke");
+            assert_eq!(axis + 2, bottom, "{title}: separate tick-label row");
+            let plot_rows = axis - top - 1;
+            assert!(
+                plot_rows >= minimum,
+                "{title}: only {plot_rows} actual plot rows, need {minimum} at {:?}",
+                buffer.area
+            );
+            return;
+        }
+    }
+    panic!("missing chart {title} at {:?}", buffer.area);
+}
+
 #[cfg(test)]
 fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
     draw_with_background(f, state, tab, &HexBackground::default(), None, None);
@@ -2697,11 +2744,14 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     } else {
         area
     };
-    // Keep a full three-tick plot at 80x24. On short screens progress is a
-    // single braille meter row, leaving room for the graph and neuron panel.
+    // Prefer plot rows to a bordered progress meter and decorative gaps.
+    // At 120x40 the shell leaves 29 rows, or 23 after the live preview:
+    // progress 1 + chart 13 + metrics/neuron 9. Thirteen allocated rows leave
+    // nine data rows after borders and both x-axis rows; shadows stay outside.
+    // At 80x24, keep progress 1 + chart 9 + compact metrics/neuron 5.
     let show_graph = area.height >= 14;
-    let compact_graph = show_graph && area.height < 21;
-    let gap = if shadow::enabled(f.area()) && area.height >= 21 {
+    let compact_graph = show_graph && area.height < 28;
+    let gap = if shadow::enabled(f.area()) && area.height >= 28 {
         1
     } else {
         0
@@ -2710,7 +2760,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         Layout::vertical([
             Constraint::Length(if compact_graph { 1 } else { 4 }),
             Constraint::Min(if show_graph { 8 } else { 0 }),
-            Constraint::Length(if compact_graph {
+            Constraint::Length(if show_graph && area.height < 21 {
                 5
             } else if show_graph {
                 9
@@ -3137,6 +3187,18 @@ fn unused_helpers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feature_area_accounts_for_gutters_header_tabs_and_divider() {
+        assert_eq!(
+            feature_area(Rect::new(0, 0, 120, 40)),
+            Rect::new(4, 9, 112, 29),
+        );
+        assert_eq!(
+            feature_area(Rect::new(0, 0, 80, 24)),
+            Rect::new(2, 8, 76, 15),
+        );
+    }
 
     #[test]
     fn parses_piped_progress_and_multicomponent_eta() {
@@ -3965,7 +4027,9 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
         let mut state = RunState::default();
         for (step, loss) in [(1, 5.0), (75, 4.0), (150, 3.0)] {
-            state.ingest(&format!("training {step}/150 (50%) loss={loss} global_update={step} tokens_per_second=100"));
+            state.ingest(&format!(
+                "training {step}/150 (50%) loss={loss} global_update={step} tokens_per_second=100"
+            ));
         }
         state.graph_updated_at = None;
         for (w, h) in [(120, 40), (80, 24)] {
@@ -3973,29 +4037,60 @@ mod tests {
             terminal.draw(|f| draw(f, &state, 0)).unwrap();
             let b = terminal.backend().buffer();
             let content = HexBackground::content_area(b.area);
-            let row = |y| (content.x..content.right()).map(|x| b[(x, y)].symbol()).collect::<String>();
-            let top = (content.y..content.bottom()).find(|&y| row(y).contains("graph / loss")).unwrap();
-            let bottom = (top + 1..content.bottom()).find(|&y| b[(content.x, y)].symbol() == "└").unwrap();
+            let row = |y| {
+                (content.x..content.right())
+                    .map(|x| b[(x, y)].symbol())
+                    .collect::<String>()
+            };
+            let top = (content.y..content.bottom())
+                .find(|&y| row(y).contains("graph / loss"))
+                .unwrap();
+            let bottom = (top + 1..content.bottom())
+                .find(|&y| b[(content.x, y)].symbol() == "└")
+                .unwrap();
             let data_top = top + 1;
             let data_bottom = bottom - 3;
-            let middle = data_bottom - (data_bottom - data_top) / 2;
-            for (y, label) in [(data_top, "6.0"), (middle, "4.0"), (data_bottom, "2.0")] {
-                assert!(row(y).starts_with(&format!("│{label}│")), "tick misplaced: {}", row(y));
+            // The visible loss range is 3..5, padded to 2.9..5.1, not 2..6.
+            let dot_height = (data_bottom - data_top + 1) * 4 - 1;
+            let mut tick_rows = Vec::new();
+            for value in [3.0, 3.5, 4.0, 4.5, 5.0] {
+                let y = data_top + (((5.1 - value) * f64::from(dot_height) / 2.2) as u16 / 4);
+                assert!(
+                    row(y).starts_with(&format!("│{value:.1}│")),
+                    "tick misplaced: {}",
+                    row(y)
+                );
+                tick_rows.push(y);
             }
-            assert!((middle - data_top).abs_diff(data_bottom - middle) <= 1);
+            assert!(tick_rows.windows(2).all(|p| p[0] > p[1]));
             let labels = row(bottom - 1);
             for token in ["1", "76", "150", "training", "step"] {
-                assert!(labels.split(|c: char| c.is_whitespace() || c == '│').any(|s| s == token), "missing {token}: {labels}");
+                assert!(
+                    labels
+                        .split(|c: char| c.is_whitespace() || c == '│')
+                        .any(|s| s == token),
+                    "missing {token}: {labels}"
+                );
             }
             assert!(!labels.contains("75.5"));
             assert!(row(bottom).contains("green: loss"));
             let axis = content.x + 4;
-            let right = (axis + 1..content.right()).find(|&x| b[(x, data_top)].symbol() == "│").unwrap();
+            let right = (axis + 1..content.right())
+                .find(|&x| b[(x, data_top)].symbol() == "│")
+                .unwrap();
             for y in data_top..=data_bottom {
                 for x in axis + 1..right {
                     let cell = &b[(x, y)];
                     assert_eq!(cell.bg, PANEL_BG);
-                    assert!(cell.symbol() == " " || cell.symbol().chars().all(|c| ('\u{2800}'..='\u{28ff}').contains(&c)), "label over curve: {}", row(y));
+                    assert!(
+                        cell.symbol() == " "
+                            || cell
+                                .symbol()
+                                .chars()
+                                .all(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+                        "label over curve: {}",
+                        row(y)
+                    );
                 }
             }
         }
@@ -4050,6 +4145,15 @@ mod tests {
                 let bottom = (top + 1..content.bottom())
                     .find(|&row| buffer[(content.x, row)].symbol() == "└")
                     .unwrap();
+                assert_chart_rows(
+                    buffer,
+                    if view == GraphView::Memory {
+                        "memory / Poincare"
+                    } else {
+                        "graph /"
+                    },
+                    if h == 40 { 8 } else { 3 },
+                );
                 let rect = Rect::new(content.x, top, content.width - 1, bottom - top + 1);
                 charts::assert_plot(
                     buffer,

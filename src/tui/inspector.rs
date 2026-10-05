@@ -200,7 +200,13 @@ impl Inspector {
                     .map(|s| (s.used as u64, s.capacity as u64))
             })
             .unwrap_or((0, 0));
-        let chunks = Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).split(area);
+        // Budget for eight actual history rows on the full-height shell, but
+        // retain room for occupancy details and refresh/scroll hints when short.
+        let chunks = Layout::vertical([
+            Constraint::Length(if area.height >= 26 { 13 } else { 8 }),
+            Constraint::Min(0),
+        ])
+        .split(area);
         let history: Vec<_> = self
             .history
             .iter()
@@ -366,10 +372,24 @@ mod tests {
             terminal
                 .draw(|f| inspector.draw(f, f.area(), &RunState::default()))
                 .unwrap();
-            super::super::charts::assert_plot(
+            super::super::charts::assert_named_plot(
                 terminal.backend().buffer(),
-                Rect::new(0, 0, w, 8),
-                &["used slots", "sample", "Used memory slots", "0", "4", "8"],
+                "plastic memory",
+                &["used slots", "sample", "Used memory slots", "6/8 slots", "0"],
+            );
+            super::super::charts::assert_named_plot(
+                terminal.backend().buffer(),
+                "plastic memory",
+                if h == 40 {
+                    &["0", "2", "4", "6", "8"]
+                } else {
+                    &["0.0", "2.5", "5.0", "7.5"]
+                },
+            );
+            super::super::assert_chart_rows(
+                terminal.backend().buffer(),
+                "plastic memory",
+                if h == 40 { 8 } else { 3 },
             );
             terminal
                 .draw(|f| {
@@ -384,6 +404,11 @@ mod tests {
                 terminal.backend().buffer(),
                 "plastic memory",
                 &["used slots", "sample", "Used memory slots"],
+            );
+            super::super::assert_chart_rows(
+                terminal.backend().buffer(),
+                "plastic memory",
+                if h == 40 { 8 } else { 3 },
             );
         }
     }

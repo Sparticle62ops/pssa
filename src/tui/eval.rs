@@ -1239,7 +1239,9 @@ impl Eval {
                 } else {
                     4
                 }),
-                Constraint::Length((area.height / 3).clamp(8, 12)),
+                // Keep eight data rows after chart chrome on the 120x40 shell,
+                // without stealing the selected answer or prompt controls at 80x24.
+                Constraint::Length(if area.height >= 26 { 13 } else { 8 }),
                 Constraint::Min(3),
                 Constraint::Length(if area.height < 20 { 1 } else { 2 }),
             ])
@@ -1320,13 +1322,17 @@ impl Eval {
     }
 
     fn draw_chart(&self, f: &mut Frame, area: Rect) {
-        let points: Vec<(f64, f64)> = self
+        // History can contain several fingerprints of a replaced checkpoint.
+        // Plot its latest score once, not a vertical segment through stale
+        // revisions. Keep the full history available to the answer browser.
+        let latest: std::collections::BTreeMap<_, _> = self
             .snapshot
             .records
             .iter()
             .filter(|r| r.suite == self.snapshot.suite)
-            .map(|r| (r.number as f64, r.mean_nll().unwrap_or(f64::NAN)))
+            .map(|r| (r.number, r.mean_nll().unwrap_or(f64::NAN)))
             .collect();
+        let points: Vec<_> = latest.into_iter().map(|(n, y)| (n as f64, y)).collect();
         if !points.iter().any(|p| p.1.is_finite()) {
             let chart_area = panel_area(f, area);
             f.render_widget(Paragraph::new("Reference NLL ↓ better\nWaiting for a fully scoreable fixed suite.\nUnknown words / invalid or oversized checkpoints are skipped.")
@@ -1843,13 +1849,14 @@ mod tests {
     #[test]
     fn quality_chart_has_braille_axes_at_both_sizes() {
         let (mut eval, _) = screen();
+        eval.snapshot.records.push(record(3));
         eval.edit = Some("custom-prompts.json".into());
         for (w, h) in [(120, 40), (80, 24)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             terminal.draw(|f| eval.draw(f, f.area())).unwrap();
-            charts::assert_plot(
+            charts::assert_named_plot(
                 terminal.backend().buffer(),
-                Rect::new(0, 4, w, (h / 3).clamp(8, 12)),
+                "quality / checkpoint",
                 &[
                     "quality / checkpoint",
                     "checkpoint",
@@ -1860,6 +1867,11 @@ mod tests {
                     "3",
                 ],
             );
+            super::super::assert_chart_rows(
+                terminal.backend().buffer(),
+                "quality / checkpoint",
+                if h == 40 { 8 } else { 3 },
+            );
             terminal
                 .draw(|f| eval.draw(f, super::super::feature_area(f.area())))
                 .unwrap();
@@ -1867,6 +1879,11 @@ mod tests {
                 terminal.backend().buffer(),
                 "quality / checkpoint",
                 &["checkpoint", "reference loss", "Lower = less surprise"],
+            );
+            super::super::assert_chart_rows(
+                terminal.backend().buffer(),
+                "quality / checkpoint",
+                if h == 40 { 8 } else { 3 },
             );
             let text: String = terminal
                 .backend()
@@ -1877,6 +1894,40 @@ mod tests {
                 .collect();
             assert!(text.contains("AUTO EVAL / WATCHING"));
             assert!(text.contains("Prompt file > custom-prompts.json"));
+        }
+    }
+
+    #[test]
+    fn quality_chart_uses_latest_revision_without_a_checkpoint_one_spike() {
+        let (mut eval, _) = screen();
+        let mut stale = record(1);
+        stale.fingerprint = "old-revision".into();
+        stale.samples[0].nll = Some(6.0);
+        let mut other_suite = record(2);
+        other_suite.suite = "other-suite".into();
+        other_suite.samples[0].nll = Some(100.0);
+        for (w, h) in [(120, 40), (80, 24)] {
+            for missing_latest in [false, true] {
+                let mut current = vec![record(1), record(2), record(3)];
+                if missing_latest {
+                    // A skipped new revision is a gap, not its old valid score.
+                    current[0].samples[0].nll = None;
+                }
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                let area = Rect::new(2, 3, w - 4, if h == 40 { 13 } else { 8 });
+                eval.snapshot.records = current.clone();
+                terminal.draw(|f| eval.draw_chart(f, area)).unwrap();
+                let expected = terminal.backend().buffer().clone();
+                eval.snapshot.records.insert(0, stale.clone());
+                eval.snapshot.records.push(other_suite.clone());
+                terminal.draw(|f| eval.draw_chart(f, area)).unwrap();
+                assert_eq!(
+                    terminal.backend().buffer(),
+                    &expected,
+                    "stale revisions or another suite changed the chart at {w}x{h}"
+                );
+                assert_eq!(eval.snapshot.records.len(), 5, "history must be preserved");
+            }
         }
     }
 
