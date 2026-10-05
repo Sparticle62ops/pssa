@@ -8,7 +8,7 @@ use crate::dataset::{
     DatasetManager, HuggingFaceDatasetOptions, Tokenizer, TokenizerKind, clean_wikitext,
 };
 use crate::inference::{InferenceConfig, PSSAInferenceEngine};
-use crate::pssa::{PSSAConfigV2, PSSALayerV2};
+use crate::pssa::{GradientClipOutcome, PSSAConfigV2, PSSALayerV2};
 use crate::ui;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Write};
@@ -17,6 +17,33 @@ use std::time::Instant;
 /// Keep command-line generation requests bounded before inference preallocates
 /// its token and byte buffers.
 const MAX_GENERATION_TOKENS: usize = 100_000;
+
+/// Opt-in clipping tolerates isolated bad gradients, not sustained divergence.
+const MAX_CONSECUTIVE_SKIPPED_UPDATES: usize = 20;
+
+#[derive(Default)]
+struct SkippedUpdates {
+    total: usize,
+    consecutive: usize,
+}
+impl SkippedUpdates {
+    fn record(&mut self, norm: f64, step: usize) -> Result<(), String> {
+        self.total += 1;
+        self.consecutive += 1;
+        eprintln!(
+            "warning: non-finite grad_norm={norm:.6e}; skipped optimizer update at global_step={step} skipped_updates={} consecutive_skips={}/{} (gradients cleared; Adam unchanged)",
+            self.total, self.consecutive, MAX_CONSECUTIVE_SKIPPED_UPDATES
+        );
+        if self.consecutive > MAX_CONSECUTIVE_SKIPPED_UPDATES {
+            Err(format!(
+                "more than {MAX_CONSECUTIVE_SKIPPED_UPDATES} consecutive non-finite gradient updates; training aborted without checkpoint (skipped_updates={})",
+                self.total
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct TrainingOptions {
@@ -36,6 +63,10 @@ pub struct TrainingOptions {
     pub chunk: usize,
     pub lr: f32,
     pub accumulate: usize,
+    /// Runtime-only global L2 gradient limit; None preserves historical Adam.
+    pub grad_clip: Option<f32>,
+    /// Runtime-only per-vector episodic memory L2 limit; repeat on resume.
+    pub memory_value_cap: Option<f32>,
     /// Independent document lanes per PSSA microbatch (runtime-only).
     pub batch_size: usize,
     pub warmup_steps: usize,
@@ -82,6 +113,8 @@ impl Default for TrainingOptions {
             chunk: 64,
             lr: 1e-3,
             accumulate: 8,
+            grad_clip: None,
+            memory_value_cap: None,
             batch_size: 1,
             warmup_steps: 0,
             schedule_total_updates: None,
@@ -226,6 +259,18 @@ impl Parsed {
         CLIHandler::validate_loops(loops)?;
         Ok(loops)
     }
+    fn optional_positive_f32(&self, flag: &str) -> Result<Option<f32>, String> {
+        self.string(flag, "")
+            .map(|_| {
+                let value = self.f32(flag, "", 0.0)?;
+                if value > 0.0 {
+                    Ok(value)
+                } else {
+                    Err(format!("{flag} must be finite and positive"))
+                }
+            })
+            .transpose()
+    }
     fn f32(&self, long: &str, short: &str, default: f32) -> Result<f32, String> {
         self.f32_first(&[long, short], long, default)
     }
@@ -319,6 +364,8 @@ impl CLIHandler {
             chunk: parsed.usize_nonzero("--chunk", "", 64)?,
             lr: parsed.f32("--lr", "", 1e-3)?,
             accumulate: parsed.usize_nonzero("--accumulate", "", 8)?,
+            grad_clip: parsed.optional_positive_f32("--grad-clip")?,
+            memory_value_cap: parsed.optional_positive_f32("--memory-value-cap")?,
             batch_size: parsed.usize_nonzero("--batch-size", "", 1)?,
             warmup_steps: parsed.required_usize("--warmup-steps", "", 0)?,
             schedule_total_updates: parsed
@@ -611,6 +658,14 @@ impl CLIHandler {
             );
         }
         Self::validate_loops(options.loops)?;
+        for (flag, value) in [
+            ("--grad-clip", options.grad_clip),
+            ("--memory-value-cap", options.memory_value_cap),
+        ] {
+            if value.is_some_and(|x| !x.is_finite() || x <= 0.0) {
+                return Err(format!("{flag} must be finite and positive"));
+            }
+        }
         if options.batch_size > 65_536 {
             return Err("--batch-size must be at most 65536; use fewer document lanes".into());
         }
@@ -695,6 +750,24 @@ impl CLIHandler {
         };
         if options.resume.is_some() {
             model.set_loops(options.loops)?;
+        }
+        // Runtime-only safeguards: never serialized, and no extra math/logging
+        // on the historical flags-off path. Cap loaded values before any read.
+        if options.grad_clip.is_some() || options.memory_value_cap.is_some() {
+            println!(
+                "grad_clip={} memory_value_cap={} max_consecutive_skipped_updates={MAX_CONSECUTIVE_SKIPPED_UPDATES} (runtime-only; repeat flags on resume)",
+                options
+                    .grad_clip
+                    .map_or_else(|| "off".into(), |x| x.to_string()),
+                options
+                    .memory_value_cap
+                    .map_or_else(|| "off".into(), |x| x.to_string())
+            );
+        }
+        if options.memory_value_cap.is_some() {
+            for block in std::iter::once(&mut model.block).chain(&mut model.extra_blocks) {
+                block.memory.set_value_cap(options.memory_value_cap);
+            }
         }
         // Keep an explicit resume override in the checkpoint's persisted
         // configuration so a later link does not silently revert to the old LR.
@@ -832,6 +905,7 @@ impl CLIHandler {
         let mut sequence_views = Vec::with_capacity(options.batch_size);
         let started = Instant::now();
         let mut update = 0;
+        let mut skipped = SkippedUpdates::default();
         let mut tokens_seen = 0usize;
         let mut progress = ui::Progress::new_with_tui("training", total_updates, !options.no_tui);
         if let Some(path) = options.checkpoint_path.as_deref() {
@@ -930,9 +1004,24 @@ impl CLIHandler {
                         offset += c.len;
                     }
                 }
+                let learning_rate = schedule.lr(update + 1)?;
+                if let Some(max_norm) = options.grad_clip {
+                    match model.apply_adamw_with_grad_clip(learning_rate, max_norm) {
+                        GradientClipOutcome::Applied { norm } => {
+                            skipped.consecutive = 0;
+                            progress.set_gradient_metrics(norm, skipped.total);
+                        }
+                        GradientClipOutcome::Skipped { norm } => {
+                            skipped.record(norm, model.step_counter)?;
+                            // Consume this group, but neither Adam nor the LR
+                            // schedule advances. The next group gets clean grads.
+                            continue;
+                        }
+                    }
+                } else {
+                    model.apply_adamw(learning_rate);
+                }
                 update += 1;
-                let learning_rate = schedule.lr(update)?;
-                model.apply_adamw(learning_rate);
                 if !Self::finite(&model) {
                     return Err("non-finite parameters; training aborted without checkpoint".into());
                 }
@@ -1001,6 +1090,12 @@ impl CLIHandler {
             "training_seconds={:.3} optimizer_updates={update}",
             started.elapsed().as_secs_f32()
         );
+        if options.grad_clip.is_some() {
+            println!(
+                "skipped_updates={} consecutive_skips={}",
+                skipped.total, skipped.consecutive
+            );
+        }
         ui::section("summary");
         ui::field("wall time", &ui::duration(wall));
         ui::field("tokens", &ui::thousands(tokens_seen));
@@ -1647,6 +1742,16 @@ impl CLIHandler {
         );
         println!(
             "    {:<48}{}",
+            "  --grad-clip max_norm",
+            ui::dim("opt-in global L2 limit; skip bad norms, abort after 20 consecutive skips")
+        );
+        println!(
+            "    {:<48}{}",
+            "  --memory-value-cap c",
+            ui::dim("opt-in memory value L2 limit (also caps loaded banks; repeat on resume)")
+        );
+        println!(
+            "    {:<48}{}",
             "  --lr f --warmup-steps n --total-updates n",
             ui::dim("optimizer schedule; fixed whole-run horizon for fresh chains")
         );
@@ -1814,6 +1919,15 @@ impl CLIHandler {
                 println!("      --batch-size <N>          independent document lanes (default: 1)");
                 println!(
                     "      --accumulate <N>          microbatches per optimizer update (default: 8)"
+                );
+                println!(
+                    "      --grad-clip <MAX_NORM>     opt-in global gradient L2 limit, finite >0; bad norms skip Adam (abort on 21st consecutive skip)"
+                );
+                println!(
+                    "      --memory-value-cap <C>    opt-in memory value L2 limit, finite >0; caps loaded banks and writes"
+                );
+                println!(
+                    "                                both default off, runtime-only; repeat flags on resume"
                 );
                 println!("      --lr <F>                  base learning rate (default: 0.001)");
                 println!("      --warmup-steps <N>        linear warm-up updates (default: 0)");
@@ -2101,7 +2215,14 @@ impl CLIHandler {
                     allowed.retain(|x| !["--latent", "--state", "--key", "--memory"].contains(x));
                     allowed.push("--tokenizer-from");
                 } else {
-                    allowed.extend(["--batch-size", "--depth", "--loops", "--backend"]);
+                    allowed.extend([
+                        "--batch-size",
+                        "--depth",
+                        "--loops",
+                        "--backend",
+                        "--grad-clip",
+                        "--memory-value-cap",
+                    ]);
                 }
                 let p = Parsed::parse(&args[2..], &allowed)?;
                 for flag in ["--threads", "--ram-mib"] {
@@ -2491,6 +2612,48 @@ fn probe_max_abs_diff(actual: &[f32], expected: &[f32]) -> Result<f32, String> {
         .zip(expected)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f32::max))
+}
+
+#[cfg(test)]
+mod training_safeguards_tests {
+    use super::*;
+
+    #[test]
+    fn opt_in_flags_require_positive_finite_f32() {
+        let defaults = CLIHandler::common_options(&Parsed::parse(&[], &[]).unwrap()).unwrap();
+        assert_eq!(defaults.grad_clip, None);
+        assert_eq!(defaults.memory_value_cap, None);
+        for flag in ["--grad-clip", "--memory-value-cap"] {
+            for bad in ["0", "-1", "NaN", "inf", "1e40", "1e-50", "garbage"] {
+                let parsed = Parsed::parse(&[flag.into(), bad.into()], &[flag]).unwrap();
+                assert!(CLIHandler::common_options(&parsed).is_err(), "{flag}={bad}");
+            }
+            let parsed = Parsed::parse(&[flag.into(), "1.0".into()], &[flag]).unwrap();
+            let options = CLIHandler::common_options(&parsed).unwrap();
+            assert_eq!(
+                if flag == "--grad-clip" {
+                    options.grad_clip
+                } else {
+                    options.memory_value_cap
+                },
+                Some(1.0)
+            );
+        }
+    }
+
+    #[test]
+    fn skip_limit_allows_twenty_and_resets_after_success() {
+        let mut skipped = SkippedUpdates::default();
+        for _ in 0..MAX_CONSECUTIVE_SKIPPED_UPDATES {
+            skipped.record(f64::INFINITY, 7).unwrap();
+        }
+        skipped.consecutive = 0; // the successful-update branch
+        for _ in 0..MAX_CONSECUTIVE_SKIPPED_UPDATES {
+            skipped.record(f64::NAN, 8).unwrap();
+        }
+        assert!(skipped.record(f64::NAN, 8).is_err());
+        assert_eq!(skipped.total, 41);
+    }
 }
 
 #[cfg(test)]

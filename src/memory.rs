@@ -10,6 +10,8 @@ pub struct HyperbolicEpisodicBankV2 {
     pub write_head: usize,
     pub keys: Vec<f32>,
     pub values: Vec<f32>,
+    /// Runtime-only Euclidean value norm limit; configure with `set_value_cap`.
+    pub value_cap: Option<f32>,
     pub norm_sq: Vec<f32>,
     pub confidence: Vec<f32>,
     pub last_seen_step: Vec<usize>,
@@ -29,9 +31,53 @@ impl HyperbolicEpisodicBankV2 {
             write_head: 0,
             keys: vec![0.0; capacity * dim_key],
             values: vec![0.0; capacity * dim_val],
+            value_cap: None,
             norm_sq: vec![0.0; capacity],
             confidence: vec![1.0; capacity],
             last_seen_step: vec![0; capacity],
+        }
+    }
+
+    /// Set an opt-in Euclidean norm cap for each stored value vector.
+    /// Enabling or tightening it clamps existing values, including unused slots,
+    /// without changing keys or their metadata. Call again after checkpoint load:
+    /// the cap is runtime-only and is not part of the checkpoint format.
+    /// Disabling it preserves current values and restores exact-copy writes.
+    ///
+    /// Panics if the cap is not finite and positive, or capped values are non-finite.
+    pub fn set_value_cap(&mut self, value_cap: Option<f32>) {
+        if let Some(cap) = value_cap {
+            assert!(
+                cap.is_finite() && cap > 0.0,
+                "memory value cap must be positive and finite"
+            );
+            for value in self.values.chunks_exact_mut(self.dim_val) {
+                Self::clamp_value(value, cap);
+            }
+        }
+        self.value_cap = value_cap;
+    }
+
+    fn clamp_value(value: &mut [f32], cap: f32) {
+        let norm_sq = Self::squared_norm_f64(value);
+        assert!(norm_sq.is_finite(), "capped memory value must be finite");
+        let cap_sq = (cap as f64) * (cap as f64);
+        if norm_sq <= cap_sq {
+            return;
+        }
+        let scale = cap as f64 / norm_sq.sqrt();
+        for x in value.iter_mut() {
+            *x = (*x as f64 * scale) as f32;
+        }
+        // Nearest-f32 rounding can push the norm above the cap. Move components
+        // one ulp toward zero until it fits; unlike multiplicative headroom, this
+        // also works for subnormal caps/components, where a rescale may round away.
+        while Self::squared_norm_f64(value) > cap_sq {
+            for x in value.iter_mut() {
+                if *x != 0.0 {
+                    *x = f32::from_bits(x.to_bits() - 1);
+                }
+            }
         }
     }
 
@@ -148,6 +194,9 @@ impl HyperbolicEpisodicBankV2 {
         self.norm_sq[idx] = key_sq;
         let v_off = idx * self.dim_val;
         self.values[v_off..v_off + self.dim_val].copy_from_slice(val);
+        if let Some(cap) = self.value_cap {
+            Self::clamp_value(&mut self.values[v_off..v_off + self.dim_val], cap);
+        }
         self.confidence[idx] = 1.0;
         self.last_seen_step[idx] = 0;
         idx
@@ -294,5 +343,190 @@ impl HyperbolicEpisodicBankV2 {
             }
         }
         -max_distance
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HyperbolicEpisodicBankV2 as Bank;
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|x| x.to_bits()).collect()
+    }
+
+    fn assert_capped(value: &[f32], cap: f32) {
+        assert!(value.iter().all(|x| x.is_finite()));
+        let norm_sq: f64 = value.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        assert!(norm_sq <= (cap as f64) * (cap as f64));
+    }
+
+    fn assert_metadata_eq(a: &Bank, b: &Bank) {
+        assert_eq!(a.capacity, b.capacity);
+        assert_eq!(a.count, b.count);
+        assert_eq!(a.dim_key, b.dim_key);
+        assert_eq!(a.dim_val, b.dim_val);
+        assert_eq!(a.write_head, b.write_head);
+        assert_eq!(bits(&a.keys), bits(&b.keys));
+        assert_eq!(bits(&a.norm_sq), bits(&b.norm_sq));
+        assert_eq!(bits(&a.confidence), bits(&b.confidence));
+        assert_eq!(a.last_seen_step, b.last_seen_step);
+    }
+
+    #[test]
+    fn value_cap_clamps_insert_and_ring_overwrite_without_changing_metadata() {
+        let mut uncapped = Bank::new(2, 2, 2);
+        let mut capped = uncapped.clone();
+        capped.set_value_cap(Some(2.0));
+        for (key, value) in [
+            ([0.25, -0.125], [6.0, 8.0]),
+            ([-0.5, 0.25], [0.0, -1.0]),
+            ([0.125, 0.0], [30.0, -40.0]),
+        ] {
+            let idx = uncapped.insert(&key, &value);
+            assert_eq!(capped.insert(&key, &value), idx);
+            assert_metadata_eq(&capped, &uncapped);
+            for stored in capped.values.chunks_exact(capped.dim_val) {
+                assert_capped(stored, 2.0);
+            }
+        }
+        assert_eq!(capped.write_head, 1);
+        assert_eq!(&capped.values[2..4], &[0.0, -1.0]);
+    }
+
+    #[test]
+    fn value_cap_clamps_protected_writes_but_not_defended_values() {
+        let mut bank = Bank::new(1, 1, 2);
+        bank.set_value_cap(Some(1.0));
+        assert_eq!(bank.insert_protected(&[0.1], &[3.0, 4.0], 0.0, 1), Some(0));
+        assert_capped(&bank.values, 1.0);
+        let before = bank.clone();
+        assert_eq!(bank.insert_protected(&[0.2], &[30.0, 40.0], 0.0, 2), None);
+        assert_eq!(bits(&bank.values), bits(&before.values));
+        assert_eq!(bits(&bank.keys), bits(&before.keys));
+        assert_eq!(bits(&bank.norm_sq), bits(&before.norm_sq));
+        assert_eq!(
+            bank.insert_protected(&[0.2], &[-30.0, 40.0], 1e6, 1000),
+            Some(0)
+        );
+        assert_capped(&bank.values, 1.0);
+        assert!(bank.values[0] < 0.0);
+        assert_eq!(bank.keys, vec![0.2]);
+        assert_eq!(bank.norm_sq[0], Bank::squared_norm(&[0.2]));
+        assert_eq!(bank.confidence, vec![1.0]);
+        assert_eq!(bank.last_seen_step, vec![1000]);
+    }
+
+    #[test]
+    fn enabling_value_cap_clamps_existing_and_loaded_unused_slots_only() {
+        let mut bank = Bank::new(3, 2, 2);
+        bank.insert(&[0.25, -0.5], &[3.0, 4.0]);
+        bank.insert(&[-0.125, 0.25], &[0.125, -0.25]);
+        // Checkpoints store all capacity slots, not just occupied slots.
+        bank.values[4..6].copy_from_slice(&[10.0, -20.0]);
+        bank.confidence[0] = 3.5;
+        bank.last_seen_step[0] = 42;
+        let before = bank.clone();
+        bank.set_value_cap(Some(1.0));
+        assert_eq!(bank.value_cap, Some(1.0));
+        assert_metadata_eq(&bank, &before);
+        for value in bank.values.chunks_exact(bank.dim_val) {
+            assert_capped(value, 1.0);
+        }
+        assert_eq!(bits(&bank.values[2..4]), bits(&before.values[2..4]));
+    }
+
+    #[test]
+    fn value_cap_can_be_tightened_and_disabled_without_restoring_values() {
+        let mut bank = Bank::new(1, 1, 2);
+        bank.insert(&[0.0], &[3.0, 4.0]);
+        bank.set_value_cap(Some(4.0));
+        assert_capped(&bank.values, 4.0);
+        let capped = bits(&bank.values);
+        bank.set_value_cap(Some(10.0));
+        assert_eq!(bits(&bank.values), capped);
+        bank.set_value_cap(Some(0.5));
+        assert_capped(&bank.values, 0.5);
+        let capped = bits(&bank.values);
+        bank.set_value_cap(None);
+        assert_eq!(bank.value_cap, None);
+        assert_eq!(bits(&bank.values), capped);
+        bank.insert(&[0.0], &[30.0, 40.0]);
+        assert_eq!(bits(&bank.values), bits(&[30.0, 40.0]));
+    }
+
+    #[test]
+    fn disabled_value_cap_preserves_exact_copy_bits() {
+        let mut bank = Bank::new(1, 1, 8);
+        assert_eq!(bank.value_cap, None);
+        let value = [
+            0.0,
+            -0.0,
+            f32::MAX,
+            -f32::MAX,
+            f32::from_bits(0x7fc0_1234),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(1),
+        ];
+        bank.insert(&[0.0], &value);
+        assert_eq!(bits(&bank.values), bits(&value));
+        bank.set_value_cap(None);
+        assert_eq!(bits(&bank.values), bits(&value));
+        let overwritten = value.map(|x| -x);
+        bank.insert(&[0.1], &overwritten);
+        assert_eq!(bits(&bank.values), bits(&overwritten));
+    }
+
+    #[test]
+    fn enabled_value_cap_preserves_under_limit_bits() {
+        let mut bank = Bank::new(1, 1, 3);
+        bank.set_value_cap(Some(1.0));
+        let value = [-0.0, f32::from_bits(1), 0.5];
+        bank.insert(&[0.0], &value);
+        assert_eq!(bits(&bank.values), bits(&value));
+        bank.set_value_cap(Some(1.0));
+        assert_eq!(bits(&bank.values), bits(&value));
+    }
+
+    #[test]
+    fn value_cap_handles_extreme_finite_values_and_caps() {
+        for cap in [1.0, f32::MAX, f32::MIN_POSITIVE, f32::from_bits(1)] {
+            let mut bank = Bank::new(1, 1, 3);
+            bank.set_value_cap(Some(cap));
+            bank.insert(&[0.0], &[f32::MAX, -f32::MAX, f32::MAX]);
+            assert_capped(&bank.values, cap);
+        }
+    }
+
+    #[test]
+    fn value_cap_corrects_normal_and_subnormal_rounding_overshoot() {
+        // Direct nearest-f32 rounding of the normalized 3-4-5 vector overshoots.
+        let rounded_norm_sq = (0.6f32 as f64).powi(2) + (0.8f32 as f64).powi(2);
+        assert!(rounded_norm_sq > 1.0);
+        let mut bank = Bank::new(1, 1, 2);
+        bank.set_value_cap(Some(1.0));
+        bank.insert(&[0.0], &[3.0, 4.0]);
+        assert_capped(&bank.values, 1.0);
+        assert!((bank.values[0] - 0.6).abs() <= f32::EPSILON);
+        assert!((bank.values[1] - 0.8).abs() <= f32::EPSILON);
+
+        let tiny = f32::from_bits(1);
+        bank.set_value_cap(Some(tiny));
+        bank.insert(&[0.0], &[tiny, -tiny]);
+        assert_capped(&bank.values, tiny);
+    }
+
+    #[test]
+    fn invalid_value_caps_are_rejected_without_changing_the_bank() {
+        let mut bank = Bank::new(1, 1, 2);
+        bank.insert(&[0.25], &[3.0, 4.0]);
+        let before = bank.clone();
+        for cap in [0.0, -0.0, -1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                bank.set_value_cap(Some(cap));
+            }));
+            assert!(result.is_err());
+            assert_eq!(bank, before);
+        }
     }
 }

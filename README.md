@@ -724,6 +724,8 @@ Options:
 | `--chunk <n>` | `64` | `train`, `train-transformer` | Sequence chunk length. |
 | `--lr <float>` | `1e-3` | `train`, `train-transformer` | Base learning rate. |
 | `--accumulate <n>` | `8` | `train`, `train-transformer` | Chunks per optimizer update. |
+| `--grad-clip <max_norm>` | off | `train` | Opt-in global L2 gradient limit across all Adam parameters; finite positive f32. |
+| `--memory-value-cap <c>` | off | `train` | Opt-in L2 limit per episodic-memory value on load and every write; finite positive f32. |
 | `--warmup-steps <n>` | `0` | `train`, `train-transformer` | Linear warm-up before cosine decay. |
 | `--total-updates <n>` | unset | `train`, `train-transformer` | Fixed whole-run schedule horizon. |
 | `--seed <n>` | `42` | `train`, `train-transformer` | Initialization seed. |
@@ -766,6 +768,17 @@ cargo run --release -- train data/downloaded.txt -e 1 \
 cargo run --release -- train data/downloaded.txt -e 1 \
   --skip-tokens 200000 --max-tokens 200000 --resume chain/ck01.pssa -o chain/ck02.pssa
 ```
+
+For opt-in divergence containment, add e.g. `--grad-clip 1.0 --memory-value-cap 512`.
+Clipping runs after gradient accumulation, immediately before Adam on CPU and GPU;
+progress reports the pre-clip `grad_norm`. A non-finite norm clears gradients and
+skips the update without advancing Adam moments, step count, or the LR schedule;
+the data group is not retried. Warnings and `skipped_updates` count these skips,
+and the **21st consecutive skip** aborts without saving. The memory cap rescales
+vectors (not individual coordinates); key norms and other bank metadata are
+unchanged. Both flags default off, preserve the checkpoint format, and are
+**runtime-only: repeat them on every resumed link**. The example cap is a policy
+choice, not a guarantee of stability or a universal model-scale setting.
 
 `kaggle/kaggle_continue.sh` drives this pattern end to end: it sets a window size and a link count, walks the corpus offset by offset, and resumes each link from the previous checkpoint. `status` then reports every checkpoint in the chain with its shape and optimizer step count.
 
