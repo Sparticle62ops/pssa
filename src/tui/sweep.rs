@@ -622,9 +622,9 @@ mod tests {
         for (w, h) in [(120, 40), (80, 24)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             terminal.draw(|f| sweep.draw(f, f.area())).unwrap();
-            super::super::charts::assert_plot(
+            super::super::charts::assert_named_plot(
                 terminal.backend().buffer(),
-                Rect::new(w / 2, 6, w / 2, h - 10),
+                "sweep / loss by trial",
                 &[
                     "trial",
                     "loss",
@@ -634,6 +634,11 @@ mod tests {
                     "3",
                 ],
             );
+            super::super::assert_chart_rows(
+                terminal.backend().buffer(),
+                "sweep / loss by trial",
+                if h == 40 { 8 } else { 3 },
+            );
             terminal
                 .draw(|f| sweep.draw(f, super::super::feature_area(f.area())))
                 .unwrap();
@@ -641,6 +646,11 @@ mod tests {
                 terminal.backend().buffer(),
                 "sweep / loss by trial",
                 &["trial", "loss", "Lower = better training fit"],
+            );
+            super::super::assert_chart_rows(
+                terminal.backend().buffer(),
+                "sweep / loss by trial",
+                if h == 40 { 8 } else { 3 },
             );
         }
     }

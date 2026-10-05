@@ -493,7 +493,9 @@ impl Timeline {
         let show_plot = area.height >= 14 && self.entries.iter().any(|e| e.metrics.loss.is_some());
         let parts = Layout::vertical([
             Constraint::Length(if show_plot {
-                8
+                // Thirteen panel rows retain eight plot rows after all chrome;
+                // shorter screens still leave space for selection and controls.
+                if area.height >= 26 { 13 } else { 8 }
             } else if area.height < 12 {
                 3
             } else {
@@ -885,9 +887,9 @@ mod tests {
         for (w, h) in [(120, 40), (80, 24)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             terminal.draw(|f| timeline.draw(f, f.area())).unwrap();
-            super::super::charts::assert_plot(
+            super::super::charts::assert_named_plot(
                 terminal.backend().buffer(),
-                Rect::new(0, 0, w, 8),
+                "timeline / saved checkpoints",
                 &[
                     "checkpoint",
                     "loss",
@@ -896,6 +898,11 @@ mod tests {
                     "2",
                     "3",
                 ],
+            );
+            super::super::assert_chart_rows(
+                terminal.backend().buffer(),
+                "timeline / saved checkpoints",
+                if h == 40 { 8 } else { 3 },
             );
             assert!(terminal.backend().buffer().content().iter().any(|c| {
                 c.fg == super::super::SECOND_ACCENT
@@ -910,6 +917,11 @@ mod tests {
                 terminal.backend().buffer(),
                 "timeline / saved checkpoints",
                 &["checkpoint", "loss", "Lower loss = better fit"],
+            );
+            super::super::assert_chart_rows(
+                terminal.backend().buffer(),
+                "timeline / saved checkpoints",
+                if h == 40 { 8 } else { 3 },
             );
         }
     }

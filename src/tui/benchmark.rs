@@ -195,7 +195,13 @@ impl Benchmark {
             .as_ref()
             .filter(|_| area.width >= 70 && area.height >= 15)
         {
-            let parts = Layout::vertical([Constraint::Min(0), Constraint::Length(9)]).split(area);
+            // Reserve eight data rows after shadows/borders/axes on a tall
+            // screen; keep the selected input and run controls usable when short.
+            let parts = Layout::vertical([
+                Constraint::Min(0),
+                Constraint::Length(if area.height >= 26 { 13 } else { 9 }),
+            ])
+            .split(area);
             // Paint the upper panel first; its shadow must not erase the plot title.
             self.draw_card(f, parts[0]);
             let pssa = result["pssa"]["perplexity"]
@@ -249,31 +255,62 @@ impl Benchmark {
 
     fn draw_card(&self, f: &mut ratatui::Frame, area: Rect) {
         let area = panel_area(f, area);
+        // A taller chart must not hide the matched-result details. On a wide,
+        // short card, arrange inputs in two columns instead of dropping rows.
+        let paired_fields = self.result.is_some() && area.width >= 100 && area.height < 20;
         let mut lines = vec![
-            Line::styled("MATCHED / PSSA vs transformer", accent()),
+            Line::styled(
+                if paired_fields {
+                    "MATCHED / PSSA vs transformer / held-out (not training loss)"
+                } else {
+                    "MATCHED / PSSA vs transformer"
+                },
+                accent(),
+            ),
             Line::from(
                 "Replays the PSSA chain; trains ONLY the baseline; scores both on the next unseen 256 tokens.",
             ),
             Line::from("↑/↓ choose • Enter edit • Ctrl+U clear • b run • Esc stop • Tab tabs"),
         ];
-        for (i, label) in LABELS.iter().enumerate() {
-            lines.push(Line::from(format!(
-                "{} {label}: {}{}",
-                if i == self.selected { ">" } else { " " },
-                clean(&self.fields[i]),
-                if i == self.selected && self.editing {
-                    " ▌"
-                } else {
-                    ""
-                }
-            )));
-        }
+        let fields: Vec<_> = LABELS
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                format!(
+                    "{} {label}: {}{}",
+                    if i == self.selected { ">" } else { " " },
+                    clean(&self.fields[i]),
+                    if i == self.selected && self.editing {
+                        " ▌"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect();
+        let field_rows = fields.len().div_ceil(2);
+        let selected_line = 3 + if paired_fields {
+            let column_width = usize::from(area.width.saturating_sub(4)) / 2;
+            for i in 0..field_rows {
+                lines.push(Line::from(format!(
+                    "{:<column_width$}  {}",
+                    fields[i],
+                    fields.get(i + field_rows).map_or("", String::as_str),
+                )));
+            }
+            self.selected % field_rows
+        } else {
+            lines.extend(fields.into_iter().map(Line::from));
+            self.selected
+        };
         lines.push(Line::from(self.note.as_str()));
         if let Some(v) = &self.result {
-            lines.push(Line::styled(
-                "RESULT / held-out (not training loss)",
-                accent(),
-            ));
+            if !paired_fields {
+                lines.push(Line::styled(
+                    "RESULT / held-out (not training loss)",
+                    accent(),
+                ));
+            }
             for model in ["pssa", "transformer"] {
                 lines.push(Line::from(format!(
                     "{model}: ppl {} • accuracy {} • parameters {}",
@@ -309,7 +346,7 @@ impl Benchmark {
         }
         let block = panel(" benchmark / b run ");
         let inner = block.inner(area);
-        let selected_row = Paragraph::new(lines[..3 + self.selected].to_vec())
+        let selected_row = Paragraph::new(lines[..selected_line].to_vec())
             .wrap(Wrap { trim: false })
             .line_count(inner.width);
         let scroll = selected_row
@@ -410,9 +447,9 @@ mod tests {
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
             terminal.draw(|f| b.draw(f, f.area())).unwrap();
-            super::super::charts::assert_plot(
+            super::super::charts::assert_named_plot(
                 terminal.backend().buffer(),
-                Rect::new(0, h - 9, w, 9),
+                "held-out / PSSA",
                 &[
                     "model",
                     "perplexity",
@@ -420,9 +457,14 @@ mod tests {
                     "transformer",
                     "Lower = less surprise",
                     "0",
-                    "15",
-                    "30",
+                    "13.4",
+                    "26.8",
                 ],
+            );
+            super::super::assert_chart_rows(
+                terminal.backend().buffer(),
+                "held-out / PSSA",
+                if h == 40 { 8 } else { 4 },
             );
             terminal
                 .draw(|f| b.draw(f, super::super::feature_area(f.area())))
@@ -438,6 +480,51 @@ mod tests {
                     "Lower = less surprise",
                 ],
             );
+            super::super::assert_chart_rows(
+                terminal.backend().buffer(),
+                "held-out / PSSA",
+                if h == 40 { 8 } else { 4 },
+            );
+            if h == 40 {
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                for label in LABELS.into_iter().chain([
+                    "Enter edit",
+                    "not training loss",
+                    "accuracy",
+                    "Matched targets",
+                    "matches exposure, not compute",
+                ]) {
+                    assert!(
+                        text.contains(label),
+                        "hidden benchmark information: {label}"
+                    );
+                }
+            }
+            // The shorter card must still scroll to every selected input.
+            for (index, label) in LABELS.iter().enumerate() {
+                b.selected = index;
+                terminal
+                    .draw(|f| b.draw(f, super::super::feature_area(f.area())))
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(
+                    text.contains(&format!("> {label}")),
+                    "hidden input at {w}x{h}: {label}"
+                );
+            }
+            b.selected = 0;
         }
     }
 
