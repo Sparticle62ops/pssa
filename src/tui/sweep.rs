@@ -423,6 +423,7 @@ impl Sweep {
                     title: " sweep / loss by trial ",
                     caption: "Lower = better training fit",
                     x: "trial",
+                    integer_x: true,
                     y: "loss",
                     x_bounds: super::charts::domain(&points),
                     y_bounds: super::charts::bounds(points.iter().map(|p| p.1)),

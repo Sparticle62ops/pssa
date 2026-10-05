@@ -1,15 +1,15 @@
 //! Shared CRT plots: connected braille strokes, honest gaps, and readable scales.
-use super::{NORMAL_GREEN, SECOND_ACCENT, accent, panel, panel_area};
+use super::{NORMAL_GREEN, PANEL_BG, SECOND_ACCENT, accent, panel, panel_area};
 use ratatui::{
     Frame,
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     symbols::Marker,
-    text::Line,
+    text::{Line, Span},
     widgets::{
-        Axis, Chart, Dataset, GraphType, Paragraph, Widget,
-        canvas::{Canvas, Line as Stroke, Points},
+        Paragraph, Widget,
+        canvas::{Canvas, Painter, Points, Shape},
     },
 };
 
@@ -38,6 +38,7 @@ pub(super) struct Plot<'a> {
     pub y: &'a str,
     pub x_bounds: [f64; 2],
     pub y_bounds: [f64; 2],
+    pub integer_x: bool,
 }
 
 /// Short labels, not false precision. Small learning rates retain their scale.
@@ -101,21 +102,22 @@ pub(super) fn domain(points: &[(f64, f64)]) -> [f64; 2] {
 
 fn ticks(bounds: [f64; 2]) -> Vec<String> {
     let step = (bounds[1] - bounds[0]) / 2.0;
+    let magnitude = bounds[0].abs().max(bounds[1].abs());
+    // Choose precision once for the entire scale, including zero/endpoints.
+    let scientific = step < 0.01 || (magnitude >= 1_000_000.0 && step >= magnitude * 0.01);
+    let digits = if step < 1.0 {
+        (1.0 - step.log10().floor()).clamp(1.0, 8.0) as usize
+    } else {
+        usize::from(magnitude < 100.0)
+    };
     (0..3)
         .map(|i| {
             let value = bounds[0] + step * i as f64;
-            if step < 0.01 && value != 0.0 {
-                format!("{value:.2e}").replace(".00e", "e")
-            } else if step < 1.0 {
-                format!("{value:.2}")
-                    .trim_end_matches('0')
-                    .trim_end_matches('.')
-                    .to_owned()
-            } else if value.abs() >= 1_000_000.0 && step < value.abs() * 0.01 {
-                // Nearby large training steps must not all become "1e6".
-                format!("{value:.0}")
+            if scientific {
+                format!("{value:.2e}")
             } else {
-                number(value)
+                // Keep nearby large step counts distinct rather than using 1e6.
+                format!("{value:.digits$}")
             }
         })
         .collect()
@@ -134,8 +136,27 @@ pub(super) fn draw_labeled(
     y_labels: Option<Vec<String>>,
 ) {
     let area = panel_area(f, area);
-    let block =
-        panel(plot.title).title_bottom(Line::styled(plot.caption, Style::new().fg(SECOND_ACCENT)));
+    // Ratatui's Chart axis titles are drawn over the first/last data rows.
+    // Keep units and any extra legend entries on the border instead.
+    let heading = if plot.title.contains(plot.y) {
+        plot.title.to_owned()
+    } else {
+        format!("{} / {} ", plot.title.trim_end(), plot.y)
+    };
+    let mut title = Line::styled(heading, accent().add_modifier(Modifier::BOLD));
+    for s in series {
+        let legend = format!(" | {} ", s.name);
+        if !title.to_string().contains(s.name)
+            && title.width() + legend.len() <= area.width.saturating_sub(2) as usize
+        {
+            title
+                .spans
+                .push(Span::styled(legend, Style::new().fg(s.color)));
+        }
+    }
+    let block = panel("")
+        .title(title)
+        .title_bottom(Line::styled(plot.caption, Style::new().fg(SECOND_ACCENT)));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width < 16 || inner.height < 5 {
@@ -145,47 +166,158 @@ pub(super) fn draw_labeled(
         );
         return;
     }
-    // Split at missing observations rather than drawing an invented bridge.
-    let datasets = series
-        .iter()
-        .flat_map(|s| {
-            s.points
-                .split(|(x, y)| !x.is_finite() || !y.is_finite())
-                .filter(|run| !run.is_empty())
-                .map(move |run| {
-                    Dataset::default()
-                        .name(s.name)
-                        .marker(Marker::Braille)
-                        .graph_type(if s.scatter {
-                            GraphType::Scatter
-                        } else {
-                            GraphType::Line
-                        })
-                        .style(Style::new().fg(s.color))
-                        .data(run)
-                })
-        })
-        .collect::<Vec<_>>();
-    f.render_widget(
-        Chart::new(datasets)
-            // Legends otherwise hide much of a short plot; captions identify traces.
-            .legend_position(None)
-            .x_axis(
-                Axis::default()
-                    .title(plot.x)
-                    .bounds(plot.x_bounds)
-                    .labels(ticks(plot.x_bounds))
-                    .style(accent()),
-            )
-            .y_axis(
-                Axis::default()
-                    .title(plot.y)
-                    .bounds(plot.y_bounds)
-                    .labels(y_labels.unwrap_or_else(|| ticks(plot.y_bounds)))
-                    .style(accent()),
-            ),
-        inner,
+    let y_labels = y_labels.unwrap_or_else(|| ticks(plot.y_bounds));
+    let label_width = y_labels.iter().map(|s| s.len()).max().unwrap_or(0) as u16;
+    let gutter = label_width.min(inner.width / 3) + 1;
+    // Reserve separate rows for the axis stroke and its labels, never data.
+    let graph = Rect::new(
+        inner.x + gutter,
+        inner.y,
+        inner.width - gutter,
+        inner.height - 2,
     );
+    let axis_x = graph.x - 1;
+    let axis_y = graph.bottom();
+    let buffer = f.buffer_mut();
+    for y in graph.y..graph.bottom() {
+        buffer[(axis_x, y)].set_symbol("│").set_style(accent());
+    }
+    for x in graph.x..graph.right() {
+        buffer[(x, axis_y)].set_symbol("─").set_style(accent());
+    }
+    buffer[(axis_x, axis_y)].set_symbol("└").set_style(accent());
+    for (i, label) in y_labels.iter().enumerate() {
+        // Anchor the endpoints to the actual data rows; rounding can differ
+        // by at most one terminal row at the midpoint of an even height.
+        let offset = i as u16 * (graph.height - 1) / y_labels.len().saturating_sub(1).max(1) as u16;
+        Line::styled(label.as_str(), accent())
+            .right_aligned()
+            .render(
+                Rect::new(inner.x, graph.bottom() - 1 - offset, gutter - 1, 1),
+                buffer,
+            );
+    }
+    let x_labels: Vec<String> = if plot.integer_x {
+        (0..3)
+            .map(|i| {
+                let value =
+                    plot.x_bounds[0] + (plot.x_bounds[1] - plot.x_bounds[0]) * i as f64 / 2.0;
+                format!("{:.0}", value.round())
+            })
+            .collect()
+    } else {
+        ticks(plot.x_bounds)
+    };
+    draw_x_labels(buffer, graph, plot.x, &x_labels);
+    f.render_widget(
+        Canvas::default()
+            .background_color(PANEL_BG)
+            .marker(Marker::Braille)
+            .x_bounds(plot.x_bounds)
+            .y_bounds(plot.y_bounds)
+            .paint(|ctx| {
+                for s in series {
+                    // Split at missing observations, never bridge a gap.
+                    for run in s.points.split(|(x, y)| !x.is_finite() || !y.is_finite()) {
+                        ctx.draw(&Points {
+                            coords: run,
+                            color: s.color,
+                        });
+                        if !s.scatter {
+                            for pair in run.windows(2) {
+                                ctx.draw(&DenseLine {
+                                    from: pair[0],
+                                    to: pair[1],
+                                    color: s.color,
+                                });
+                            }
+                        }
+                    }
+                    ctx.layer();
+                }
+            }),
+        graph,
+    );
+}
+
+/// Put the axis name in a free gap on the tick-label row. At small widths,
+/// prefer the name and endpoints to an overlapping middle tick.
+fn draw_x_labels(buffer: &mut Buffer, graph: Rect, name: &str, labels: &[String]) {
+    let widths: Vec<_> = labels.iter().map(|s| s.len() as u16).collect();
+    let mut positions = vec![
+        (graph.x, 0),
+        (
+            graph.x + ((graph.width - 1) / 2).saturating_sub(widths[1] / 2),
+            1,
+        ),
+        (graph.right().saturating_sub(widths[2]), 2),
+    ];
+    let gap = |positions: &[(u16, usize)]| {
+        positions
+            .windows(2)
+            .map(|pair| {
+                let start = pair[0].0 + widths[pair[0].1] + 1;
+                (start, pair[1].0.saturating_sub(start + 1))
+            })
+            .max_by_key(|(_, width)| *width)
+            .unwrap_or((graph.x, 0))
+    };
+    if gap(&positions).1 < name.len() as u16 {
+        positions.remove(1);
+    }
+    let (start, width) = gap(&positions);
+    let row = graph.bottom() + 1;
+    if width >= name.len() as u16 {
+        Line::styled(name, accent())
+            .centered()
+            .render(Rect::new(start, row, width, 1), buffer);
+        for (x, i) in positions {
+            buffer.set_stringn(x, row, &labels[i], widths[i] as usize, accent());
+        }
+    } else {
+        Line::styled(name, accent())
+            .centered()
+            .render(Rect::new(graph.x, row, graph.width, 1), buffer);
+    }
+}
+
+/// A two-dot-weight braille stroke. Fill each column's vertical interval to
+/// the previous column, rather than leaving a diagonal chain of single dots.
+/// Scatter points remain points, and callers split missing observations first.
+struct DenseLine {
+    from: (f64, f64),
+    to: (f64, f64),
+    color: Color,
+}
+
+impl Shape for DenseLine {
+    fn draw(&self, painter: &mut Painter) {
+        let Some((mut x1, mut y1)) = painter.get_point(self.from.0, self.from.1) else {
+            return;
+        };
+        let Some((mut x2, mut y2)) = painter.get_point(self.to.0, self.to.1) else {
+            return;
+        };
+        if x1 > x2 {
+            std::mem::swap(&mut x1, &mut x2);
+            std::mem::swap(&mut y1, &mut y2);
+        }
+        let mut previous = y1;
+        for x in x1..=x2 {
+            let y = if x1 == x2 {
+                y2
+            } else {
+                (y1 as f64 + (y2 as f64 - y1 as f64) * (x - x1) as f64 / (x2 - x1) as f64).round()
+                    as usize
+            };
+            for dot_y in previous.min(y)..=previous.max(y) {
+                painter.paint(x, dot_y, self.color);
+                // Pair within the same cell, including at the canvas edges.
+                painter.paint(x, dot_y ^ 1, self.color);
+            }
+            previous = y;
+        }
+    }
 }
 
 /// A one-cell-high Canvas still has four vertical and two horizontal dots/cell.
@@ -231,13 +363,11 @@ pub(super) fn sparkline(values: &[f64], width: usize) -> String {
                     color: NORMAL_GREEN,
                 });
                 for pair in run.windows(2) {
-                    ctx.draw(&Stroke::new(
-                        pair[0].0,
-                        pair[0].1,
-                        pair[1].0,
-                        pair[1].1,
-                        NORMAL_GREEN,
-                    ));
+                    ctx.draw(&DenseLine {
+                        from: pair[0],
+                        to: pair[1],
+                        color: NORMAL_GREEN,
+                    });
                 }
             }
         })
@@ -342,6 +472,7 @@ mod tests {
                         Plot {
                             title: " trend ",
                             caption: "Lower is better",
+                            integer_x: true,
                             x: "training step",
                             y: "loss",
                             x_bounds: [0.0, 100.0],
@@ -378,6 +509,152 @@ mod tests {
     }
 
     #[test]
+    fn loss_ticks_are_even_and_labels_stay_outside_data() {
+        for (w, h) in [(120, 40), (80, 24), (48, 18)] {
+            for height in [8, 9, 12] {
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                // Offset the panel too: labels must use plot-relative rows.
+                let area = Rect::new(2, 3, w - 4, height);
+                terminal
+                    .draw(|f| {
+                        draw(
+                            f,
+                            area,
+                            Plot {
+                                title: " trend ",
+                                caption: "Lower is better",
+                                x: "training step",
+                                y: "loss",
+                                integer_x: true,
+                                x_bounds: [1.0, 150.0],
+                                y_bounds: [2.0, 6.0],
+                            },
+                            &[Series::line(
+                                "measured",
+                                &[(1.0, 6.0), (150.0, 2.0)],
+                                NORMAL_GREEN,
+                            )],
+                        )
+                    })
+                    .unwrap();
+                let b = terminal.backend().buffer();
+                let row = |y| {
+                    (area.x..area.right())
+                        .map(|x| b[(x, y)].symbol())
+                        .collect::<String>()
+                };
+                let top = area.y + 1;
+                let bottom = area.bottom() - 4;
+                let middle = bottom - (bottom - top) / 2;
+                for (y, label) in [(top, "6.0"), (middle, "4.0"), (bottom, "2.0")] {
+                    assert_eq!(
+                        (area.x + 1..area.x + 4)
+                            .map(|x| b[(x, y)].symbol())
+                            .collect::<String>(),
+                        label
+                    );
+                }
+                assert!((middle - top).abs_diff(bottom - middle) <= 1);
+                assert!(row(area.y).contains("loss"));
+                assert!(row(area.y).contains("measured"));
+                let labels = row(area.bottom() - 2);
+                let tokens: Vec<_> = labels
+                    .split(|c: char| c.is_whitespace() || c == '│')
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                for label in ["1", "76", "150", "training", "step"] {
+                    assert!(tokens.contains(&label), "missing {label}: {labels}");
+                }
+                assert!(!labels.contains('.'), "fractional training step: {labels}");
+                for y in top..=bottom {
+                    for x in area.x + 5..area.right() - 1 {
+                        let cell = &b[(x, y)];
+                        assert!(
+                            cell.symbol() == " "
+                                || cell
+                                    .symbol()
+                                    .chars()
+                                    .all(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+                            "text over data: {}",
+                            row(y)
+                        );
+                    }
+                }
+                // The high endpoint occupies the first data cell, not a title.
+                assert!(
+                    b[(area.x + 5, top)]
+                        .symbol()
+                        .chars()
+                        .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+                );
+                for y in top..area.bottom() - 1 {
+                    for x in area.x + 1..area.right() - 1 {
+                        assert_eq!(b[(x, y)].bg, PANEL_BG, "plot must match its panel");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dense_strokes_fill_vertical_gaps_and_give_flat_traces_weight() {
+        for values in [&[4.0, 4.0][..], &[4.0, 1.0], &[1.0, 4.0]] {
+            let line = sparkline(values, 20);
+            assert!(
+                line.chars().all(|c| (c as u32 - 0x2800).count_ones() >= 4),
+                "faint trace: {line}"
+            );
+        }
+        // Exercise steep and vertical strokes, both directions, at dot resolution.
+        for (from, to) in [
+            ((0.0, 0.0), (1.0, 1.0)),
+            ((1.0, 1.0), (0.0, 0.0)),
+            ((0.0, 0.0), (0.0, 1.0)),
+        ] {
+            let area = Rect::new(0, 0, 3, 5);
+            let mut b = Buffer::empty(area);
+            Canvas::default()
+                .marker(Marker::Braille)
+                .x_bounds([0.0, 1.0])
+                .y_bounds([0.0, 1.0])
+                .paint(|ctx| {
+                    ctx.draw(&DenseLine {
+                        from,
+                        to,
+                        color: NORMAL_GREEN,
+                    })
+                })
+                .render(area, &mut b);
+            let mut previous: Option<Vec<usize>> = None;
+            for x in 0..area.width * 2 {
+                let mut dots = Vec::new();
+                for y in 0..area.height * 4 {
+                    let ch = b[(x / 2, y / 4)].symbol().chars().next().unwrap();
+                    let mask = [[1, 2, 4, 64], [8, 16, 32, 128]][x as usize % 2][y as usize % 4];
+                    if ch != ' ' && (ch as u32 - 0x2800) & mask != 0 {
+                        dots.push(y as usize);
+                    }
+                }
+                if dots.is_empty() {
+                    continue;
+                }
+                assert!(dots.len() >= 2);
+                assert!(
+                    dots.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                    "gap in stroke: {dots:?}"
+                );
+                if let Some(prior) = &previous {
+                    assert!(
+                        dots.iter().any(|y| prior.contains(y)),
+                        "disconnected columns"
+                    );
+                }
+                previous = Some(dots);
+            }
+        }
+    }
+
+    #[test]
     fn missing_samples_leave_a_visible_gap_between_connected_runs() {
         let points = [
             (0.0, 3.0),
@@ -396,6 +673,7 @@ mod tests {
                         Plot {
                             title: " observations ",
                             caption: "Gaps mean no measurement",
+                            integer_x: true,
                             x: "training step",
                             y: "loss",
                             x_bounds: [0.0, 100.0],
@@ -430,6 +708,8 @@ mod tests {
         assert_eq!(number(331.303), "331");
         assert_eq!(number(26.087), "26.1");
         assert_eq!(number(0.00025), "2.5e-4");
+        assert_eq!(ticks([2.0, 6.0]), ["2.0", "4.0", "6.0"]);
+        assert_eq!(ticks([0.0, 0.0004]), ["0.00e0", "2.00e-4", "4.00e-4"]);
         assert_eq!(
             ticks([1_000_000.0, 1_000_200.0]),
             ["1000000", "1000100", "1000200"]

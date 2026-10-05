@@ -521,6 +521,7 @@ impl Timeline {
                     ),
                     caption: "Lower loss = better fit; gaps = unrecorded, blue = selected",
                     x: "checkpoint",
+                    integer_x: true,
                     y: "loss",
                     x_bounds: super::charts::domain(&points),
                     y_bounds: super::charts::bounds(points.iter().map(|p| p.1)),
