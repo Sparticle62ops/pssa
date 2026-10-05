@@ -1,6 +1,6 @@
 //! Read-only chat telemetry: copied retrieval weights, never a second retrieval.
 //! Only the latest full snapshot is retained; history stores 64 token summaries.
-use super::{AMBER, BRIGHT_RED, SECOND_ACCENT, accent, panel, panel_area};
+use super::{AMBER, BRIGHT_RED, SECOND_ACCENT, accent, charts::bar, panel, panel_area};
 use crate::{dataset::Tokenizer, pssa::PSSALayerV2};
 use ratatui::{
     Frame,
@@ -13,7 +13,6 @@ use std::{collections::VecDeque, sync::Arc};
 
 const HISTORY_LIMIT: usize = 64;
 const RANKED_LIMIT: usize = 32;
-const EIGHTHS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct LayerStrengths {
@@ -199,6 +198,7 @@ impl MemoryView {
                     "out {}: {}",
                     snapshot.generated_token_id, snapshot.generated_token
                 )),
+                Line::from("strength 0..1 / slots used/capacity"),
             ];
             if used == 0 {
                 lines.push(Line::from("No occupied slots."));
@@ -207,7 +207,7 @@ impl MemoryView {
                     snapshot
                         .strongest
                         .iter()
-                        .take(inner.height.saturating_sub(3) as usize)
+                        .take(inner.height.saturating_sub(4) as usize)
                         .map(|slot| strength_line(*slot, inner.width)),
                 );
             }
@@ -228,7 +228,7 @@ impl MemoryView {
             Paragraph::new(vec![
                 Line::styled(
                     format!(
-                        "TOKEN #{}   {used}/{capacity} slots   {} layer(s)",
+                        "TOKEN #{}   {used}/{capacity} slots used/capacity   {} layer(s)",
                         snapshot.generated_tokens,
                         snapshot.layers.len()
                     ),
@@ -261,7 +261,7 @@ impl MemoryView {
             Paragraph::new(vec![
                 Line::styled(
                     format!(
-                        "Actual retrieval weights (0..1); final loop pass {}/{}.",
+                        "Retrieval strength 0..1 (0..100%); ticks 0 / 50 / 100; final loop pass {}/{}.",
                         snapshot.loops, snapshot.loops
                     ),
                     Style::new().fg(SECOND_ACCENT),
@@ -366,17 +366,14 @@ fn strength_line(slot: SlotStrength, width: u16) -> Line<'static> {
 }
 
 fn strength_bar(weight: f32, width: usize) -> String {
-    let units = if weight.is_finite() {
-        (weight.clamp(0.0, 1.0) * (width * 8) as f32).round() as usize
+    // Out-of-range telemetry is not a real strength; retain the invalid label
+    // without drawing a plausible-looking clamped value.
+    let fraction = if weight.is_finite() && (0.0..=1.0).contains(&weight) {
+        f64::from(weight)
     } else {
-        0
+        f64::NAN
     };
-    (0..width)
-        .map(|column| {
-            let fill = units.saturating_sub(column * 8).min(8);
-            if fill == 8 { '█' } else { EIGHTHS[fill] }
-        })
-        .collect()
+    bar(fraction, width)
 }
 
 #[cfg(test)]
@@ -534,7 +531,7 @@ mod tests {
     #[test]
     fn live_memory_renders_real_strength_bars_wide_and_below_eighty_columns() {
         let view = view();
-        for (width, height) in [(120, 32), (80, 24), (79, 24), (52, 24), (40, 16)] {
+        for (width, height) in [(120, 40), (120, 32), (80, 24), (79, 24), (52, 24), (40, 16)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|f| view.draw(f, f.area())).unwrap();
             let rendered = text(&terminal);
@@ -544,7 +541,7 @@ mod tests {
                 "predicted [1] hello",
                 "L1 S1",
                 "75.0%",
-                "█",
+                "⣿",
             ] {
                 assert!(
                     rendered.contains(expected),
@@ -553,6 +550,31 @@ mod tests {
             }
             if height >= 24 {
                 assert!(rendered.contains("#4 [1]"), "history at {width}");
+            }
+            assert!(
+                !rendered
+                    .chars()
+                    .any(|c| ('\u{2580}'..='\u{259f}').contains(&c))
+            );
+            if width >= 80 {
+                for label in [
+                    "used/capacity",
+                    "Retrieval strength 0..1 (0..100%)",
+                    "ticks 0 / 50 / 100",
+                    "final loop pass 2/2",
+                ] {
+                    assert!(
+                        rendered.contains(label),
+                        "{width}x{height}: missing {label}"
+                    );
+                }
+                assert!(terminal.backend().buffer().content().iter().any(|cell| {
+                    cell.fg == super::super::NORMAL_GREEN
+                        && cell
+                            .symbol()
+                            .chars()
+                            .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+                }));
             }
             assert!(
                 !rendered.contains("999"),
@@ -617,11 +639,19 @@ mod tests {
 
     #[test]
     fn bars_have_fixed_width_and_invalid_values_do_not_invent_strength() {
-        assert_eq!(strength_bar(0.0, 4), "    ");
-        assert_eq!(strength_bar(0.75, 4), "███ ");
-        assert_eq!(strength_bar(0.5 / 8.0, 2), "▏ ");
-        assert_eq!(strength_bar(1.0, 4), "████");
-        assert_eq!(strength_bar(f32::NAN, 4), "    ");
+        assert_eq!(strength_bar(0.0, 4), "····");
+        assert_eq!(strength_bar(0.75, 4), "⣿⣿⣿·");
+        assert_eq!(strength_bar(0.5 / 8.0, 2), "⡀·");
+        assert_eq!(strength_bar(1.0, 4), "⣿⣿⣿⣿");
+        assert_eq!(strength_bar(f32::NAN, 4), "····");
+        for invalid in [f32::INFINITY, f32::NEG_INFINITY, -0.1, 1.1] {
+            assert_eq!(strength_bar(invalid, 4), "····");
+        }
+        for weight in [0.0, 0.0625, 0.25, 0.75, 1.0, f32::NAN] {
+            for width in [0, 1, 4, 40] {
+                assert_eq!(strength_bar(weight, width).chars().count(), width);
+            }
+        }
         let line = strength_line(
             SlotStrength {
                 layer: 0,

@@ -1,5 +1,10 @@
 //! Throttled read-only host telemetry. OS reads and GPU tools run off the UI.
-use super::{NORMAL_GREEN, SECOND_ACCENT, accent, heatmap, panel, panel_area, preview::Process};
+use super::{
+    NORMAL_GREEN, SECOND_ACCENT, accent,
+    charts::{bar, sparkline},
+    heatmap, panel, panel_area,
+    preview::Process,
+};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -237,35 +242,39 @@ impl Hardware {
             }),
         ];
         if !self.history.is_empty() {
-            const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-            let trace: String = self
+            let width = area.width.saturating_sub(2) as usize;
+            let values: Vec<_> = self
                 .history
                 .iter()
-                .rev()
-                .take(area.width.saturating_sub(16) as usize)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .map(|n| SPARK[(*n as usize * 7 / 100).min(7)])
+                .skip(self.history.len().saturating_sub(width.saturating_mul(2)))
+                .map(|&usage| usage as f64)
                 .collect();
+            let low = values.iter().copied().reduce(f64::min).unwrap_or(0.0);
+            let high = values.iter().copied().reduce(f64::max).unwrap_or(0.0);
             lines.push(Line::styled(
-                format!("CPU history {trace}"),
+                format!("CPU history / observed {low:.0}..{high:.0}% / time: oldest -> latest"),
+                Style::new().fg(SECOND_ACCENT),
+            ));
+            lines.push(Line::styled(
+                sparkline(&values, width),
                 Style::new().fg(NORMAL_GREEN),
             ));
         }
-        // Aggregate always stays visible; per-core bars use only spare rows.
+        lines.push(Line::styled(
+            "CPU meters 0..100% / ticks 0 / 50 / 100 / each logical CPU",
+            Style::new().fg(SECOND_ACCENT),
+        ));
+        // Aggregate always stays visible; per-core meters use only spare rows.
         let gpu_rows = self.latest.gpu.len().max(1) * if area.width < 80 { 3 } else { 2 };
         let room = (area.height as usize)
             .saturating_sub(lines.len() + gpu_rows + 5)
             .min(16);
         for (i, value) in self.usage.iter().enumerate().skip(1).take(room) {
-            let filled = (value.unwrap_or(0.0) / 10.0).round() as usize;
             lines.push(Line::styled(
                 format!(
-                    "cpu{:>2} [{}{}] {}",
+                    "cpu{:>2} [{}] {}",
                     i - 1,
-                    "█".repeat(filled.min(10)),
-                    "·".repeat(10 - filled.min(10)),
+                    bar(value.map_or(f64::NAN, |usage| usage / 100.0), 10),
                     usage(*value)
                 ),
                 accent(),
@@ -346,9 +355,9 @@ mod tests {
                     cpu: vec![Cpu::default(); 3],
                 };
                 hardware.usage = vec![Some(50.0); 3];
-                hardware.history.push_back(50);
+                hardware.history.extend([0, 25, 50, 75, 100, 50]);
             }
-            for (w, h) in [(120, 30), (79, 24), (40, 22), (1, 1)] {
+            for (w, h) in [(120, 40), (80, 24), (120, 30), (79, 24), (40, 22), (1, 1)] {
                 let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
                 t.draw(|f| hardware.draw(f, f.area())).unwrap();
                 if w >= 40 {
@@ -362,6 +371,29 @@ mod tests {
                     assert!(text.contains("CPU"));
                     assert!(text.contains("RAM"));
                     assert!(text.contains(if populated { "Fixture GPU" } else { "n/a" }));
+                    assert!(!text.chars().any(|c| ('\u{2580}'..='\u{259f}').contains(&c)));
+                    if w >= 80 {
+                        assert!(text.contains("CPU meters 0..100%"));
+                        if populated {
+                            assert!(text.contains("CPU history / observed 0..100%"));
+                            assert!(text.contains("oldest -> latest"));
+                            assert!(text.contains(&sparkline(
+                                &[0.0, 25.0, 50.0, 75.0, 100.0, 50.0],
+                                usize::from(w.saturating_sub(2)),
+                            )));
+                            assert!(text.contains("RAM 1.00 / 3.00 GiB used/total"));
+                            assert!(text.contains(&format!("cpu 0 [{}] 50.0%", bar(0.5, 10))));
+                            assert!(t.backend().buffer().content().iter().any(|cell| {
+                                cell.fg == NORMAL_GREEN
+                                    && cell
+                                        .symbol()
+                                        .chars()
+                                        .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+                            }));
+                        } else {
+                            assert!(!text.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)));
+                        }
+                    }
                 }
             }
         }

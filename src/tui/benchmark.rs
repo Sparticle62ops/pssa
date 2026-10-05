@@ -5,7 +5,7 @@ use super::{
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Layout, Rect},
     text::Line,
     widgets::{Paragraph, Wrap},
 };
@@ -190,6 +190,63 @@ impl Benchmark {
         }
     }
     pub fn draw(&self, f: &mut ratatui::Frame, area: Rect) {
+        if let Some(result) = self
+            .result
+            .as_ref()
+            .filter(|_| area.width >= 70 && area.height >= 15)
+        {
+            let parts = Layout::vertical([Constraint::Min(0), Constraint::Length(9)]).split(area);
+            // Paint the upper panel first; its shadow must not erase the plot title.
+            self.draw_card(f, parts[0]);
+            let pssa = result["pssa"]["perplexity"]
+                .as_f64()
+                .filter(|v| v.is_finite() && *v >= 0.0);
+            let transformer = result["transformer"]["perplexity"]
+                .as_f64()
+                .filter(|v| v.is_finite() && *v >= 0.0);
+            // Independent braille lollipops: models are categories, not time.
+            let a: Vec<_> = pssa
+                .into_iter()
+                .flat_map(|v| [(0.0, 1.0), (v, 1.0)])
+                .collect();
+            let b: Vec<_> = transformer
+                .into_iter()
+                .flat_map(|v| [(0.0, 2.0), (v, 2.0)])
+                .collect();
+            let max = super::charts::bounds(pssa.into_iter().chain(transformer))[1].max(1.0);
+            let label = |v: Option<f64>| v.map(super::charts::number).unwrap_or_else(|| "—".into());
+            super::charts::draw_labeled(
+                f,
+                parts[1],
+                super::charts::Plot {
+                    title: &format!(
+                        " held-out / PSSA ppl {} / transformer ppl {} ",
+                        label(pssa),
+                        label(transformer)
+                    ),
+                    caption: "Lower = less surprise on unseen text; matched training exposure",
+                    x: "perplexity",
+                    y: "model",
+                    x_bounds: [0.0, max],
+                    y_bounds: [0.0, 3.0],
+                },
+                &[
+                    super::charts::Series::line("PSSA", &a, super::NORMAL_GREEN),
+                    super::charts::Series::line("transformer", &b, super::SECOND_ACCENT),
+                ],
+                Some(vec![
+                    "".into(),
+                    "PSSA".into(),
+                    "transformer".into(),
+                    "".into(),
+                ]),
+            );
+        } else {
+            self.draw_card(f, area);
+        }
+    }
+
+    fn draw_card(&self, f: &mut ratatui::Frame, area: Rect) {
         let area = panel_area(f, area);
         let mut lines = vec![
             Line::styled("MATCHED / PSSA vs transformer", accent()),
@@ -219,8 +276,14 @@ impl Benchmark {
             for model in ["pssa", "transformer"] {
                 lines.push(Line::from(format!(
                     "{model}: ppl {} • accuracy {} • parameters {}",
-                    v[model]["perplexity"],
-                    v[model]["next_token_accuracy"],
+                    v[model]["perplexity"]
+                        .as_f64()
+                        .map(super::charts::number)
+                        .unwrap_or_else(|| "—".into()),
+                    v[model]["next_token_accuracy"]
+                        .as_f64()
+                        .map(|v| format!("{:.0}%", v * 100.0))
+                        .unwrap_or_else(|| "—".into()),
                     v[format!("{model}_parameters")]
                 )));
             }
@@ -336,6 +399,47 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn benchmark_comparison_has_braille_and_clear_axes_at_both_sizes() {
+        let mut b = Benchmark::new("chain".into());
+        b.result = Some(
+            serde_json::json!({"pssa":{"perplexity":12.087},"transformer":{"perplexity":26.087}}),
+        );
+        for (w, h) in [(120, 40), (80, 24)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| b.draw(f, f.area())).unwrap();
+            super::super::charts::assert_plot(
+                terminal.backend().buffer(),
+                Rect::new(0, h - 9, w, 9),
+                &[
+                    "model",
+                    "perplexity",
+                    "PSSA",
+                    "transformer",
+                    "Lower = less surprise",
+                    "0",
+                    "15",
+                    "30",
+                ],
+            );
+            terminal
+                .draw(|f| b.draw(f, super::super::feature_area(f.area())))
+                .unwrap();
+            super::super::charts::assert_named_plot(
+                terminal.backend().buffer(),
+                "held-out / PSSA",
+                &[
+                    "model",
+                    "perplexity",
+                    "PSSA",
+                    "transformer",
+                    "Lower = less surprise",
+                ],
+            );
+        }
+    }
+
     #[test]
     fn benchmark_result_card_renders_wide_and_narrow() {
         let mut b = Benchmark::new("chain".into());

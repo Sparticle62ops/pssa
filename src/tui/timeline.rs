@@ -1,6 +1,8 @@
 //! Read-only checkpoint history: filenames + bounded recorded logs, never weights.
 //! A single background scan is allowed at a time, including across run switches.
-use super::{AMBER, RunState, accent, checkpoint_sort_key, panel, panel_area, parse_field, process::clean};
+use super::{
+    AMBER, RunState, accent, checkpoint_sort_key, panel, panel_area, parse_field, process::clean,
+};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
@@ -488,56 +490,97 @@ impl Timeline {
             return;
         }
         let compact = area.width < 80;
+        let show_plot = area.height >= 14 && self.entries.iter().any(|e| e.metrics.loss.is_some());
         let parts = Layout::vertical([
-            Constraint::Length(if area.height < 12 { 3 } else { 5 }),
+            Constraint::Length(if show_plot {
+                8
+            } else if area.height < 12 {
+                3
+            } else {
+                5
+            }),
             Constraint::Min(0),
-            Constraint::Length(if area.height < 12 { 2 } else { 4 }),
+            Constraint::Length(if area.height < 20 { 2 } else { 4 }),
         ])
         .split(area);
-        let timeline_area = panel_area(f, parts[0]);
-        let block = panel(" timeline / saved checkpoints ");
-        let inner = block.inner(timeline_area);
-        f.render_widget(block, timeline_area);
-        if self.entries.is_empty() {
-            f.render_widget(
-                Paragraph::new("No saved checkpoints in this run. r refresh"),
-                inner,
+        if show_plot {
+            let points: Vec<_> = self
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| ((i + 1) as f64, e.metrics.loss.unwrap_or(f64::NAN)))
+                .collect();
+            let selected: Vec<_> = points.get(self.selected).copied().into_iter().collect();
+            super::charts::draw(
+                f,
+                parts[0],
+                super::charts::Plot {
+                    title: &format!(
+                        " timeline / saved checkpoints / selected #{} ",
+                        self.selected + 1
+                    ),
+                    caption: "Lower loss = better fit; gaps = unrecorded, blue = selected",
+                    x: "checkpoint",
+                    y: "loss",
+                    x_bounds: super::charts::domain(&points),
+                    y_bounds: super::charts::bounds(points.iter().map(|p| p.1)),
+                },
+                &[
+                    super::charts::Series::line("recorded loss", &points, super::NORMAL_GREEN),
+                    super::charts::Series {
+                        name: "selected",
+                        points: &selected,
+                        color: super::SECOND_ACCENT,
+                        scatter: true,
+                    },
+                ],
             );
         } else {
-            // A fixed-width horizontal window avoids truncating the selected
-            // checkpoint off the right edge on narrow terminals.
-            let slots = usize::from(inner.width / 9).max(1);
-            let start = self
-                .selected
-                .saturating_sub(slots / 2)
-                .min(self.entries.len().saturating_sub(slots));
-            let mut marks = Vec::new();
-            for index in start..(start + slots).min(self.entries.len()) {
-                marks.push(Span::styled(
-                    format!(
-                        " {}#{:03}{} ",
-                        if index == self.selected { '[' } else { '─' },
-                        index + 1,
-                        if index == self.selected { ']' } else { '─' }
-                    ),
-                    if index == self.selected {
-                        accent().add_modifier(Modifier::REVERSED)
-                    } else {
-                        accent()
-                    },
-                ));
+            let timeline_area = panel_area(f, parts[0]);
+            let block = panel(" timeline / saved checkpoints ");
+            let inner = block.inner(timeline_area);
+            f.render_widget(block, timeline_area);
+            if self.entries.is_empty() {
+                f.render_widget(
+                    Paragraph::new("No saved checkpoints in this run. r refresh"),
+                    inner,
+                );
+            } else {
+                // A fixed-width horizontal window avoids truncating the selected
+                // checkpoint off the right edge on narrow terminals.
+                let slots = usize::from(inner.width / 9).max(1);
+                let start = self
+                    .selected
+                    .saturating_sub(slots / 2)
+                    .min(self.entries.len().saturating_sub(slots));
+                let mut marks = Vec::new();
+                for index in start..(start + slots).min(self.entries.len()) {
+                    marks.push(Span::styled(
+                        format!(
+                            " {}#{:03}{} ",
+                            if index == self.selected { '[' } else { '─' },
+                            index + 1,
+                            if index == self.selected { ']' } else { '─' }
+                        ),
+                        if index == self.selected {
+                            accent().add_modifier(Modifier::REVERSED)
+                        } else {
+                            accent()
+                        },
+                    ));
+                }
+                f.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(marks),
+                        Line::from(format!(
+                            "checkpoint {} / {}   ← older / newer →",
+                            self.selected + 1,
+                            self.entries.len()
+                        )),
+                    ]),
+                    inner,
+                );
             }
-            f.render_widget(
-                Paragraph::new(vec![
-                    Line::from(marks),
-                    Line::from(format!(
-                        "checkpoint {} / {}   ← older / newer →",
-                        self.selected + 1,
-                        self.entries.len()
-                    )),
-                ]),
-                inner,
-            );
         }
         let mut rows = Vec::new();
         if let Some(entry) = self.entries.get(self.selected) {
@@ -550,7 +593,7 @@ impl Timeline {
                 entry
                     .metrics
                     .loss
-                    .map_or("— (not recorded)".into(), |v| format!("{v:.6}"))
+                    .map_or("— (not recorded)".into(), super::charts::number)
             )));
             rows.push(Line::from(format!(
                 "Recorded throughput: {}",
@@ -572,7 +615,7 @@ impl Timeline {
             )));
             if !compact {
                 rows.push(Line::from(
-                    "No interpolation, held-out scores, or metrics recovered from weights.",
+                    "Lines join recorded samples only; not held-out scores or recovered weights.",
                 ));
             }
         } else {
@@ -817,6 +860,57 @@ mod tests {
         }
         assert_eq!(timeline.entries.len(), 1);
         assert_eq!(timeline.entries[0].path, wanted);
+    }
+
+    #[test]
+    fn timeline_loss_has_braille_axes_at_both_sizes() {
+        let timeline = Timeline {
+            entries: [4.0, 3.0, 2.0]
+                .into_iter()
+                .enumerate()
+                .map(|(i, loss)| Entry {
+                    path: PathBuf::from(format!("ck{}.pssa", i + 1)),
+                    metrics: Metrics {
+                        loss: Some(loss),
+                        ..Default::default()
+                    },
+                    source: None,
+                    explicit: true,
+                })
+                .collect(),
+            selected: 1,
+            ..Default::default()
+        };
+        for (w, h) in [(120, 40), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| timeline.draw(f, f.area())).unwrap();
+            super::super::charts::assert_plot(
+                terminal.backend().buffer(),
+                Rect::new(0, 0, w, 8),
+                &[
+                    "checkpoint",
+                    "loss",
+                    "Lower loss = better fit",
+                    "1",
+                    "2",
+                    "3",
+                ],
+            );
+            assert!(terminal.backend().buffer().content().iter().any(|c| {
+                c.fg == super::super::SECOND_ACCENT
+                    && c.symbol()
+                        .chars()
+                        .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+            }));
+            terminal
+                .draw(|f| timeline.draw(f, super::super::feature_area(f.area())))
+                .unwrap();
+            super::super::charts::assert_named_plot(
+                terminal.backend().buffer(),
+                "timeline / saved checkpoints",
+                &["checkpoint", "loss", "Lower loss = better fit"],
+            );
+        }
     }
 
     #[test]
