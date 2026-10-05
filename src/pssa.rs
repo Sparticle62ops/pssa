@@ -2040,6 +2040,21 @@ impl PSSALayerV2 {
     }
 
     pub fn zero_gradients(&mut self) {
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(ctx) = self.device.clone() {
+            if ctx.safeguarded_parameters_finite().is_some() {
+                let d = self.cfg.d_latent;
+                for (row, mark) in self.embed_row_marks.iter_mut().enumerate() {
+                    if *mark != 0 {
+                        self.embed_w.grad[row * d..(row + 1) * d].fill(0.0);
+                        *mark = 0;
+                    }
+                }
+                ctx.zero_safeguarded_gradients(&mut self.adam_tensors())
+                    .expect("CUDA gradient clearing failed");
+                return;
+            }
+        }
         self.embed_w.zero_grad();
         self.block.zero_gradients();
         for b in &mut self.extra_blocks {
@@ -2264,20 +2279,30 @@ impl PSSALayerV2 {
     pub fn apply_adamw_with_grad_clip(&mut self, lr: f32, max_norm: f32) -> GradientClipOutcome {
         assert!(max_norm.is_finite() && max_norm > 0.0);
         let cfg = self.cfg.clone();
-        let step = self
-            .step_counter
-            .checked_add(1)
-            .expect("optimizer step counter overflow");
+        let step = self.step_counter.checked_add(1);
         #[cfg(feature = "cuda")]
         if let Device::Cuda(ctx) = self.device.clone() {
+            let embedding_rows: Vec<_> = self
+                .embed_row_marks
+                .iter()
+                .enumerate()
+                .filter_map(|(row, &mark)| (Some(mark) == step).then_some(row))
+                .collect();
             let norm = ctx
-                .clip_adamw(&mut self.adam_tensors(), &cfg, lr, step, max_norm)
+                .clip_adamw(
+                    &mut self.adam_tensors(),
+                    &cfg,
+                    lr,
+                    step,
+                    max_norm,
+                    &embedding_rows,
+                )
                 .expect("CUDA gradient clipping/AdamW failed; refusing a silent CPU fallback");
             if !norm.is_finite() {
                 self.zero_gradients();
                 return GradientClipOutcome::Skipped { norm };
             }
-            self.step_counter = step;
+            self.step_counter = step.expect("optimizer step counter overflow");
             ctx.invalidate_weights();
             return GradientClipOutcome::Applied { norm };
         }
@@ -2294,6 +2319,7 @@ impl PSSALayerV2 {
             self.zero_gradients();
             return GradientClipOutcome::Skipped { norm };
         }
+        let step = step.expect("optimizer step counter overflow");
         let scale = if norm > max_norm as f64 {
             max_norm as f64 / norm
         } else {
@@ -2340,6 +2366,13 @@ impl PSSALayerV2 {
         for b in &mut self.extra_blocks {
             b.ema_consolidate_plasticity();
         }
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(ctx) = &self.device {
+            for b in std::iter::once(&self.block).chain(&self.extra_blocks) {
+                ctx.refresh_safeguarded_weight(&b.adapters[0].up_proj)
+                    .expect("CUDA adapter EMA synchronization failed");
+            }
+        }
         // The effective adapter-up weights are cached by host pointer. EMA
         // changes the consolidated half in place, so force a fresh upload.
         if let Some(ctx) = self.device.gpu() {
@@ -2358,11 +2391,12 @@ impl PSSALayerV2 {
             } else {
                 (loops - 1) * b.tape.max_l
             };
-            b.memory.insert_protected(
+            b.memory.insert_protected_with_device(
                 &b.tape.q_poincare[(loop_l + last) * k..(loop_l + last + 1) * k],
                 &b.tape.z_final[(loop_l + last) * d..(loop_l + last + 1) * d],
                 loss,
                 self.step_counter,
+                &self.device,
             );
         }
     }
@@ -2516,6 +2550,169 @@ mod training_safeguards_tests {
                     .collect::<Vec<_>>()
             };
             assert_eq!(bits(&mut new), bits(&mut old));
+        }
+    }
+
+    #[test]
+    fn nonfinite_clip_still_skips_at_step_counter_limit() {
+        let mut m = model();
+        m.step_counter = usize::MAX;
+        m.embed_w.grad[0] = f32::NAN;
+        let before = optimizer_state(&m);
+        assert!(matches!(
+            m.apply_adamw_with_grad_clip(1e-3, 1.0),
+            GradientClipOutcome::Skipped { .. }
+        ));
+        assert_eq!(m.step_counter, usize::MAX);
+        assert_eq!(optimizer_state(&m), before);
+        assert!(gradients(&mut m).iter().all(|&g| g == 0.0));
+    }
+
+    #[cfg(feature = "cuda")]
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (i, (&a, &b)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (a - b).abs() <= 2e-6 + 2e-5 * b.abs(),
+                "element {i}: {a} != {b}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA GPU; exercises embedded PTX and resident optimizer state"]
+    fn cuda_resident_clip_accumulation_skip_and_ema_match_cpu() {
+        let ctx = crate::cuda::CudaContext::init().expect("CUDA GPU required");
+        let mut old = model();
+        let mut new = model();
+        new.device = Device::Cuda(ctx.clone());
+        ctx.begin_safeguarded_training(&new.adam_tensors()).unwrap();
+        for iteration in 0..4 {
+            for m in [&mut old, &mut new] {
+                m.zero_gradients();
+                m.for_each_adam_gradient(|g| g.fill(0.125));
+                m.embed_row_marks.fill(m.step_counter + 1);
+                m.unembed_w.grad.fill(0.0);
+                if iteration == 3 {
+                    m.block.a_mat.grad[0] = 1e21;
+                }
+            }
+            let mut a = vec![0.5f32; 2 * old.cfg.d_vocab];
+            if iteration == 1 {
+                a[0] = f32::INFINITY;
+            }
+            let b = vec![0.25f32; 2 * old.cfg.d_latent];
+            // Two TN dispatches must accumulate without any gradient readback.
+            for _ in 0..2 {
+                crate::backend::gemm_tn_cpu_accumulate_into(
+                    &a,
+                    &b,
+                    2,
+                    5,
+                    4,
+                    &mut old.unembed_w.grad,
+                )
+                .unwrap();
+                ctx.try_gemm_tn_accumulate_into(&a, &b, 2, 5, 4, &mut new.unembed_w.grad)
+                    .unwrap();
+            }
+            let cap = if iteration == 2 { f32::MAX } else { 1.0 };
+            match (
+                historical_clip(&mut old, 1e-3, cap),
+                new.apply_adamw_with_grad_clip(1e-3, cap),
+            ) {
+                (
+                    GradientClipOutcome::Applied { norm: a },
+                    GradientClipOutcome::Applied { norm: b },
+                ) => {
+                    assert!((a - b).abs() <= 1e-12 * a.max(1.0));
+                }
+                (
+                    GradientClipOutcome::Skipped { norm: a },
+                    GradientClipOutcome::Skipped { norm: b },
+                ) => {
+                    assert!(!a.is_finite() && !b.is_finite());
+                }
+                outcome => panic!("clip outcomes differ: {outcome:?}"),
+            }
+            assert_eq!(new.step_counter, old.step_counter);
+            if iteration == 0 {
+                old.ema_consolidate_plasticity();
+                new.ema_consolidate_plasticity();
+            }
+        }
+        ctx.finish_safeguarded_training(&mut new.adam_tensors())
+            .unwrap();
+        assert_close(&optimizer_state(&new), &optimizer_state(&old));
+        assert_close(&gradients(&mut new), &gradients(&mut old));
+        // The fused finite check must include moments, not only weights/grads.
+        new.block.a_mat.v[0] = f32::NAN;
+        ctx.begin_safeguarded_training(&new.adam_tensors()).unwrap();
+        new.zero_gradients();
+        new.apply_adamw_with_grad_clip(1e-3, 1.0);
+        assert_eq!(ctx.safeguarded_parameters_finite(), Some(false));
+        ctx.finish_safeguarded_training(&mut new.adam_tensors())
+            .unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA GPU; checks real CLI scope, packed/replayed batches and handoff"]
+    fn cuda_safeguarded_cli_training_matches_cpu() {
+        use crate::cli::{CLIHandler, TrainingBackend, TrainingOptions};
+        let words = (0..48)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let raw = format!("{words}\n\n{words}");
+        for (depth, loops) in [(1, 1), (2, 1), (1, 2)] {
+            let options = TrainingOptions {
+                backend: TrainingBackend::Cpu,
+                latent: 4,
+                state: 2,
+                key: 2,
+                memory: 2,
+                chunk: 3,
+                batch_size: 2,
+                accumulate: 2,
+                epochs: 2,
+                depth,
+                loops,
+                grad_clip: Some(1.0),
+                memory_value_cap: Some(0.25),
+                no_tui: true,
+                ..Default::default()
+            };
+            let (mut old, _) = CLIHandler::train_corpus(&raw, &options).unwrap();
+            let (mut new, _) = CLIHandler::train_corpus(
+                &raw,
+                &TrainingOptions {
+                    backend: TrainingBackend::Cuda,
+                    ..options
+                },
+            )
+            .unwrap();
+            assert_eq!(new.step_counter, old.step_counter);
+            assert_close(&optimizer_state(&new), &optimizer_state(&old));
+            assert_close(&gradients(&mut new), &gradients(&mut old));
+            for (a, b) in std::iter::once(&new.block)
+                .chain(&new.extra_blocks)
+                .zip(std::iter::once(&old.block).chain(&old.extra_blocks))
+            {
+                assert!(a.memory.count > 0);
+                assert_eq!(a.memory.count, b.memory.count);
+                assert_close(&a.memory.values, &b.memory.values);
+                assert_close(
+                    &a.adapters[0].consolidated_up,
+                    &b.adapters[0].consolidated_up,
+                );
+                for value in a.memory.values.chunks_exact(a.cfg.d_latent) {
+                    assert!(
+                        value.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() <= 0.25f64.powi(2)
+                    );
+                }
+            }
         }
     }
 

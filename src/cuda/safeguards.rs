@@ -13,6 +13,7 @@ struct Kernels {
 }
 
 struct TensorState {
+    host_data: usize,
     data: CudaSlice<f32>,
     grad: CudaSlice<f32>,
     m: CudaSlice<f32>,
@@ -25,8 +26,22 @@ struct TensorState {
 pub(super) struct Safeguards {
     kernels: Option<Kernels>,
     tensors: HashMap<usize, TensorState>,
+    cap_workspace: Option<CudaSlice<f32>>,
     resident: bool,
+    fresh_gradients: bool,
     finite: bool,
+}
+
+impl Safeguards {
+    pub(super) fn weight(&self, host: &[f32]) -> Option<&CudaSlice<f32>> {
+        if !self.resident {
+            return None;
+        }
+        self.tensors
+            .values()
+            .find(|t| t.host_data == host.as_ptr() as usize && t.data.len() == host.len())
+            .map(|t| &t.data)
+    }
 }
 
 fn error(e: impl std::fmt::Debug) -> String {
@@ -53,6 +68,7 @@ impl CudaContext {
 
     fn upload_tensor(&self, tensor: &AdamTensor<'_>) -> Result<TensorState, String> {
         Ok(TensorState {
+            host_data: tensor.data.as_ptr() as usize,
             data: self.stream.clone_htod(tensor.data).map_err(error)?,
             grad: self.stream.clone_htod(tensor.grad).map_err(error)?,
             m: self.stream.clone_htod(tensor.m).map_err(error)?,
@@ -77,6 +93,7 @@ impl CudaContext {
         }
         self.stream.synchronize().map_err(error)?;
         state.resident = true;
+        state.fresh_gradients = true;
         state.finite = true;
         Ok(())
     }
@@ -108,17 +125,49 @@ impl CudaContext {
         state.resident.then_some(state.finite)
     }
 
-    pub(crate) fn zero_safeguarded_gradients(&self) -> Result<(), String> {
+    pub(crate) fn zero_safeguarded_gradients(
+        &self,
+        tensors: &mut [AdamTensor<'_>],
+    ) -> Result<(), String> {
+        let mut state = self.safeguards.lock().map_err(error)?;
+        let fresh = state.fresh_gradients;
+        for (index, t) in tensors.iter_mut().enumerate() {
+            let device = state
+                .tensors
+                .get_mut(&(t.grad.as_ptr() as usize))
+                .ok_or("CUDA optimizer tensor registration changed")?;
+            self.stream.memset_zeros(&mut device.grad).map_err(error)?;
+            // Embedding rows were cleared sparsely by the model. Dense TN
+            // gradients have no host consumers inside this training scope.
+            if (index == 0 && fresh) || (index != 0 && !device.dense) {
+                t.grad.fill(0.0);
+            }
+        }
+        state.fresh_gradients = false;
+        Ok(())
+    }
+
+    /// Epoch EMA transfers part of the fast adapter into its slow host copy.
+    /// Keep the resident fast weights in sync without resetting Adam moments.
+    pub(crate) fn refresh_safeguarded_weight(
+        &self,
+        p: &crate::pssa::ParamMatrix,
+    ) -> Result<(), String> {
         let mut state = self.safeguards.lock().map_err(error)?;
         if state.resident {
-            for device in state.tensors.values_mut() {
-                self.stream.memset_zeros(&mut device.grad).map_err(error)?;
-            }
+            let device = state
+                .tensors
+                .get_mut(&(p.grad.as_ptr() as usize))
+                .ok_or("CUDA optimizer tensor registration changed")?;
+            self.stream
+                .memcpy_htod(&p.data, &mut device.data)
+                .map_err(error)?;
+            self.stream.synchronize().map_err(error)?;
         }
         Ok(())
     }
 
-    // None preserves the historical host-slice GEMM API outside scoped training.
+    // False preserves the historical host-slice GEMM API outside scoped training.
     pub(super) fn resident_tn(
         &self,
         a: &[f32],
@@ -160,8 +209,9 @@ impl CudaContext {
         tensors: &mut [AdamTensor<'_>],
         cfg: &PSSAConfigV2,
         lr: f32,
-        step: usize,
+        step: Option<usize>,
         max_norm: f32,
+        embedding_rows: &[usize],
     ) -> Result<f64, String> {
         let mut state = self.safeguards.lock().map_err(error)?;
         self.safeguard_kernels(&mut state)?;
@@ -173,14 +223,27 @@ impl CudaContext {
                     .insert(t.grad.as_ptr() as usize, self.upload_tensor(t)?);
             }
         } else {
-            for t in tensors.iter() {
+            for (index, t) in tensors.iter().enumerate() {
                 let device = state
                     .tensors
                     .get_mut(&(t.grad.as_ptr() as usize))
                     .ok_or("CUDA optimizer tensor registration changed")?;
-                if !device.dense {
-                    // Embedding scatter, norm and SSM-rate gradients are still
-                    // computed by CPU stages; bulk upload, never a host norm walk.
+                if index == 0 {
+                    // Embedding scatter is host-owned, but only used rows have
+                    // gradients. Device zeroing already cleared all other rows.
+                    for &row in embedding_rows {
+                        let start = row * cfg.d_latent;
+                        let end = start + cfg.d_latent;
+                        self.stream
+                            .memcpy_htod(
+                                &t.grad[start..end],
+                                &mut device.grad.slice_mut(start..end),
+                            )
+                            .map_err(error)?;
+                    }
+                } else if !device.dense {
+                    // Norm/SSM-rate (and looped-head) gradients are still CPU
+                    // computed; upload them without a host norm/scale walk.
                     self.stream
                         .memcpy_htod(t.grad, &mut device.grad)
                         .map_err(error)?;
@@ -238,6 +301,7 @@ impl CudaContext {
         } else {
             1.0
         };
+        let step = step.ok_or("optimizer step counter overflow")?;
         let bias1 = 1.0 - cfg.beta1.powf(step as f32);
         let bias2 = 1.0 - cfg.beta2.powf(step as f32);
         let mut invalid = self.stream.alloc_zeros::<u32>(1).map_err(error)?;
@@ -309,8 +373,18 @@ impl CudaContext {
             return Ok(());
         }
         let mut state = self.safeguards.lock().map_err(error)?;
-        let kernels = self.safeguard_kernels(&mut state)?;
-        let mut values_dev = self.stream.clone_htod(values).map_err(error)?;
+        self.safeguard_kernels(&mut state)?;
+        let Safeguards {
+            kernels,
+            cap_workspace,
+            ..
+        } = &mut *state;
+        reserve_device(cap_workspace, &self.stream, values.len())?;
+        let mut values_dev = cap_workspace.as_mut().unwrap().slice_mut(..values.len());
+        self.stream
+            .memcpy_htod(values, &mut values_dev)
+            .map_err(error)?;
+        let kernels = kernels.as_ref().unwrap();
         let mut invalid = self.stream.alloc_zeros::<u32>(1).map_err(error)?;
         let rows = u32::try_from(values.len() / width).map_err(error)?;
         let width = u32::try_from(width).map_err(error)?;

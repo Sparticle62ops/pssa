@@ -599,6 +599,20 @@ impl CLIHandler {
                 .chain(&p.v)
                 .all(|v| v.is_finite())
         }
+        #[cfg(feature = "cuda")]
+        let device_finite = match &model.device {
+            crate::backend::Device::Cuda(ctx) => ctx.safeguarded_parameters_finite(),
+            _ => None,
+        };
+        #[cfg(not(feature = "cuda"))]
+        let device_finite = None::<bool>;
+        if device_finite == Some(false) {
+            return false;
+        }
+        // The CUDA Adam kernel checks data/grad/m/v in its existing pass. Host
+        // moments/gradients are deliberately stale until training handoff.
+        let matrix_finite = |p| device_finite == Some(true) || matrix_finite(p);
+        let vector_finite = |p| device_finite == Some(true) || vector_finite(p);
         matrix_finite(&model.embed_w)
             && matrix_finite(&model.unembed_w)
             && std::iter::once(&model.block)
@@ -764,11 +778,6 @@ impl CLIHandler {
                     .map_or_else(|| "off".into(), |x| x.to_string())
             );
         }
-        if options.memory_value_cap.is_some() {
-            for block in std::iter::once(&mut model.block).chain(&mut model.extra_blocks) {
-                block.memory.set_value_cap(options.memory_value_cap);
-            }
-        }
         // Keep an explicit resume override in the checkpoint's persisted
         // configuration so a later link does not silently revert to the old LR.
         model.cfg.lr = options.lr;
@@ -805,6 +814,13 @@ impl CLIHandler {
                 } else {
                     println!("backend=cpu ({e})");
                 }
+            }
+        }
+        if options.memory_value_cap.is_some() {
+            for block in std::iter::once(&mut model.block).chain(&mut model.extra_blocks) {
+                block
+                    .memory
+                    .set_value_cap_with_device(options.memory_value_cap, &model.device);
             }
         }
         let docs = Self::documents(raw, &tokenizer, options.max_tokens, options.skip_tokens)?;
@@ -903,6 +919,19 @@ impl CLIHandler {
         // Sequence values are borrowed views into `docs`; reuse the descriptor
         // vector so packed training does not allocate once per microbatch.
         let mut sequence_views = Vec::with_capacity(options.batch_size);
+        #[cfg(feature = "cuda")]
+        let cuda_optimizer = match model.device.clone() {
+            crate::backend::Device::Cuda(ctx) if options.grad_clip.is_some() => {
+                // Validate checkpoint/initial host state once, before its moments
+                // and dense gradients become exclusively device-owned.
+                if !Self::finite(&model) {
+                    return Err("non-finite initial parameters".into());
+                }
+                ctx.begin_safeguarded_training(&model.adam_tensors())?;
+                Some(ctx)
+            }
+            _ => None,
+        };
         let started = Instant::now();
         let mut update = 0;
         let mut skipped = SkippedUpdates::default();
@@ -1082,6 +1111,12 @@ impl CLIHandler {
             );
         }
         progress.finish();
+        #[cfg(feature = "cuda")]
+        if let Some(ctx) = cuda_optimizer {
+            // Checkpoint/public API state is complete only at this handoff;
+            // there are no full gradient/moment readbacks inside the loop.
+            ctx.finish_safeguarded_training(&mut model.adam_tensors())?;
+        }
         if let Some(curve) = &mut curve {
             curve.finish()?;
         }
