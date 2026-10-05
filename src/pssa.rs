@@ -198,6 +198,40 @@ pub enum GradientClipOutcome {
     Skipped { norm: f64 },
 }
 
+/// Borrowed optimizer state, in the same order as the historical global norm.
+/// A non-unit scale is fused into Adam's existing pass, not a second clip walk.
+pub(crate) struct AdamTensor<'a> {
+    pub data: &'a mut [f32],
+    pub grad: &'a mut [f32],
+    pub m: &'a mut [f32],
+    pub v: &'a mut [f32],
+    pub weight_decay: f32,
+}
+
+impl AdamTensor<'_> {
+    fn step(&mut self, cfg: &PSSAConfigV2, lr: f32, step: usize, scale: f64) {
+        let bias1 = 1.0 - cfg.beta1.powf(step as f32);
+        let bias2 = 1.0 - cfg.beta2.powf(step as f32);
+        for i in 0..self.data.len() {
+            let g = if scale < 1.0 {
+                let g = (self.grad[i] as f64 * scale) as f32;
+                self.grad[i] = g;
+                g
+            } else {
+                self.grad[i]
+            };
+            if self.weight_decay > 0.0 {
+                self.data[i] -= lr * self.weight_decay * self.data[i];
+            }
+            self.m[i] = cfg.beta1 * self.m[i] + (1.0 - cfg.beta1) * g;
+            self.v[i] = cfg.beta2 * self.v[i] + (1.0 - cfg.beta2) * g * g;
+            let m_hat = self.m[i] / bias1;
+            let v_hat = self.v[i] / bias2;
+            self.data[i] -= lr * m_hat / (v_hat.sqrt() + cfg.eps);
+        }
+    }
+}
+
 // =============================================================================
 // ENGINE CONFIGURATION
 // =============================================================================
@@ -2047,12 +2081,7 @@ impl PSSALayerV2 {
             &self.continuous_inputs[..n]
         };
         if let Some(gpu) = gpu.as_ref() {
-            crate::gpu_batch::stacked_backward_logits(
-                self,
-                seq_len,
-                scale_loss,
-                Some(gpu),
-            );
+            crate::gpu_batch::stacked_backward_logits(self, seq_len, scale_loss, Some(gpu));
             self.output_adjoints[..n].copy_from_slice(&self.block.bwd_g_zfinal[..n]);
         } else {
             // Keep the old reverse-time accumulation order for bit-exact depth one.
@@ -2157,6 +2186,7 @@ impl PSSALayerV2 {
     /// Visit exactly the gradients consumed by `apply_adamw`, including the
     /// shared embedding/head and every continuous block. Stored memory and the
     /// adapter's consolidated copy are detached, not Adam parameters.
+    #[cfg(test)]
     fn for_each_adam_gradient(&mut self, mut visit: impl FnMut(&mut [f32])) {
         visit(&mut self.embed_w.grad);
         visit(&mut self.unembed_w.grad);
@@ -2182,32 +2212,101 @@ impl PSSALayerV2 {
         }
     }
 
-    /// Opt-in global L2 clipping immediately before Adam, for any backward
-    /// backend. CUDA/WebGPU gradients have already been synchronized to host.
-    /// A non-finite norm clears gradients without touching weights, moments,
-    /// device weight caches, or the optimizer step counter.
+    pub(crate) fn adam_tensors(&mut self) -> Vec<AdamTensor<'_>> {
+        let wd = self.cfg.weight_decay;
+        let mut tensors = Vec::with_capacity(2 + 14 * self.depth());
+        fn matrix(p: &mut ParamMatrix, weight_decay: f32) -> AdamTensor<'_> {
+            AdamTensor {
+                data: &mut p.data,
+                grad: &mut p.grad,
+                m: &mut p.m,
+                v: &mut p.v,
+                weight_decay,
+            }
+        }
+        tensors.push(matrix(&mut self.embed_w, wd));
+        tensors.push(matrix(&mut self.unembed_w, wd));
+        for b in std::iter::once(&mut self.block).chain(&mut self.extra_blocks) {
+            for p in [&mut b.norm_gamma, &mut b.norm_beta] {
+                tensors.push(AdamTensor {
+                    data: &mut p.data,
+                    grad: &mut p.grad,
+                    m: &mut p.m,
+                    v: &mut p.v,
+                    weight_decay: 0.0,
+                });
+            }
+            for p in [
+                &mut b.a_mat,
+                &mut b.w_delta,
+                &mut b.w_b,
+                &mut b.w_c,
+                &mut b.w_qx,
+                &mut b.w_qh,
+                &mut b.w_gate,
+                &mut b.w_proj,
+                &mut b.mlp_w1,
+                &mut b.mlp_w2,
+            ] {
+                tensors.push(matrix(p, wd));
+            }
+            let ad = &mut b.adapters[0];
+            tensors.push(matrix(&mut ad.down_proj, wd));
+            tensors.push(matrix(&mut ad.up_proj, wd));
+        }
+        tensors
+    }
+
+    /// Global f64 L2 norm, then min(1, max_norm / norm) before AdamW.
+    /// CUDA reduces and scales on-device. The CPU fallback has one norm pass;
+    /// scaling is fused into AdamW's required pass over optimizer state.
+    /// Non-finite norms skip atomically, including the optimizer step counter.
     pub fn apply_adamw_with_grad_clip(&mut self, lr: f32, max_norm: f32) -> GradientClipOutcome {
         assert!(max_norm.is_finite() && max_norm > 0.0);
+        let cfg = self.cfg.clone();
+        let step = self
+            .step_counter
+            .checked_add(1)
+            .expect("optimizer step counter overflow");
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(ctx) = self.device.clone() {
+            let norm = ctx
+                .clip_adamw(&mut self.adam_tensors(), &cfg, lr, step, max_norm)
+                .expect("CUDA gradient clipping/AdamW failed; refusing a silent CPU fallback");
+            if !norm.is_finite() {
+                self.zero_gradients();
+                return GradientClipOutcome::Skipped { norm };
+            }
+            self.step_counter = step;
+            ctx.invalidate_weights();
+            return GradientClipOutcome::Applied { norm };
+        }
+        let mut tensors = self.adam_tensors();
         let mut norm_sq = 0.0f64;
-        self.for_each_adam_gradient(|grad| {
-            for &g in grad.iter() {
+        for tensor in &tensors {
+            for &g in tensor.grad.iter() {
                 norm_sq += (g as f64) * (g as f64);
             }
-        });
+        }
         let norm = norm_sq.sqrt();
         if !norm.is_finite() {
+            drop(tensors);
             self.zero_gradients();
             return GradientClipOutcome::Skipped { norm };
         }
-        if norm > max_norm as f64 {
-            let scale = max_norm as f64 / norm;
-            self.for_each_adam_gradient(|grad| {
-                for g in grad {
-                    *g = (*g as f64 * scale) as f32;
-                }
-            });
+        let scale = if norm > max_norm as f64 {
+            max_norm as f64 / norm
+        } else {
+            1.0
+        };
+        for tensor in &mut tensors {
+            tensor.step(&cfg, lr, step, scale);
         }
-        self.apply_adamw(lr);
+        drop(tensors);
+        self.step_counter = step;
+        if let Some(ctx) = self.device.gpu() {
+            ctx.invalidate_weights();
+        }
         GradientClipOutcome::Applied { norm }
     }
 
@@ -2347,6 +2446,77 @@ mod training_safeguards_tests {
             }
         }
         out
+    }
+
+    fn historical_clip(m: &mut PSSALayerV2, lr: f32, max_norm: f32) -> GradientClipOutcome {
+        let mut sum = 0.0f64;
+        m.for_each_adam_gradient(|grad| {
+            for &g in grad.iter() {
+                sum += (g as f64) * (g as f64);
+            }
+        });
+        let norm = sum.sqrt();
+        if !norm.is_finite() {
+            m.zero_gradients();
+            return GradientClipOutcome::Skipped { norm };
+        }
+        if norm > max_norm as f64 {
+            let scale = max_norm as f64 / norm;
+            m.for_each_adam_gradient(|grad| {
+                for g in grad {
+                    *g = (*g as f64 * scale) as f32;
+                }
+            });
+        }
+        m.apply_adamw(lr);
+        GradientClipOutcome::Applied { norm }
+    }
+
+    #[test]
+    fn fused_cpu_clip_matches_historical_optimizer_exactly() {
+        let mut old = model();
+        let mut new = model();
+        // Cover nonzero moments, decay (but not norm-vector decay), every block,
+        // both signs, signed zero, huge finite values, and subnormal clip limits.
+        for (step, cap) in [1.0, f32::MAX, 0.25, f32::from_bits(1), 2.0]
+            .into_iter()
+            .enumerate()
+        {
+            for m in [&mut old, &mut new] {
+                let mut index = 0;
+                m.for_each_adam_gradient(|grad| {
+                    for g in grad {
+                        *g = match index % 6 {
+                            0 => -0.0,
+                            1 => 0.125,
+                            2 => -3.5,
+                            3 => {
+                                if step == 2 {
+                                    1e21
+                                } else {
+                                    0.75
+                                }
+                            }
+                            4 => f32::from_bits(1),
+                            _ => -0.25,
+                        };
+                        index += 1;
+                    }
+                });
+            }
+            let expected = historical_clip(&mut old, 0.003, cap);
+            assert_eq!(new.apply_adamw_with_grad_clip(0.003, cap), expected);
+            assert_eq!(new.step_counter, old.step_counter);
+            assert_eq!(optimizer_state(&new), optimizer_state(&old));
+            // Compare bits too: below-threshold signed zeros must be untouched.
+            let bits = |m: &mut PSSALayerV2| {
+                gradients(m)
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits(&mut new), bits(&mut old));
+        }
     }
 
     #[test]

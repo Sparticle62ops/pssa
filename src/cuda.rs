@@ -10,6 +10,7 @@ use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::{CudaContext as DriverContext, CudaSlice, CudaStream};
 
 use crate::backend::{checked_gemm_sizes, shared_gemm_rows, zeroed_output};
+mod safeguards;
 
 // cudarc 0.19 lazily loads symbols with unwrap/panic, including error formatting
 // and Drop paths. Preflight *every* symbol used by this backend before calling
@@ -39,6 +40,10 @@ const DRIVER_SYMBOLS: &[&str] = &[
     "cuEventRecord",
     "cuEventSynchronize",
     "cuEventDestroy_v2",
+    "cuModuleLoadData",
+    "cuModuleUnload",
+    "cuModuleGetFunction",
+    "cuLaunchKernel",
 ];
 const BLAS_SYMBOLS: &[&str] = &[
     "cublasCreate_v2",
@@ -145,6 +150,7 @@ pub struct CudaContext {
     name: Arc<str>,
     weight_cache: Arc<Mutex<HashMap<(usize, usize), Arc<CudaSlice<f32>>>>>,
     workspace: Arc<Mutex<Workspace>>,
+    safeguards: Arc<Mutex<safeguards::Safeguards>>,
 }
 
 impl CudaContext {
@@ -164,6 +170,7 @@ impl CudaContext {
             name,
             weight_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace: Arc::new(Mutex::new(Workspace::default())),
+            safeguards: Arc::new(Mutex::new(safeguards::Safeguards::default())),
         })
     }
 
@@ -388,11 +395,16 @@ impl CudaContext {
         n: usize,
         out: &mut [f32],
     ) -> Result<(), String> {
-        self.try_gemm_tn_accumulate_into(a, b, m, k, n, out)
-            .or_else(|error| {
-                eprintln!("warning: CUDA backward GEMM (TN) failed; using CPU fallback: {error}");
-                crate::backend::gemm_tn_cpu_accumulate_into(a, b, m, k, n, out)
-            })
+        let result = self.try_gemm_tn_accumulate_into(a, b, m, k, n, out);
+        // A resident gradient cannot silently switch to host accumulation: that
+        // would lose the device contribution and change the global norm.
+        if self.safeguarded_parameters_finite().is_some() {
+            return result;
+        }
+        result.or_else(|error| {
+            eprintln!("warning: CUDA backward GEMM (TN) failed; using CPU fallback: {error}");
+            crate::backend::gemm_tn_cpu_accumulate_into(a, b, m, k, n, out)
+        })
     }
 
     pub fn try_gemm_tn_accumulate_into(
@@ -420,6 +432,9 @@ impl CudaContext {
             ldb: k as i32,
             ldc: n as i32,
         };
+        if self.resident_tn(a, b, cfg, out)? {
+            return Ok(());
+        }
         self.execute_into(a, b, cfg, 1, 0, 0, false, true, out)
     }
 
@@ -488,11 +503,10 @@ impl CudaContext {
         self.stream
             .memcpy_dtoh(&c_dev, out)
             .map_err(|e| format!("CUDA readback failed ({e:?})"))?;
-        // HostSlice synchronizes on guard Drop and records asynchronous errors
-        // in the context. Surface those now, not on an unrelated next dispatch.
+        // cudarc 0.19's ordinary host slices do not synchronize on guard Drop.
+        // Finish the copy before CPU stages consume or mutate borrowed buffers.
         self.stream
-            .context()
-            .check_err()
+            .synchronize()
             .map_err(|e| format!("CUDA readback synchronization failed ({e:?})"))
     }
 }

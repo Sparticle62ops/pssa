@@ -1,0 +1,285 @@
+// Embedded PTX: no toolkit, NVRTC library or runtime compilation required.
+// f64 norms/scales and explicit rounded f32 Adam operations (no FMA).
+.version 6.0
+.target sm_50
+.address_size 64
+
+.visible .entry norm_partials(
+ .param .u64 descriptors, .param .u32 count, .param .u64 partials
+) {
+ .reg .pred %p<4>;
+ .reg .b32 %r<12>;
+ .reg .b64 %rd<14>;
+ .reg .f32 %f;
+ .reg .f64 %d<5>;
+ .shared .align 8 .b8 scratch[2048];
+ ld.param.u64 %rd0, [descriptors];
+ ld.param.u32 %r0, [count];
+ ld.param.u64 %rd1, [partials];
+ mov.u32 %r1, %tid.x;
+ mov.u32 %r2, %ctaid.x;
+ mov.u32 %r3, %ntid.x;
+ mov.u32 %r4, %nctaid.x;
+ mad.lo.u32 %r5, %r2, %r3, %r1;
+ mul.lo.u32 %r6, %r3, %r4;
+ cvt.u64.u32 %rd2, %r5;
+ cvt.u64.u32 %rd3, %r6;
+ mov.u32 %r7, 0;
+ mov.f64 %d0, 0d0000000000000000;
+N_TENSOR:
+ setp.ge.u32 %p0, %r7, %r0;
+ @%p0 bra N_SHARED;
+ mul.wide.u32 %rd4, %r7, 16;
+ add.u64 %rd4, %rd0, %rd4;
+ ld.global.u64 %rd5, [%rd4];
+ ld.global.u64 %rd6, [%rd4+8];
+ mov.u64 %rd7, %rd2;
+N_ELEMENT:
+ setp.ge.u64 %p0, %rd7, %rd6;
+ @%p0 bra N_NEXT;
+ shl.b64 %rd8, %rd7, 2;
+ add.u64 %rd8, %rd5, %rd8;
+ ld.global.f32 %f, [%rd8];
+ cvt.f64.f32 %d1, %f;
+ mul.rn.f64 %d2, %d1, %d1;
+ add.rn.f64 %d0, %d0, %d2;
+ add.u64 %rd7, %rd7, %rd3;
+ bra N_ELEMENT;
+N_NEXT:
+ add.u32 %r7, %r7, 1;
+ bra N_TENSOR;
+N_SHARED:
+ mov.u64 %rd9, scratch;
+ mul.wide.u32 %rd10, %r1, 8;
+ add.u64 %rd10, %rd9, %rd10;
+ st.shared.f64 [%rd10], %d0;
+ bar.sync 0;
+ mov.u32 %r8, 128;
+N_REDUCE:
+ setp.ge.u32 %p1, %r1, %r8;
+ @%p1 bra N_BARRIER;
+ mul.wide.u32 %rd11, %r8, 8;
+ add.u64 %rd11, %rd10, %rd11;
+ ld.shared.f64 %d1, [%rd10];
+ ld.shared.f64 %d2, [%rd11];
+ add.rn.f64 %d3, %d1, %d2;
+ st.shared.f64 [%rd10], %d3;
+N_BARRIER:
+ bar.sync 0;
+ shr.u32 %r8, %r8, 1;
+ setp.ne.u32 %p2, %r8, 0;
+ @%p2 bra N_REDUCE;
+ setp.ne.u32 %p3, %r1, 0;
+ @%p3 bra N_EXIT;
+ ld.shared.f64 %d4, [%rd9];
+ mul.wide.u32 %rd12, %r2, 8;
+ add.u64 %rd12, %rd1, %rd12;
+ st.global.f64 [%rd12], %d4;
+N_EXIT:
+ ret;
+}
+
+.visible .entry norm_finish(.param .u64 partials, .param .u64 norm) {
+ .reg .pred %p;
+ .reg .b32 %r;
+ .reg .b64 %rd<4>;
+ .reg .f64 %d<3>;
+ ld.param.u64 %rd0, [partials];
+ ld.param.u64 %rd1, [norm];
+ mov.u32 %r, 0;
+ mov.f64 %d0, 0d0000000000000000;
+F_LOOP:
+ mul.wide.u32 %rd2, %r, 8;
+ add.u64 %rd3, %rd0, %rd2;
+ ld.global.f64 %d1, [%rd3];
+ add.rn.f64 %d0, %d0, %d1;
+ add.u32 %r, %r, 1;
+ setp.lt.u32 %p, %r, 256;
+ @%p bra F_LOOP;
+ sqrt.rn.f64 %d2, %d0;
+ st.global.f64 [%rd1], %d2;
+ ret;
+}
+
+.visible .entry scaled_adam(
+ .param .u64 data, .param .u64 grad, .param .u64 moment, .param .u64 variance,
+ .param .u64 len, .param .f32 lr, .param .f32 beta1, .param .f32 beta2,
+ .param .f32 decay, .param .f32 eps, .param .f32 bias1, .param .f32 bias2,
+ .param .f64 scale, .param .u64 invalid
+) {
+ .reg .pred %p<8>;
+ .reg .b32 %r<6>;
+ .reg .b64 %rd<10>;
+ .reg .f32 %f<24>;
+ .reg .f64 %d<3>;
+ ld.param.u64 %rd0, [data];
+ ld.param.u64 %rd1, [grad];
+ ld.param.u64 %rd2, [moment];
+ ld.param.u64 %rd3, [variance];
+ ld.param.u64 %rd4, [len];
+ ld.param.f32 %f0, [lr];
+ ld.param.f32 %f1, [beta1];
+ ld.param.f32 %f2, [beta2];
+ ld.param.f32 %f3, [decay];
+ ld.param.f32 %f4, [eps];
+ ld.param.f32 %f5, [bias1];
+ ld.param.f32 %f6, [bias2];
+ ld.param.f64 %d0, [scale];
+ ld.param.u64 %rd5, [invalid];
+ mov.u32 %r0, %tid.x;
+ mov.u32 %r1, %ctaid.x;
+ mov.u32 %r2, %ntid.x;
+ mad.lo.u32 %r3, %r1, %r2, %r0;
+ cvt.u64.u32 %rd6, %r3;
+ setp.ge.u64 %p0, %rd6, %rd4;
+ @%p0 bra A_EXIT;
+ shl.b64 %rd7, %rd6, 2;
+ add.u64 %rd0, %rd0, %rd7;
+ add.u64 %rd1, %rd1, %rd7;
+ add.u64 %rd2, %rd2, %rd7;
+ add.u64 %rd3, %rd3, %rd7;
+ ld.global.f32 %f7, [%rd0];
+ ld.global.f32 %f8, [%rd1];
+ ld.global.f32 %f9, [%rd2];
+ ld.global.f32 %f10, [%rd3];
+ setp.lt.f64 %p1, %d0, 0d3FF0000000000000;
+ @!%p1 bra A_DECAY;
+ cvt.f64.f32 %d1, %f8;
+ mul.rn.f64 %d2, %d1, %d0;
+ cvt.rn.f32.f64 %f8, %d2;
+ st.global.f32 [%rd1], %f8;
+A_DECAY:
+ setp.gt.f32 %p2, %f3, 0f00000000;
+ @!%p2 bra A_MOMENTS;
+ mul.rn.f32 %f11, %f0, %f3;
+ mul.rn.f32 %f11, %f11, %f7;
+ sub.rn.f32 %f7, %f7, %f11;
+A_MOMENTS:
+ sub.rn.f32 %f11, 0f3F800000, %f1;
+ mul.rn.f32 %f12, %f1, %f9;
+ mul.rn.f32 %f13, %f11, %f8;
+ add.rn.f32 %f9, %f12, %f13;
+ sub.rn.f32 %f11, 0f3F800000, %f2;
+ mul.rn.f32 %f12, %f2, %f10;
+ mul.rn.f32 %f13, %f11, %f8;
+ mul.rn.f32 %f13, %f13, %f8;
+ add.rn.f32 %f10, %f12, %f13;
+ div.rn.f32 %f14, %f9, %f5;
+ div.rn.f32 %f15, %f10, %f6;
+ sqrt.rn.f32 %f15, %f15;
+ add.rn.f32 %f15, %f15, %f4;
+ mul.rn.f32 %f14, %f0, %f14;
+ div.rn.f32 %f14, %f14, %f15;
+ sub.rn.f32 %f7, %f7, %f14;
+ st.global.f32 [%rd0], %f7;
+ st.global.f32 [%rd2], %f9;
+ st.global.f32 [%rd3], %f10;
+ abs.f32 %f16, %f7;
+ abs.f32 %f17, %f8;
+ abs.f32 %f18, %f9;
+ abs.f32 %f19, %f10;
+ setp.le.f32 %p3, %f16, 0f7F7FFFFF;
+ setp.le.f32 %p4, %f17, 0f7F7FFFFF;
+ setp.le.f32 %p5, %f18, 0f7F7FFFFF;
+ setp.le.f32 %p6, %f19, 0f7F7FFFFF;
+ and.pred %p3, %p3, %p4;
+ and.pred %p3, %p3, %p5;
+ and.pred %p3, %p3, %p6;
+ @%p3 bra A_EXIT;
+ atom.global.or.b32 %r4, [%rd5], 1;
+A_EXIT:
+ ret;
+}
+
+// Values are host-owned today. Only a terminal value (or startup bank) is
+// transferred. One thread per row preserves CPU's sequential f64 sum and exact
+// nearest-f32 / one-ULP-toward-zero cap correction, including subnormal caps.
+.visible .entry cap_values(
+ .param .u64 values, .param .u32 rows, .param .u32 width,
+ .param .f64 cap, .param .u64 invalid
+) {
+ .reg .pred %p<5>;
+ .reg .b32 %r<8>;
+ .reg .b64 %rd<7>;
+ .reg .f32 %f;
+ .reg .f64 %d<7>;
+ ld.param.u64 %rd0, [values];
+ ld.param.u32 %r0, [rows];
+ ld.param.u32 %r1, [width];
+ ld.param.f64 %d0, [cap];
+ ld.param.u64 %rd1, [invalid];
+ mov.u32 %r2, %tid.x;
+ mov.u32 %r3, %ctaid.x;
+ mov.u32 %r4, %ntid.x;
+ mad.lo.u32 %r2, %r3, %r4, %r2;
+ setp.ge.u32 %p0, %r2, %r0;
+ @%p0 bra C_EXIT;
+ mul.wide.u32 %rd2, %r2, %r1;
+ shl.b64 %rd2, %rd2, 2;
+ add.u64 %rd0, %rd0, %rd2;
+ mul.rn.f64 %d1, %d0, %d0;
+ mov.u32 %r5, 0;
+ mov.f64 %d2, 0d0000000000000000;
+C_NORM:
+ mul.wide.u32 %rd3, %r5, 4;
+ add.u64 %rd4, %rd0, %rd3;
+ ld.global.f32 %f, [%rd4];
+ cvt.f64.f32 %d3, %f;
+ mul.rn.f64 %d3, %d3, %d3;
+ add.rn.f64 %d2, %d2, %d3;
+ add.u32 %r5, %r5, 1;
+ setp.lt.u32 %p1, %r5, %r1;
+ @%p1 bra C_NORM;
+ setp.le.f64 %p2, %d2, 0d7FEFFFFFFFFFFFFF;
+ @!%p2 bra C_BAD;
+ setp.le.f64 %p3, %d2, %d1;
+ @%p3 bra C_EXIT;
+ sqrt.rn.f64 %d3, %d2;
+ div.rn.f64 %d4, %d0, %d3;
+ mov.u32 %r5, 0;
+C_SCALE:
+ mul.wide.u32 %rd3, %r5, 4;
+ add.u64 %rd4, %rd0, %rd3;
+ ld.global.f32 %f, [%rd4];
+ cvt.f64.f32 %d3, %f;
+ mul.rn.f64 %d3, %d3, %d4;
+ cvt.rn.f32.f64 %f, %d3;
+ st.global.f32 [%rd4], %f;
+ add.u32 %r5, %r5, 1;
+ setp.lt.u32 %p1, %r5, %r1;
+ @%p1 bra C_SCALE;
+C_CHECK:
+ mov.u32 %r5, 0;
+ mov.f64 %d2, 0d0000000000000000;
+C_CHECK_NORM:
+ mul.wide.u32 %rd3, %r5, 4;
+ add.u64 %rd4, %rd0, %rd3;
+ ld.global.f32 %f, [%rd4];
+ cvt.f64.f32 %d3, %f;
+ mul.rn.f64 %d3, %d3, %d3;
+ add.rn.f64 %d2, %d2, %d3;
+ add.u32 %r5, %r5, 1;
+ setp.lt.u32 %p1, %r5, %r1;
+ @%p1 bra C_CHECK_NORM;
+ setp.le.f64 %p3, %d2, %d1;
+ @%p3 bra C_EXIT;
+ mov.u32 %r5, 0;
+C_ULP:
+ mul.wide.u32 %rd3, %r5, 4;
+ add.u64 %rd4, %rd0, %rd3;
+ ld.global.f32 %f, [%rd4];
+ setp.eq.f32 %p4, %f, 0f00000000;
+ @%p4 bra C_ULP_NEXT;
+ mov.b32 %r6, %f;
+ sub.u32 %r6, %r6, 1;
+ st.global.b32 [%rd4], %r6;
+C_ULP_NEXT:
+ add.u32 %r5, %r5, 1;
+ setp.lt.u32 %p1, %r5, %r1;
+ @%p1 bra C_ULP;
+ bra C_CHECK;
+C_BAD:
+ atom.global.or.b32 %r7, [%rd1], 1;
+C_EXIT:
+ ret;
+}
