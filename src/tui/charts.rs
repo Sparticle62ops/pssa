@@ -129,60 +129,95 @@ fn ticks(bounds: [f64; 2]) -> Vec<String> {
         .collect()
 }
 
-/// Use Canvas/Painter's sub-pixel-to-row mapping, not label indices.
+/// Project values onto the available row intervals and round consistently.
+/// Labels use whole rows; the curve retains Canvas's finer braille projection.
 fn tick_row(value: f64, bounds: [f64; 2], height: u16) -> u16 {
-    let dot = ((bounds[1] - value) * f64::from(height * 4 - 1) / (bounds[1] - bounds[0])) as u16;
-    (dot / 4).min(height - 1)
+    let fraction = (bounds[1] - value) / (bounds[1] - bounds[0]);
+    (fraction * f64::from(height - 1)).round() as u16
 }
 
-/// Three to five round-valued ticks inside the fitted bounds. Prefer uniform
-/// steps; on short plots, omit colliding labels rather than losing the scale.
-/// All labels share a precision and use the same projection as the line.
+/// Prefer three to five nice-valued ticks with evenly spaced rows. Short plots
+/// may need fewer ticks, but never a mixture of adjacent and separated labels.
+/// Tick selection must not expand the fitted bounds or introduce unequal
+/// value steps.
 fn y_ticks(bounds: [f64; 2], height: u16) -> Vec<(f64, String)> {
     let range = bounds[1] - bounds[0];
     let power = 10.0_f64.powf((range / 4.0).log10().floor());
     let mut best = Vec::new();
-    let mut best_score = (false, 0);
-    // Prefer familiar 1/2/2.5/5 steps when equally many labels fit. The
-    // remaining steps fill awkward narrow ranges without expanding the bounds.
+    let mut best_step = power;
+    let mut best_score = (false, false, false, 0, 0);
+    // Start with familiar 1/2/2.5/5 steps. The remaining steps fill awkward
+    // narrow ranges without expanding the bounds.
     for multiplier in [1.0, 2.0, 2.5, 5.0, 10.0, 1.5, 3.0, 4.0, 6.0, 8.0] {
         let step = power * multiplier;
         let first = (bounds[0] / step).ceil();
         let last = (bounds[1] / step).floor();
         let count = (last - first + 1.0).max(0.0) as usize;
-        if !(3..=5).contains(&count) {
+        if count < 3 {
             continue;
         }
-        let mut values: Vec<_> = (0..count).map(|i| (first + i as f64) * step).collect();
-        values.dedup_by_key(|value| tick_row(*value, bounds, height));
-        let score = (values.len() == count, values.len());
-        if values.len() < 3 || score <= best_score {
-            continue;
+        // Thin even dense candidates by a uniform stride, never by individual
+        // row collisions: the latter silently introduces unequal value steps.
+        // Try each starting offset so rounding at an edge cannot exclude an
+        // evenly spaced sequence of nice values elsewhere inside the bounds.
+        for stride in count.div_ceil(5)..count {
+            for offset in 0..stride {
+                let len = (count - 1 - offset) / stride + 1;
+                if !(2..=5).contains(&len) {
+                    continue;
+                }
+                let values: Vec<_> = (offset..count)
+                    .step_by(stride)
+                    .map(|i| (first + i as f64) * step)
+                    .collect();
+                let (min_gap, max_gap) = values.windows(2).fold((u16::MAX, 0), |(min, max), p| {
+                    let gap = tick_row(p[0], bounds, height) - tick_row(p[1], bounds, height);
+                    (min.min(gap), max.max(gap))
+                });
+                if min_gap == 0 || max_gap - min_gap > 1 || (min_gap == 1 && max_gap > 1) {
+                    continue;
+                }
+                let span = tick_row(values[0], bounds, height)
+                    - tick_row(*values.last().unwrap(), bounds, height);
+                // Prefer exact gaps and familiar unthinned scales over more
+                // labels. Allow one-row rounding differences only when no
+                // scale with >=3 evenly spaced ticks fits.
+                let score = (
+                    values.len() >= 3,
+                    min_gap == max_gap,
+                    stride == 1,
+                    values.len(),
+                    span,
+                );
+                if score > best_score {
+                    best_score = score;
+                    best = values;
+                    best_step = step;
+                }
+            }
         }
-        best_score = score;
-        let magnitude = bounds[0].abs().max(bounds[1].abs());
-        let scientific = magnitude < 0.01 || (magnitude >= 1_000_000.0 && step >= magnitude * 0.01);
-        let scientific_digits = (magnitude / step).log10().ceil().clamp(2.0, 15.0) as usize;
-        let digits = (0..=15)
-            .find(|&d| {
-                let scaled = step * 10.0_f64.powi(d);
-                scaled >= 1.0 && (scaled - scaled.round()).abs() < 1e-6
-            })
-            .unwrap_or(15) as usize;
-        best = values
-            .into_iter()
-            .map(|value| {
-                let value = if value == 0.0 { 0.0 } else { value };
-                let label = if scientific {
-                    format!("{value:.scientific_digits$e}")
-                } else {
-                    format!("{value:.digits$}")
-                };
-                (value, label)
-            })
-            .collect();
     }
-    best
+    let magnitude = bounds[0].abs().max(bounds[1].abs());
+    let scientific =
+        magnitude < 0.01 || (magnitude >= 1_000_000.0 && best_step >= magnitude * 0.01);
+    let scientific_digits = (magnitude / best_step).log10().ceil().clamp(2.0, 15.0) as usize;
+    let digits = (0..=15)
+        .find(|&d| {
+            let scaled = best_step * 10.0_f64.powi(d);
+            scaled >= 1.0 && (scaled - scaled.round()).abs() < 1e-6
+        })
+        .unwrap_or(15) as usize;
+    best.into_iter()
+        .map(|value| {
+            let value = if value == 0.0 { 0.0 } else { value };
+            let label = if scientific {
+                format!("{value:.scientific_digits$e}")
+            } else {
+                format!("{value:.digits$}")
+            };
+            (value, label)
+        })
+        .collect()
 }
 
 pub(super) fn draw(f: &mut Frame, area: Rect, plot: Plot<'_>, series: &[Series<'_>]) {
@@ -723,15 +758,16 @@ mod tests {
                             .collect::<String>();
                         if !label.trim().is_empty() {
                             let value = label.trim().parse::<f64>().expect("numeric y tick");
-                            let expected_dot = ((y_bounds[1] - value)
-                                * f64::from(graph.height * 4 - 1)
-                                / (y_bounds[1] - y_bounds[0]))
-                                as u16;
+                            let fraction = (y_bounds[1] - value) / (y_bounds[1] - y_bounds[0]);
+                            let expected_row =
+                                (fraction * f64::from(graph.height - 1)).round() as u16;
                             assert_eq!(
                                 y,
-                                graph.y + expected_dot / 4,
+                                graph.y + expected_row,
                                 "misplaced {label} in {y_bounds:?}"
                             );
+                            let dot = (fraction * f64::from(graph.height * 4 - 1)) as u16;
+                            assert!(expected_row.abs_diff(dot / 4) <= 1, "tick far from curve");
                             assert!(!label.ends_with(' '), "ticks must share a right edge");
                             labels.push((y, value));
                         }
@@ -747,7 +783,7 @@ mod tests {
                         }
                     }
                     assert!(
-                        (3..=5).contains(&labels.len()),
+                        (2..=5).contains(&labels.len()),
                         "{y_bounds:?}, height {height}: {labels:?}"
                     );
                     assert!(
@@ -766,6 +802,106 @@ mod tests {
                         area,
                         &["loss", "measured", "training step", "Lower is better"],
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_y_ticks_have_even_row_and_value_gaps_at_both_sizes() {
+        // Extrema from the quick recording's 150 synthetic monitor samples.
+        let monitor_loss = [3.853054, 5.737391];
+        for (w, h) in [(120, 40), (80, 24)] {
+            // Include the nine-row monitor/timeline plots and every smaller or
+            // larger plot that fits in each terminal, with an offset panel.
+            for height in 7..=h - 3 {
+                for (name, y_bounds) in [
+                    ("monitor loss", bounds(monitor_loss.into_iter())),
+                    (
+                        "monitor perplexity",
+                        bounds(monitor_loss.into_iter().map(f64::exp)),
+                    ),
+                    ("checkpoint timeline", bounds([3.9, 5.3].into_iter())),
+                    ("auto-eval", bounds([0.77, 2.57].into_iter())),
+                    ("sweep", bounds([6.330799, 6.341673].into_iter())),
+                    ("negative", bounds([-351.263608, -350.91351].into_iter())),
+                    ("flat", bounds([0.0, 0.0].into_iter())),
+                    ("empty", bounds(std::iter::empty())),
+                    ("endpoints", [0.0, 4.0]),
+                ] {
+                    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                    let area = Rect::new(2, 3, w - 4, height);
+                    terminal
+                        .draw(|f| {
+                            draw(
+                                f,
+                                area,
+                                Plot {
+                                    title: name,
+                                    caption: "Lower is better",
+                                    x: "step",
+                                    y: "value",
+                                    integer_x: true,
+                                    x_bounds: [1.0, 150.0],
+                                    y_bounds,
+                                },
+                                &[Series::line(
+                                    "measured",
+                                    &[(1.0, y_bounds[1]), (150.0, y_bounds[0])],
+                                    NORMAL_GREEN,
+                                )],
+                            )
+                        })
+                        .unwrap();
+                    let b = terminal.backend().buffer();
+                    let graph = graph_rect(b, area);
+                    let labels: Vec<_> = (graph.y..graph.bottom())
+                        .filter_map(|y| {
+                            let text: String = (area.x + 1..graph.x - 1)
+                                .map(|x| b[(x, y)].symbol())
+                                .collect();
+                            (!text.trim().is_empty())
+                                .then(|| (y, text.trim().parse::<f64>().unwrap()))
+                        })
+                        .collect();
+                    let context =
+                        format!("{name}, {w}x{h}, plot height {}: {labels:?}", graph.height);
+                    assert!((2..=5).contains(&labels.len()), "{context}");
+                    let gaps: Vec<_> = labels.windows(2).map(|p| p[1].0 - p[0].0).collect();
+                    let min = *gaps.iter().min().unwrap();
+                    let max = *gaps.iter().max().unwrap();
+                    assert!(min > 0, "tick rows must strictly increase: {context}");
+                    assert!(max - min <= 1, "uneven tick rows: {context}");
+                    assert!(min != 1 || max == 1, "mixed adjacent tick rows: {context}");
+                    if name == "endpoints" {
+                        assert_eq!(
+                            labels.last().copied(),
+                            Some((graph.bottom() - 1, 0.0)),
+                            "bottom endpoint must use the last plot row: {context}"
+                        );
+                    }
+                    let step = labels[0].1 - labels[1].1;
+                    assert!(step > 0.0, "{context}");
+                    for pair in labels.windows(2) {
+                        assert!(
+                            ((pair[0].1 - pair[1].1) - step).abs() <= step * 1e-8,
+                            "unequal value steps: {context}"
+                        );
+                    }
+                    let row_step = step * f64::from(graph.height - 1) / (y_bounds[1] - y_bounds[0]);
+                    if (row_step - row_step.round()).abs() < 1e-8
+                        || (graph.height == 9
+                            && matches!(
+                                name,
+                                "monitor loss" | "monitor perplexity" | "checkpoint timeline"
+                            ))
+                        || (graph.height == 15 && name == "sweep")
+                    {
+                        assert_eq!(
+                            min, max,
+                            "rounding does not require unequal gaps: {context}"
+                        );
+                    }
                 }
             }
         }
