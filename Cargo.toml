@@ -46,7 +46,9 @@ features = ["events", "event-stream"]
 version = "0.19"
 optional = true
 default-features = false
-features = ["cuda-12080", "driver", "cublas", "dynamic-loading"]
+# nvrtc exposes Ptx/from_src and module loading; embedded PTX means no NVRTC
+# runtime library or CUDA toolkit is needed to execute the safeguard kernels.
+features = ["cuda-12080", "driver", "cublas", "nvrtc", "dynamic-loading"]
 
 [features]
 default = []
