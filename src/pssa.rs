@@ -2568,6 +2568,33 @@ mod training_safeguards_tests {
         assert!(gradients(&mut m).iter().all(|&g| g == 0.0));
     }
 
+    #[test]
+    fn stacked_batched_backward_marks_all_accumulated_embedding_rows() {
+        let mut m = model();
+        m.step_counter = 5;
+        m.zero_gradients();
+        // Exercise the same stacked scatter used by CUDA, on the CPU. The
+        // second chunk represents another lane/microbatch before a shared step.
+        for (inputs, targets, marks) in [
+            ([0, 1], [1, 2], [6, 6, 0, 0, 0]),
+            ([2, 0], [3, 1], [6, 6, 6, 0, 0]),
+        ] {
+            m.reset_recurrent_state();
+            crate::gpu_batch::forward_train_chunk_batched(&mut m, &inputs, &targets);
+            crate::gpu_batch::backward_chunk_batched(&mut m, 2, 0.5);
+            assert_eq!(m.embed_row_marks, marks);
+        }
+        let d = m.cfg.d_latent;
+        for row in 0..3 {
+            assert!(
+                m.embed_w.grad[row * d..(row + 1) * d]
+                    .iter()
+                    .any(|&g| g != 0.0)
+            );
+        }
+        assert!(m.embed_w.grad[3 * d..].iter().all(|&g| g == 0.0));
+    }
+
     #[cfg(feature = "cuda")]
     fn assert_close(actual: &[f32], expected: &[f32]) {
         assert_eq!(actual.len(), expected.len());
@@ -2666,7 +2693,7 @@ mod training_safeguards_tests {
             .collect::<Vec<_>>()
             .join(" ");
         let raw = format!("{words}\n\n{words}");
-        for (depth, loops) in [(1, 1), (2, 1), (1, 2)] {
+        for (depth, loops, batch_size) in [(1, 1, 1), (1, 1, 2), (2, 1, 1), (2, 1, 2), (1, 2, 2)] {
             let options = TrainingOptions {
                 backend: TrainingBackend::Cpu,
                 latent: 4,
@@ -2674,7 +2701,7 @@ mod training_safeguards_tests {
                 key: 2,
                 memory: 2,
                 chunk: 3,
-                batch_size: 2,
+                batch_size,
                 accumulate: 2,
                 epochs: 2,
                 depth,

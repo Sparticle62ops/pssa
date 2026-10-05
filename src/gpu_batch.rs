@@ -3239,8 +3239,16 @@ fn backward_chunk_stacked_batched(m: &mut PSSALayerV2, seq_len: usize, accumulat
         gpu.as_ref(),
     );
     m.boundary_adjoints[0][..n].copy_from_slice(&m.input_adjoints[..n]);
+    let pending_step = m
+        .step_counter
+        .checked_add(1)
+        .expect("optimizer step counter overflow");
     for t in (0..seq_len).rev() {
-        let row = m.block.tape.x_ids[t] * d;
+        let id = m.block.tape.x_ids[t];
+        // Resident CUDA clipping uploads/clears only the rows touched by this
+        // optimizer group, including every replayed lane in stacked batches.
+        m.embed_row_marks[id] = pending_step;
+        let row = id * d;
         for i in 0..d {
             m.embed_w.grad[row + i] += m.input_adjoints[t * d + i];
         }
