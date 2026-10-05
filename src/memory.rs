@@ -1,3 +1,4 @@
+use crate::backend::Device;
 use crate::defense::{RateLimiterGate, UpdateOutcome};
 use std::f32;
 
@@ -46,16 +47,32 @@ impl HyperbolicEpisodicBankV2 {
     ///
     /// Panics if the cap is not finite and positive, or capped values are non-finite.
     pub fn set_value_cap(&mut self, value_cap: Option<f32>) {
+        self.set_value_cap_with_device(value_cap, &Device::Cpu);
+    }
+
+    pub(crate) fn set_value_cap_with_device(&mut self, value_cap: Option<f32>, device: &Device) {
         if let Some(cap) = value_cap {
             assert!(
                 cap.is_finite() && cap > 0.0,
                 "memory value cap must be positive and finite"
             );
-            for value in self.values.chunks_exact_mut(self.dim_val) {
-                Self::clamp_value(value, cap);
-            }
+            Self::clamp_values_with_device(&mut self.values, self.dim_val, cap, device);
         }
         self.value_cap = value_cap;
+    }
+
+    fn clamp_values_with_device(values: &mut [f32], width: usize, cap: f32, device: &Device) {
+        match device {
+            #[cfg(feature = "cuda")]
+            Device::Cuda(ctx) => ctx
+                .cap_memory_values(values, width, cap)
+                .expect("CUDA memory value cap failed; refusing a silent CPU fallback"),
+            _ => {
+                for value in values.chunks_exact_mut(width) {
+                    Self::clamp_value(value, cap);
+                }
+            }
+        }
     }
 
     fn clamp_value(value: &mut [f32], cap: f32) {
@@ -173,6 +190,10 @@ impl HyperbolicEpisodicBankV2 {
     }
 
     pub fn insert(&mut self, key_pnc: &[f32], val: &[f32]) -> usize {
+        self.insert_with_device(key_pnc, val, &Device::Cpu)
+    }
+
+    fn insert_with_device(&mut self, key_pnc: &[f32], val: &[f32], device: &Device) -> usize {
         assert_eq!(key_pnc.len(), self.dim_key);
         assert_eq!(val.len(), self.dim_val);
         let key_sq = Self::squared_norm(key_pnc);
@@ -195,7 +216,12 @@ impl HyperbolicEpisodicBankV2 {
         let v_off = idx * self.dim_val;
         self.values[v_off..v_off + self.dim_val].copy_from_slice(val);
         if let Some(cap) = self.value_cap {
-            Self::clamp_value(&mut self.values[v_off..v_off + self.dim_val], cap);
+            Self::clamp_values_with_device(
+                &mut self.values[v_off..v_off + self.dim_val],
+                self.dim_val,
+                cap,
+                device,
+            );
         }
         self.confidence[idx] = 1.0;
         self.last_seen_step[idx] = 0;
@@ -209,8 +235,19 @@ impl HyperbolicEpisodicBankV2 {
         surprise: f32,
         current_step: usize,
     ) -> Option<usize> {
+        self.insert_protected_with_device(key_pnc, val, surprise, current_step, &Device::Cpu)
+    }
+
+    pub(crate) fn insert_protected_with_device(
+        &mut self,
+        key_pnc: &[f32],
+        val: &[f32],
+        surprise: f32,
+        current_step: usize,
+        device: &Device,
+    ) -> Option<usize> {
         if self.count < self.capacity {
-            let idx = self.insert(key_pnc, val);
+            let idx = self.insert_with_device(key_pnc, val, device);
             self.last_seen_step[idx] = current_step;
             return Some(idx);
         }
@@ -223,7 +260,7 @@ impl HyperbolicEpisodicBankV2 {
         ) {
             UpdateOutcome::Defended { .. } | UpdateOutcome::Stable { .. } => None,
             UpdateOutcome::Overwritten => {
-                let inserted = self.insert(key_pnc, val);
+                let inserted = self.insert_with_device(key_pnc, val, device);
                 self.last_seen_step[inserted] = current_step;
                 Some(inserted)
             }
@@ -514,6 +551,47 @@ mod tests {
         bank.set_value_cap(Some(tiny));
         bank.insert(&[0.0], &[tiny, -tiny]);
         assert_capped(&bank.values, tiny);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA GPU; checks PTX cap rounding and protected-write semantics"]
+    fn cuda_value_cap_matches_cpu_bits_and_metadata() {
+        use crate::backend::Device;
+        let ctx = crate::cuda::CudaContext::init().expect("CUDA GPU required");
+        let device = Device::Cuda(ctx.clone());
+        for cap in [1.0, f32::MAX, f32::MIN_POSITIVE, f32::from_bits(1)] {
+            let mut old = Bank::new(3, 1, 3);
+            old.insert(&[0.1], &[3.0, -4.0, 0.0]);
+            old.values[3..6].copy_from_slice(&[f32::MAX, -f32::MAX, f32::MAX]);
+            old.values[6..9].copy_from_slice(&[-0.0, f32::from_bits(1), 0.5]);
+            let mut new = old.clone();
+            old.set_value_cap(Some(cap));
+            new.set_value_cap_with_device(Some(cap), &device);
+            assert_eq!(bits(&new.values), bits(&old.values));
+            assert_metadata_eq(&new, &old);
+            for (step, surprise, value) in [
+                (1, 0.0, [3.0, 4.0, 0.0]),
+                (2, 0.0, [-0.0, f32::from_bits(1), 0.125]),
+                (3, 0.0, [f32::NAN; 3]), // defended: must not cap/reject unused input
+                (1000, 1e6, [f32::MAX, -f32::MAX, f32::MAX]),
+            ] {
+                let a = old.insert_protected(&[0.2], &value, surprise, step);
+                let b = new.insert_protected_with_device(&[0.2], &value, surprise, step, &device);
+                assert_eq!(a, b);
+                assert_eq!(bits(&new.values), bits(&old.values));
+                assert_metadata_eq(&new, &old);
+                for value in new.values.chunks_exact(3) {
+                    assert_capped(value, cap);
+                }
+            }
+            old.set_value_cap(None);
+            new.set_value_cap_with_device(None, &device);
+            assert_eq!(new, old);
+        }
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(ctx.cap_memory_values(&mut [bad, 0.0], 2, 1.0).is_err());
+        }
     }
 
     #[test]

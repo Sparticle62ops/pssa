@@ -463,8 +463,22 @@ impl CudaContext {
         self.stream
             .memcpy_htod(a, &mut a_dev)
             .map_err(|e| format!("CUDA lhs upload failed ({e:?})"))?;
+        // Registered optimizer weights are already current on the device.
+        // Reuse them for both forward and NN input adjoints instead of uploading
+        // the host mirror again after every clipped AdamW update.
+        let safeguards = self
+            .safeguards
+            .lock()
+            .map_err(|_| "CUDA safeguard lock poisoned")?;
+        let resident_weight = if cache_rhs {
+            safeguards.weight(b)
+        } else {
+            None
+        };
         let cached;
-        let b_dev = if cache_rhs {
+        let b_dev = if let Some(weight) = resident_weight {
+            weight.slice(..b.len())
+        } else if cache_rhs {
             cached = self.weight_buffer(b)?;
             cached.slice(..b.len())
         } else {
