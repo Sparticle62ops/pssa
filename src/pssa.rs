@@ -190,6 +190,14 @@ impl ParamMatrix {
     }
 }
 
+/// Result of an opt-in, globally clipped optimizer update. The norm is computed
+/// once, before scaling, in f64 so large finite f32 gradients do not overflow.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GradientClipOutcome {
+    Applied { norm: f64 },
+    Skipped { norm: f64 },
+}
+
 // =============================================================================
 // ENGINE CONFIGURATION
 // =============================================================================
@@ -2146,6 +2154,63 @@ impl PSSALayerV2 {
         }
     }
 
+    /// Visit exactly the gradients consumed by `apply_adamw`, including the
+    /// shared embedding/head and every continuous block. Stored memory and the
+    /// adapter's consolidated copy are detached, not Adam parameters.
+    fn for_each_adam_gradient(&mut self, mut visit: impl FnMut(&mut [f32])) {
+        visit(&mut self.embed_w.grad);
+        visit(&mut self.unembed_w.grad);
+        for b in std::iter::once(&mut self.block).chain(&mut self.extra_blocks) {
+            visit(&mut b.norm_gamma.grad);
+            visit(&mut b.norm_beta.grad);
+            for p in [
+                &mut b.a_mat,
+                &mut b.w_delta,
+                &mut b.w_b,
+                &mut b.w_c,
+                &mut b.w_qx,
+                &mut b.w_qh,
+                &mut b.w_gate,
+                &mut b.w_proj,
+                &mut b.mlp_w1,
+                &mut b.mlp_w2,
+            ] {
+                visit(&mut p.grad);
+            }
+            visit(&mut b.adapters[0].down_proj.grad);
+            visit(&mut b.adapters[0].up_proj.grad);
+        }
+    }
+
+    /// Opt-in global L2 clipping immediately before Adam, for any backward
+    /// backend. CUDA/WebGPU gradients have already been synchronized to host.
+    /// A non-finite norm clears gradients without touching weights, moments,
+    /// device weight caches, or the optimizer step counter.
+    pub fn apply_adamw_with_grad_clip(&mut self, lr: f32, max_norm: f32) -> GradientClipOutcome {
+        assert!(max_norm.is_finite() && max_norm > 0.0);
+        let mut norm_sq = 0.0f64;
+        self.for_each_adam_gradient(|grad| {
+            for &g in grad.iter() {
+                norm_sq += (g as f64) * (g as f64);
+            }
+        });
+        let norm = norm_sq.sqrt();
+        if !norm.is_finite() {
+            self.zero_gradients();
+            return GradientClipOutcome::Skipped { norm };
+        }
+        if norm > max_norm as f64 {
+            let scale = max_norm as f64 / norm;
+            self.for_each_adam_gradient(|grad| {
+                for g in grad {
+                    *g = (*g as f64 * scale) as f32;
+                }
+            });
+        }
+        self.apply_adamw(lr);
+        GradientClipOutcome::Applied { norm }
+    }
+
     pub fn apply_adamw(&mut self, lr: f32) {
         self.step_counter = self
             .step_counter
@@ -2217,5 +2282,134 @@ impl PSSALayerV2 {
                 .iter()
                 .map(PSSAContinuousBlockV2::parameter_count)
                 .sum::<usize>()
+    }
+}
+
+#[cfg(test)]
+mod training_safeguards_tests {
+    use super::*;
+
+    fn model() -> PSSALayerV2 {
+        PSSALayerV2::new_with_device(
+            PSSAConfigV2 {
+                depth: 2,
+                d_vocab: 5,
+                d_latent: 4,
+                d_state: 2,
+                d_mem_key: 2,
+                mem_capacity: 2,
+                chunk_len: 2,
+                ..Default::default()
+            },
+            42,
+            Device::Cpu,
+        )
+    }
+
+    fn gradients(m: &mut PSSALayerV2) -> Vec<f32> {
+        let mut out = Vec::new();
+        m.for_each_adam_gradient(|g| out.extend_from_slice(g));
+        out
+    }
+
+    fn optimizer_state(m: &PSSALayerV2) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut matrix = |p: &ParamMatrix| {
+            out.extend_from_slice(&p.data);
+            out.extend_from_slice(&p.m);
+            out.extend_from_slice(&p.v);
+        };
+        matrix(&m.embed_w);
+        matrix(&m.unembed_w);
+        for b in std::iter::once(&m.block).chain(&m.extra_blocks) {
+            for p in [
+                &b.a_mat,
+                &b.w_delta,
+                &b.w_b,
+                &b.w_c,
+                &b.w_qx,
+                &b.w_qh,
+                &b.w_gate,
+                &b.w_proj,
+                &b.mlp_w1,
+                &b.mlp_w2,
+                &b.adapters[0].down_proj,
+                &b.adapters[0].up_proj,
+            ] {
+                matrix(p);
+            }
+        }
+        for b in std::iter::once(&m.block).chain(&m.extra_blocks) {
+            for p in [&b.norm_gamma, &b.norm_beta] {
+                out.extend_from_slice(&p.data);
+                out.extend_from_slice(&p.m);
+                out.extend_from_slice(&p.v);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn global_clip_covers_every_adam_parameter_and_preserves_small_gradients() {
+        let mut m = model();
+        m.for_each_adam_gradient(|g| g.fill(2.0));
+        let original = gradients(&mut m);
+        assert_eq!(original.len(), m.parameter_count());
+        let expected_norm = 2.0 * (original.len() as f64).sqrt();
+        let GradientClipOutcome::Applied { norm } = m.apply_adamw_with_grad_clip(1e-3, 1.0) else {
+            panic!("finite gradients skipped");
+        };
+        assert_eq!(norm, expected_norm);
+        let clipped = gradients(&mut m);
+        let norm_after = clipped
+            .iter()
+            .map(|&g| (g as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!((norm_after - 1.0).abs() < 1e-6);
+        for g in clipped {
+            assert!((g as f64 - 2.0 / expected_norm).abs() < 1e-6 / expected_norm);
+        }
+        m.zero_gradients();
+        m.embed_w.grad[0] = 0.3;
+        m.block.adapters[0].up_proj.grad[0] = 0.4;
+        let before = gradients(&mut m);
+        assert!(matches!(
+            m.apply_adamw_with_grad_clip(1e-3, 1.0),
+            GradientClipOutcome::Applied { .. }
+        ));
+        assert_eq!(gradients(&mut m), before); // no multiply, even by 1
+        assert_eq!(m.step_counter, 2);
+    }
+
+    #[test]
+    fn nonfinite_clip_skips_atomically_with_nonzero_adam_moments() {
+        let mut m = model();
+        m.for_each_adam_gradient(|g| g.fill(0.1));
+        m.apply_adamw(1e-3);
+        let before = optimizer_state(&m);
+        for bad in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            m.for_each_adam_gradient(|g| g.fill(0.2));
+            m.extra_blocks[0].adapters[0].up_proj.grad[0] = bad;
+            assert!(matches!(
+                m.apply_adamw_with_grad_clip(1e-3, 1.0),
+                GradientClipOutcome::Skipped { .. }
+            ));
+            assert_eq!(m.step_counter, 1);
+            assert_eq!(optimizer_state(&m), before);
+            assert!(gradients(&mut m).iter().all(|&g| g == 0.0));
+        }
+    }
+
+    #[test]
+    fn huge_finite_gradients_clip_before_f32_adam_second_moment_overflow() {
+        let mut m = model();
+        m.block.norm_gamma.grad[0] = 1e21;
+        let GradientClipOutcome::Applied { norm } = m.apply_adamw_with_grad_clip(1e-3, 1.0) else {
+            panic!("large finite gradient must not overflow the norm");
+        };
+        assert_eq!(norm, 1e21f32 as f64);
+        assert_eq!(m.block.norm_gamma.grad[0], 1.0);
+        assert!(optimizer_state(&m).iter().all(|x| x.is_finite()));
     }
 }
