@@ -214,6 +214,7 @@ impl Inspector {
                 title: &format!(" plastic memory / {used}/{capacity} slots "),
                 caption: "Used memory slots over recent observations",
                 x: "sample",
+                integer_x: true,
                 y: "used slots",
                 x_bounds: super::charts::domain(&history),
                 y_bounds: [0.0, capacity.max(1) as f64],

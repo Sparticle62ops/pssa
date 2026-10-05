@@ -226,6 +226,7 @@ impl Benchmark {
                     ),
                     caption: "Lower = less surprise on unseen text; matched training exposure",
                     x: "perplexity",
+                    integer_x: false,
                     y: "model",
                     x_bounds: [0.0, max],
                     y_bounds: [0.0, 3.0],

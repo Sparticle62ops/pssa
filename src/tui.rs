@@ -2618,6 +2618,7 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
             title: &title,
             caption,
             x: if has_steps { "training step" } else { "sample" },
+            integer_x: true,
             y,
             x_bounds,
             y_bounds,
@@ -2664,6 +2665,7 @@ fn draw_memory_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             title: &title,
             caption: "Dots = used slots, not learned positions",
             x: "disk x",
+            integer_x: false,
             y: "disk y",
             x_bounds: [-1.0, 1.0],
             y_bounds: [-1.0, 1.0],
@@ -3956,6 +3958,47 @@ mod tests {
             .collect();
         assert!(text.contains("Poincare disk"));
         assert!(text.contains("12/64"));
+    }
+
+    #[test]
+    fn monitor_loss_axes_keep_ticks_and_titles_out_of_the_curve() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut state = RunState::default();
+        for (step, loss) in [(1, 5.0), (75, 4.0), (150, 3.0)] {
+            state.ingest(&format!("training {step}/150 (50%) loss={loss} global_update={step} tokens_per_second=100"));
+        }
+        state.graph_updated_at = None;
+        for (w, h) in [(120, 40), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| draw(f, &state, 0)).unwrap();
+            let b = terminal.backend().buffer();
+            let content = HexBackground::content_area(b.area);
+            let row = |y| (content.x..content.right()).map(|x| b[(x, y)].symbol()).collect::<String>();
+            let top = (content.y..content.bottom()).find(|&y| row(y).contains("graph / loss")).unwrap();
+            let bottom = (top + 1..content.bottom()).find(|&y| b[(content.x, y)].symbol() == "└").unwrap();
+            let data_top = top + 1;
+            let data_bottom = bottom - 3;
+            let middle = data_bottom - (data_bottom - data_top) / 2;
+            for (y, label) in [(data_top, "6.0"), (middle, "4.0"), (data_bottom, "2.0")] {
+                assert!(row(y).starts_with(&format!("│{label}│")), "tick misplaced: {}", row(y));
+            }
+            assert!((middle - data_top).abs_diff(data_bottom - middle) <= 1);
+            let labels = row(bottom - 1);
+            for token in ["1", "76", "150", "training", "step"] {
+                assert!(labels.split(|c: char| c.is_whitespace() || c == '│').any(|s| s == token), "missing {token}: {labels}");
+            }
+            assert!(!labels.contains("75.5"));
+            assert!(row(bottom).contains("green: loss"));
+            let axis = content.x + 4;
+            let right = (axis + 1..content.right()).find(|&x| b[(x, data_top)].symbol() == "│").unwrap();
+            for y in data_top..=data_bottom {
+                for x in axis + 1..right {
+                    let cell = &b[(x, y)];
+                    assert_eq!(cell.bg, PANEL_BG);
+                    assert!(cell.symbol() == " " || cell.symbol().chars().all(|c| ('\u{2800}'..='\u{28ff}').contains(&c)), "label over curve: {}", row(y));
+                }
+            }
+        }
     }
 
     #[test]

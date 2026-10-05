@@ -1340,6 +1340,7 @@ impl Eval {
                 title: " quality / checkpoint ",
                 caption: "Lower = less surprise on fixed reference answers, not correctness",
                 x: "checkpoint",
+                integer_x: true,
                 y: "reference loss",
                 x_bounds: charts::domain(&points),
                 y_bounds: charts::bounds(points.iter().map(|p| p.1)),
