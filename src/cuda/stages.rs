@@ -1,0 +1,970 @@
+//! CUDA SSM scan, episodic-memory retrieval, and token-local arithmetic.
+//!
+//! The decomposition is backend-neutral: the affine scan is a tiled exclusive
+//! Blelloch scan. One workgroup/block owns one independent latent/state channel
+//! and one lane owns one sequence row within a tile. Tile totals are scanned by
+//! the same kernel recursively, then composed into each tile's local prefix.
+//! Memory retrieval and its VJP use one invocation per token and keep the slot
+//! loop inside that invocation. A WGSL port can reuse these ownership rules.
+
+use super::*;
+use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
+
+struct Kernels {
+    prepare: CudaFunction,
+    scan: CudaFunction,
+    scan_apply: CudaFunction,
+    materialize: CudaFunction,
+    backward_maps: CudaFunction,
+    backward_local: CudaFunction,
+    memory_forward: CudaFunction,
+    memory_backward: CudaFunction,
+    memory_backward_local: CudaFunction,
+    add: CudaFunction,
+    sigmoid_mul: CudaFunction,
+    sigmoid: CudaFunction,
+    softplus: CudaFunction,
+}
+
+struct MemoryBuffers {
+    x: CudaSlice<f32>,
+    y: CudaSlice<f32>,
+    q_euc: CudaSlice<f32>,
+    q_pnc: CudaSlice<f32>,
+    q_norm: CudaSlice<f32>,
+    weights: CudaSlice<f32>,
+    m_val: CudaSlice<f32>,
+    g_mem: CudaSlice<f32>,
+    m_proj: CudaSlice<f32>,
+    m_inj: CudaSlice<f32>,
+    keys: Option<CudaSlice<f32>>,
+    norm_sq: Option<CudaSlice<f32>>,
+    values: Option<CudaSlice<f32>>,
+}
+
+struct ForwardBuffers {
+    seq_len: usize,
+    d_m: usize,
+    d_s: usize,
+    stride: usize,
+    delta: CudaSlice<f32>,
+    delta_raw: CudaSlice<f32>,
+    b_proj: CudaSlice<f32>,
+    x_norm: CudaSlice<f32>,
+    rates: CudaSlice<f32>,
+    rate_deriv: Option<CudaSlice<f32>>,
+    c_proj: CudaSlice<f32>,
+    bar_a: CudaSlice<f32>,
+    bar_b: CudaSlice<f32>,
+    scan_a: CudaSlice<f32>,
+    scan_b: CudaSlice<f32>,
+    states: CudaSlice<f32>,
+    y_ssm: CudaSlice<f32>,
+    memory: Option<MemoryBuffers>,
+}
+
+#[derive(Default)]
+pub(super) struct StageState {
+    kernels: Option<Kernels>,
+    forward: Option<ForwardBuffers>,
+}
+
+fn error(e: impl std::fmt::Debug) -> String {
+    format!("CUDA scan/memory stage failed ({e:?})")
+}
+
+fn elems(value: usize, what: &str) -> Result<u32, String> {
+    u32::try_from(value).map_err(|_| format!("CUDA {what} exceeds the kernel index limit"))
+}
+
+fn product(a: usize, b: usize, what: &str) -> Result<usize, String> {
+    a.checked_mul(b)
+        .ok_or_else(|| format!("CUDA {what} size overflow"))
+}
+
+fn scan_capacity(len: usize) -> usize {
+    if len <= 1 {
+        return 1;
+    }
+    if len <= 512 {
+        len.next_power_of_two()
+    } else {
+        1024
+    }
+}
+
+impl CudaContext {
+    fn stage_kernels<'a>(&self, state: &'a mut StageState) -> Result<&'a Kernels, String> {
+        if state.kernels.is_none() {
+            let module = self
+                .stream
+                .context()
+                .load_module(cudarc::nvrtc::Ptx::from_src(include_str!("stages.ptx")))
+                .map_err(error)?;
+            state.kernels = Some(Kernels {
+                prepare: module.load_function("ssm_prepare").map_err(error)?,
+                scan: module.load_function("affine_scan").map_err(error)?,
+                scan_apply: module.load_function("scan_apply").map_err(error)?,
+                materialize: module.load_function("ssm_materialize").map_err(error)?,
+                backward_maps: module.load_function("ssm_backward_maps").map_err(error)?,
+                backward_local: module.load_function("ssm_backward_local").map_err(error)?,
+                memory_forward: module.load_function("memory_forward").map_err(error)?,
+                memory_backward: module.load_function("memory_backward").map_err(error)?,
+                memory_backward_local: module
+                    .load_function("memory_backward_local")
+                    .map_err(error)?,
+                add: module.load_function("add_in_place").map_err(error)?,
+                sigmoid_mul: module.load_function("sigmoid_mul").map_err(error)?,
+                sigmoid: module.load_function("sigmoid_in_place").map_err(error)?,
+                softplus: module.load_function("softplus_in_place").map_err(error)?,
+            });
+        }
+        Ok(state.kernels.as_ref().unwrap())
+    }
+
+    fn gemm_device(
+        &self,
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), String> {
+        if [m, k, n].iter().any(|&x| x == 0 || x > i32::MAX as usize) {
+            return Err("CUDA stage GEMM dimensions are invalid".into());
+        }
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: 1.0,
+            beta: 0.0,
+            lda: n as i32,
+            ldb: k as i32,
+            ldc: n as i32,
+        };
+        unsafe { self.blas.gemm(cfg, b, a, out) }.map_err(error)
+    }
+
+    /// Scan arbitrary sequence lengths in tiled workgroups.  The temporary
+    /// tile-total arrays are device-only; recursive calls never cross the host
+    /// boundary.  `out_a/out_b` are exclusive prefixes on return.
+    fn launch_scan(
+        &self,
+        kernels: &Kernels,
+        in_a: &CudaSlice<f32>,
+        in_b: &CudaSlice<f32>,
+        out_a: &mut CudaSlice<f32>,
+        out_b: &mut CudaSlice<f32>,
+        len: usize,
+        stride: usize,
+    ) -> Result<(), String> {
+        if len == 0 || stride == 0 {
+            return Err("CUDA affine scan dimensions must be positive".into());
+        }
+        let capacity = scan_capacity(len);
+        let tiles = len.div_ceil(capacity);
+        let len_arg = elems(len, "scan length")?;
+        let stride_arg = elems(stride, "scan stride")?;
+        let capacity_arg = elems(capacity, "scan tile width")?;
+        let tiles_arg = elems(tiles, "scan tile count")?;
+        let mut summary_a = self
+            .stream
+            .alloc_zeros::<f32>(product(tiles, stride, "scan summaries")?)
+            .map_err(error)?;
+        let mut summary_b = self
+            .stream
+            .alloc_zeros::<f32>(product(tiles, stride, "scan summaries")?)
+            .map_err(error)?;
+        unsafe {
+            self.stream
+                .launch_builder(&kernels.scan)
+                .arg(in_a)
+                .arg(in_b)
+                .arg(&mut *out_a)
+                .arg(&mut *out_b)
+                .arg(&mut summary_a)
+                .arg(&mut summary_b)
+                .arg(&len_arg)
+                .arg(&stride_arg)
+                .arg(&capacity_arg)
+                .launch(LaunchConfig {
+                    grid_dim: (stride_arg, tiles_arg, 1),
+                    block_dim: (capacity_arg, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(error)?;
+        }
+        if tiles == 1 {
+            return Ok(());
+        }
+        let mut prefix_a = self
+            .stream
+            .alloc_zeros::<f32>(product(tiles, stride, "scan prefixes")?)
+            .map_err(error)?;
+        let mut prefix_b = self
+            .stream
+            .alloc_zeros::<f32>(product(tiles, stride, "scan prefixes")?)
+            .map_err(error)?;
+        self.launch_scan(
+            kernels,
+            &summary_a,
+            &summary_b,
+            &mut prefix_a,
+            &mut prefix_b,
+            tiles,
+            stride,
+        )?;
+        unsafe {
+            self.stream
+                .launch_builder(&kernels.scan_apply)
+                .arg(&mut *out_a)
+                .arg(&mut *out_b)
+                .arg(&prefix_a)
+                .arg(&prefix_b)
+                .arg(&len_arg)
+                .arg(&stride_arg)
+                .arg(&capacity_arg)
+                .launch(LaunchConfig::for_num_elems(elems(product(len, stride, "scan elements")?, "scan elements")?))
+                .map_err(error)?;
+        }
+        Ok(())
+    }
+
+    fn make_ssm_buffers(
+        &self,
+        kernels: &Kernels,
+        delta: &[f32],
+        delta_raw: &[f32],
+        b_proj: &[f32],
+        x_norm: &[f32],
+        rates: &[f32],
+        c_proj: &[f32],
+        initial: &[f32],
+        seq_len: usize,
+        d_m: usize,
+        d_s: usize,
+    ) -> Result<ForwardBuffers, String> {
+        if seq_len == 0 || d_m == 0 || d_s == 0 {
+            return Err("CUDA SSM dimensions must be positive".into());
+        }
+        let stride = product(d_m, d_s, "SSM stride")?;
+        let token_m = product(seq_len, d_m, "SSM latent tape")?;
+        let token_s = product(seq_len, d_s, "SSM projection tape")?;
+        let token_state = product(seq_len, stride, "SSM state tape")?;
+        let state_len = product(seq_len + 1, stride, "SSM state tape")?;
+        if delta.len() != token_m
+            || delta_raw.len() != token_m
+            || b_proj.len() != token_s
+            || x_norm.len() != token_m
+            || rates.len() != stride
+            || c_proj.len() != token_s
+            || initial.len() != stride
+        {
+            return Err("CUDA SSM forward shape mismatch".into());
+        }
+        let d_delta = self.stream.clone_htod(delta).map_err(error)?;
+        let d_delta_raw = self.stream.clone_htod(delta_raw).map_err(error)?;
+        let d_b = self.stream.clone_htod(b_proj).map_err(error)?;
+        let d_x = self.stream.clone_htod(x_norm).map_err(error)?;
+        let d_rates = self.stream.clone_htod(rates).map_err(error)?;
+        let d_c = self.stream.clone_htod(c_proj).map_err(error)?;
+        let d_initial = self.stream.clone_htod(initial).map_err(error)?;
+        let mut d_bar_a = self.stream.alloc_zeros::<f32>(token_state).map_err(error)?;
+        let mut d_bar_b = self.stream.alloc_zeros::<f32>(token_state).map_err(error)?;
+        let mut d_scan_a = self.stream.alloc_zeros::<f32>(token_state).map_err(error)?;
+        let mut d_scan_b = self.stream.alloc_zeros::<f32>(token_state).map_err(error)?;
+        let mut d_scan_input_b = self.stream.alloc_zeros::<f32>(token_state).map_err(error)?;
+        let mut d_states = self.stream.alloc_zeros::<f32>(state_len).map_err(error)?;
+        self.stream
+            .memcpy_htod(initial, &mut d_states.slice_mut(..stride))
+            .map_err(error)?;
+        let mut d_y = self.stream.alloc_zeros::<f32>(token_m).map_err(error)?;
+        let len_arg = elems(seq_len, "SSM length")?;
+        let dm_arg = elems(d_m, "latent width")?;
+        let ds_arg = elems(d_s, "state width")?;
+        unsafe {
+            self.stream
+                .launch_builder(&kernels.prepare)
+                .arg(&d_delta)
+                .arg(&d_b)
+                .arg(&d_x)
+                .arg(&d_rates)
+                .arg(&mut d_bar_a)
+                .arg(&mut d_bar_b)
+                .arg(&mut d_scan_input_b)
+                .arg(&len_arg)
+                .arg(&dm_arg)
+                .arg(&ds_arg)
+                .launch(LaunchConfig::for_num_elems(elems(token_state, "SSM elements")?))
+                .map_err(error)?;
+        }
+        self.launch_scan(
+            kernels,
+            &d_bar_a,
+            &d_scan_input_b,
+            &mut d_scan_a,
+            &mut d_scan_b,
+            seq_len,
+            stride,
+        )?;
+        unsafe {
+            self.stream
+                .launch_builder(&kernels.materialize)
+                .arg(&d_initial)
+                .arg(&d_bar_a)
+                .arg(&d_bar_b)
+                .arg(&d_x)
+                .arg(&d_scan_a)
+                .arg(&d_scan_b)
+                .arg(&d_c)
+                .arg(&mut d_states)
+                .arg(&mut d_y)
+                .arg(&len_arg)
+                .arg(&dm_arg)
+                .arg(&ds_arg)
+                .launch(LaunchConfig::for_num_elems(elems(token_m, "SSM outputs")?))
+                .map_err(error)?;
+        }
+        Ok(ForwardBuffers {
+            seq_len,
+            d_m,
+            d_s,
+            stride,
+            delta: d_delta,
+            delta_raw: d_delta_raw,
+            b_proj: d_b,
+            x_norm: d_x,
+            rates: d_rates,
+            rate_deriv: None,
+            c_proj: d_c,
+            bar_a: d_bar_a,
+            bar_b: d_bar_b,
+            scan_a: d_scan_a,
+            scan_b: d_scan_b,
+            states: d_states,
+            y_ssm: d_y,
+            memory: None,
+        })
+    }
+
+    fn readback_ssm(
+        &self,
+        fwd: &ForwardBuffers,
+        bar_a: &mut [f32],
+        bar_b: &mut [f32],
+        states: &mut [f32],
+        y_ssm: &mut [f32],
+    ) -> Result<(), String> {
+        let token_state = product(fwd.seq_len, fwd.stride, "SSM state tape")?;
+        let token_m = product(fwd.seq_len, fwd.d_m, "SSM output tape")?;
+        if bar_a.len() != token_state
+            || bar_b.len() != token_state
+            || states.len() < (fwd.seq_len + 1) * fwd.stride
+            || y_ssm.len() != token_m
+        {
+            return Err("CUDA SSM output shape mismatch".into());
+        }
+        self.stream.memcpy_dtoh(&fwd.bar_a, bar_a).map_err(error)?;
+        self.stream.memcpy_dtoh(&fwd.bar_b, bar_b).map_err(error)?;
+        self.stream
+            .memcpy_dtoh(&fwd.states, &mut states[..(fwd.seq_len + 1) * fwd.stride])
+            .map_err(error)?;
+        self.stream.memcpy_dtoh(&fwd.y_ssm, y_ssm).map_err(error)?;
+        Ok(())
+    }
+
+    pub(crate) fn ssm_forward_resident(
+        &self,
+        delta: &[f32],
+        delta_raw: &[f32],
+        b_proj: &[f32],
+        x_norm: &[f32],
+        rates: &[f32],
+        c_proj: &[f32],
+        initial: &[f32],
+        seq_len: usize,
+        d_m: usize,
+        d_s: usize,
+    ) -> Result<(), String> {
+        let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
+        let kernels = self.stage_kernels(&mut state)?.clone();
+        let fwd = self.make_ssm_buffers(
+            &kernels, delta, delta_raw, b_proj, x_norm, rates, c_proj, initial, seq_len, d_m, d_s,
+        )?;
+        state.forward = Some(fwd);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ssm_forward(
+        &self,
+        delta: &[f32],
+        delta_raw: &[f32],
+        b_proj: &[f32],
+        x_norm: &[f32],
+        rates: &[f32],
+        rate_deriv: &[f32],
+        c_proj: &[f32],
+        initial: &[f32],
+        seq_len: usize,
+        d_m: usize,
+        d_s: usize,
+        bar_a: &mut [f32],
+        bar_b: &mut [f32],
+        states: &mut [f32],
+        y_ssm: &mut [f32],
+    ) -> Result<(), String> {
+        let _ = rate_deriv;
+        self.ssm_forward_resident(
+            delta, delta_raw, b_proj, x_norm, rates, c_proj, initial, seq_len, d_m, d_s,
+        )?;
+        let state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
+        let fwd = state.forward.as_ref().ok_or("CUDA SSM state was lost")?;
+        self.readback_ssm(fwd, bar_a, bar_b, states, y_ssm)?;
+        self.stream.synchronize().map_err(error)
+    }
+
+    fn make_memory_buffers(
+        &self,
+        x: CudaSlice<f32>,
+        y: CudaSlice<f32>,
+        seq_len: usize,
+        d_m: usize,
+        d_k: usize,
+        d_val: usize,
+        capacity: usize,
+        weights: &[f32],
+    ) -> Result<MemoryBuffers, String> {
+        let x_len = product(seq_len, d_m, "memory input")?;
+        let q_len = product(seq_len, d_k, "memory query")?;
+        let value_len = product(seq_len, d_val, "memory value")?;
+        let weight_len = product(seq_len, capacity, "memory weights")?;
+        if x.len() != x_len || y.len() != x_len || weights.len() != weight_len {
+            return Err("CUDA memory buffer shape mismatch".into());
+        }
+        Ok(MemoryBuffers {
+            x,
+            y,
+            q_euc: self.stream.alloc_zeros::<f32>(q_len).map_err(error)?,
+            q_pnc: self.stream.alloc_zeros::<f32>(q_len).map_err(error)?,
+            q_norm: self.stream.alloc_zeros::<f32>(seq_len).map_err(error)?,
+            weights: self.stream.clone_htod(weights).map_err(error)?,
+            m_val: self.stream.alloc_zeros::<f32>(value_len).map_err(error)?,
+            g_mem: self.stream.alloc_zeros::<f32>(x_len).map_err(error)?,
+            m_proj: self.stream.alloc_zeros::<f32>(x_len).map_err(error)?,
+            m_inj: self.stream.alloc_zeros::<f32>(x_len).map_err(error)?,
+            keys: None,
+            norm_sq: None,
+            values: None,
+        })
+    }
+
+    fn run_memory_forward(
+        &self,
+        kernels: &Kernels,
+        mem: &mut MemoryBuffers,
+        w_qx: &[f32],
+        w_qh: &[f32],
+        w_gate: &[f32],
+        w_proj: &[f32],
+        keys: &[f32],
+        norm_sq: &[f32],
+        values: &[f32],
+        seq_len: usize,
+        d_m: usize,
+        d_k: usize,
+        d_val: usize,
+        capacity: usize,
+        count: usize,
+        tau: f32,
+    ) -> Result<(), String> {
+        if count > capacity
+            || w_qx.len() != d_k * d_m
+            || w_qh.len() != d_k * d_m
+            || w_gate.len() != d_m * d_m
+            || w_proj.len() != d_m * d_val
+            || keys.len() != capacity * d_k
+            || norm_sq.len() != capacity
+            || values.len() != capacity * d_val
+            || !tau.is_finite()
+            || tau <= 0.0
+        {
+            return Err("CUDA memory forward shape mismatch".into());
+        }
+        let dwqx = self.stream.clone_htod(w_qx).map_err(error)?;
+        let dwqh = self.stream.clone_htod(w_qh).map_err(error)?;
+        let dwg = self.stream.clone_htod(w_gate).map_err(error)?;
+        let dwp = self.stream.clone_htod(w_proj).map_err(error)?;
+        let dkeys = self.stream.clone_htod(keys).map_err(error)?;
+        let dnorm = self.stream.clone_htod(norm_sq).map_err(error)?;
+        let dvalues = self.stream.clone_htod(values).map_err(error)?;
+        self.gemm_device(&mem.x, &dwqx, seq_len, d_m, d_k, &mut mem.q_euc)?;
+        self.gemm_device(&mem.y, &dwqh, seq_len, d_m, d_k, &mut mem.m_proj)?;
+        let q_len = elems(product(seq_len, d_k, "query count")?, "query count")?;
+        unsafe {
+            self.stream
+                .launch_builder(&kernels.add)
+                .arg(&mut mem.q_euc)
+                .arg(&mem.m_proj)
+                .arg(&q_len)
+                .launch(LaunchConfig::for_num_elems(q_len))
+                .map_err(error)?;
+        }
+        let len_arg = elems(seq_len, "memory length")?;
+        let count_arg = elems(count, "memory count")?;
+        let capacity_arg = elems(capacity, "memory capacity")?;
+        let key_arg = elems(d_k, "key width")?;
+        let val_arg = elems(d_val, "value width")?;
+        unsafe {
+            self.stream
+                .launch_builder(&kernels.memory_forward)
+                .arg(&mem.q_euc)
+                .arg(&dkeys)
+                .arg(&dnorm)
+                .arg(&dvalues)
+                .arg(&mut mem.q_pnc)
+                .arg(&mut mem.q_norm)
+                .arg(&mut mem.m_val)
+                .arg(&mut mem.weights)
+                .arg(&len_arg)
+                .arg(&count_arg)
+                .arg(&capacity_arg)
+                .arg(&key_arg)
+                .arg(&val_arg)
+                .arg(&tau)
+                .launch(LaunchConfig::for_num_elems(len_arg))
+                .map_err(error)?;
+        }
+        self.gemm_device(&mem.x, &dwg, seq_len, d_m, d_m, &mut mem.g_mem)?;
+        let x_len = elems(product(seq_len, d_m, "memory element count")?, "memory element count")?;
+        unsafe {
+            self.stream
+                .launch_builder(&kernels.sigmoid)
+                .arg(&mut mem.g_mem)
+                .arg(&x_len)
+                .launch(LaunchConfig::for_num_elems(x_len))
+                .map_err(error)?;
+        }
+        self.gemm_device(&mem.m_val, &dwp, seq_len, d_val, d_m, &mut mem.m_proj)?;
+        unsafe {
+            self.stream
+                .launch_builder(&kernels.sigmoid_mul)
+                .arg(&mem.g_mem)
+                .arg(&mem.m_proj)
+                .arg(&mut mem.m_inj)
+                .arg(&x_len)
+                .launch(LaunchConfig::for_num_elems(x_len))
+                .map_err(error)?;
+        }
+        mem.keys = Some(dkeys);
+        mem.norm_sq = Some(dnorm);
+        mem.values = Some(dvalues);
+        Ok(())
+    }
+
+    fn readback_memory(
+        &self,
+        mem: &MemoryBuffers,
+        q_euc: &mut [f32],
+        q_pnc: &mut [f32],
+        q_norm: &mut [f32],
+        weights: &mut [f32],
+        m_val: &mut [f32],
+        g_mem: &mut [f32],
+        m_proj: &mut [f32],
+        m_inj: &mut [f32],
+    ) -> Result<(), String> {
+        self.stream.memcpy_dtoh(&mem.q_euc, q_euc).map_err(error)?;
+        self.stream.memcpy_dtoh(&mem.q_pnc, q_pnc).map_err(error)?;
+        self.stream.memcpy_dtoh(&mem.q_norm, q_norm).map_err(error)?;
+        self.stream.memcpy_dtoh(&mem.weights, weights).map_err(error)?;
+        self.stream.memcpy_dtoh(&mem.m_val, m_val).map_err(error)?;
+        self.stream.memcpy_dtoh(&mem.g_mem, g_mem).map_err(error)?;
+        self.stream.memcpy_dtoh(&mem.m_proj, m_proj).map_err(error)?;
+        self.stream.memcpy_dtoh(&mem.m_inj, m_inj).map_err(error)?;
+        self.stream.synchronize().map_err(error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn memory_forward_after_ssm(
+        &self,
+        x_norm: &[f32],
+        w_qx: &[f32],
+        w_qh: &[f32],
+        w_gate: &[f32],
+        w_proj: &[f32],
+        keys: &[f32],
+        norm_sq: &[f32],
+        values: &[f32],
+        seq_len: usize,
+        d_m: usize,
+        d_k: usize,
+        d_val: usize,
+        capacity: usize,
+        count: usize,
+        tau: f32,
+        bar_a: &mut [f32],
+        bar_b: &mut [f32],
+        states: &mut [f32],
+        y_ssm: &mut [f32],
+        q_euc: &mut [f32],
+        q_pnc: &mut [f32],
+        q_norm: &mut [f32],
+        weights: &mut [f32],
+        m_val: &mut [f32],
+        g_mem: &mut [f32],
+        m_proj: &mut [f32],
+        m_inj: &mut [f32],
+    ) -> Result<(), String> {
+        let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
+        let mut fwd = state
+            .forward
+            .take()
+            .ok_or("CUDA SSM result is not resident")?;
+        let kernels = self.stage_kernels(&mut state)?.clone();
+        if fwd.seq_len != seq_len || fwd.d_m != d_m || fwd.d_s * d_m != fwd.stride {
+            return Err("CUDA resident SSM shape mismatch".into());
+        }
+        let x = self.stream.clone_htod(x_norm).map_err(error)?;
+        let y = fwd.y_ssm.clone();
+        let mut mem = self.make_memory_buffers(
+            x, y, seq_len, d_m, d_k, d_val, capacity, weights,
+        )?;
+        self.run_memory_forward(
+            &kernels, &mut mem, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len,
+            d_m, d_k, d_val, capacity, count, tau,
+        )?;
+        self.readback_ssm(&fwd, bar_a, bar_b, states, y_ssm)?;
+        self.readback_memory(
+            &mem, q_euc, q_pnc, q_norm, weights, m_val, g_mem, m_proj, m_inj,
+        )?;
+        fwd.memory = Some(mem);
+        state.forward = Some(fwd);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn memory_forward(
+        &self,
+        x_norm: &[f32],
+        y_ssm: &[f32],
+        w_qx: &[f32],
+        w_qh: &[f32],
+        w_gate: &[f32],
+        w_proj: &[f32],
+        keys: &[f32],
+        norm_sq: &[f32],
+        values: &[f32],
+        seq_len: usize,
+        d_m: usize,
+        d_k: usize,
+        d_val: usize,
+        capacity: usize,
+        count: usize,
+        tau: f32,
+        q_euc: &mut [f32],
+        q_pnc: &mut [f32],
+        q_norm: &mut [f32],
+        weights: &mut [f32],
+        m_val: &mut [f32],
+        g_mem: &mut [f32],
+        m_proj: &mut [f32],
+        m_inj: &mut [f32],
+    ) -> Result<(), String> {
+        let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
+        let kernels = self.stage_kernels(&mut state)?.clone();
+        let x = self.stream.clone_htod(x_norm).map_err(error)?;
+        let y = self.stream.clone_htod(y_ssm).map_err(error)?;
+        let mut mem = self.make_memory_buffers(
+            x, y, seq_len, d_m, d_k, d_val, capacity, weights,
+        )?;
+        self.run_memory_forward(
+            &kernels, &mut mem, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len,
+            d_m, d_k, d_val, capacity, count, tau,
+        )?;
+        self.readback_memory(
+            &mem, q_euc, q_pnc, q_norm, weights, m_val, g_mem, m_proj, m_inj,
+        )
+    }
+
+    pub(crate) fn memory_backward_local(
+        &self,
+        g_zraw: &[f32],
+        g_mem: &[f32],
+        m_proj: &[f32],
+        g_m_proj: &mut [f32],
+        g_gate: &mut [f32],
+    ) -> Result<(), String> {
+        if g_zraw.len() != g_mem.len()
+            || g_zraw.len() != m_proj.len()
+            || g_zraw.len() != g_m_proj.len()
+            || g_zraw.len() != g_gate.len()
+        {
+            return Err("CUDA memory backward local shape mismatch".into());
+        }
+        let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
+        let kernels = self.stage_kernels(&mut state)?.clone();
+        let dz = self.stream.clone_htod(g_zraw).map_err(error)?;
+        let dm = self.stream.clone_htod(g_mem).map_err(error)?;
+        let dp = self.stream.clone_htod(m_proj).map_err(error)?;
+        let mut out_m = self.stream.alloc_zeros::<f32>(g_m_proj.len()).map_err(error)?;
+        let mut out_g = self.stream.alloc_zeros::<f32>(g_gate.len()).map_err(error)?;
+        let len = elems(g_zraw.len(), "memory backward local count")?;
+        unsafe {
+            self.stream
+                .launch_builder(&kernels.memory_backward_local)
+                .arg(&dz)
+                .arg(&dm)
+                .arg(&dp)
+                .arg(&mut out_m)
+                .arg(&mut out_g)
+                .arg(&len)
+                .launch(LaunchConfig::for_num_elems(len))
+                .map_err(error)?;
+        }
+        self.stream.memcpy_dtoh(&out_m, g_m_proj).map_err(error)?;
+        self.stream.memcpy_dtoh(&out_g, g_gate).map_err(error)?;
+        self.stream.synchronize().map_err(error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ssm_backward(
+        &self,
+        delta: &[f32],
+        delta_raw: &[f32],
+        b_proj: &[f32],
+        c_proj: &[f32],
+        rates: &[f32],
+        rate_deriv: &[f32],
+        x_norm: &[f32],
+        states: &[f32],
+        bar_a: &[f32],
+        bar_b: &[f32],
+        g_zraw: &[f32],
+        g_ysm: &[f32],
+        seq_len: usize,
+        d_m: usize,
+        d_s: usize,
+        scale: f32,
+        g_delta: &mut [f32],
+        g_b: &mut [f32],
+        g_c: &mut [f32],
+        g_a: &mut [f32],
+        g_x: &mut [f32],
+    ) -> Result<(), String> {
+        let stride = product(d_m, d_s, "SSM stride")?;
+        let token_m = product(seq_len, d_m, "SSM latent tape")?;
+        let token_s = product(seq_len, d_s, "SSM projection tape")?;
+        let token_state = product(seq_len, stride, "SSM state tape")?;
+        if delta.len() != token_m
+            || delta_raw.len() != token_m
+            || b_proj.len() != token_s
+            || c_proj.len() != token_s
+            || rates.len() != stride
+            || rate_deriv.len() != stride
+            || x_norm.len() != token_m
+            || states.len() < (seq_len + 1) * stride
+            || bar_a.len() != token_state
+            || bar_b.len() != token_state
+            || g_zraw.len() != token_m
+            || g_ysm.len() != token_m
+            || g_delta.len() != token_m
+            || g_b.len() != token_s
+            || g_c.len() != token_s
+            || g_a.len() != token_state
+            || g_x.len() != token_m
+        {
+            return Err("CUDA SSM backward shape mismatch".into());
+        }
+        let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
+        let kernels = self.stage_kernels(&mut state)?.clone();
+        let d_delta = self.stream.clone_htod(delta).map_err(error)?;
+        let d_raw = self.stream.clone_htod(delta_raw).map_err(error)?;
+        let d_b = self.stream.clone_htod(b_proj).map_err(error)?;
+        let d_c = self.stream.clone_htod(c_proj).map_err(error)?;
+        let d_rates = self.stream.clone_htod(rates).map_err(error)?;
+        let d_deriv = self.stream.clone_htod(rate_deriv).map_err(error)?;
+        let d_x = self.stream.clone_htod(x_norm).map_err(error)?;
+        let d_states = self.stream.clone_htod(&states[..(seq_len + 1) * stride]).map_err(error)?;
+        let d_bar_a = self.stream.clone_htod(bar_a).map_err(error)?;
+        let d_bar_b = self.stream.clone_htod(bar_b).map_err(error)?;
+        let d_gz = self.stream.clone_htod(g_zraw).map_err(error)?;
+        let d_gy = self.stream.clone_htod(g_ysm).map_err(error)?;
+        let mut d_rev_a = self.stream.alloc_zeros::<f32>(token_state).map_err(error)?;
+        let mut d_rev_b = self.stream.alloc_zeros::<f32>(token_state).map_err(error)?;
+        let mut d_scan_a = self.stream.alloc_zeros::<f32>(token_state).map_err(error)?;
+        let mut d_scan_b = self.stream.alloc_zeros::<f32>(token_state).map_err(error)?;
+        let mut d_gdelta = self.stream.alloc_zeros::<f32>(token_m).map_err(error)?;
+        let mut d_gb = self.stream.alloc_zeros::<f32>(token_s).map_err(error)?;
+        let mut d_gc = self.stream.alloc_zeros::<f32>(token_s).map_err(error)?;
+        let mut d_ga = self.stream.alloc_zeros::<f32>(token_state).map_err(error)?;
+        let mut d_gx = self.stream.alloc_zeros::<f32>(token_m).map_err(error)?;
+        let len_arg = elems(seq_len, "SSM length")?;
+        let dm_arg = elems(d_m, "latent width")?;
+        let ds_arg = elems(d_s, "state width")?;
+        let stride_arg = elems(stride, "SSM stride")?;
+        unsafe {
+            self.stream
+                .launch_builder(&kernels.backward_maps)
+                .arg(&d_bar_a)
+                .arg(&d_c)
+                .arg(&d_gz)
+                .arg(&d_gy)
+                .arg(&mut d_rev_a)
+                .arg(&mut d_rev_b)
+                .arg(&len_arg)
+                .arg(&dm_arg)
+                .arg(&ds_arg)
+                .arg(&scale)
+                .launch(LaunchConfig::for_num_elems(elems(token_state, "SSM backward maps")?))
+                .map_err(error)?;
+        }
+        self.launch_scan(
+            &kernels,
+            &d_rev_a,
+            &d_rev_b,
+            &mut d_scan_a,
+            &mut d_scan_b,
+            seq_len,
+            stride,
+        )?;
+        unsafe {
+            self.stream
+                .launch_builder(&kernels.backward_local)
+                .arg(&d_delta)
+                .arg(&d_raw)
+                .arg(&d_b)
+                .arg(&d_c)
+                .arg(&d_rates)
+                .arg(&d_deriv)
+                .arg(&d_x)
+                .arg(&d_states)
+                .arg(&d_bar_a)
+                .arg(&d_bar_b)
+                .arg(&d_scan_b)
+                .arg(&d_gz)
+                .arg(&d_gy)
+                .arg(&mut d_gdelta)
+                .arg(&mut d_gb)
+                .arg(&mut d_gc)
+                .arg(&mut d_ga)
+                .arg(&mut d_gx)
+                .arg(&len_arg)
+                .arg(&dm_arg)
+                .arg(&ds_arg)
+                .arg(&stride_arg)
+                .arg(&scale)
+                .launch(LaunchConfig::for_num_elems(len_arg))
+                .map_err(error)?;
+        }
+        self.stream.memcpy_dtoh(&d_gdelta, g_delta).map_err(error)?;
+        self.stream.memcpy_dtoh(&d_gb, g_b).map_err(error)?;
+        self.stream.memcpy_dtoh(&d_gc, g_c).map_err(error)?;
+        self.stream.memcpy_dtoh(&d_ga, g_a).map_err(error)?;
+        self.stream.memcpy_dtoh(&d_gx, g_x).map_err(error)?;
+        self.stream.synchronize().map_err(error)
+    }
+
+    pub(crate) fn memory_backward_retrieval(
+        &self,
+        q_pnc: &[f32],
+        q_euc: &[f32],
+        g_m: &[f32],
+        m_val: &[f32],
+        weights: &[f32],
+        keys: &[f32],
+        norm_sq: &[f32],
+        values: &[f32],
+        seq_len: usize,
+        count: usize,
+        capacity: usize,
+        d_key: usize,
+        d_val: usize,
+        tau: f32,
+        query_pnc: &mut [f32],
+        query_euc: &mut [f32],
+    ) -> Result<(), String> {
+        if count > capacity
+            || q_pnc.len() != seq_len * d_key
+            || q_euc.len() != q_pnc.len()
+            || g_m.len() != seq_len * d_val
+            || m_val.len() != g_m.len()
+            || weights.len() != seq_len * capacity
+            || keys.len() != capacity * d_key
+            || norm_sq.len() != capacity
+            || values.len() != capacity * d_val
+            || query_pnc.len() != q_pnc.len()
+            || query_euc.len() != q_euc.len()
+            || !tau.is_finite()
+            || tau <= 0.0
+        {
+            return Err("CUDA memory backward shape mismatch".into());
+        }
+        let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
+        let kernels = self.stage_kernels(&mut state)?.clone();
+        let dq = self.stream.clone_htod(q_pnc).map_err(error)?;
+        let de = self.stream.clone_htod(q_euc).map_err(error)?;
+        let dgm = self.stream.clone_htod(g_m).map_err(error)?;
+        let dmv = self.stream.clone_htod(m_val).map_err(error)?;
+        let dw = self.stream.clone_htod(weights).map_err(error)?;
+        let dk = self.stream.clone_htod(keys).map_err(error)?;
+        let dn = self.stream.clone_htod(norm_sq).map_err(error)?;
+        let dv = self.stream.clone_htod(values).map_err(error)?;
+        let mut dqp = self.stream.alloc_zeros::<f32>(query_pnc.len()).map_err(error)?;
+        let mut dqe = self.stream.alloc_zeros::<f32>(query_euc.len()).map_err(error)?;
+        let len_arg = elems(seq_len, "memory length")?;
+        let count_arg = elems(count, "memory count")?;
+        let capacity_arg = elems(capacity, "memory capacity")?;
+        let key_arg = elems(d_key, "key width")?;
+        let val_arg = elems(d_val, "value width")?;
+        unsafe {
+            self.stream
+                .launch_builder(&kernels.memory_backward)
+                .arg(&dq)
+                .arg(&de)
+                .arg(&dgm)
+                .arg(&dmv)
+                .arg(&dw)
+                .arg(&dk)
+                .arg(&dn)
+                .arg(&dv)
+                .arg(&mut dqp)
+                .arg(&mut dqe)
+                .arg(&len_arg)
+                .arg(&count_arg)
+                .arg(&capacity_arg)
+                .arg(&key_arg)
+                .arg(&val_arg)
+                .arg(&tau)
+                .launch(LaunchConfig::for_num_elems(len_arg))
+                .map_err(error)?;
+        }
+        self.stream.memcpy_dtoh(&dqp, query_pnc).map_err(error)?;
+        self.stream.memcpy_dtoh(&dqe, query_euc).map_err(error)?;
+        self.stream.synchronize().map_err(error)
+    }
+
+    pub(crate) fn softplus_in_place(&self, values: &mut [f32]) -> Result<(), String> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
+        let kernels = self.stage_kernels(&mut state)?.clone();
+        let mut device = self.stream.clone_htod(values).map_err(error)?;
+        let len = elems(values.len(), "softplus count")?;
+        unsafe {
+            self.stream
+                .launch_builder(&kernels.softplus)
+                .arg(&mut device)
+                .arg(&len)
+                .launch(LaunchConfig::for_num_elems(len))
+                .map_err(error)?;
+        }
+        self.stream.memcpy_dtoh(&device, values).map_err(error)?;
+        self.stream.synchronize().map_err(error)
+    }
+}

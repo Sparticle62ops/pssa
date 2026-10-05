@@ -470,8 +470,18 @@ pub fn stage_projections(m: &mut PSSALayerV2, seq_len: usize) {
     );
     // Reference keeps the raw projection in `delta_raw` and the softplus in
     // `delta`; the backward pass takes sigmoid(delta_raw), so both are needed.
-    for i in 0..l * d_m {
-        m.tape.delta[i] = softplus(m.tape.delta_raw[i]);
+    if let Some(gpu) = gpu.as_ref() {
+        m.tape.delta[..l * d_m].copy_from_slice(&m.tape.delta_raw[..l * d_m]);
+        if let Err(error) = gpu.softplus_in_place(&mut m.tape.delta[..l * d_m]) {
+            eprintln!("warning: CUDA softplus failed; using CPU elementwise path: {error}");
+            for i in 0..l * d_m {
+                m.tape.delta[i] = softplus(m.tape.delta_raw[i]);
+            }
+        }
+    } else {
+        for i in 0..l * d_m {
+            m.tape.delta[i] = softplus(m.tape.delta_raw[i]);
+        }
     }
     batched_matvec_dev(
         gpu.as_ref(),
@@ -538,6 +548,29 @@ fn stage_ssm_scan_sequential(m: &mut PSSALayerV2, seq_len: usize) {
 /// tape for the unchanged backward oracle.
 #[inline]
 pub fn stage_ssm_scan(m: &mut PSSALayerV2, seq_len: usize) {
+    if let Some(gpu) = gpu_ctx(m) {
+        let d_m = m.cfg.d_latent;
+        let d_s = m.cfg.d_state;
+        m.block.refresh_ssm_rates();
+        let b = &mut m.block;
+        let result = gpu.ssm_forward_resident(
+            &b.tape.delta[..seq_len * d_m],
+            &b.tape.delta_raw[..seq_len * d_m],
+            &b.tape.b_proj[..seq_len * d_s],
+            &b.tape.x_norm[..seq_len * d_m],
+            &b.ssm_rates,
+            &b.tape.c_proj[..seq_len * d_s],
+            &b.h_persistent,
+            seq_len,
+            d_m,
+            d_s,
+        );
+        if let Err(error) = result {
+            eprintln!("warning: CUDA SSM forward failed; using CPU scan: {error}");
+        } else {
+            return;
+        }
+    }
     let d_m = m.cfg.d_latent;
     let d_s = m.cfg.d_state;
     let stride = d_m * d_s;
@@ -678,6 +711,77 @@ pub fn stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
     let d_m = m.cfg.d_latent;
     let d_k = m.cfg.d_mem_key;
     let mem_cap = m.cfg.mem_capacity;
+
+    if let Some(gpu) = gpu.as_ref() {
+        let result = gpu.memory_forward_after_ssm(
+            &m.tape.x_norm[..seq_len * d_m],
+            &m.w_qx.data,
+            &m.w_qh.data,
+            &m.w_gate.data,
+            &m.w_proj.data,
+            &m.memory.keys,
+            &m.memory.norm_sq,
+            &m.memory.values,
+            seq_len,
+            d_m,
+            d_k,
+            d_m,
+            mem_cap,
+            m.memory.count,
+            m.cfg.tau_mem,
+            &mut m.tape.bar_a[..seq_len * d_m * m.cfg.d_state],
+            &mut m.tape.bar_b[..seq_len * d_m * m.cfg.d_state],
+            &mut m.tape.h_states[..(seq_len + 1) * d_m * m.cfg.d_state],
+            &mut m.tape.y_ssm[..seq_len * d_m],
+            &mut m.tape.q_euc[..seq_len * d_k],
+            &mut m.tape.q_poincare[..seq_len * d_k],
+            &mut m.tape.q_norm[..seq_len],
+            &mut m.tape.mem_weights[..seq_len * mem_cap],
+            &mut m.tape.m_val[..seq_len * d_m],
+            &mut m.tape.g_mem[..seq_len * d_m],
+            &mut m.tape.m_proj[..seq_len * d_m],
+            &mut m.tape.m_inj[..seq_len * d_m],
+        );
+        if let Err(error) = result {
+            // SequenceBatch owns lane-local SSM carries and therefore reaches
+            // this stage with a host-produced y_ssm. Keep its memory stage on
+            // CUDA too, without pretending that a resident single-lane scan
+            // exists.
+            let direct = gpu.memory_forward(
+                &m.tape.x_norm[..seq_len * d_m],
+                &m.tape.y_ssm[..seq_len * d_m],
+                &m.w_qx.data,
+                &m.w_qh.data,
+                &m.w_gate.data,
+                &m.w_proj.data,
+                &m.memory.keys,
+                &m.memory.norm_sq,
+                &m.memory.values,
+                seq_len,
+                d_m,
+                d_k,
+                d_m,
+                mem_cap,
+                m.memory.count,
+                m.cfg.tau_mem,
+                &mut m.tape.q_euc[..seq_len * d_k],
+                &mut m.tape.q_poincare[..seq_len * d_k],
+                &mut m.tape.q_norm[..seq_len],
+                &mut m.tape.mem_weights[..seq_len * mem_cap],
+                &mut m.tape.m_val[..seq_len * d_m],
+                &mut m.tape.g_mem[..seq_len * d_m],
+                &mut m.tape.m_proj[..seq_len * d_m],
+                &mut m.tape.m_inj[..seq_len * d_m],
+            );
+            if let Err(direct_error) = direct {
+                eprintln!("warning: CUDA memory forward failed; using host retrieval: {error}; direct path: {direct_error}");
+            } else {
+                return;
+            }
+        } else {
+            return;
+        }
+    }
 
     if let Some(gpu) = gpu.as_ref() {
         // Query projection is two shared-weight GEMMs. The second result uses
@@ -1921,27 +2025,43 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
     let g_zraw = &m.bwd_g_zraw[..l * d_m];
     let g_mem = &m.tape.g_mem[..l * d_m];
     let m_proj = &m.tape.m_proj[..l * d_m];
-    let calculate_gate = |(t, (g_mp, g_gate)): (usize, (&mut [f32], &mut [f32]))| {
-        let off = t * d_m;
-        for i in 0..d_m {
-            let gz_i = g_zraw[off + i];
-            let g_mem_i = g_mem[off + i];
-            g_mp[i] = gz_i * g_mem_i;
-            g_gate[i] = gz_i * m_proj[off + i] * g_mem_i * (1.0 - g_mem_i);
+    if let Some(gpu) = gpu.as_ref() {
+        if let Err(error) = gpu.memory_backward_local(
+            g_zraw,
+            g_mem,
+            m_proj,
+            g_m_proj_out,
+            g_gate_pre,
+        ) {
+            eprintln!("warning: CUDA memory elementwise backward failed; using host path: {error}");
+            for i in 0..g_zraw.len() {
+                g_m_proj_out[i] = g_zraw[i] * g_mem[i];
+                g_gate_pre[i] = g_zraw[i] * m_proj[i] * g_mem[i] * (1.0 - g_mem[i]);
+            }
         }
-    };
-    if parallel_backward(l, d_m, d_m) {
-        g_m_proj_out
-            .par_chunks_mut(d_m)
-            .zip(g_gate_pre.par_chunks_mut(d_m))
-            .enumerate()
-            .for_each(calculate_gate);
     } else {
-        g_m_proj_out
-            .chunks_mut(d_m)
-            .zip(g_gate_pre.chunks_mut(d_m))
-            .enumerate()
-            .for_each(calculate_gate);
+        let calculate_gate = |(t, (g_mp, g_gate)): (usize, (&mut [f32], &mut [f32]))| {
+            let off = t * d_m;
+            for i in 0..d_m {
+                let gz_i = g_zraw[off + i];
+                let g_mem_i = g_mem[off + i];
+                g_mp[i] = gz_i * g_mem_i;
+                g_gate[i] = gz_i * m_proj[off + i] * g_mem_i * (1.0 - g_mem_i);
+            }
+        };
+        if parallel_backward(l, d_m, d_m) {
+            g_m_proj_out
+                .par_chunks_mut(d_m)
+                .zip(g_gate_pre.par_chunks_mut(d_m))
+                .enumerate()
+                .for_each(calculate_gate);
+        } else {
+            g_m_proj_out
+                .chunks_mut(d_m)
+                .zip(g_gate_pre.chunks_mut(d_m))
+                .enumerate()
+                .for_each(calculate_gate);
+        }
     }
 
     // The input adjoint is first formed per token, then added in token order
@@ -2024,7 +2144,45 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
     let g_m_values = &gate_x[..l * d_m];
     let query_pnc = &mut m.bwd_g_query_pnc[..l * d_k];
     let query_euc = &mut m.bwd_g_query_euc[..l * d_k];
-    if parallel {
+    if let Some(gpu) = gpu.as_ref() {
+        if let Err(error) = gpu.memory_backward_retrieval(
+            q_poincare,
+            q_euc,
+            g_m_values,
+            m_values,
+            mem_weights,
+            &memory.keys,
+            &memory.norm_sq,
+            &memory.values,
+            l,
+            memory.count,
+            mem_cap,
+            d_k,
+            d_m,
+            m.cfg.tau_mem,
+            query_pnc,
+            query_euc,
+        ) {
+            eprintln!("warning: CUDA memory retrieval backward failed; using host path: {error}");
+            for (t, (pnc, euc)) in query_pnc
+                .chunks_mut(d_k)
+                .zip(query_euc.chunks_mut(d_k))
+                .enumerate()
+            {
+                memory_query_adjoint(
+                    memory,
+                    &q_poincare[t * d_k..(t + 1) * d_k],
+                    &q_euc[t * d_k..(t + 1) * d_k],
+                    &g_m_values[t * d_m..(t + 1) * d_m],
+                    &m_values[t * d_m..(t + 1) * d_m],
+                    &mem_weights[t * mem_cap..(t + 1) * mem_cap],
+                    m.cfg.tau_mem,
+                    pnc,
+                    euc,
+                );
+            }
+        }
+    } else if parallel {
         query_pnc
             .par_chunks_mut(d_k)
             .zip(query_euc.par_chunks_mut(d_k))
@@ -2128,9 +2286,127 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
     }
 }
 
-/// Short-chunk SSM recurrence for CUDA. The temporal chain and nonlinear
-/// derivatives stay ordered on the host, while the three dense projection VJPs
-/// are reduced with cuBLAS after all token-local adjoints are available.
+/// CUDA SSM backward. Reverse affine maps, the tiled scan, and token-local
+/// derivatives stay on the device. Only the existing dense projection boundary
+/// and the final RMSNorm/embedding scatter return to the host-owned tape.
+#[inline]
+fn bwd_stage_ssm_cuda(
+    m: &mut PSSALayerV2,
+    seq_len: usize,
+    input_is_embedding: bool,
+    gpu: &crate::backend::GpuDispatch,
+) -> Result<(), String> {
+    let pending_step = m.step_counter + 1;
+    let (embed_w, embed_row_marks, block) =
+        (&mut m.embed_w, &mut m.embed_row_marks, &mut m.block);
+    block.refresh_ssm_rates();
+    let d_m = block.cfg.d_latent;
+    let d_s = block.cfg.d_state;
+    let l = seq_len;
+    let stride = d_m * d_s;
+    let ssm_scale = 1.0 / (d_s as f32).sqrt();
+    if input_is_embedding {
+        for t in 0..l {
+            embed_row_marks[block.tape.x_ids[t]] = pending_step;
+        }
+    }
+
+    // bwd_g_mlp is dead after the memory stage and is a model-owned temporary
+    // for the device recurrence adjoint. The memory/adapter contribution already
+    // in bwd_g_xnorm is preserved and the CUDA result is added below.
+    let mut g_ssm_x = vec![0.0f32; l * d_m];
+    gpu.ssm_backward(
+        &block.tape.delta[..l * d_m],
+        &block.tape.delta_raw[..l * d_m],
+        &block.tape.b_proj[..l * d_s],
+        &block.tape.c_proj[..l * d_s],
+        &block.ssm_rates,
+        &block.ssm_rate_derivatives,
+        &block.tape.x_norm[..l * d_m],
+        &block.tape.h_states[..(l + 1) * stride],
+        &block.tape.bar_a[..l * stride],
+        &block.tape.bar_b[..l * stride],
+        &block.bwd_g_zraw[..l * d_m],
+        &block.bwd_g_ysm[..l * d_m],
+        l,
+        d_m,
+        d_s,
+        ssm_scale,
+        &mut block.bwd_ssm_delta[..l * d_m],
+        &mut block.bwd_ssm_b[..l * d_s],
+        &mut block.bwd_ssm_c[..l * d_s],
+        &mut block.bwd_ssm_a[..l * stride],
+        &mut g_ssm_x,
+    )?;
+    for (dst, src) in block.bwd_g_xnorm[..l * d_m].iter_mut().zip(g_ssm_x) {
+        *dst += src;
+    }
+
+    for (g, w, rows) in [
+        (&block.bwd_ssm_delta[..l * d_m], &mut block.w_delta, d_m),
+        (&block.bwd_ssm_b[..l * d_s], &mut block.w_b, d_s),
+        (&block.bwd_ssm_c[..l * d_s], &mut block.w_c, d_s),
+    ] {
+        gemm_nn_dev_into(
+            Some(gpu),
+            g,
+            &w.data,
+            l,
+            rows,
+            d_m,
+            &mut block.bwd_g_mlp[..l * d_m],
+        );
+        for (dst, src) in block.bwd_g_xnorm[..l * d_m]
+            .iter_mut()
+            .zip(&block.bwd_g_mlp[..l * d_m])
+        {
+            *dst += src;
+        }
+        gemm_tn_dev_accumulate(
+            Some(gpu),
+            g,
+            &block.tape.x_norm[..l * d_m],
+            l,
+            rows,
+            d_m,
+            &mut w.grad,
+        );
+    }
+    for t in (0..l).rev() {
+        for idx in 0..stride {
+            block.a_mat.grad[idx] += block.bwd_ssm_a[t * stride + idx];
+        }
+    }
+
+    // This final chain is deliberately identical to the CPU twin. It consumes
+    // the device-produced x_norm adjoint and owns the sparse embedding scatter.
+    for t in (0..l).rev() {
+        let x_id = block.tape.x_ids[t];
+        let off = t * d_m;
+        let inv_rms = block.tape.inv_rms[t];
+        let e_t = &block.tape.x_raw[off..off + d_m];
+        let mut dot_gx_e = 0.0f32;
+        for i in 0..d_m {
+            let gx_i = block.bwd_g_xnorm[off + i];
+            block.norm_beta.grad[i] += gx_i;
+            block.norm_gamma.grad[i] += gx_i * (e_t[i] * inv_rms);
+            dot_gx_e += gx_i * block.norm_gamma.data[i] * e_t[i];
+        }
+        if input_is_embedding {
+            let row = x_id * d_m;
+            for i in 0..d_m {
+                let g_unnorm = block.bwd_g_xnorm[off + i] * block.norm_gamma.data[i];
+                embed_w.grad[row + i] +=
+                    inv_rms * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / d_m as f32));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compatibility fallback for a CUDA driver/kernel error. The normal path above
+/// keeps the recurrence device-resident; this ordered implementation preserves
+/// training progress when a deployment has an incompatible stage module.
 #[inline]
 fn bwd_stage_ssm_sequential_gpu(
     m: &mut PSSALayerV2,
@@ -2376,16 +2652,19 @@ pub(crate) fn bwd_stage_ssm_with_input(
     let d_s = m.cfg.d_state;
     let stride = d_m * d_s;
     let gpu = gpu_ctx(m).filter(|g| g.accelerates_backward());
-    if !parallel_scan_enabled(seq_len, stride) {
-        if let Some(gpu) = gpu.as_ref() {
+    if let Some(gpu) = gpu.as_ref() {
+        if let Err(error) = bwd_stage_ssm_cuda(m, seq_len, input_is_embedding, gpu) {
+            eprintln!("warning: CUDA SSM backward failed; using host fallback: {error}");
             bwd_stage_ssm_sequential_gpu(m, seq_len, input_is_embedding, gpu);
-        } else {
-            bwd_stage_ssm_sequential(m, seq_len, input_is_embedding);
         }
         return;
     }
+    if !parallel_scan_enabled(seq_len, stride) {
+        bwd_stage_ssm_sequential(m, seq_len, input_is_embedding);
+        return;
+    }
     let executor = m.scan_executor.clone();
-    executor.run(|| bwd_stage_ssm_parallel(m, seq_len, input_is_embedding, gpu.as_ref()));
+    executor.run(|| bwd_stage_ssm_parallel(m, seq_len, input_is_embedding, None));
 }
 
 #[inline]
@@ -3282,4 +3561,39 @@ pub fn backward_chunk_batched(m: &mut PSSALayerV2, seq_len: usize, accumulation_
     bwd_stage_adapter_down(m, seq_len);
     bwd_stage_memory(m, seq_len);
     bwd_stage_ssm(m, seq_len);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn affine_scan_keeps_cpu_exclusive_prefix_contract_for_short_and_padded_rows() {
+        for &(len, stride) in &[(1usize, 1usize), (3, 2), (7, 3), (33, 4)] {
+            let width = len.next_power_of_two();
+            let mut a = vec![0.0; width * stride];
+            let mut b = vec![0.0; width * stride];
+            for t in 0..len {
+                for c in 0..stride {
+                    a[t * stride + c] = 0.8 + 0.01 * (t + c) as f32;
+                    b[t * stride + c] = -0.2 + 0.03 * (2 * t + c) as f32;
+                }
+            }
+            let input_a = a.clone();
+            let input_b = b.clone();
+            affine_scan_in_place(&mut a, &mut b, len, stride);
+            for c in 0..stride {
+                let mut pa = 1.0f32;
+                let mut pb = 0.0f32;
+                for t in 0..len {
+                    assert!((a[t * stride + c] - pa).abs() < 2e-6);
+                    assert!((b[t * stride + c] - pb).abs() < 1e-4);
+                    let aa = input_a[t * stride + c];
+                    let bb = input_b[t * stride + c];
+                    pb = aa * pb + bb;
+                    pa *= aa;
+                }
+            }
+        }
+    }
 }

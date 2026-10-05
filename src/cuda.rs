@@ -11,6 +11,7 @@ use cudarc::driver::{CudaContext as DriverContext, CudaSlice, CudaStream};
 
 use crate::backend::{checked_gemm_sizes, shared_gemm_rows, zeroed_output};
 mod safeguards;
+mod stages;
 
 // cudarc 0.19 lazily loads symbols with unwrap/panic, including error formatting
 // and Drop paths. Preflight *every* symbol used by this backend before calling
@@ -151,6 +152,7 @@ pub struct CudaContext {
     weight_cache: Arc<Mutex<HashMap<(usize, usize), Arc<CudaSlice<f32>>>>>,
     workspace: Arc<Mutex<Workspace>>,
     safeguards: Arc<Mutex<safeguards::Safeguards>>,
+    stages: Arc<Mutex<stages::StageState>>,
 }
 
 impl CudaContext {
@@ -171,6 +173,7 @@ impl CudaContext {
             weight_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace: Arc::new(Mutex::new(Workspace::default())),
             safeguards: Arc::new(Mutex::new(safeguards::Safeguards::default())),
+            stages: Arc::new(Mutex::new(stages::StageState::default())),
         })
     }
 

@@ -82,6 +82,164 @@ fn assert_close(actual: &[f32], expected: &[f32]) {
     );
 }
 
+fn assert_close_stage(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    for (a, b) in actual.iter().zip(expected) {
+        assert!(a.is_finite() && b.is_finite() && (a - b).abs() < 3e-3, "{a} != {b}");
+    }
+}
+
+#[test]
+#[ignore]
+fn cuda_ssm_scan_forward_and_backward_match_cpu_twin() {
+    let ctx = CudaContext::init().expect("CUDA is required for the ignored parity test");
+    let gpu = pssa::backend::GpuDispatch::Cuda(ctx);
+    let (l, dm, ds) = (7usize, 3usize, 2usize);
+    let delta: Vec<f32> = vec![0.2, 0.4, 0.3, 0.5, 0.25, 0.6, 0.35, 0.45, 0.55, 0.3, 0.7, 0.2, 0.5, 0.4, 0.65, 0.25, 0.35, 0.8, 0.45, 0.3, 0.6];
+    let delta_raw = delta.iter().map(|x| x - 0.1).collect::<Vec<_>>();
+    let b_proj = (0..l * ds).map(|i| 0.03 * (i as f32 - 4.0)).collect::<Vec<_>>();
+    let x_norm = (0..l * dm).map(|i| 0.1 + 0.02 * i as f32).collect::<Vec<_>>();
+    let rates = vec![-0.2, -0.35, -0.25, -0.45, -0.3, -0.15];
+    let rate_deriv = vec![0.7, 0.8, 0.9, 0.6, 0.75, 0.85];
+    let c_proj = (0..l * ds).map(|i| -0.04 + 0.01 * i as f32).collect::<Vec<_>>();
+    let initial = vec![0.01, -0.02, 0.03, -0.04, 0.02, -0.01];
+    let stride = dm * ds;
+    let mut cpu_a = vec![0.0; l * stride];
+    let mut cpu_b = vec![0.0; l * stride];
+    let mut cpu_states = vec![0.0; (l + 1) * stride];
+    let mut cpu_y = vec![0.0; l * dm];
+    cpu_states[..stride].copy_from_slice(&initial);
+    for t in 0..l {
+        for i in 0..dm {
+            for j in 0..ds {
+                let c = i * ds + j;
+                let a = (delta[t * dm + i] * rates[c]).exp();
+                let b = delta[t * dm + i] * b_proj[t * ds + j];
+                cpu_a[t * stride + c] = a;
+                cpu_b[t * stride + c] = b;
+                let h = a * cpu_states[t * stride + c]
+                    + b * x_norm[t * dm + i];
+                cpu_states[(t + 1) * stride + c] = h;
+                cpu_y[t * dm + i] += h * c_proj[t * ds + j];
+            }
+        }
+    }
+    let mut a = vec![0.0; l * stride];
+    let mut b = vec![0.0; l * stride];
+    let mut states = vec![0.0; (l + 1) * stride];
+    let mut y = vec![0.0; l * dm];
+    gpu.ssm_forward(
+        &delta, &delta_raw, &b_proj, &x_norm, &rates, &rate_deriv, &c_proj,
+        &initial, l, dm, ds, &mut a, &mut b, &mut states, &mut y,
+    ).unwrap();
+    assert_close_stage(&a, &cpu_a);
+    assert_close_stage(&b, &cpu_b);
+    assert_close_stage(&states, &cpu_states);
+    assert_close_stage(&y, &cpu_y);
+
+    let gz = (0..l * dm).map(|i| 0.02 * (i as f32 + 1.0)).collect::<Vec<_>>();
+    let gym = (0..l * dm).map(|i| -0.01 + 0.005 * i as f32).collect::<Vec<_>>();
+    let scale = 1.0 / (ds as f32).sqrt();
+    let mut exp_gd = vec![0.0; l * dm];
+    let mut exp_gb = vec![0.0; l * ds];
+    let mut exp_gc = vec![0.0; l * ds];
+    let mut exp_ga = vec![0.0; l * stride];
+    let mut exp_gx = vec![0.0; l * dm];
+    let mut future = vec![0.0; stride];
+    for t in (0..l).rev() {
+        let mut next = vec![0.0; stride];
+        for i in 0..dm {
+            let gy = gz[t * dm + i] * scale + gym[t * dm + i];
+            for j in 0..ds {
+                let c = i * ds + j;
+                let q = gy * c_proj[t * ds + j] + future[c];
+                let hprev = cpu_states[t * stride + c];
+                exp_gc[t * ds + j] += gy * cpu_states[(t + 1) * stride + c];
+                exp_ga[t * stride + c] = q * delta[t * dm + i] * cpu_a[t * stride + c]
+                    * hprev * rate_deriv[c];
+                exp_gd[t * dm + i] += q * (rates[c] * cpu_a[t * stride + c] * hprev
+                    + b_proj[t * ds + j] * x_norm[t * dm + i]);
+                exp_gb[t * ds + j] += q * delta[t * dm + i] * x_norm[t * dm + i];
+                exp_gx[t * dm + i] += q * cpu_b[t * stride + c];
+                next[c] = q * cpu_a[t * stride + c];
+            }
+            exp_gd[t * dm + i] *= pssa::linalg::sigmoid(delta_raw[t * dm + i]);
+        }
+        future = next;
+    }
+    let mut gd = vec![0.0; l * dm];
+    let mut gb = vec![0.0; l * ds];
+    let mut gc = vec![0.0; l * ds];
+    let mut ga = vec![0.0; l * stride];
+    let mut gx = vec![0.0; l * dm];
+    gpu.ssm_backward(
+        &delta, &delta_raw, &b_proj, &c_proj, &rates, &rate_deriv, &x_norm,
+        &cpu_states, &cpu_a, &cpu_b, &gz, &gym, l, dm, ds, scale,
+        &mut gd, &mut gb, &mut gc, &mut ga, &mut gx,
+    ).unwrap();
+    assert_close_stage(&gd, &exp_gd);
+    assert_close_stage(&gb, &exp_gb);
+    assert_close_stage(&gc, &exp_gc);
+    assert_close_stage(&ga, &exp_ga);
+    assert_close_stage(&gx, &exp_gx);
+}
+
+#[test]
+#[ignore]
+fn cuda_memory_forward_and_backward_match_cpu_twin() {
+    let ctx = CudaContext::init().expect("CUDA is required for the ignored parity test");
+    let gpu = pssa::backend::GpuDispatch::Cuda(ctx);
+    let (l, dm, dk, cap, count) = (4usize, 3usize, 2usize, 3usize, 2usize);
+    let x = vec![0.2, -0.1, 0.3, 0.1, 0.4, -0.2, -0.3, 0.2, 0.05, 0.25, -0.15, 0.35];
+    let y = vec![0.1, 0.3, -0.2, -0.2, 0.05, 0.4, 0.25, -0.3, 0.2, 0.1, 0.15, -0.05];
+    let w_qx = vec![0.2, -0.1, 0.3, -0.2, 0.15, 0.05];
+    let w_qh = vec![-0.1, 0.25, 0.2, 0.15, -0.2, 0.1];
+    let w_gate = vec![0.1, -0.2, 0.15, 0.2, 0.05, -0.1, -0.15, 0.1, 0.2];
+    let w_proj = vec![0.2, 0.1, -0.1, -0.15, 0.25, 0.05, 0.1, -0.2, 0.15];
+    let keys = vec![0.1, -0.2, -0.15, 0.2, 0.0, 0.0];
+    let norm_sq = vec![0.05, 0.0625, 0.0];
+    let values = vec![0.2, -0.1, 0.3, -0.4, 0.1, 0.25, 0.0, 0.0, 0.0];
+    let tau = 0.7;
+    let mut qe = vec![0.0; l * dk];
+    let mut qp = vec![0.0; l * dk];
+    let mut qn = vec![0.0; l];
+    let mut weights = vec![0.0; l * cap];
+    let mut mv = vec![0.0; l * dm];
+    let mut gm = vec![0.0; l * dm];
+    let mut mp = vec![0.0; l * dm];
+    let mut inj = vec![0.0; l * dm];
+    gpu.memory_forward(&x, &y, &w_qx, &w_qh, &w_gate, &w_proj, &keys, &norm_sq, &values,
+        l, dm, dk, dm, cap, count, tau, &mut qe, &mut qp, &mut qn, &mut weights,
+        &mut mv, &mut gm, &mut mp, &mut inj).unwrap();
+    let mut cqe = vec![0.0; l * dk]; let mut cqp = vec![0.0; l * dk]; let mut cqn = vec![0.0; l];
+    let mut cw = vec![0.0; l * cap]; let mut cmv = vec![0.0; l * dm]; let mut cgm = vec![0.0; l * dm];
+    let mut cmp = vec![0.0; l * dm]; let mut cinj = vec![0.0; l * dm];
+    let bank = pssa::memory::HyperbolicEpisodicBankV2 { capacity: cap, count, dim_key: dk, dim_val: dm,
+        write_head: 0, keys: keys.clone(), values: values.clone(), value_cap: None, norm_sq: norm_sq.clone(),
+        confidence: vec![1.0; cap], last_seen_step: vec![0; cap] };
+    for t in 0..l {
+        for k in 0..dk { cqe[t*dk+k] = (0..dm).map(|j| w_qx[k*dm+j]*x[t*dm+j] + w_qh[k*dm+j]*y[t*dm+j]).sum(); }
+        cqn[t] = pssa::memory::HyperbolicEpisodicBankV2::diffeomorphic_project(&cqe[t*dk..(t+1)*dk], &mut cqp[t*dk..(t+1)*dk]);
+        bank.retrieve_soft_into(&cqp[t*dk..(t+1)*dk], tau, &mut cmv[t*dm..(t+1)*dm], &mut cw[t*cap..(t+1)*cap]);
+        for i in 0..dm { cgm[t*dm+i] = pssa::linalg::sigmoid((0..dm).map(|j| w_gate[i*dm+j]*x[t*dm+j]).sum()); cmp[t*dm+i] = (0..dm).map(|j| w_proj[i*dm+j]*cmv[t*dm+j]).sum(); cinj[t*dm+i]=cgm[t*dm+i]*cmp[t*dm+i]; }
+    }
+    assert_close_stage(&qe, &cqe); assert_close_stage(&qp, &cqp); assert_close_stage(&qn, &cqn);
+    assert_close_stage(&weights, &cw); assert_close_stage(&mv, &cmv); assert_close_stage(&gm, &cgm); assert_close_stage(&mp, &cmp); assert_close_stage(&inj, &cinj);
+    let gmval = (0..l*dm).map(|i| 0.03 * (i as f32 - 2.0)).collect::<Vec<_>>();
+    let mut exp_qp = vec![0.0; l*dk]; let mut exp_qe = vec![0.0; l*dk];
+    for t in 0..l { let q=&cqp[t*dk..(t+1)*dk]; let qe0=&cqe[t*dk..(t+1)*dk]; let out=&mut exp_qp[t*dk..(t+1)*dk];
+        let qsq: f64=q.iter().map(|v|(*v as f64)*(*v as f64)).sum();
+        for e in 0..count { let mut dot=0.; let mut sq=0.; for j in 0..dm { dot += gmval[t*dm+j] as f64 * (values[e*dm+j]-cmv[t*dm+j]) as f64; }
+            for k in 0..dk { let diff=q[k] as f64-keys[e*dk+k] as f64; sq+=diff*diff; }
+            if sq>0. { let denom=(1.-qsq)*(1.-norm_sq[e] as f64); let z=sq/denom; let coeff=cw[t*cap+e] as f64*dot*(-1./tau as f64)/(z*(1.+z)).sqrt(); for k in 0..dk { let diff=q[k] as f64-keys[e*dk+k] as f64; let dd=-2.*q[k] as f64*(1.-norm_sq[e] as f64); out[k]+=(coeff*(2.*diff*denom-sq*dd)/(denom*denom)) as f32; } }
+        }
+        pssa::memory::HyperbolicEpisodicBankV2::projection_adjoint(qe0,out,&mut exp_qe[t*dk..(t+1)*dk]);
+    }
+    let mut got_qp=vec![0.;l*dk]; let mut got_qe=vec![0.;l*dk];
+    gpu.memory_backward_retrieval(&cqp,&cqe,&gmval,&cmv,&cw,&keys,&norm_sq,&values,l,count,cap,dk,dm,tau,&mut got_qp,&mut got_qe).unwrap();
+    assert_close_stage(&got_qp,&exp_qp); assert_close_stage(&got_qe,&exp_qe);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn cuda_missing_driver_symbol_returns_error_in_a_fresh_process() {
