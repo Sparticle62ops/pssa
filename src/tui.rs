@@ -7,9 +7,11 @@ mod alerts;
 mod background;
 mod benchmark;
 pub(crate) mod benchmark_replay;
+mod charts;
 mod chat;
 mod depth_zoom;
 mod device;
+mod eval;
 mod extras;
 mod github;
 mod hardware;
@@ -19,24 +21,23 @@ mod hf_backup;
 mod inspector;
 mod kaggle;
 mod keybindings;
+mod library;
 mod limits;
+mod local;
 mod log_stream;
 mod math;
+mod memory_view;
+mod mixer;
 mod network;
 mod notify;
 mod overlay;
 mod preview;
 mod process;
-mod library;
-mod local;
-mod mixer;
-mod eval;
-mod memory_view;
 mod ring;
 mod runs;
 mod session;
-mod shadow;
 mod setup;
+mod shadow;
 #[cfg(feature = "speech")]
 mod speech;
 mod support;
@@ -51,7 +52,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Chart, Dataset, GraphType, LegendPosition, Paragraph, Tabs, Wrap,
+    Block, Borders, Paragraph, Tabs, Wrap,
     canvas::{Canvas, Line as CanvasLine, Points},
 };
 use std::io::{self, BufRead, IsTerminal};
@@ -77,7 +78,7 @@ const AMBER: Color = Color::Rgb(0xff, 0xbf, 0x00);
 const BRIGHT_RED: Color = Color::Rgb(0xff, 0x2f, 0x3f);
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const PROGRESS_INTERPOLATION: Duration = Duration::from_millis(450);
-const EIGHTH_BLOCKS: [&str; 8] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"];
+const BRAILLE_LEVELS: [&str; 8] = ["⡀", "⡄", "⡆", "⡇", "⣇", "⣧", "⣷", "⣿"];
 const GRAPH_MAX_ZOOM: usize = 8;
 const GRAPH_INTERPOLATION: Duration = Duration::from_millis(300);
 const FRAME_INTERVAL: Duration = Duration::from_millis(34); // at most ~30 fps
@@ -89,6 +90,7 @@ const NEURON_NODE_COUNT: usize = 80;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MetricSample {
+    step: Option<f64>,
     loss: Option<f64>,
     tokens_per_second: Option<f64>,
     learning_rate: Option<f64>,
@@ -423,6 +425,10 @@ impl RunState {
                 }
             }
             let sample = MetricSample {
+                step: parse_kv::<f64>(line, "global_update=")
+                    .or_else(|| parse_kv::<f64>(line, "optimizer_updates="))
+                    .or_else(|| parse_fraction(line, "training ").map(|(done, _)| done as f64))
+                    .filter(|v| v.is_finite()),
                 loss: raw_loss.filter(|v| v.is_finite()),
                 tokens_per_second: speed,
                 learning_rate: parse_kv::<f64>(line, "learning_rate=").filter(|v| v.is_finite()),
@@ -765,11 +771,11 @@ impl RunState {
         let eased = t * t * (3.0 - 2.0 * t);
         let lerp = |before: Option<f64>, after: Option<f64>| match (before, after) {
             (Some(before), Some(after)) => Some(before + (after - before) * eased),
-            (None, Some(after)) => Some(after * eased),
-            (Some(before), None) => Some(before),
-            (None, None) => None,
+            (None, Some(after)) => Some(after),
+            (_, None) => None,
         };
         Some(MetricSample {
+            step: target.step,
             loss: lerp(from.loss, target.loss),
             tokens_per_second: lerp(from.tokens_per_second, target.tokens_per_second),
             learning_rate: lerp(from.learning_rate, target.learning_rate),
@@ -1324,62 +1330,52 @@ fn draw_header_stats(f: &mut ratatui::Frame, area: Rect, state: &RunState, healt
     let loss = state
         .live_loss
         .or(state.epoch_loss)
-        .map(|v| format!("{v:.4}"))
+        .map(charts::number)
         .unwrap_or_else(|| "-".into());
     let speed = state
         .tok_s
         .map(|v| format!("{v:.0}"))
         .unwrap_or_else(|| "-".into());
     let eta = state.eta.as_deref().unwrap_or("-");
+    // The header has only three rows: a compact, explicitly labeled trace
+    // with its value range and time direction instead of a block sparkline.
+    let values = &state.loss_series[state.loss_series.len().saturating_sub(12)..];
+    let finite = values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect::<Vec<_>>();
+    let range = if finite.is_empty() {
+        "—".into()
+    } else {
+        let low = finite.iter().copied().fold(f64::INFINITY, f64::min);
+        let high = finite.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        format!(
+            "{}/{}/{}",
+            charts::number(low),
+            charts::number((low + high) / 2.0),
+            charts::number(high)
+        )
+    };
     f.render_widget(
         Paragraph::new(vec![
             status,
-            Line::from(vec![
-                Span::styled("loss ", Style::new().fg(SECOND_ACCENT)),
-                Span::styled(loss, Style::new().fg(health.color())),
-                Span::styled(format!("  tok/s {speed}"), accent()),
-            ]),
-            Line::from(vec![
-                Span::styled(format!("ETA {eta}  "), accent()),
-                Span::styled(
-                    format!("loss {}", loss_trace(state)),
-                    Style::new().fg(SECOND_ACCENT),
-                ),
-            ]),
+            Line::from(vec![Span::styled(
+                format!("loss {loss}  tok/s {speed}  ETA {eta}"),
+                Style::new().fg(health.color()),
+            )]),
+            Line::styled(
+                format!("loss {} {range} step → / lower better", loss_trace(state)),
+                Style::new().fg(SECOND_ACCENT),
+            ),
         ]),
         inner,
     );
 }
 
 fn loss_trace(state: &RunState) -> String {
-    // Bounded to twelve real samples; missing/invalid data is a gap, not zero.
     let values = &state.loss_series[state.loss_series.len().saturating_sub(12)..];
-    if values.is_empty() {
-        return "············".into();
-    }
-    let min = values
-        .iter()
-        .copied()
-        .filter(|v| v.is_finite())
-        .fold(f64::INFINITY, f64::min);
-    let max = values
-        .iter()
-        .copied()
-        .filter(|v| v.is_finite())
-        .fold(f64::NEG_INFINITY, f64::max);
-    let bars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    values
-        .iter()
-        .map(|v| {
-            if !v.is_finite() {
-                '·'
-            } else if max == min {
-                bars[3]
-            } else {
-                bars[(((v - min) / (max - min)) * 7.0).round().clamp(0.0, 7.0) as usize]
-            }
-        })
-        .collect()
+    charts::sparkline(values, 12)
 }
 
 // Empty states are instrument cards, not invented run data. A dim dot grid
@@ -1742,8 +1738,29 @@ fn progress_label(state: &RunState, pct: f64, width: u16) -> String {
 }
 
 fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64) {
+    if area.height == 1 {
+        let label = progress_label(state, pct, area.width);
+        let meter_width = area.width.saturating_sub(label.len() as u16 + 1);
+        let meter = charts::bar(pct / 100.0, meter_width as usize);
+        for (i, glyph) in meter.chars().enumerate() {
+            f.buffer_mut().set_string(
+                area.x + i as u16,
+                area.y,
+                glyph.to_string(),
+                Style::new().fg(progress_gradient(i as u16, meter_width)),
+            );
+        }
+        f.buffer_mut().set_stringn(
+            area.x + meter_width,
+            area.y,
+            format!(" {label}"),
+            (area.width - meter_width) as usize,
+            accent(),
+        );
+        return;
+    }
     let area = panel_area(f, area);
-    let block = panel(" progress ");
+    let block = panel(" progress / completed training steps ");
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.is_empty() {
@@ -1758,16 +1775,16 @@ fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64)
     for index in 0..inner.width {
         let (symbol, mut style) = if index < full_cells {
             (
-                EIGHTH_BLOCKS[7],
+                BRAILLE_LEVELS[7],
                 Style::new().fg(progress_gradient(index, inner.width)),
             )
         } else if index == full_cells && partial > 0 {
             (
-                EIGHTH_BLOCKS[partial - 1],
+                BRAILLE_LEVELS[partial - 1],
                 Style::new().fg(progress_gradient(index, inner.width)),
             )
         } else {
-            ("░", Style::new().fg(Color::Rgb(0x0d, 0x2b, 0x1d)))
+            ("·", Style::new().fg(Color::Rgb(0x0d, 0x2b, 0x1d)))
         };
         let filled = index < full_cells || (index == full_cells && partial > 0);
         if shine == Some(index) && filled {
@@ -2232,7 +2249,7 @@ fn metric_points(
     latest: Option<MetricSample>,
 ) -> Vec<(f64, f64)> {
     (start..end.min(series.len()))
-        .filter_map(|index| {
+        .map(|index| {
             let sample = if index + 1 == series.len() {
                 latest.unwrap_or(series[index])
             } else {
@@ -2242,8 +2259,13 @@ fn metric_points(
                 sample.loss
             } else {
                 metric_value(sample, kind)
-            }?;
-            value.is_finite().then_some((index as f64, value.max(0.0)))
+            };
+            (
+                index as f64,
+                value
+                    .filter(|v| v.is_finite())
+                    .map_or(f64::NAN, |v| v.max(0.0)),
+            )
         })
         .collect()
 }
@@ -2255,39 +2277,22 @@ fn moving_loss_points(
     latest: Option<MetricSample>,
 ) -> Vec<(f64, f64)> {
     (start..end.min(series.len()))
-        .filter_map(|index| {
-            moving_loss_at(series, index, latest).map(|value| (index as f64, value))
+        .map(|index| {
+            // The average smooths measured losses, not missing observations.
+            let value = series[index]
+                .loss
+                .filter(|v| v.is_finite())
+                .and_then(|_| moving_loss_at(series, index, latest))
+                .unwrap_or(f64::NAN);
+            (index as f64, value)
         })
         .collect()
 }
 
 fn normalize_points(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let bounds: Option<(f64, f64)> = points.iter().map(|(_, y)| *y).fold(None, |bounds, y| {
-        Some(match bounds {
-            Some((min, max)) => (min.min(y), max.max(y)),
-            None => (y, y),
-        })
-    });
-    let Some((min, max)) = bounds else {
-        return Vec::new();
-    };
-    if (max - min).abs() <= f64::EPSILON {
-        return points.iter().map(|(x, _)| (*x, 0.5)).collect();
-    }
-    points
+    let bounds: Option<(f64, f64)> = points
         .iter()
-        .map(|(x, y)| (*x, (*y - min) / (max - min)))
-        .collect()
-}
-
-fn graph_y_bounds(data: &[&[(f64, f64)]], normalized: bool) -> [f64; 2] {
-    if normalized {
-        return [0.0, 1.0];
-    }
-    let bounds: Option<(f64, f64)> = data
-        .iter()
-        .flat_map(|points| points.iter().copied())
-        .map(|(_, y)| y)
+        .map(|(_, y)| *y)
         .filter(|y| y.is_finite())
         .fold(None, |bounds, y| {
             Some(match bounds {
@@ -2296,24 +2301,18 @@ fn graph_y_bounds(data: &[&[(f64, f64)]], normalized: bool) -> [f64; 2] {
             })
         });
     let Some((min, max)) = bounds else {
-        return [0.0, 1.0];
+        return Vec::new();
     };
     if (max - min).abs() <= f64::EPSILON {
-        let padding = (max.abs() * 0.1).max(1.0e-6);
-        [min - padding, max + padding]
-    } else {
-        let padding = (max - min) * 0.08;
-        [min - padding, max + padding]
+        return points
+            .iter()
+            .map(|(x, y)| (*x, if y.is_finite() { 0.5 } else { f64::NAN }))
+            .collect();
     }
-}
-
-fn graph_dataset<'a>(name: &'static str, data: &'a [(f64, f64)], color: Color) -> Dataset<'a> {
-    Dataset::default()
-        .name(name)
-        .marker(Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(Style::new().fg(color))
-        .data(data)
+    points
+        .iter()
+        .map(|(x, y)| (*x, (*y - min) / (max - min)))
+        .collect()
 }
 
 fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant) {
@@ -2333,7 +2332,14 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
     }
 
     let latest = state.displayed_metric_at(now);
-    let (loss, moving_loss, compare_loss, perplexity, tokens, learning_rate) = match view {
+    let (
+        mut loss,
+        mut moving_loss,
+        mut compare_loss,
+        mut perplexity,
+        mut tokens,
+        mut learning_rate,
+    ) = match view {
         GraphView::Loss => (
             Some(metric_points(
                 &state.metric_series,
@@ -2437,6 +2443,41 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
         ),
         GraphView::Memory => unreachable!(),
     };
+    // Never mix training-step coordinates with observation indices, including
+    // when comparing a modern log against one without step telemetry.
+    let ordered_steps = |samples: &[MetricSample]| {
+        samples
+            .iter()
+            .all(|s| s.step.is_some_and(|step| step.is_finite()))
+            && samples.windows(2).all(|pair| pair[0].step <= pair[1].step)
+    };
+    let has_steps = ordered_steps(&state.metric_series)
+        && (view != GraphView::Comparison || ordered_steps(&state.comparison_series));
+    if has_steps {
+        for points in [
+            &mut loss,
+            &mut moving_loss,
+            &mut perplexity,
+            &mut tokens,
+            &mut learning_rate,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for (x, _) in points {
+                *x = state.metric_series[*x as usize]
+                    .step
+                    .expect("checked above");
+            }
+        }
+        if let Some(points) = &mut compare_loss {
+            for (x, _) in points {
+                *x = state.comparison_series[*x as usize]
+                    .step
+                    .expect("checked above");
+            }
+        }
+    }
     let mut data: Vec<(&'static str, &[(f64, f64)], Color)> = Vec::new();
     match view {
         GraphView::Loss => {
@@ -2444,7 +2485,7 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
             data.push((
                 "moving avg",
                 moving_loss.as_deref().unwrap_or(&[]),
-                Color::Rgb(0x80, 0xf5, 0xa8),
+                SECOND_ACCENT,
             ));
         }
         GraphView::Perplexity => {
@@ -2503,19 +2544,28 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
     }
     let normalized = view == GraphView::All;
 
-    let datasets: Vec<_> = data
+    let series: Vec<_> = data
         .iter()
-        .map(|(name, points, color)| graph_dataset(name, points, *color))
+        .map(|(name, points, color)| charts::Series::line(name, points, *color))
         .collect();
-    let x_start = start as f64;
-    let x_end = (end.saturating_sub(1).max(start) as f64).max(x_start + 1.0);
-    let y_bounds = graph_y_bounds(
-        &data
-            .iter()
-            .map(|(_, points, _)| *points)
-            .collect::<Vec<_>>(),
-        normalized,
-    );
+    let x_start = data
+        .iter()
+        .flat_map(|(_, p, _)| p.iter().map(|p| p.0))
+        .fold(f64::INFINITY, f64::min);
+    let x_end = data
+        .iter()
+        .flat_map(|(_, p, _)| p.iter().map(|p| p.0))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let x_bounds = if x_start.is_finite() {
+        [x_start, x_end.max(x_start + 2.0)]
+    } else {
+        [0.0, 2.0]
+    };
+    let y_bounds = if normalized {
+        [0.0, 1.0]
+    } else {
+        charts::bounds(data.iter().flat_map(|(_, p, _)| p.iter().map(|p| p.1)))
+    };
     let mut title = match view {
         GraphView::Loss => " graph / loss + moving average ",
         GraphView::Perplexity => " graph / perplexity (exp loss) ",
@@ -2537,33 +2587,43 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
             title = format!(" graph / comparison / {label} ");
         }
     }
-    let chart_area = panel_area(f, area);
-    let chart = Chart::new(datasets)
-        .block(panel(&title))
-        .legend_position(Some(LegendPosition::TopRight))
-        .x_axis(
-            Axis::default()
-                .title("update")
-                .style(accent().add_modifier(Modifier::DIM))
-                .bounds([x_start, x_end])
-                .labels([
-                    format!("{start}"),
-                    format!("{}", (start + end.saturating_sub(1)) / 2),
-                    format!("{}", end.saturating_sub(1)),
-                ]),
-        )
-        .y_axis(
-            Axis::default()
-                .title(if normalized { "normalized" } else { "value" })
-                .style(accent().add_modifier(Modifier::DIM))
-                .bounds(y_bounds)
-                .labels([
-                    format!("{:.3}", y_bounds[0]),
-                    format!("{:.3}", (y_bounds[0] + y_bounds[1]) / 2.0),
-                    format!("{:.3}", y_bounds[1]),
-                ]),
-        );
-    f.render_widget(chart, chart_area);
+    let (y, caption) = match view {
+        GraphView::Loss => (
+            "loss",
+            "Lower = better predictions; green: loss, blue: 8-sample average",
+        ),
+        GraphView::Perplexity => ("perplexity", "Lower = less surprise about the next word"),
+        GraphView::TokensPerSecond => (
+            "tokens / second",
+            "Higher = more training text processed each second",
+        ),
+        GraphView::LearningRate => (
+            "learning rate",
+            "How much each training step changes the model",
+        ),
+        GraphView::Comparison => (
+            "loss",
+            "Lower = better; green: current average, blue: comparison",
+        ),
+        GraphView::All => (
+            "relative level",
+            "Own ranges: green loss / blue surprise / purple speed / gold rate",
+        ),
+        GraphView::Memory => unreachable!(),
+    };
+    charts::draw(
+        f,
+        area,
+        charts::Plot {
+            title: &title,
+            caption,
+            x: if has_steps { "training step" } else { "sample" },
+            y,
+            x_bounds,
+            y_bounds,
+        },
+        &series,
+    );
 }
 
 fn draw_memory_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
@@ -2582,9 +2642,14 @@ fn draw_memory_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         let angle = index as f64 * 2.399963229728653;
         entries.push((radius * angle.cos(), radius * angle.sin()));
     }
-    let disk_points = vec![
-        graph_dataset("unit circle", &boundary, Color::Rgb(0x32, 0x8f, 0x60)),
-        graph_dataset("occupied entries", &entries, NORMAL_GREEN),
+    let disk_points = [
+        charts::Series::line("unit circle", &boundary, Color::Rgb(0x32, 0x8f, 0x60)),
+        charts::Series {
+            name: "occupied entries",
+            points: &entries,
+            color: NORMAL_GREEN,
+            scatter: true,
+        },
     ];
     let occupancy_label = if capacity > 0 {
         format!("{occupancy}/{capacity}")
@@ -2592,17 +2657,23 @@ fn draw_memory_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         "not reported".to_string()
     };
     let title = format!(" memory / Poincare disk / occupancy only ({occupancy_label}) ");
-    let chart_area = panel_area(f, area);
-    let chart = Chart::new(disk_points)
-        .block(panel(&title))
-        .legend_position(Some(LegendPosition::TopRight))
-        .x_axis(Axis::default().bounds([-1.1, 1.1]).labels(["-1", "0", "1"]))
-        .y_axis(Axis::default().bounds([-1.1, 1.1]).labels(["-1", "0", "1"]));
-    f.render_widget(chart, chart_area);
+    charts::draw(
+        f,
+        area,
+        charts::Plot {
+            title: &title,
+            caption: "Dots = used slots, not learned positions",
+            x: "disk x",
+            y: "disk y",
+            x_bounds: [-1.0, 1.0],
+            y_bounds: [-1.0, 1.0],
+        },
+        &disk_points,
+    );
 }
 
 fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
-    let area = if area.height >= 18 {
+    let area = if area.height >= 27 {
         let gap = if shadow::enabled(f.area()) && area.height >= 21 {
             1
         } else {
@@ -2624,9 +2695,10 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     } else {
         area
     };
-    // Prefer the metrics to a squashed graph on short terminals. Each visible
-    // panel retains at least one content row and a complete top/bottom border.
+    // Keep a full three-tick plot at 80x24. On short screens progress is a
+    // single braille meter row, leaving room for the graph and neuron panel.
     let show_graph = area.height >= 14;
+    let compact_graph = show_graph && area.height < 21;
     let gap = if shadow::enabled(f.area()) && area.height >= 21 {
         1
     } else {
@@ -2634,9 +2706,11 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     };
     let chunks = if gap == 0 {
         Layout::vertical([
-            Constraint::Length(4),
-            Constraint::Min(if show_graph { 6 } else { 0 }),
-            Constraint::Length(if show_graph {
+            Constraint::Length(if compact_graph { 1 } else { 4 }),
+            Constraint::Min(if show_graph { 8 } else { 0 }),
+            Constraint::Length(if compact_graph {
+                5
+            } else if show_graph {
                 9
             } else {
                 area.height.saturating_sub(4)
@@ -2647,7 +2721,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         Layout::vertical([
             Constraint::Length(4),
             Constraint::Length(gap),
-            Constraint::Min(if show_graph { 6 } else { 0 }),
+            Constraint::Min(if show_graph { 8 } else { 0 }),
             Constraint::Length(gap),
             Constraint::Length(if show_graph {
                 9
@@ -3499,13 +3573,22 @@ mod tests {
                 for expected in [
                     "[ TRAINING ]",
                     "step 3/10",
-                    "loss 2.0000",
+                    "loss 2",
                     "tok/s 125",
                     "ETA 2h 14m 09s",
-                    "█▅▁",
+                    "step → / lower better",
+                    "2/3/4",
                 ] {
                     assert!(header.contains(expected), "missing {expected}: {header}");
                 }
+                assert!(header.contains(&loss_trace(&state)));
+                assert!(
+                    loss_trace(&state)
+                        .chars()
+                        .filter(|c| ('\u{2801}'..='\u{28ff}').contains(c))
+                        .count()
+                        >= 10
+                );
             }
             terminal.draw(|f| draw(f, &RunState::default(), 2)).unwrap();
             let buffer = terminal.backend().buffer();
@@ -3516,7 +3599,15 @@ mod tests {
         }
         // Invalid measurements do not become a plausible zero-valued trace.
         state.loss_series = vec![f64::NAN, 2.0, f64::INFINITY];
-        assert_eq!(loss_trace(&state), "·▄·");
+        let trace = loss_trace(&state);
+        assert!(trace.starts_with('·') && trace.ends_with('·'));
+        assert_eq!(
+            trace
+                .chars()
+                .filter(|c| ('\u{2801}'..='\u{28ff}').contains(c))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -3667,7 +3758,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_renders_eighth_block_bar_gradient_and_metrics() {
+    fn test_backend_renders_braille_progress_gradient_and_metrics() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use std::collections::HashSet;
@@ -3681,13 +3772,8 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(
-            text.contains("▏")
-                || text.contains("▎")
-                || text.contains("▍")
-                || text.contains("▌")
-                || text.contains("▋")
-                || text.contains("▊")
-                || text.contains("▉")
+            BRAILLE_LEVELS[..7].iter().any(|glyph| text.contains(glyph)),
+            "progress retains fractional precision"
         );
         assert!(text.contains("13%"));
         assert!(text.contains("updates 13/100"));
@@ -3696,7 +3782,7 @@ mod tests {
         let colors: HashSet<_> = buffer
             .content()
             .iter()
-            .filter(|cell| EIGHTH_BLOCKS.contains(&cell.symbol()))
+            .filter(|cell| BRAILLE_LEVELS.contains(&cell.symbol()))
             .map(|cell| cell.fg)
             .collect();
         assert!(
@@ -3759,6 +3845,68 @@ mod tests {
     }
 
     #[test]
+    fn missing_chart_observations_stay_gaps_when_smoothed_or_normalized() {
+        let series = [
+            MetricSample {
+                loss: Some(3.0),
+                ..Default::default()
+            },
+            MetricSample::default(),
+            MetricSample {
+                loss: Some(3.0),
+                ..Default::default()
+            },
+        ];
+        for points in [
+            metric_points(&series, MetricKind::Loss, 0, series.len(), None),
+            moving_loss_points(&series, 0, series.len(), None),
+        ] {
+            assert_eq!(points.len(), 3);
+            assert!(points[1].1.is_nan());
+            let normalized = normalize_points(&points);
+            assert_eq!(normalized[0].1, 0.5);
+            assert!(normalized[1].1.is_nan());
+            assert_eq!(normalized[2].1, 0.5);
+        }
+        let state = RunState {
+            metric_series: vec![series[0], series[1]],
+            graph_from: Some(series[0]),
+            graph_updated_at: Some(Instant::now()),
+            ..Default::default()
+        };
+        assert!(
+            state
+                .displayed_metric_at(Instant::now())
+                .unwrap()
+                .loss
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn comparison_with_missing_steps_uses_one_honest_sample_axis() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut state = RunState::default();
+        for step in [100, 200, 300] {
+            state.ingest(&format!(
+                "training 1/3 (33%) loss=3 tokens_per_second=100 global_update={step}"
+            ));
+        }
+        state.graph_view = GraphView::Comparison;
+        state.comparison_series = state.metric_series.clone();
+        state.comparison_series[1].step = None;
+        for (w, h) in [(120, 40), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| draw(f, &state, 0)).unwrap();
+            charts::assert_named_plot(
+                terminal.backend().buffer(),
+                "graph / comparison",
+                &["sample", "loss", "0", "1", "2"],
+            );
+        }
+    }
+
+    #[test]
     fn test_backend_renders_braille_chart_views_and_memory_disk() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -3808,6 +3956,84 @@ mod tests {
             .collect();
         assert!(text.contains("Poincare disk"));
         assert!(text.contains("12/64"));
+    }
+
+    #[test]
+    fn every_monitor_view_has_readable_braille_axes_in_the_real_shell() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut state = RunState::default();
+        for (i, loss) in [4.0, 3.2, 3.5, 2.5].into_iter().enumerate() {
+            state.ingest(&format!("training {}/4 (50%) loss={loss} tokens_per_second={} learning_rate={} global_update={} memory_occupancy=12/64",
+                i + 1, 100 + i * 10, 0.001 / (i + 1) as f64, (i + 1) * 100));
+        }
+        state.graph_updated_at = None;
+        state.comparison_series = state.metric_series.clone();
+        for (w, h) in [(120, 40), (80, 24)] {
+            for (view, y, caption) in [
+                (GraphView::Loss, "loss", "Lower = better predictions"),
+                (GraphView::Perplexity, "perplexity", "Lower = less surprise"),
+                (
+                    GraphView::TokensPerSecond,
+                    "tokens / second",
+                    "Higher = more training",
+                ),
+                (
+                    GraphView::LearningRate,
+                    "learning rate",
+                    "How much each training step",
+                ),
+                (GraphView::Comparison, "loss", "Lower = better"),
+                (GraphView::All, "relative level", "Own ranges"),
+                (GraphView::Memory, "disk y", "Dots = used slots"),
+            ] {
+                state.graph_view = view;
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                terminal.draw(|f| draw(f, &state, 0)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let content = HexBackground::content_area(buffer.area);
+                // Isolate the plot, excluding header trace, progress and neurons.
+                let top = (content.y..content.bottom())
+                    .find(|&row| {
+                        let text: String = (content.x..content.right())
+                            .map(|x| buffer[(x, row)].symbol())
+                            .collect();
+                        text.contains(if view == GraphView::Memory {
+                            "memory / Poincare"
+                        } else {
+                            "graph /"
+                        })
+                    })
+                    .unwrap();
+                let bottom = (top + 1..content.bottom())
+                    .find(|&row| buffer[(content.x, row)].symbol() == "└")
+                    .unwrap();
+                let rect = Rect::new(content.x, top, content.width - 1, bottom - top + 1);
+                charts::assert_plot(
+                    buffer,
+                    rect,
+                    &[
+                        y,
+                        caption,
+                        if view == GraphView::Memory {
+                            "disk x"
+                        } else {
+                            "training step"
+                        },
+                    ],
+                );
+                if view != GraphView::Memory {
+                    charts::assert_plot(buffer, rect, &["100", "250", "400"]);
+                }
+                if view == GraphView::Loss {
+                    assert!(buffer.content().iter().any(|c| {
+                        c.fg == SECOND_ACCENT
+                            && c.symbol()
+                                .chars()
+                                .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+                    }));
+                }
+            }
+        }
     }
 
     #[test]

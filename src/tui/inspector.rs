@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     text::Line,
-    widgets::{Paragraph, Sparkline, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 use std::{
     collections::VecDeque,
@@ -200,18 +200,29 @@ impl Inspector {
                     .map(|s| (s.used as u64, s.capacity as u64))
             })
             .unwrap_or((0, 0));
-        let chunks = Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).split(area);
-        let history: Vec<_> = self.history.iter().copied().collect();
-        let sparkline_area = panel_area(f, chunks[0]);
-        f.render_widget(
-            Sparkline::default()
-                .data(&history)
-                .style(accent())
-                .max(capacity.max(1))
-                .block(panel(&format!(
-                    " plastic memory / {used}/{capacity} slots "
-                ))),
-            sparkline_area,
+        let chunks = Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).split(area);
+        let history: Vec<_> = self
+            .history
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as f64, *v as f64))
+            .collect();
+        super::charts::draw(
+            f,
+            chunks[0],
+            super::charts::Plot {
+                title: &format!(" plastic memory / {used}/{capacity} slots "),
+                caption: "Used memory slots over recent observations",
+                x: "sample",
+                y: "used slots",
+                x_bounds: super::charts::domain(&history),
+                y_bounds: [0.0, capacity.max(1) as f64],
+            },
+            &[super::charts::Series::line(
+                "used slots",
+                &history,
+                super::NORMAL_GREEN,
+            )],
         );
         let content = if area.width >= 80 {
             let columns =
@@ -300,8 +311,7 @@ mod tests {
     use super::*;
     #[test]
     fn checkpoint_snapshot_reads_real_slots_without_modifying_bytes() {
-        let path =
-            std::env::temp_dir().join(format!("pssa-inspector-{}.pssa", std::process::id()));
+        let path = std::env::temp_dir().join(format!("pssa-inspector-{}.pssa", std::process::id()));
         let mut model = crate::pssa::PSSALayerV2::new(
             crate::pssa::PSSAConfigV2 {
                 d_vocab: 3,
@@ -344,6 +354,39 @@ mod tests {
         assert_eq!(inspector.events.len(), 32);
         assert_eq!(inspector.events[0], "real write");
     }
+    #[test]
+    fn occupancy_history_uses_braille_and_labels_at_both_sizes() {
+        let mut inspector = Inspector::default();
+        inspector.history = [2, 4, 3, 6].into_iter().collect();
+        inspector.last_occupancy = Some((6, 8));
+        for (w, h) in [(120, 40), (80, 24)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| inspector.draw(f, f.area(), &RunState::default()))
+                .unwrap();
+            super::super::charts::assert_plot(
+                terminal.backend().buffer(),
+                Rect::new(0, 0, w, 8),
+                &["used slots", "sample", "Used memory slots", "0", "4", "8"],
+            );
+            terminal
+                .draw(|f| {
+                    inspector.draw(
+                        f,
+                        super::super::feature_area(f.area()),
+                        &RunState::default(),
+                    )
+                })
+                .unwrap();
+            super::super::charts::assert_named_plot(
+                terminal.backend().buffer(),
+                "plastic memory",
+                &["used slots", "sample", "Used memory slots"],
+            );
+        }
+    }
+
     #[test]
     fn test_backend_inspector_has_truthful_empty_and_narrow_states() {
         for (w, h) in [(120, 30), (79, 24), (24, 8), (1, 1)] {

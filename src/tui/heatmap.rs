@@ -87,14 +87,14 @@ fn color(probability: f32) -> Color {
 
 pub(super) fn legend(enabled: bool) -> Line<'static> {
     if !enabled {
-        return Line::from("F6 heatmap off / raw model confidence");
+        return Line::from("F6 heatmap off / raw token confidence");
     }
     Line::from(vec![
-        Span::raw("F6 heatmap: "),
-        Span::styled("<10% ", Style::new().fg(LOW)),
-        Span::styled("10-50% ", Style::new().fg(AMBER)),
-        Span::styled(">=50% ", Style::new().fg(NORMAL_GREEN)),
-        Span::styled("n/a", Style::new().fg(SECOND_ACCENT)),
+        Span::raw("F6 heatmap / token confidence: "),
+        Span::styled("<10% low ", Style::new().fg(LOW)),
+        Span::styled("10-<50% mid ", Style::new().fg(AMBER)),
+        Span::styled(">=50% high ", Style::new().fg(NORMAL_GREEN)),
+        Span::styled("n/a unknown", Style::new().fg(SECOND_ACCENT)),
     ])
 }
 
@@ -155,8 +155,8 @@ mod tests {
 
     #[test]
     fn render_confidence_legend_and_multiline_unicode_at_all_widths() {
-        for width in [120, 79, 40, 20] {
-            let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+        for (width, height) in [(120, 40), (80, 24), (120, 12), (79, 12), (40, 12), (20, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let text = "low medium high\n猫";
             let marks = vec![
                 TokenMark {
@@ -183,6 +183,26 @@ mod tests {
             let output: String = b.content().iter().map(|c| c.symbol()).collect();
             assert!(output.contains("low medium high"));
             assert!(output.contains("猫"));
+            // This is colored token text, not a data chart.
+            assert!(
+                !output
+                    .chars()
+                    .any(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+            );
+            if width >= 80 {
+                for label in [
+                    "token confidence",
+                    "<10% low",
+                    "10-<50% mid",
+                    ">=50% high",
+                    "n/a unknown",
+                ] {
+                    assert!(output.contains(label), "{width}x{height}: missing {label}");
+                }
+                assert_eq!(b[(0, 1)].fg, LOW);
+                assert_eq!(b[(4, 1)].fg, AMBER);
+                assert_eq!(b[(11, 1)].fg, NORMAL_GREEN);
+            }
             for (word, expected) in [("l", LOW), ("m", AMBER), ("h", NORMAL_GREEN)] {
                 assert!(
                     b.content()

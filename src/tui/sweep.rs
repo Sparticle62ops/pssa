@@ -298,13 +298,29 @@ impl Sweep {
         if area.is_empty() {
             return;
         }
-        let compact = area.width < 80;
+        let show_plot =
+            area.width >= 70 && area.height >= 15 && self.trials.iter().any(|t| t.loss.is_some());
         let parts = Layout::vertical([
             Constraint::Length(if area.height < 12 { 4 } else { 6 }),
             Constraint::Min(0),
-            Constraint::Length(if area.height < 12 { 2 } else { 4 }),
+            Constraint::Length(if show_plot && area.height < 20 {
+                1
+            } else if area.height < 12 {
+                2
+            } else {
+                4
+            }),
         ])
         .split(area);
+        let (results, plot) = if show_plot {
+            let columns =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(parts[1]);
+            (columns[0], Some(columns[1]))
+        } else {
+            (parts[1], None)
+        };
+        let compact = results.width < 80;
         let mut fields = Vec::new();
         for (index, label) in LABELS.iter().enumerate() {
             let value = if index == self.selected {
@@ -352,7 +368,7 @@ impl Sweep {
                 "No runs queued. Configure setup, edit grids, then p.",
             ));
         }
-        let height = usize::from(parts[1].height.saturating_sub(3));
+        let height = usize::from(results.height.saturating_sub(3));
         let focus = self.current.unwrap_or_else(|| {
             self.trials
                 .iter()
@@ -361,7 +377,7 @@ impl Sweep {
         });
         let start = focus.saturating_sub(height.saturating_sub(1));
         for (i, trial) in self.trials.iter().enumerate().skip(start).take(height) {
-            let loss = trial.loss.map_or("—".into(), |n| format!("{n:.4}"));
+            let loss = trial.loss.map_or("—".into(), super::charts::number);
             let speed = trial.speed.map_or("—".into(), |n| format!("{n:.0}"));
             let [lr, latent, batch] = &trial.grid;
             let row = if compact {
@@ -386,11 +402,38 @@ impl Sweep {
                 },
             ));
         }
-        let results_area = panel_area(f, parts[1]);
+        let results_area = panel_area(f, results);
         f.render_widget(
             Paragraph::new(rows).block(panel(" results / training only ")),
             results_area,
         );
+        if let Some(area) = plot {
+            // Later shadows from the base/results panels must not erase the
+            // chart's top or left border inside the shared feature rectangle.
+            let points: Vec<_> = self
+                .trials
+                .iter()
+                .enumerate()
+                .map(|(i, trial)| ((i + 1) as f64, trial.loss.unwrap_or(f64::NAN)))
+                .collect();
+            super::charts::draw(
+                f,
+                area,
+                super::charts::Plot {
+                    title: " sweep / loss by trial ",
+                    caption: "Lower = better training fit",
+                    x: "trial",
+                    y: "loss",
+                    x_bounds: super::charts::domain(&points),
+                    y_bounds: super::charts::bounds(points.iter().map(|p| p.1)),
+                },
+                &[super::charts::Series::line(
+                    "loss",
+                    &points,
+                    super::NORMAL_GREEN,
+                )],
+            );
+        }
         let mut footer = vec![Line::styled(
             if self.editing() {
                 "Enter save / Esc cancel / Ctrl+U clear / type"
@@ -557,6 +600,48 @@ mod tests {
         );
         assert_eq!(sweep.trials.len(), 1);
         assert!(sweep.current.is_none());
+    }
+
+    #[test]
+    fn completed_trials_render_braille_and_axes_at_both_sizes() {
+        let sweep = Sweep {
+            trials: [4.0, 3.0, 2.0]
+                .into_iter()
+                .map(|loss| Trial {
+                    grid: [".001".into(), "32".into(), "1".into()],
+                    output: PathBuf::from("unused"),
+                    spec: None,
+                    status: Status::Done,
+                    loss: Some(loss),
+                    speed: Some(100.0),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for (w, h) in [(120, 40), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| sweep.draw(f, f.area())).unwrap();
+            super::super::charts::assert_plot(
+                terminal.backend().buffer(),
+                Rect::new(w / 2, 6, w / 2, h - 10),
+                &[
+                    "trial",
+                    "loss",
+                    "Lower = better training fit",
+                    "1",
+                    "2",
+                    "3",
+                ],
+            );
+            terminal
+                .draw(|f| sweep.draw(f, super::super::feature_area(f.area())))
+                .unwrap();
+            super::super::charts::assert_named_plot(
+                terminal.backend().buffer(),
+                "sweep / loss by trial",
+                &["trial", "loss", "Lower = better training fit"],
+            );
+        }
     }
 
     #[test]

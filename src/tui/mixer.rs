@@ -2,6 +2,7 @@
 //! trainer; neither dataset CLI defaults nor training math are changed.
 use super::{
     AMBER, accent,
+    charts::bar,
     library::{self, Entry, Kind, Records, Stats},
     panel, panel_area,
 };
@@ -338,14 +339,15 @@ impl Mixer {
         let sum: u64 = self.sources.iter().map(|s| u64::from(s.weight)).sum();
         let mut lines = vec![
             Line::styled("DATASET MIX / token shares", accent()),
-            Line::from("↑↓ source  +/- slider  Enter export → Setup Dataset"),
+            Line::from("↑↓ source  +/- weight  Enter export → Setup Dataset"),
             Line::from(format!(
                 "~{} word tokens total / cap {TOKEN_CAP} / no repetition",
                 quotas.iter().sum::<u64>()
             )),
             Line::from("Counts use word tokens, not model BPE; big sources are estimates."),
+            Line::from("Mixture share 0..100% / normalized weights / ticks 0 / 50 / 100"),
         ];
-        let visible = area.height.saturating_sub(9) as usize;
+        let visible = area.height.saturating_sub(10) as usize;
         let start = self.selected.saturating_sub(visible.saturating_sub(1));
         for (i, (source, quota)) in self
             .sources
@@ -356,16 +358,15 @@ impl Mixer {
             .take(visible)
         {
             let cells = if area.width < 80 { 8 } else { 16 };
-            let filled = source.weight as usize * cells / 100;
-            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(cells - filled));
             let share = if sum == 0 {
                 0.0
             } else {
                 source.weight as f64 * 100.0 / sum as f64
             };
+            let meter = bar(share / 100.0, cells);
             lines.push(Line::styled(
                 format!(
-                    "{} {:<16.16} [{bar}] {:>5.1}% ~{quota}",
+                    "{} {:<16.16} [{meter}] {:>5.1}% ~{quota}",
                     if i == self.selected { "▶" } else { " " },
                     source.entry.name(),
                     share
@@ -473,6 +474,7 @@ mod tests {
     fn mixer_screen_wide_narrow_tiny() {
         let temp = Temp::new();
         fs::write(temp.0.join("a.txt"), "one two").unwrap();
+        fs::write(temp.0.join("b.txt"), "three four").unwrap();
         let mut mixer = Mixer::default();
         mixer.sources = library::scan(&temp.0, &temp.0)
             .0
@@ -483,7 +485,15 @@ mod tests {
                 weight: 100,
             })
             .collect();
-        for (w, h) in [(120, 30), (79, 24), (40, 16), (1, 1), (0, 0)] {
+        for (w, h) in [
+            (120, 40),
+            (80, 24),
+            (120, 30),
+            (79, 24),
+            (40, 16),
+            (1, 1),
+            (0, 0),
+        ] {
             let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             t.draw(|f| mixer.draw(f, f.area())).unwrap();
             if w >= 40 {
@@ -496,6 +506,24 @@ mod tests {
                     .collect();
                 assert!(text.contains("word tokens total"));
                 assert!(text.contains("a.txt"));
+                assert!(!text.chars().any(|c| ('\u{2580}'..='\u{259f}').contains(&c)));
+                if w >= 80 {
+                    assert!(text.contains("Mixture share 0..100%"));
+                    assert!(text.contains("normalized weights"));
+                    assert!(text.contains("b.txt"));
+                    // Equal weights of 100 mean a 50% mixture share, not full meters.
+                    let cells = if w < 80 { 8 } else { 16 };
+                    let expected = format!("[{}]  50.0% ~2", bar(0.5, cells));
+                    assert_eq!(text.matches(expected.as_str()).count(), 2);
+                    assert!(!text.contains(&format!("[{}]", bar(1.0, cells))));
+                    assert!(t.backend().buffer().content().iter().any(|cell| {
+                        cell.fg == super::super::NORMAL_GREEN
+                            && cell
+                                .symbol()
+                                .chars()
+                                .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+                    }));
+                }
             }
         }
     }

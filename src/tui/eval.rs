@@ -17,7 +17,7 @@
 //! space for BPE continuations. OOV probes remain visible but are not charted.
 //! PSSA uses its checkpoint memory, fresh recurrent carry, and runtime loops=1.
 //! No training, optimizer, memory-write, GPU, or checkpoint-save path is called.
-use super::{AMBER, NORMAL_GREEN, SECOND_ACCENT, accent, panel, panel_area};
+use super::{AMBER, NORMAL_GREEN, SECOND_ACCENT, accent, charts, panel, panel_area};
 use crate::{
     checkpoint,
     cli::CLIHandler,
@@ -32,9 +32,8 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
-    symbols::Marker,
     text::Line,
-    widgets::{Axis, Chart, Dataset, GraphType, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 use serde_json::{Value, json};
 use std::{
@@ -1233,14 +1232,16 @@ impl Eval {
         let parts = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(if narrow { 5 } else { 4 }),
-                Constraint::Length(if narrow {
-                    6
+                Constraint::Length(if area.height < 20 {
+                    2
+                } else if narrow {
+                    5
                 } else {
-                    (area.height / 3).clamp(7, 12)
+                    4
                 }),
+                Constraint::Length((area.height / 3).clamp(8, 12)),
                 Constraint::Min(3),
-                Constraint::Length(2),
+                Constraint::Length(if area.height < 20 { 1 } else { 2 }),
             ])
             .split(area);
         let status = if !self.enabled {
@@ -1263,17 +1264,32 @@ impl Eval {
                         .unwrap_or_else(|| "embedded assets/eval_prompts.json".into())
                 )
             });
-        let status_area = panel_area(f, parts[0]);
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::from(source),
-                Line::from(clean(&self.snapshot.note, 512)),
-            ])
-            .style(accent())
-            .wrap(Wrap { trim: false })
-            .block(panel(&format!(" AUTO EVAL / {status} "))),
-            status_area,
-        );
+        if parts[0].height < 4 {
+            // A two-row bordered panel has no content; keep prompt editing usable.
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!(
+                        "AUTO EVAL / {status} / {}",
+                        clean(&self.snapshot.note, 512)
+                    )),
+                    Line::from(source),
+                ])
+                .style(accent()),
+                parts[0],
+            );
+        } else {
+            let status_area = panel_area(f, parts[0]);
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from(source),
+                    Line::from(clean(&self.snapshot.note, 512)),
+                ])
+                .style(accent())
+                .wrap(Wrap { trim: false })
+                .block(panel(&format!(" AUTO EVAL / {status} "))),
+                status_area,
+            );
+        }
         self.draw_chart(f, parts[1]);
         let selected = self.snapshot.records.get(self.selected);
         let previous = self
@@ -1309,46 +1325,30 @@ impl Eval {
             .records
             .iter()
             .filter(|r| r.suite == self.snapshot.suite)
-            .filter_map(|r| r.mean_nll().map(|n| (r.number as f64, n)))
+            .map(|r| (r.number as f64, r.mean_nll().unwrap_or(f64::NAN)))
             .collect();
-        if points.is_empty() {
+        if !points.iter().any(|p| p.1.is_finite()) {
             let chart_area = panel_area(f, area);
             f.render_widget(Paragraph::new("Reference NLL ↓ better\nWaiting for a fully scoreable fixed suite.\nUnknown words / invalid or oversized checkpoints are skipped.")
                 .style(accent()).wrap(Wrap { trim: true }).block(panel(" quality / checkpoint ")), chart_area);
             return;
         }
-        let first = points.first().unwrap().0;
-        let last = points
-            .last()
-            .unwrap()
-            .0
-            .max(first + (first.abs() * 1e-6).max(1.0));
-        let min = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-        let max = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
-        let pad = ((max - min) * 0.1).max(0.1).max(max.abs() * 0.01);
-        let data = Dataset::default()
-            .name("reference NLL ↓")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(NORMAL_GREEN))
-            .data(&points);
-        let chart_area = panel_area(f, area);
-        f.render_widget(
-            Chart::new(vec![data])
-                .block(panel(" quality / checkpoint "))
-                .x_axis(
-                    Axis::default()
-                        .bounds([first, last])
-                        .labels([format!("{first:.0}"), format!("{last:.0}")])
-                        .style(Style::new().fg(SECOND_ACCENT)),
-                )
-                .y_axis(
-                    Axis::default()
-                        .bounds([(min - pad).max(0.0), max + pad])
-                        .labels([format!("{min:.2}"), format!("{max:.2}")])
-                        .style(accent()),
-                ),
-            chart_area,
+        charts::draw(
+            f,
+            area,
+            charts::Plot {
+                title: " quality / checkpoint ",
+                caption: "Lower = less surprise on fixed reference answers, not correctness",
+                x: "checkpoint",
+                y: "reference loss",
+                x_bounds: charts::domain(&points),
+                y_bounds: charts::bounds(points.iter().map(|p| p.1)),
+            },
+            &[charts::Series::line(
+                "reference loss",
+                &points,
+                NORMAL_GREEN,
+            )],
         );
     }
 
@@ -1379,9 +1379,10 @@ impl Eval {
             ));
             lines.push(Line::from(match sample.nll {
                 Some(nll) => format!(
-                    "NLL {nll:.3}  ppl {}  n={}",
+                    "NLL {}  perplexity {}  n={}",
+                    charts::number(nll),
                     if nll.exp().is_finite() {
-                        format!("{:.2}", nll.exp())
+                        charts::number(nll.exp())
                     } else {
                         "overflow".into()
                     },
@@ -1836,6 +1837,46 @@ mod tests {
         assert_eq!(buffer[(0, 3)].symbol(), "└");
         assert_eq!(buffer[(109, 3)].symbol(), "┘");
         assert!(buffer.content().iter().any(|cell| cell.fg == NORMAL_GREEN));
+    }
+
+    #[test]
+    fn quality_chart_has_braille_axes_at_both_sizes() {
+        let (mut eval, _) = screen();
+        eval.edit = Some("custom-prompts.json".into());
+        for (w, h) in [(120, 40), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| eval.draw(f, f.area())).unwrap();
+            charts::assert_plot(
+                terminal.backend().buffer(),
+                Rect::new(0, 4, w, (h / 3).clamp(8, 12)),
+                &[
+                    "quality / checkpoint",
+                    "checkpoint",
+                    "reference loss",
+                    "Lower = less surprise",
+                    "1",
+                    "2",
+                    "3",
+                ],
+            );
+            terminal
+                .draw(|f| eval.draw(f, super::super::feature_area(f.area())))
+                .unwrap();
+            charts::assert_named_plot(
+                terminal.backend().buffer(),
+                "quality / checkpoint",
+                &["checkpoint", "reference loss", "Lower = less surprise"],
+            );
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(text.contains("AUTO EVAL / WATCHING"));
+            assert!(text.contains("Prompt file > custom-prompts.json"));
+        }
     }
 
     #[test]
