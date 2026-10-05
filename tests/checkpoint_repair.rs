@@ -978,6 +978,7 @@ fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
         write_head: _,
         keys,
         values,
+        value_cap: _, // runtime-only; not an allocated/serialized buffer
         norm_sq,
         confidence,
         last_seen_step,

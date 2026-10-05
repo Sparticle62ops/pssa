@@ -307,6 +307,8 @@ pub struct Progress {
     tokens: usize,
     loss_history: VecDeque<(f64, usize)>,
     learning_rate: Option<f32>,
+    // Opt-in training safeguards, already measured by the optimizer wrapper.
+    gradient_metrics: Option<(f64, usize)>,
     checkpoint_path: Option<String>,
     last_checkpoint: Option<String>,
     prior_updates: usize,
@@ -345,6 +347,7 @@ impl Progress {
             tokens: 0,
             loss_history: VecDeque::with_capacity(8),
             learning_rate: None,
+            gradient_metrics: None,
             checkpoint_path: None,
             last_checkpoint: None,
             prior_updates: 0,
@@ -391,6 +394,12 @@ impl Progress {
         self.learning_rate = learning_rate.filter(|x| x.is_finite() && *x > 0.0);
         self.memory_occupancy =
             memory.filter(|(used, capacity)| *used <= *capacity && *capacity > 0);
+    }
+
+    /// Reuse the pre-clip norm without another gradient pass. Unset by default
+    /// so existing progress lines remain unchanged when clipping is disabled.
+    pub fn set_gradient_metrics(&mut self, norm: f64, skipped: usize) {
+        self.gradient_metrics = Some((norm, skipped));
     }
 
     /// Set the optional source/sample metadata shown by the feed tab. The
@@ -491,6 +500,7 @@ impl Progress {
             .map(|path| format!(" last_checkpoint={path}"))
             .unwrap_or_default();
         let feed_fields = self.feed_fields();
+        let gradient_fields = self.gradient_fields();
         let global = self.prior_updates.saturating_add(done);
 
         if self.interactive {
@@ -502,7 +512,7 @@ impl Progress {
                     fraction * 100.0,
                     self.total
                 ),
-                format!("loss {loss:.6} | avg(8, token-weighted) {average:.6}"),
+                format!("loss {loss:.6} | avg(8, token-weighted) {average:.6}{gradient_fields}"),
                 format!(
                     "{rate:.0} tokens/s | ETA {} | elapsed {}",
                     duration(remaining),
@@ -540,7 +550,7 @@ impl Progress {
             let _ = io::stdout().flush();
         } else {
             println!(
-                "  {} {}/{} ({:.0}%) loss={loss:.6} loss_average={average:.6} tokens_per_second={rate:.0} optimizer_updates={done} updates_total={} updates_remaining={remaining_updates} global_update={global} learning_rate={lr} memory_occupancy={memory} checkpoint_number={number} elapsed_seconds={elapsed:.3}{feed_fields} eta={}{last_checkpoint_field}",
+                "  {} {}/{} ({:.0}%) loss={loss:.6} loss_average={average:.6} tokens_per_second={rate:.0} optimizer_updates={done} updates_total={} updates_remaining={remaining_updates} global_update={global} learning_rate={lr} memory_occupancy={memory} checkpoint_number={number} elapsed_seconds={elapsed:.3}{feed_fields}{gradient_fields} eta={}{last_checkpoint_field}",
                 self.label,
                 done,
                 self.total,
@@ -550,6 +560,13 @@ impl Progress {
             );
             let _ = io::stdout().flush();
         }
+    }
+
+    fn gradient_fields(&self) -> String {
+        self.gradient_metrics
+            .map_or_else(String::new, |(norm, skipped)| {
+                format!(" grad_norm={norm:.6e} skipped_updates={skipped}")
+            })
     }
 
     fn feed_fields(&self) -> String {
@@ -695,6 +712,17 @@ mod progress_tests {
         );
         progress.last_draw = Instant::now() - std::time::Duration::from_secs(6);
         assert!(progress.should_emit(2));
+    }
+
+    #[test]
+    fn gradient_metrics_are_opt_in_and_reuse_the_supplied_norm() {
+        let mut progress = Progress::new_with_tui("training", 10, false);
+        assert!(progress.gradient_fields().is_empty());
+        progress.set_gradient_metrics(12.5, 3);
+        assert_eq!(
+            progress.gradient_fields(),
+            " grad_norm=1.250000e1 skipped_updates=3"
+        );
     }
 
     #[test]
