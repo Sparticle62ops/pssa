@@ -1056,6 +1056,152 @@ impl GpuDispatch {
         }
     }
 
+    /// Device-native SSM scan. CUDA owns map preparation, the tiled scan, and
+    /// materialization. The resident form deliberately has no host outputs:
+    /// memory_forward_after_ssm consumes the same device tape.
+    pub fn ssm_forward_resident(
+        &self,
+        delta: &[f32],
+        delta_raw: &[f32],
+        b_proj: &[f32],
+        x_norm: &[f32],
+        rates: &[f32],
+        c_proj: &[f32],
+        initial: &[f32],
+        seq_len: usize,
+        d_m: usize,
+        d_s: usize,
+    ) -> Result<(), String> {
+        match self {
+            Self::Wgpu(_) => Err("WGSL SSM scan is not enabled".into()),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(ctx) => ctx.ssm_forward_resident(delta, delta_raw, b_proj, x_norm, rates, c_proj, initial, seq_len, d_m, d_s),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ssm_forward(
+        &self,
+        delta: &[f32],
+        delta_raw: &[f32],
+        b_proj: &[f32],
+        x_norm: &[f32],
+        rates: &[f32],
+        rate_deriv: &[f32],
+        c_proj: &[f32],
+        initial: &[f32],
+        seq_len: usize,
+        d_m: usize,
+        d_s: usize,
+        bar_a: &mut [f32],
+        bar_b: &mut [f32],
+        states: &mut [f32],
+        y_ssm: &mut [f32],
+    ) -> Result<(), String> {
+        match self {
+            Self::Wgpu(_) => Err("WGSL SSM scan is not enabled".into()),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(ctx) => ctx.ssm_forward(delta, delta_raw, b_proj, x_norm, rates, rate_deriv, c_proj, initial, seq_len, d_m, d_s, bar_a, bar_b, states, y_ssm),
+        }
+    }
+
+    pub fn memory_forward_after_ssm(
+        &self,
+        x_norm: &[f32],
+        w_qx: &[f32], w_qh: &[f32], w_gate: &[f32], w_proj: &[f32],
+        keys: &[f32], norm_sq: &[f32], values: &[f32],
+        seq_len: usize, d_m: usize, d_k: usize, d_val: usize,
+        capacity: usize, count: usize, tau: f32,
+        bar_a: &mut [f32], bar_b: &mut [f32], states: &mut [f32], y_ssm: &mut [f32],
+        q_euc: &mut [f32], q_pnc: &mut [f32], q_norm: &mut [f32], weights: &mut [f32],
+        m_val: &mut [f32], g_mem: &mut [f32], m_proj: &mut [f32], m_inj: &mut [f32],
+    ) -> Result<(), String> {
+        match self {
+            Self::Wgpu(_) => Err("WGSL resident memory stage is not enabled".into()),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(ctx) => ctx.memory_forward_after_ssm(x_norm, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len, d_m, d_k, d_val, capacity, count, tau, bar_a, bar_b, states, y_ssm, q_euc, q_pnc, q_norm, weights, m_val, g_mem, m_proj, m_inj),
+        }
+    }
+
+    pub fn memory_backward_local(
+        &self,
+        g_zraw: &[f32], g_mem: &[f32], m_proj: &[f32],
+        g_m_proj: &mut [f32], g_gate: &mut [f32],
+    ) -> Result<(), String> {
+        match self {
+            Self::Wgpu(_) => Err("WGSL memory backward is not enabled".into()),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(ctx) => ctx.memory_backward_local(g_zraw, g_mem, m_proj, g_m_proj, g_gate),
+        }
+    }
+
+    pub fn ssm_backward(
+        &self,
+        delta: &[f32],
+        delta_raw: &[f32],
+        b_proj: &[f32],
+        c_proj: &[f32],
+        rates: &[f32],
+        rate_deriv: &[f32],
+        x_norm: &[f32],
+        states: &[f32],
+        bar_a: &[f32],
+        bar_b: &[f32],
+        g_zraw: &[f32],
+        g_ysm: &[f32],
+        seq_len: usize,
+        d_m: usize,
+        d_s: usize,
+        scale: f32,
+        g_delta: &mut [f32],
+        g_b: &mut [f32],
+        g_c: &mut [f32],
+        g_a: &mut [f32],
+        g_x: &mut [f32],
+    ) -> Result<(), String> {
+        match self {
+            Self::Wgpu(_) => Err("WGSL SSM backward scan is not enabled".into()),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(ctx) => ctx.ssm_backward(delta, delta_raw, b_proj, c_proj, rates, rate_deriv, x_norm, states, bar_a, bar_b, g_zraw, g_ysm, seq_len, d_m, d_s, scale, g_delta, g_b, g_c, g_a, g_x),
+        }
+    }
+
+    pub fn memory_forward(
+        &self,
+        x_norm: &[f32], y_ssm: &[f32], w_qx: &[f32], w_qh: &[f32], w_gate: &[f32], w_proj: &[f32],
+        keys: &[f32], norm_sq: &[f32], values: &[f32], seq_len: usize, d_m: usize, d_k: usize,
+        d_val: usize, capacity: usize, count: usize, tau: f32, q_euc: &mut [f32], q_pnc: &mut [f32],
+        q_norm: &mut [f32], weights: &mut [f32], m_val: &mut [f32], g_mem: &mut [f32],
+        m_proj: &mut [f32], m_inj: &mut [f32],
+    ) -> Result<(), String> {
+        match self {
+            Self::Wgpu(_) => Err("WGSL memory stage is not enabled".into()),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(ctx) => ctx.memory_forward(x_norm, y_ssm, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len, d_m, d_k, d_val, capacity, count, tau, q_euc, q_pnc, q_norm, weights, m_val, g_mem, m_proj, m_inj),
+        }
+    }
+
+    pub fn memory_backward_retrieval(
+        &self,
+        q_pnc: &[f32], q_euc: &[f32], g_m: &[f32], m_val: &[f32], weights: &[f32], keys: &[f32], norm_sq: &[f32],
+        values: &[f32], seq_len: usize, count: usize, capacity: usize, d_key: usize, d_val: usize, tau: f32,
+        query_pnc: &mut [f32], query_euc: &mut [f32],
+    ) -> Result<(), String> {
+        match self {
+            Self::Wgpu(_) => Err("WGSL memory backward is not enabled".into()),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(ctx) => ctx.memory_backward_retrieval(q_pnc, q_euc, g_m, m_val, weights, keys, norm_sq, values, seq_len, count, capacity, d_key, d_val, tau, query_pnc, query_euc),
+        }
+    }
+
+    pub fn softplus_in_place(&self, values: &mut [f32]) -> Result<(), String> {
+        match self {
+            Self::Wgpu(_) => Err("WGSL softplus is not enabled".into()),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(ctx) => ctx.softplus_in_place(values),
+        }
+    }
+
     /// Whether this backend actually accelerates the backward-pass GEMM shapes.
     /// The WGSL kernel only implements the forward X * W^T layout, so on WebGPU
     /// the backward pass stays on its fused CPU loops instead of paying to

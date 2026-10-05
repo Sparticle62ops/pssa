@@ -264,7 +264,23 @@ impl SequenceBatch {
         stages::stage_embed_norm(m, self.tokens);
         stages::stage_projections(m, self.tokens);
         m.refresh_ssm_rates();
-        if self.parallel_lanes(m) {
+        let gpu = m.device.gpu().filter(|g| g.accelerates_backward());
+        if let Some(gpu) = gpu.as_ref() {
+            let mut failed = None;
+            for lane in self.lanes.iter_mut().filter(|lane| lane.len > 0) {
+                if let Err(error) = lane.forward_gpu(m, gpu) {
+                    failed = Some(error);
+                    break;
+                }
+            }
+            if let Some(error) = failed {
+                eprintln!("warning: CUDA packed SSM forward failed; using host scan: {error}");
+                self.lanes
+                    .iter_mut()
+                    .filter(|lane| lane.len > 0)
+                    .for_each(|lane| lane.forward(m));
+            }
+        } else if self.parallel_lanes(m) {
             m.scan_executor.run(|| {
                 self.lanes
                     .par_iter_mut()
@@ -311,7 +327,23 @@ impl SequenceBatch {
         stages::bwd_stage_adapter_down(m, n);
         stages::bwd_stage_memory(m, n);
         m.refresh_ssm_rates();
-        if self.parallel_lanes(m) {
+        let gpu = m.device.gpu().filter(|g| g.accelerates_backward());
+        if let Some(gpu) = gpu.as_ref() {
+            let mut failed = None;
+            for lane in self.lanes.iter_mut().filter(|lane| lane.len > 0) {
+                if let Err(error) = lane.backward_gpu(m, gpu) {
+                    failed = Some(error);
+                    break;
+                }
+            }
+            if let Some(error) = failed {
+                eprintln!("warning: CUDA packed SSM backward failed; using host scan: {error}");
+                self.lanes
+                    .iter_mut()
+                    .filter(|lane| lane.len > 0)
+                    .for_each(|lane| lane.backward(m));
+            }
+        } else if self.parallel_lanes(m) {
             m.scan_executor.run(|| {
                 self.lanes
                     .par_iter_mut()
@@ -512,6 +544,85 @@ fn copy_carry_to_model(carry: &[f32], m: &mut PSSALayerV2) {
 }
 
 impl Lane {
+    fn forward_gpu(
+        &mut self,
+        m: &PSSALayerV2,
+        gpu: &crate::backend::GpuDispatch,
+    ) -> Result<(), String> {
+        let d = m.cfg.d_latent;
+        let s = m.cfg.d_state;
+        let hs = d * s;
+        let l = self.len;
+        let offset = self.offset;
+        self.h[..hs].copy_from_slice(&self.carry);
+        gpu.ssm_forward(
+            &m.tape.delta[offset * d..(offset + l) * d],
+            &m.tape.delta_raw[offset * d..(offset + l) * d],
+            &m.tape.b_proj[offset * s..(offset + l) * s],
+            &m.tape.x_norm[offset * d..(offset + l) * d],
+            &m.ssm_rates,
+            &m.ssm_rate_derivatives,
+            &m.tape.c_proj[offset * s..(offset + l) * s],
+            &self.carry[..hs],
+            l,
+            d,
+            s,
+            &mut self.bar_a[..l * hs],
+            &mut self.bar_b[..l * hs],
+            &mut self.h[..(l + 1) * hs],
+            &mut self.y[..l * d],
+        )?;
+        self.carry.copy_from_slice(&self.h[l * hs..(l + 1) * hs]);
+        Ok(())
+    }
+
+    fn backward_gpu(
+        &mut self,
+        m: &PSSALayerV2,
+        gpu: &crate::backend::GpuDispatch,
+    ) -> Result<(), String> {
+        let d = m.cfg.d_latent;
+        let s = m.cfg.d_state;
+        let hs = d * s;
+        let l = self.len;
+        let offset = self.offset;
+        self.gd[..l * d].fill(0.0);
+        self.gb[..l * s].fill(0.0);
+        self.gc[..l * s].fill(0.0);
+        self.ga_tokens[..l * hs].fill(0.0);
+        self.gx[..l * d].fill(0.0);
+        gpu.ssm_backward(
+            &m.tape.delta[offset * d..(offset + l) * d],
+            &m.tape.delta_raw[offset * d..(offset + l) * d],
+            &m.tape.b_proj[offset * s..(offset + l) * s],
+            &m.tape.c_proj[offset * s..(offset + l) * s],
+            &m.ssm_rates,
+            &m.ssm_rate_derivatives,
+            &m.tape.x_norm[offset * d..(offset + l) * d],
+            &self.h[..(l + 1) * hs],
+            &self.bar_a[..l * hs],
+            &self.bar_b[..l * hs],
+            &m.bwd_g_zraw[offset * d..(offset + l) * d],
+            &m.bwd_g_ysm[offset * d..(offset + l) * d],
+            l,
+            d,
+            s,
+            1.0 / (s as f32).sqrt(),
+            &mut self.gd[..l * d],
+            &mut self.gb[..l * s],
+            &mut self.gc[..l * s],
+            &mut self.ga_tokens[..l * hs],
+            &mut self.gx[..l * d],
+        )?;
+        self.ga.fill(0.0);
+        for row in self.ga_tokens[..l * hs].chunks_exact(hs).rev() {
+            for (dst, src) in self.ga.iter_mut().zip(row) {
+                *dst += src;
+            }
+        }
+        Ok(())
+    }
+
     /// Ordered lane recurrence for short sequences. The packed dense stages
     /// still run as usual; only the scan itself stays serial when its tree
     /// would cost more than the recurrence it replaces.
