@@ -255,6 +255,7 @@ impl SequenceBatch {
             }
             return Ok(loss);
         }
+        let mut cuda_packed_stages = false;
         self.tokens = 0;
         for lane in &mut self.lanes {
             lane.len = 0;
@@ -291,8 +292,11 @@ impl SequenceBatch {
                 .map(|lane| (lane.offset, lane.carry.clone()))
                 .collect::<Vec<_>>();
             let mut failed = None;
-            for lane in self.lanes.iter_mut().filter(|lane| lane.len > 0) {
-                if let Err(error) = lane.forward_gpu(m, gpu) {
+            for lane_index in 0..self.lanes.len() {
+                if self.lanes[lane_index].len == 0 {
+                    continue;
+                }
+                if let Err(error) = self.forward_lane_cuda(m, gpu, lane_index) {
                     failed = Some(error);
                     break;
                 }
@@ -300,7 +304,9 @@ impl SequenceBatch {
             if let Some(error) = failed {
                 crate::gpu_batch::warn_cuda_fallback_once(
                     &error,
-                    format!("warning: CUDA packed SSM forward failed; using host scan: {error}"),
+                    format!(
+                        "warning: CUDA packed SSM/memory forward failed; using host stages: {error}"
+                    ),
                 );
                 for (offset, carry) in carry_snapshots {
                     let lane = self
@@ -314,6 +320,11 @@ impl SequenceBatch {
                     .iter_mut()
                     .filter(|lane| lane.len > 0)
                     .for_each(|lane| lane.forward(m));
+            } else {
+                // Each lane's resident SSM result was consumed immediately by
+                // CUDA memory_forward_after_ssm. Do not run the packed host
+                // memory stage a second time.
+                cuda_packed_stages = true;
             }
         } else if self.parallel_lanes(m) {
             m.scan_executor.run(|| {
@@ -333,7 +344,9 @@ impl SequenceBatch {
             m.block.tape.y_ssm[start..start + lane.len * m.cfg.d_latent]
                 .copy_from_slice(&lane.y[..lane.len * m.cfg.d_latent]);
         }
-        stages::stage_memory_packed(m, self.tokens);
+        if !cuda_packed_stages {
+            stages::stage_memory_packed(m, self.tokens);
+        }
         stages::stage_adapter(m, self.tokens);
         stages::stage_mlp(m, self.tokens);
         let loss = stages::stage_logits_loss(m, self.tokens);
@@ -589,39 +602,74 @@ fn copy_carry_to_model(carry: &[f32], m: &mut PSSALayerV2) {
     m.copy_recurrent_state_from(carry);
 }
 
-impl Lane {
-    fn forward_gpu(
+impl SequenceBatch {
+    /// Run one independent lane's resident CUDA SSM and consume it immediately
+    /// with the memory kernels. The existing scan is single-sequence, so the
+    /// lane boundary is explicit: no carry can leak into a neighboring lane.
+    fn forward_lane_cuda(
         &mut self,
-        m: &PSSALayerV2,
+        m: &mut PSSALayerV2,
         gpu: &crate::backend::GpuDispatch,
+        lane_index: usize,
     ) -> Result<(), String> {
+        let lane = &mut self.lanes[lane_index];
         let d = m.cfg.d_latent;
         let s = m.cfg.d_state;
         let hs = d * s;
-        let l = self.len;
-        let offset = self.offset;
-        self.h[..hs].copy_from_slice(&self.carry);
-        gpu.ssm_forward(
-            &m.tape.delta[offset * d..(offset + l) * d],
-            &m.tape.delta_raw[offset * d..(offset + l) * d],
-            &m.tape.b_proj[offset * s..(offset + l) * s],
-            &m.tape.x_norm[offset * d..(offset + l) * d],
-            &m.ssm_rates,
-            &m.ssm_rate_derivatives,
-            &m.tape.c_proj[offset * s..(offset + l) * s],
-            &self.carry[..hs],
+        let k = m.cfg.d_mem_key;
+        let l = lane.len;
+        let offset = lane.offset;
+        lane.h[..hs].copy_from_slice(&lane.carry);
+        gpu.ssm_forward_resident(
+            &m.block.tape.delta[offset * d..(offset + l) * d],
+            &m.block.tape.delta_raw[offset * d..(offset + l) * d],
+            &m.block.tape.b_proj[offset * s..(offset + l) * s],
+            &m.block.tape.x_norm[offset * d..(offset + l) * d],
+            &m.block.ssm_rates,
+            &m.block.tape.c_proj[offset * s..(offset + l) * s],
+            &lane.carry[..hs],
             l,
             d,
             s,
-            &mut self.bar_a[..l * hs],
-            &mut self.bar_b[..l * hs],
-            &mut self.h[..(l + 1) * hs],
-            &mut self.y[..l * d],
         )?;
-        self.carry.copy_from_slice(&self.h[l * hs..(l + 1) * hs]);
+
+        let block = &mut m.block;
+        gpu.memory_forward_after_ssm(
+            &block.tape.x_norm[offset * d..(offset + l) * d],
+            &block.w_qx.data,
+            &block.w_qh.data,
+            &block.w_gate.data,
+            &block.w_proj.data,
+            &block.memory.keys,
+            &block.memory.norm_sq,
+            &block.memory.values,
+            l,
+            d,
+            k,
+            d,
+            block.memory.capacity,
+            block.memory.count,
+            block.cfg.tau_mem,
+            &mut lane.bar_a[..l * hs],
+            &mut lane.bar_b[..l * hs],
+            &mut lane.h[..(l + 1) * hs],
+            &mut lane.y[..l * d],
+            &mut block.tape.q_euc[offset * k..(offset + l) * k],
+            &mut block.tape.q_poincare[offset * k..(offset + l) * k],
+            &mut block.tape.q_norm[offset..offset + l],
+            &mut block.tape.mem_weights
+                [offset * block.memory.capacity..(offset + l) * block.memory.capacity],
+            &mut block.tape.m_val[offset * d..(offset + l) * d],
+            &mut block.tape.g_mem[offset * d..(offset + l) * d],
+            &mut block.tape.m_proj[offset * d..(offset + l) * d],
+            &mut block.tape.m_inj[offset * d..(offset + l) * d],
+        )?;
+        lane.carry.copy_from_slice(&lane.h[l * hs..(l + 1) * hs]);
         Ok(())
     }
+}
 
+impl Lane {
     fn backward_gpu(
         &mut self,
         m: &PSSALayerV2,

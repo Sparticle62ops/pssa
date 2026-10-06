@@ -782,8 +782,10 @@ impl CLIHandler {
         // configuration so a later link does not silently revert to the old LR.
         model.cfg.lr = options.lr;
         // Every model shape uses the same device selection. Dense forward and
-        // backward stages dispatch through cuBLAS when available; recurrence,
-        // retrieval, and elementwise work remain on the host for now.
+        // backward stages dispatch through cuBLAS when available. CUDA's
+        // resident scan/memory kernels are used by the depth-one packed path;
+        // host tape bookkeeping and unsupported elementwise stages remain
+        // explicit CPU work.
         match options.backend.device() {
             Err(e) if options.backend != TrainingBackend::Auto => {
                 return Err(format!("requested training backend unavailable: {e}"));
