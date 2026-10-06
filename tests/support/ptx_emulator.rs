@@ -1,7 +1,9 @@
 //! A deliberately small, test-only interpreter for the embedded stage PTX.
 //! Executes the real instructions (including addresses, branches, and barriers),
 //! not a Rust transcription of the algorithm. This is not a CUDA/JIT emulator:
-//! approximate math uses Rust f32 math, and device scheduling/copies need GPU tests.
+//! approximate transcendental math uses Rust f32 math; div.approx models its
+//! documented reciprocal-multiply range limitations. Device scheduling/copies
+//! and CUDA approximation error still need GPU tests.
 use std::collections::HashMap;
 
 pub enum Arg<'a> {
@@ -116,6 +118,8 @@ impl Thread {
                 .unwrap_or_else(|| panic!("uninitialized register {name}"))
         } else if let Some(hex) = name.strip_prefix("0f") {
             u32::from_str_radix(hex, 16).unwrap() as u64
+        } else if let Some(hex) = name.strip_prefix("0d") {
+            u64::from_str_radix(hex, 16).unwrap()
         } else {
             name.parse()
                 .unwrap_or_else(|_| panic!("unsupported operand {name}"))
@@ -123,6 +127,10 @@ impl Thread {
     }
     fn float(&self, name: &str) -> f32 {
         f32::from_bits(self.value(name) as u32)
+    }
+
+    fn double(&self, name: &str) -> f64 {
+        f64::from_bits(self.value(name))
     }
 
     fn until_barrier(
@@ -134,7 +142,9 @@ impl Thread {
         writes: &mut HashMap<u64, usize>,
         owner: usize,
     ) {
-        for _ in 0..1_000_000 {
+        // A single production-width SSM local row legitimately exceeds one
+        // million instructions (3584 latent channels x 16 state channels).
+        for _ in 0..16_000_000 {
             let ins = &kernel.code[self.pc];
             self.pc += 1;
             if let Some((predicate, expected)) = &ins.guard {
@@ -200,7 +210,7 @@ impl Thread {
                     memory.insert(address, value);
                     continue;
                 }
-                "mov.u32" | "mov.f32" => self.value(&a[1]),
+                "mov.u32" | "mov.f32" | "mov.f64" | "mov.b64" => self.value(&a[1]),
                 "add.u64" => self.value(&a[1]).wrapping_add(self.value(&a[2])),
                 "add.u32" => {
                     (self.value(&a[1]) as u32).wrapping_add(self.value(&a[2]) as u32) as u64
@@ -221,14 +231,46 @@ impl Thread {
                 "rem.u32" => self.value(&a[1]) % self.value(&a[2]),
                 "shl.b32" => ((self.value(&a[1]) as u32) << self.value(&a[2])) as u64,
                 "shr.u32" => ((self.value(&a[1]) as u32) >> self.value(&a[2])) as u64,
+                "shr.u64" => self.value(&a[1]) >> self.value(&a[2]),
+                "and.b64" => self.value(&a[1]) & self.value(&a[2]),
+                "or.b64" => self.value(&a[1]) | self.value(&a[2]),
+                "cvt.u32.u64" => self.value(&a[1]) as u32 as u64,
+                "cvt.rn.f64.u32" => (self.value(&a[1]) as u32 as f64).to_bits(),
                 "setp.ge.u32" => (self.value(&a[1]) >= self.value(&a[2])) as u64,
                 "setp.eq.u32" => (self.value(&a[1]) == self.value(&a[2])) as u64,
                 "setp.eq.f32" => (self.float(&a[1]) == self.float(&a[2])) as u64,
                 "setp.gt.f32" => (self.float(&a[1]) > self.float(&a[2])) as u64,
+                "setp.lt.f32" => (self.float(&a[1]) < self.float(&a[2])) as u64,
+                "setp.eq.f64" => (self.double(&a[1]) == self.double(&a[2])) as u64,
+                "setp.ge.f64" => (self.double(&a[1]) >= self.double(&a[2])) as u64,
+                "setp.lt.f64" => (self.double(&a[1]) < self.double(&a[2])) as u64,
+                "cvt.f64.f32" => (self.float(&a[1]) as f64).to_bits(),
+                "cvt.rn.f32.f64" => (self.double(&a[1]) as f32).to_bits() as u64,
+                "add.rn.f64" => (self.double(&a[1]) + self.double(&a[2])).to_bits(),
+                "sub.rn.f64" => (self.double(&a[1]) - self.double(&a[2])).to_bits(),
+                "mul.rn.f64" => (self.double(&a[1]) * self.double(&a[2])).to_bits(),
+                "div.rn.f64" => (self.double(&a[1]) / self.double(&a[2])).to_bits(),
+                "sqrt.rn.f64" => self.double(&a[1]).sqrt().to_bits(),
+                "min.f64" => self.double(&a[1]).min(self.double(&a[2])).to_bits(),
+                "neg.f64" => (-self.double(&a[1])).to_bits(),
                 "add.f32" => (self.float(&a[1]) + self.float(&a[2])).to_bits() as u64,
                 "sub.f32" => (self.float(&a[1]) - self.float(&a[2])).to_bits() as u64,
                 "mul.f32" => (self.float(&a[1]) * self.float(&a[2])).to_bits() as u64,
-                "div.approx.f32" => (self.float(&a[1]) / self.float(&a[2])).to_bits() as u64,
+                "div.approx.f32" => {
+                    let (numerator, denominator) = (self.float(&a[1]), self.float(&a[2]));
+                    // PTX ISA 9.7.3.8: approx is a * (1/b), not full-range
+                    // division. Above 2^126, finite a produces signed zero;
+                    // tiny b can overflow its reciprocal (including 0*inf).
+                    let reciprocal = if denominator.abs() > f32::from_bits(0x7e800000)
+                        && denominator.is_finite()
+                    {
+                        0.0f32.copysign(denominator)
+                    } else {
+                        1.0 / denominator
+                    };
+                    (numerator * reciprocal).to_bits() as u64
+                }
+                "div.rn.f32" => (self.float(&a[1]) / self.float(&a[2])).to_bits() as u64,
                 "neg.f32" => (-self.float(&a[1])).to_bits() as u64,
                 "ex2.approx.f32" => self.float(&a[1]).exp2().to_bits() as u64,
                 "sqrt.approx.f32" => self.float(&a[1]).sqrt().to_bits() as u64,

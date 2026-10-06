@@ -407,10 +407,96 @@ fn enormous_memory_feedback_is_finite_with_both_safeguards() {
     );
 }
 
-#[path = "support/cuda_ssm_ptx.rs"]
-mod cuda_ssm_ptx;
+#[test]
+fn resumed_nonfinite_loss_reports_update_stage_and_tensor_without_saving() {
+    let tmp = TempDir::new();
+    let text = "alpha beta\nalpha beta\n";
+    let corpus = tmp.path("overflow.txt");
+    fs::write(&corpus, text).unwrap();
+    let tok = Tokenizer::from_corpus(text, true).unwrap();
+    let mut m = PSSALayerV2::new(
+        PSSAConfigV2 {
+            d_latent: 4,
+            d_vocab: tok.vocab_size,
+            d_state: 1,
+            d_mem_key: 1,
+            mem_capacity: 2,
+            chunk_len: 1,
+            ..Default::default()
+        },
+        42,
+    );
+    m.vocabulary = tok.ordered_vocabulary().unwrap();
+    m.step_counter = 1814;
+    for p in [
+        &mut m.block.w_b,
+        &mut m.block.w_c,
+        &mut m.block.w_qx,
+        &mut m.block.w_qh,
+        &mut m.block.w_gate,
+        &mut m.block.w_proj,
+        &mut m.block.mlp_w1,
+        &mut m.block.mlp_w2,
+        &mut m.block.adapters[0].up_proj,
+        &mut m.unembed_w,
+    ] {
+        p.data.fill(0.0);
+    }
+    for i in 0..4 {
+        m.block.w_proj.data[i * 4 + i] = 1.0;
+    }
+    m.block.memory.insert(&[0.0], &[3.0; 4]);
+    // All checkpoint tensors are finite. Memory injects 1.5 into z_final;
+    // the head is the first stage to overflow during this update.
+    m.unembed_w.data[0] = f32::MAX;
+    let resume = tmp.path("overflow-seed.pssa");
+    let out = tmp.path("must-not-save.pssa");
+    checkpoint::save_model(&m, &resume).unwrap();
+    let before = fs::read(&resume).unwrap();
+    for batch in [1, 2] {
+        let result = Command::new(env!("CARGO_BIN_EXE_pssa"))
+            .args([
+                "train",
+                &corpus,
+                "--resume",
+                &resume,
+                "-o",
+                &out,
+                "-e",
+                "1",
+                "--backend",
+                "cpu",
+                "--batch-size",
+                &batch.to_string(),
+                "--no-tui",
+            ])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        let error = String::from_utf8_lossy(&result.stderr);
+        for message in [
+            "non-finite loss",
+            "update_index=1",
+            "global_step=1815",
+            "stage=logits_loss",
+            "tensor=logits",
+            "index=0",
+            "without checkpoint",
+        ] {
+            assert!(
+                error.contains(message),
+                "batch={batch}: missing {message}: {error}"
+            );
+        }
+        assert!(!PathBuf::from(&out).exists());
+        assert_eq!(fs::read(&resume).unwrap(), before);
+    }
+}
+
 #[path = "support/cuda_memory_ptx.rs"]
 mod cuda_memory_ptx;
+#[path = "support/cuda_ssm_ptx.rs"]
+mod cuda_ssm_ptx;
 #[path = "../src/cuda/stage_bounds.rs"]
 mod cuda_stage_bounds;
 #[path = "support/cuda_stage_local_ptx.rs"]

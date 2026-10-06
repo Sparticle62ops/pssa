@@ -211,6 +211,11 @@ impl SequenceBatch {
         m: &mut PSSALayerV2,
         sequences: &[Sequence<'_>],
     ) -> Result<f32, String> {
+        let _trace = crate::training_diagnostics::StageTrace::new(
+            &m.device,
+            "batch.forward",
+            sequences.iter().map(|s| s.inputs.len()).sum(),
+        );
         self.check_model(m)?;
         if self.pending {
             return Err("finish batch backward before the next forward".into());
@@ -243,7 +248,12 @@ impl SequenceBatch {
             }
         }
         if m.depth() > 1 || m.loops() > 1 {
-            return Ok(self.forward_stacked(m, sequences));
+            let loss = self.forward_stacked(m, sequences);
+            if !loss.is_finite() {
+                self.pending = false;
+                return Err(crate::training_diagnostics::loss_error(m, self.tokens));
+            }
+            return Ok(loss);
         }
         self.tokens = 0;
         for lane in &mut self.lanes {
@@ -266,6 +276,20 @@ impl SequenceBatch {
         m.refresh_ssm_rates();
         let gpu = m.device.gpu().filter(|g| g.accelerates_backward());
         if let Some(gpu) = gpu.as_ref() {
+            let _trace = crate::training_diagnostics::StageTrace::new(
+                &m.device,
+                "batch.forward.ssm",
+                self.tokens,
+            );
+            // A CUDA lane publishes its carry before the next lane starts. If a
+            // later launch fails, restore every carry before replaying the whole
+            // packed batch on CPU; otherwise successful lanes would advance twice.
+            let carry_snapshots = self
+                .lanes
+                .iter()
+                .filter(|lane| lane.len > 0)
+                .map(|lane| (lane.offset, lane.carry.clone()))
+                .collect::<Vec<_>>();
             let mut failed = None;
             for lane in self.lanes.iter_mut().filter(|lane| lane.len > 0) {
                 if let Err(error) = lane.forward_gpu(m, gpu) {
@@ -278,6 +302,14 @@ impl SequenceBatch {
                     &error,
                     format!("warning: CUDA packed SSM forward failed; using host scan: {error}"),
                 );
+                for (offset, carry) in carry_snapshots {
+                    let lane = self
+                        .lanes
+                        .iter_mut()
+                        .find(|lane| lane.offset == offset && lane.len > 0)
+                        .expect("snapshotted lane still exists");
+                    lane.carry.copy_from_slice(&carry);
+                }
                 self.lanes
                     .iter_mut()
                     .filter(|lane| lane.len > 0)
@@ -301,10 +333,13 @@ impl SequenceBatch {
             m.block.tape.y_ssm[start..start + lane.len * m.cfg.d_latent]
                 .copy_from_slice(&lane.y[..lane.len * m.cfg.d_latent]);
         }
-        stages::stage_memory(m, self.tokens);
+        stages::stage_memory_packed(m, self.tokens);
         stages::stage_adapter(m, self.tokens);
         stages::stage_mlp(m, self.tokens);
         let loss = stages::stage_logits_loss(m, self.tokens);
+        if !loss.is_finite() {
+            return Err(crate::training_diagnostics::loss_error(m, self.tokens));
+        }
         self.pending = true;
         Ok(loss)
     }
@@ -313,6 +348,8 @@ impl SequenceBatch {
     /// For a larger optimizer group pass batch_tokens / group_tokens. Carry is
     /// retained for the next forward, but TBPTT never differentiates across calls.
     pub fn backward(&mut self, m: &mut PSSALayerV2, accumulation_scale: f32) -> Result<(), String> {
+        let _trace =
+            crate::training_diagnostics::StageTrace::new(&m.device, "batch.backward", self.tokens);
         self.check_model(m)?;
         if !self.pending || !accumulation_scale.is_finite() {
             return Err(
@@ -332,6 +369,11 @@ impl SequenceBatch {
         m.refresh_ssm_rates();
         let gpu = m.device.gpu().filter(|g| g.accelerates_backward());
         if let Some(gpu) = gpu.as_ref() {
+            let _trace = crate::training_diagnostics::StageTrace::new(
+                &m.device,
+                "batch.backward.ssm",
+                self.tokens,
+            );
             let mut failed = None;
             for lane in self.lanes.iter_mut().filter(|lane| lane.len > 0) {
                 if let Err(error) = lane.backward_gpu(m, gpu) {
@@ -362,6 +404,11 @@ impl SequenceBatch {
                 .filter(|lane| lane.len > 0)
                 .for_each(|lane| lane.backward(m));
         }
+        let _trace = crate::training_diagnostics::StageTrace::new(
+            &m.device,
+            "batch.backward.projections_norm",
+            n,
+        );
         let d = m.cfg.d_latent;
         let s = m.cfg.d_state;
         for lane in self.lanes.iter().filter(|lane| lane.len > 0) {
@@ -390,15 +437,8 @@ impl SequenceBatch {
             (&self.gc[..n * s], &mut m.block.w_c, s),
         ] {
             if let Some(gpu) = gpu.as_ref() {
-                gpu.gemm_nn_into(
-                    g,
-                    &w.data,
-                    n,
-                    rows,
-                    d,
-                    &mut self.gx[..n * d],
-                )
-                .expect("validated model GEMM dimensions");
+                gpu.gemm_nn_into(g, &w.data, n, rows, d, &mut self.gx[..n * d])
+                    .expect("validated model GEMM dimensions");
                 gpu.gemm_tn_accumulate_into(
                     g,
                     &m.block.tape.x_norm[..n * d],

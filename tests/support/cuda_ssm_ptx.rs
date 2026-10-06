@@ -71,42 +71,54 @@ impl Ssm {
         for idx in 0..stride {
             s.states[idx] = 0.01 * (idx as f32 - 2.0);
         }
+        s.refresh();
+        s
+    }
+    fn refresh(&mut self) {
+        let (l, dm, ds) = (self.l, self.dm, self.ds);
+        let stride = dm * ds;
+        self.y.fill(0.0);
+        self.gd.fill(0.0);
+        self.gb.fill(0.0);
+        self.gc.fill(0.0);
+        self.ga.fill(0.0);
+        self.gx.fill(0.0);
         for t in 0..l {
             for i in 0..dm {
                 for j in 0..ds {
                     let idx = i * ds + j;
-                    let a = (s.delta[t * dm + i] * s.rates[idx]).exp();
-                    let b = s.delta[t * dm + i] * s.b[t * ds + j];
-                    s.a[t * stride + idx] = a;
-                    s.bar_b[t * stride + idx] = b;
-                    let h = a * s.states[t * stride + idx] + b * s.x[t * dm + i];
-                    s.states[(t + 1) * stride + idx] = h;
-                    s.y[t * dm + i] += h * s.c[t * ds + j];
+                    let a = (self.delta[t * dm + i] * self.rates[idx]).exp();
+                    let b = self.delta[t * dm + i] * self.b[t * ds + j];
+                    self.a[t * stride + idx] = a;
+                    self.bar_b[t * stride + idx] = b;
+                    let h = a * self.states[t * stride + idx] + b * self.x[t * dm + i];
+                    self.states[(t + 1) * stride + idx] = h;
+                    self.y[t * dm + i] += h * self.c[t * ds + j];
                 }
             }
         }
         let mut future = vec![0.0; stride];
         for t in (0..l).rev() {
-            s.future[(l - 1 - t) * stride..(l - t) * stride].copy_from_slice(&future);
+            self.future[(l - 1 - t) * stride..(l - t) * stride].copy_from_slice(&future);
             for i in 0..dm {
-                let gy = s.gz[t * dm + i] * s.scale() + s.gy[t * dm + i];
+                let gy = self.gz[t * dm + i] * self.scale() + self.gy[t * dm + i];
                 for j in 0..ds {
                     let idx = i * ds + j;
-                    let q = gy * s.c[t * ds + j] + future[idx];
-                    let a = s.a[t * stride + idx];
-                    let prev = s.states[t * stride + idx];
-                    s.gc[t * ds + j] += gy * s.states[(t + 1) * stride + idx];
-                    s.ga[t * stride + idx] = q * (s.delta[t * dm + i] * a) * prev * s.deriv[idx];
-                    s.gd[t * dm + i] +=
-                        q * (s.rates[idx] * a * prev + s.b[t * ds + j] * s.x[t * dm + i]);
-                    s.gb[t * ds + j] += q * (s.delta[t * dm + i] * s.x[t * dm + i]);
-                    s.gx[t * dm + i] += q * s.bar_b[t * stride + idx];
+                    let q = gy * self.c[t * ds + j] + future[idx];
+                    let a = self.a[t * stride + idx];
+                    let prev = self.states[t * stride + idx];
+                    self.gc[t * ds + j] += gy * self.states[(t + 1) * stride + idx];
+                    self.ga[t * stride + idx] =
+                        q * (self.delta[t * dm + i] * a) * prev * self.deriv[idx];
+                    self.gd[t * dm + i] +=
+                        q * (self.rates[idx] * a * prev + self.b[t * ds + j] * self.x[t * dm + i]);
+                    self.gb[t * ds + j] += q * (self.delta[t * dm + i] * self.x[t * dm + i]);
+                    self.gx[t * dm + i] += q * self.bar_b[t * stride + idx];
                     future[idx] = q * a;
                 }
-                s.gd[t * dm + i] *= pssa::linalg::sigmoid(s.raw[t * dm + i]);
+                self.gd[t * dm + i] *= pssa::linalg::sigmoid(self.raw[t * dm + i]);
             }
         }
-        s
     }
     fn scale(&self) -> f32 {
         1.0 / (self.ds as f32).sqrt()
