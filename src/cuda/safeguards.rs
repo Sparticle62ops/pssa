@@ -2,6 +2,7 @@
 //! Training may retain dense gradients and Adam moments between updates; host
 //! weights remain current because recurrence/retrieval are still host-owned.
 use super::*;
+use super::stage_bounds::{cap_shape, optimizer_shape, product};
 use crate::pssa::{AdamTensor, PSSAConfigV2};
 use cudarc::driver::{CudaFunction, DevicePtr, LaunchConfig, PushKernelArg};
 
@@ -67,6 +68,7 @@ impl CudaContext {
     }
 
     fn upload_tensor(&self, tensor: &AdamTensor<'_>) -> Result<TensorState, String> {
+        optimizer_shape(tensor.data.len(), tensor.grad.len(), tensor.m.len(), tensor.v.len())?;
         Ok(TensorState {
             host_data: tensor.data.as_ptr() as usize,
             data: self.stream.clone_htod(tensor.data).map_err(error)?,
@@ -213,6 +215,17 @@ impl CudaContext {
         max_norm: f32,
         embedding_rows: &[usize],
     ) -> Result<f64, String> {
+        let count = u32::try_from(tensors.len()).map_err(|_| "CUDA optimizer tensor count exceeds u32; refusing launch")?;
+        for t in tensors.iter() {
+            optimizer_shape(t.data.len(), t.grad.len(), t.m.len(), t.v.len())?;
+        }
+        for &row in embedding_rows {
+            let rows = row.checked_add(1).ok_or("CUDA embedding row overflow; refusing launch")?;
+            let end = product(rows, cfg.d_latent, "embedding row end")?;
+            if cfg.d_latent == 0 || tensors.first().is_none_or(|t| end > t.grad.len()) {
+                return Err(format!("CUDA embedding row {row} is out of bounds; refusing launch"));
+            }
+        }
         let mut state = self.safeguards.lock().map_err(error)?;
         self.safeguard_kernels(&mut state)?;
         if !state.resident {
@@ -228,6 +241,10 @@ impl CudaContext {
                     .tensors
                     .get_mut(&(t.grad.as_ptr() as usize))
                     .ok_or("CUDA optimizer tensor registration changed")?;
+                if device.grad.len() != t.grad.len() {
+                    return Err("CUDA registered gradient length changed; refusing launch".into());
+                }
+                optimizer_shape(device.data.len(), device.grad.len(), device.m.len(), device.v.len())?;
                 if index == 0 {
                     // Embedding scatter is host-owned, but only used rows have
                     // gradients. Device zeroing already cleared all other rows.
@@ -261,7 +278,6 @@ impl CudaContext {
         let mut partials = self.stream.alloc_zeros::<f64>(256).map_err(error)?;
         let mut norm_dev = self.stream.alloc_zeros::<f64>(1).map_err(error)?;
         let kernels = state.kernels.as_ref().unwrap();
-        let count = u32::try_from(tensors.len()).map_err(error)?;
         // SAFETY: descriptors reference exactly the registered, live gradient
         // allocations. Fixed 256-thread blocks match PTX shared storage; the
         // second stage reads exactly 256 partials. No unordered atomic FP sums.
@@ -314,7 +330,7 @@ impl CudaContext {
         for t in tensors.iter_mut() {
             let device = device_tensors.get_mut(&(t.grad.as_ptr() as usize)).unwrap();
             let len = t.grad.len() as u64;
-            let launch_len = u32::try_from(len).map_err(error)?;
+            let launch_len = optimizer_shape(device.data.len(), device.grad.len(), device.m.len(), device.v.len())?;
             // SAFETY: all four allocations have len elements, kernel bounds
             // checks every access; f64 scale rounds to f32 before Adam moments.
             unsafe {
@@ -368,7 +384,7 @@ impl CudaContext {
         width: usize,
         cap: f32,
     ) -> Result<(), String> {
-        assert!(width > 0 && values.len() % width == 0 && cap.is_finite() && cap > 0.0);
+        let (rows, width_arg) = cap_shape(values.len(), width, cap)?;
         if values.is_empty() {
             return Ok(());
         }
@@ -386,8 +402,7 @@ impl CudaContext {
             .map_err(error)?;
         let kernels = kernels.as_ref().unwrap();
         let mut invalid = self.stream.alloc_zeros::<u32>(1).map_err(error)?;
-        let rows = u32::try_from(values.len() / width).map_err(error)?;
-        let width = u32::try_from(width).map_err(error)?;
+        let width = width_arg;
         let cap = cap as f64;
         // SAFETY: validated whole rows, positive width/cap, live allocations;
         // each thread owns one row including the one-ULP correction loop.

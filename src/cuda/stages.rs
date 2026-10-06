@@ -11,6 +11,8 @@ use super::*;
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use std::{ffi::CString, ptr};
 
+use super::stage_bounds::{elems, gemm_shape, lengths, product, scan_shape, MemoryShape, SsmShape};
+
 struct Kernels {
     prepare: CudaFunction,
     scan: CudaFunction,
@@ -31,6 +33,8 @@ struct MemoryBuffers {
     x: CudaSlice<f32>,
     y: CudaSlice<f32>,
     q_euc: CudaSlice<f32>,
+    // Query projection scratch is [len,d_k], not [len,d_m].
+    q_ssm: CudaSlice<f32>,
     q_pnc: CudaSlice<f32>,
     q_norm: CudaSlice<f32>,
     weights: CudaSlice<f32>,
@@ -138,26 +142,6 @@ fn stage_load_error(
     }
 }
 
-fn elems(value: usize, what: &str) -> Result<u32, String> {
-    u32::try_from(value).map_err(|_| format!("CUDA {what} exceeds the kernel index limit"))
-}
-
-fn product(a: usize, b: usize, what: &str) -> Result<usize, String> {
-    a.checked_mul(b)
-        .ok_or_else(|| format!("CUDA {what} size overflow"))
-}
-
-fn scan_capacity(len: usize) -> usize {
-    if len <= 1 {
-        return 1;
-    }
-    if len <= 512 {
-        len.next_power_of_two()
-    } else {
-        1024
-    }
-}
-
 impl CudaContext {
     fn stage_kernels<'a>(&self, state: &'a mut StageState) -> Result<&'a Kernels, String> {
         if let Some(error) = state.load_error.as_ref() {
@@ -211,18 +195,18 @@ impl CudaContext {
         n: usize,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), String> {
-        if [m, k, n].iter().any(|&x| x == 0 || x > i32::MAX as usize) {
-            return Err("CUDA stage GEMM dimensions are invalid".into());
-        }
+        gemm_shape(m, k, n, a.len(), b.len(), out.len())?;
+        // Model weights are row-major [output,input]; transpose their
+        // column-major view, just like the public forward matvec path.
         let cfg = GemmConfig {
-            transa: cublasOperation_t::CUBLAS_OP_N,
+            transa: cublasOperation_t::CUBLAS_OP_T,
             transb: cublasOperation_t::CUBLAS_OP_N,
             m: n as i32,
             n: m as i32,
             k: k as i32,
             alpha: 1.0,
             beta: 0.0,
-            lda: n as i32,
+            lda: k as i32,
             ldb: k as i32,
             ldc: n as i32,
         };
@@ -242,11 +226,12 @@ impl CudaContext {
         len: usize,
         stride: usize,
     ) -> Result<(), String> {
-        if len == 0 || stride == 0 {
-            return Err("CUDA affine scan dimensions must be positive".into());
-        }
-        let capacity = scan_capacity(len);
-        let tiles = len.div_ceil(capacity);
+        let (capacity, tiles) = scan_shape(len, stride)?;
+        let total = product(len, stride, "scan elements")?;
+        lengths("affine scan", &[
+            ("in_a", in_a.len(), total), ("in_b", in_b.len(), total),
+            ("out_a", out_a.len(), total), ("out_b", out_b.len(), total),
+        ])?;
         let len_arg = elems(len, "scan length")?;
         let stride_arg = elems(stride, "scan stride")?;
         let capacity_arg = elems(capacity, "scan tile width")?;
@@ -328,14 +313,8 @@ impl CudaContext {
         d_m: usize,
         d_s: usize,
     ) -> Result<ForwardBuffers, String> {
-        if seq_len == 0 || d_m == 0 || d_s == 0 {
-            return Err("CUDA SSM dimensions must be positive".into());
-        }
-        let stride = product(d_m, d_s, "SSM stride")?;
-        let token_m = product(seq_len, d_m, "SSM latent tape")?;
-        let token_s = product(seq_len, d_s, "SSM projection tape")?;
-        let token_state = product(seq_len, stride, "SSM state tape")?;
-        let state_len = product(seq_len + 1, stride, "SSM state tape")?;
+        let SsmShape { stride, token_m, token_s, token_state, state_len } =
+            SsmShape::new(seq_len, d_m, d_s)?;
         if delta.len() != token_m
             || delta_raw.len() != token_m
             || b_proj.len() != token_s
@@ -439,11 +418,11 @@ impl CudaContext {
         states: &mut [f32],
         y_ssm: &mut [f32],
     ) -> Result<(), String> {
-        let token_state = product(fwd.seq_len, fwd.stride, "SSM state tape")?;
-        let token_m = product(fwd.seq_len, fwd.d_m, "SSM output tape")?;
+        let SsmShape { token_state, token_m, state_len, .. } =
+            SsmShape::new(fwd.seq_len, fwd.d_m, fwd.d_s)?;
         if bar_a.len() != token_state
             || bar_b.len() != token_state
-            || states.len() < (fwd.seq_len + 1) * fwd.stride
+            || states.len() < state_len
             || y_ssm.len() != token_m
         {
             return Err("CUDA SSM output shape mismatch".into());
@@ -451,7 +430,7 @@ impl CudaContext {
         self.stream.memcpy_dtoh(&fwd.bar_a, bar_a).map_err(error)?;
         self.stream.memcpy_dtoh(&fwd.bar_b, bar_b).map_err(error)?;
         self.stream
-            .memcpy_dtoh(&fwd.states, &mut states[..(fwd.seq_len + 1) * fwd.stride])
+            .memcpy_dtoh(&fwd.states, &mut states[..state_len])
             .map_err(error)?;
         self.stream.memcpy_dtoh(&fwd.y_ssm, y_ssm).map_err(error)?;
         Ok(())
@@ -519,10 +498,9 @@ impl CudaContext {
         capacity: usize,
         weights: &[f32],
     ) -> Result<MemoryBuffers, String> {
-        let x_len = product(seq_len, d_m, "memory input")?;
-        let q_len = product(seq_len, d_k, "memory query")?;
-        let value_len = product(seq_len, d_val, "memory value")?;
-        let weight_len = product(seq_len, capacity, "memory weights")?;
+        let shape = MemoryShape::new(seq_len, d_m, d_k, d_val, capacity, 0, 1.0)?;
+        let (x_len, q_len, value_len, weight_len) =
+            (shape.x, shape.query, shape.value, shape.weights);
         if x.len() != x_len || y.len() != x_len || weights.len() != weight_len {
             return Err("CUDA memory buffer shape mismatch".into());
         }
@@ -530,6 +508,7 @@ impl CudaContext {
             x,
             y,
             q_euc: self.stream.alloc_zeros::<f32>(q_len).map_err(error)?,
+            q_ssm: self.stream.alloc_zeros::<f32>(q_len).map_err(error)?,
             q_pnc: self.stream.alloc_zeros::<f32>(q_len).map_err(error)?,
             q_norm: self.stream.alloc_zeros::<f32>(seq_len).map_err(error)?,
             weights: self.stream.clone_htod(weights).map_err(error)?,
@@ -562,19 +541,19 @@ impl CudaContext {
         count: usize,
         tau: f32,
     ) -> Result<(), String> {
-        if count > capacity
-            || w_qx.len() != d_k * d_m
-            || w_qh.len() != d_k * d_m
-            || w_gate.len() != d_m * d_m
-            || w_proj.len() != d_m * d_val
-            || keys.len() != capacity * d_k
-            || norm_sq.len() != capacity
-            || values.len() != capacity * d_val
-            || !tau.is_finite()
-            || tau <= 0.0
-        {
-            return Err("CUDA memory forward shape mismatch".into());
-        }
+        let shape = MemoryShape::new(seq_len, d_m, d_k, d_val, capacity, count, tau)?;
+        lengths("memory forward", &[
+            ("w_qx", w_qx.len(), shape.w_query), ("w_qh", w_qh.len(), shape.w_query),
+            ("w_gate", w_gate.len(), shape.w_gate), ("w_proj", w_proj.len(), shape.w_proj),
+            ("keys", keys.len(), shape.keys), ("norm_sq", norm_sq.len(), capacity),
+            ("values", values.len(), shape.values),
+            ("x", mem.x.len(), shape.x), ("y", mem.y.len(), shape.x),
+            ("q_euc", mem.q_euc.len(), shape.query), ("q_ssm", mem.q_ssm.len(), shape.query),
+            ("q_pnc", mem.q_pnc.len(), shape.query), ("q_norm", mem.q_norm.len(), seq_len),
+            ("weights", mem.weights.len(), shape.weights), ("m_val", mem.m_val.len(), shape.value),
+            ("g_mem", mem.g_mem.len(), shape.x), ("m_proj", mem.m_proj.len(), shape.x),
+            ("m_inj", mem.m_inj.len(), shape.x),
+        ])?;
         let dwqx = self.stream.clone_htod(w_qx).map_err(error)?;
         let dwqh = self.stream.clone_htod(w_qh).map_err(error)?;
         let dwg = self.stream.clone_htod(w_gate).map_err(error)?;
@@ -583,13 +562,13 @@ impl CudaContext {
         let dnorm = self.stream.clone_htod(norm_sq).map_err(error)?;
         let dvalues = self.stream.clone_htod(values).map_err(error)?;
         self.gemm_device(&mem.x, &dwqx, seq_len, d_m, d_k, &mut mem.q_euc)?;
-        self.gemm_device(&mem.y, &dwqh, seq_len, d_m, d_k, &mut mem.m_proj)?;
+        self.gemm_device(&mem.y, &dwqh, seq_len, d_m, d_k, &mut mem.q_ssm)?;
         let q_len = elems(product(seq_len, d_k, "query count")?, "query count")?;
         unsafe {
             self.stream
                 .launch_builder(&kernels.add)
                 .arg(&mut mem.q_euc)
-                .arg(&mem.m_proj)
+                .arg(&mem.q_ssm)
                 .arg(&q_len)
                 .launch(LaunchConfig::for_num_elems(q_len))
                 .map_err(error)?;
@@ -706,7 +685,8 @@ impl CudaContext {
             .take()
             .ok_or("CUDA SSM result is not resident")?;
         let kernels = self.stage_kernels(&mut state)?.clone();
-        if fwd.seq_len != seq_len || fwd.d_m != d_m || fwd.d_s * d_m != fwd.stride {
+        MemoryShape::new(seq_len, d_m, d_k, d_val, capacity, count, tau)?;
+        if fwd.seq_len != seq_len || fwd.d_m != d_m || product(fwd.d_s, d_m, "resident SSM stride")? != fwd.stride {
             return Err("CUDA resident SSM shape mismatch".into());
         }
         let x = self.stream.clone_htod(x_norm).map_err(error)?;
@@ -757,6 +737,8 @@ impl CudaContext {
     ) -> Result<(), String> {
         let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
         let kernels = self.stage_kernels(&mut state)?.clone();
+        let shape = MemoryShape::new(seq_len, d_m, d_k, d_val, capacity, count, tau)?;
+        lengths("memory input", &[("x_norm", x_norm.len(), shape.x), ("y_ssm", y_ssm.len(), shape.x)])?;
         let x = self.stream.clone_htod(x_norm).map_err(error)?;
         let y = self.stream.clone_htod(y_ssm).map_err(error)?;
         let mut mem = self.make_memory_buffers(
@@ -786,6 +768,8 @@ impl CudaContext {
         {
             return Err("CUDA memory backward local shape mismatch".into());
         }
+        if g_zraw.is_empty() { return Ok(()); }
+        let len = elems(g_zraw.len(), "memory backward local count")?;
         let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
         let kernels = self.stage_kernels(&mut state)?.clone();
         let dz = self.stream.clone_htod(g_zraw).map_err(error)?;
@@ -793,7 +777,6 @@ impl CudaContext {
         let dp = self.stream.clone_htod(m_proj).map_err(error)?;
         let mut out_m = self.stream.alloc_zeros::<f32>(g_m_proj.len()).map_err(error)?;
         let mut out_g = self.stream.alloc_zeros::<f32>(g_gate.len()).map_err(error)?;
-        let len = elems(g_zraw.len(), "memory backward local count")?;
         unsafe {
             self.stream
                 .launch_builder(&kernels.memory_backward_local)
@@ -836,10 +819,8 @@ impl CudaContext {
         g_a: &mut [f32],
         g_x: &mut [f32],
     ) -> Result<(), String> {
-        let stride = product(d_m, d_s, "SSM stride")?;
-        let token_m = product(seq_len, d_m, "SSM latent tape")?;
-        let token_s = product(seq_len, d_s, "SSM projection tape")?;
-        let token_state = product(seq_len, stride, "SSM state tape")?;
+        let SsmShape { stride, token_m, token_s, token_state, state_len } =
+            SsmShape::new(seq_len, d_m, d_s)?;
         if delta.len() != token_m
             || delta_raw.len() != token_m
             || b_proj.len() != token_s
@@ -847,7 +828,7 @@ impl CudaContext {
             || rates.len() != stride
             || rate_deriv.len() != stride
             || x_norm.len() != token_m
-            || states.len() < (seq_len + 1) * stride
+            || states.len() < state_len
             || bar_a.len() != token_state
             || bar_b.len() != token_state
             || g_zraw.len() != token_m
@@ -869,7 +850,7 @@ impl CudaContext {
         let d_rates = self.stream.clone_htod(rates).map_err(error)?;
         let d_deriv = self.stream.clone_htod(rate_deriv).map_err(error)?;
         let d_x = self.stream.clone_htod(x_norm).map_err(error)?;
-        let d_states = self.stream.clone_htod(&states[..(seq_len + 1) * stride]).map_err(error)?;
+        let d_states = self.stream.clone_htod(&states[..state_len]).map_err(error)?;
         let d_bar_a = self.stream.clone_htod(bar_a).map_err(error)?;
         let d_bar_b = self.stream.clone_htod(bar_b).map_err(error)?;
         let d_gz = self.stream.clone_htod(g_zraw).map_err(error)?;
@@ -968,22 +949,15 @@ impl CudaContext {
         query_pnc: &mut [f32],
         query_euc: &mut [f32],
     ) -> Result<(), String> {
-        if count > capacity
-            || q_pnc.len() != seq_len * d_key
-            || q_euc.len() != q_pnc.len()
-            || g_m.len() != seq_len * d_val
-            || m_val.len() != g_m.len()
-            || weights.len() != seq_len * capacity
-            || keys.len() != capacity * d_key
-            || norm_sq.len() != capacity
-            || values.len() != capacity * d_val
-            || query_pnc.len() != q_pnc.len()
-            || query_euc.len() != q_euc.len()
-            || !tau.is_finite()
-            || tau <= 0.0
-        {
-            return Err("CUDA memory backward shape mismatch".into());
-        }
+        // Retrieval has no dense latent GEMM; use unit input width here.
+        let shape = MemoryShape::new(seq_len, 1, d_key, d_val, capacity, count, tau)?;
+        lengths("memory backward", &[
+            ("q_pnc", q_pnc.len(), shape.query), ("q_euc", q_euc.len(), shape.query),
+            ("g_m", g_m.len(), shape.value), ("m_val", m_val.len(), shape.value),
+            ("weights", weights.len(), shape.weights), ("keys", keys.len(), shape.keys),
+            ("norm_sq", norm_sq.len(), capacity), ("values", values.len(), shape.values),
+            ("query_pnc", query_pnc.len(), shape.query), ("query_euc", query_euc.len(), shape.query),
+        ])?;
         let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
         let kernels = self.stage_kernels(&mut state)?.clone();
         let dq = self.stream.clone_htod(q_pnc).map_err(error)?;
@@ -1034,8 +1008,8 @@ impl CudaContext {
         }
         let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
         let kernels = self.stage_kernels(&mut state)?.clone();
-        let mut device = self.stream.clone_htod(values).map_err(error)?;
         let len = elems(values.len(), "softplus count")?;
+        let mut device = self.stream.clone_htod(values).map_err(error)?;
         unsafe {
             self.stream
                 .launch_builder(&kernels.softplus)
