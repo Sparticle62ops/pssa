@@ -407,6 +407,9 @@ fn enormous_memory_feedback_is_finite_with_both_safeguards() {
     );
 }
 
+#[path = "support/cuda_ssm_ptx.rs"]
+mod cuda_ssm_ptx;
+
 #[test]
 fn embedded_cuda_ptx_assembles_with_ptxas_when_available() {
     let ptxas = if let Some(path) = std::env::var_os("PTXAS") {

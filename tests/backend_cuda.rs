@@ -182,6 +182,30 @@ fn cuda_ssm_scan_forward_and_backward_match_cpu_twin() {
     assert_close_stage(&gc, &exp_gc);
     assert_close_stage(&ga, &exp_ga);
     assert_close_stage(&gx, &exp_gx);
+
+    // Exercise the exact token-gradient -> shared-weight boundary that feeds
+    // w_b/w_c. Check relative error as well as the stage's absolute tolerance:
+    // a small but entirely missing gradient must not pass as "close to zero".
+    for (name, actual, expected) in [("w_b", &gb, &exp_gb), ("w_c", &gc, &exp_gc)] {
+        let expected_w = pssa::backend::gemm_tn_cpu(expected, &x_norm, l, ds, dm);
+        let magnitude = expected_w.iter().map(|v| v.abs()).fold(0.0, f32::max);
+        assert!(magnitude > 1e-6, "fixture must exercise {name}");
+        let mut actual_w = vec![0.0; ds * dm];
+        for count in 1..=2 {
+            gpu.gemm_tn_accumulate_into(actual, &x_norm, l, ds, dm, &mut actual_w)
+                .unwrap();
+            let error = actual_w
+                .iter()
+                .zip(&expected_w)
+                .map(|(a, e)| (a - count as f32 * e).abs())
+                .fold(0.0, f32::max);
+            assert!(
+                error / (count as f32 * magnitude) < 1e-3,
+                "{name} gradient relative error: {}",
+                error / (count as f32 * magnitude)
+            );
+        }
+    }
 }
 
 #[test]
