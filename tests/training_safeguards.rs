@@ -408,6 +408,64 @@ fn enormous_memory_feedback_is_finite_with_both_safeguards() {
 }
 
 #[test]
+fn embedded_cuda_ptx_assembles_with_ptxas_when_available() {
+    let ptxas = if let Some(path) = std::env::var_os("PTXAS") {
+        if path.to_string_lossy().is_empty() {
+            "ptxas".into()
+        } else {
+            path
+        }
+    } else {
+        match Command::new("ptxas").arg("--version").output() {
+            Ok(output) if output.status.success() => "ptxas".into(),
+            Ok(output) => panic!(
+                "ptxas found on PATH but --version failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipped CUDA PTX assembly test: ptxas not found via PTXAS or PATH");
+                return;
+            }
+            Err(error) => panic!("could not run ptxas from PATH: {error}"),
+        }
+    };
+    let version = Command::new(&ptxas)
+        .arg("--version")
+        .output()
+        .expect("PTXAS must name an executable ptxas binary");
+    assert!(
+        version.status.success(),
+        "PTXAS --version failed: {}",
+        String::from_utf8_lossy(&version.stderr)
+    );
+    eprintln!(
+        "testing embedded PTX with {}",
+        String::from_utf8_lossy(&version.stdout)
+    );
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/cuda");
+    let tmp = TempDir::new();
+    for source in ["stages.ptx", "safeguards.ptx"] {
+        for arch in ["sm_120", "sm_90", "sm_80"] {
+            let output = tmp.path(&format!("{source}-{arch}.cubin"));
+            let result = Command::new(&ptxas)
+                .arg(format!("-arch={arch}"))
+                .arg("-o")
+                .arg(&output)
+                .arg(root.join(source))
+                .output()
+                .expect("ptxas invocation should start");
+            assert!(
+                result.status.success(),
+                "ptxas failed for {source} at {arch}:\n{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+}
+
+#[test]
 fn resume_caps_loaded_bank_before_first_forward_without_format_changes() {
     let raw = "alpha beta gamma delta epsilon\nalpha beta gamma\n";
     let opts = TrainingOptions {

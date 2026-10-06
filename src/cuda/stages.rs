@@ -9,6 +9,7 @@
 
 use super::*;
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
+use std::{ffi::CString, ptr};
 
 struct Kernels {
     prepare: CudaFunction,
@@ -66,11 +67,75 @@ struct ForwardBuffers {
 #[derive(Default)]
 pub(super) struct StageState {
     kernels: Option<Kernels>,
+    // A module-load failure is permanent for this context. Remember it so a
+    // malformed embedded PTX cannot trigger a fresh JIT attempt on every
+    // fallback call.
+    load_error: Option<String>,
     forward: Option<ForwardBuffers>,
 }
 
+const STAGE_PTX: &str = include_str!("stages.ptx");
+
 fn error(e: impl std::fmt::Debug) -> String {
     format!("CUDA scan/memory stage failed ({e:?})")
+}
+
+fn driver_error(e: &cudarc::driver::DriverError) -> String {
+    let name = e
+        .error_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "unknown CUDA driver error".to_owned());
+    let description = e
+        .error_string()
+        .map(|description| description.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "no CUDA driver description".to_owned());
+    format!("{name}: {description}")
+}
+
+/// Ask the driver for its JIT log after cudarc's ordinary loader reports a
+/// failure. cudarc 0.19 exposes `load_module`, but not the `cuModuleLoadDataEx`
+/// JIT log options, so use its raw driver bindings for this diagnostic retry.
+fn jit_error_log(ctx: &cudarc::driver::CudaContext) -> Option<String> {
+    ctx.bind_to_thread().ok()?;
+    let source = CString::new(STAGE_PTX).ok()?;
+    let mut log = vec![0u8; 16 * 1024];
+    let mut log_size = log.len() as u32;
+    let mut module = ptr::null_mut();
+    let mut options = [
+        cudarc::driver::sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
+        cudarc::driver::sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+    ];
+    let mut values = [
+        log.as_mut_ptr().cast(),
+        (&mut log_size as *mut u32).cast(),
+    ];
+    let result = unsafe {
+        cudarc::driver::sys::cuModuleLoadDataEx(
+            &mut module,
+            source.as_ptr().cast(),
+            options.len() as u32,
+            options.as_mut_ptr(),
+            values.as_mut_ptr(),
+        )
+    };
+    if !module.is_null() {
+        let _ = unsafe { cudarc::driver::result::module::unload(module) };
+    }
+    let end = log.iter().position(|&byte| byte == 0).unwrap_or(log.len());
+    let message = String::from_utf8_lossy(&log[..end]).trim().to_owned();
+    (result != cudarc::driver::sys::CUresult::CUDA_SUCCESS && !message.is_empty())
+        .then_some(message)
+}
+
+fn stage_load_error(
+    ctx: &cudarc::driver::CudaContext,
+    error: &cudarc::driver::DriverError,
+) -> String {
+    let detail = driver_error(error);
+    match jit_error_log(ctx) {
+        Some(log) => format!("{detail}; CUDA JIT error log: {log}"),
+        None => format!("{detail}; CUDA driver returned no JIT error log"),
+    }
 }
 
 fn elems(value: usize, what: &str) -> Result<u32, String> {
@@ -95,29 +160,44 @@ fn scan_capacity(len: usize) -> usize {
 
 impl CudaContext {
     fn stage_kernels<'a>(&self, state: &'a mut StageState) -> Result<&'a Kernels, String> {
+        if let Some(error) = state.load_error.as_ref() {
+            return Err(error.clone());
+        }
         if state.kernels.is_none() {
-            let module = self
-                .stream
-                .context()
-                .load_module(cudarc::nvrtc::Ptx::from_src(include_str!("stages.ptx")))
-                .map_err(error)?;
-            state.kernels = Some(Kernels {
-                prepare: module.load_function("ssm_prepare").map_err(error)?,
-                scan: module.load_function("affine_scan").map_err(error)?,
-                scan_apply: module.load_function("scan_apply").map_err(error)?,
-                materialize: module.load_function("ssm_materialize").map_err(error)?,
-                backward_maps: module.load_function("ssm_backward_maps").map_err(error)?,
-                backward_local: module.load_function("ssm_backward_local").map_err(error)?,
-                memory_forward: module.load_function("memory_forward").map_err(error)?,
-                memory_backward: module.load_function("memory_backward").map_err(error)?,
-                memory_backward_local: module
-                    .load_function("memory_backward_local")
-                    .map_err(error)?,
-                add: module.load_function("add_in_place").map_err(error)?,
-                sigmoid_mul: module.load_function("sigmoid_mul").map_err(error)?,
-                sigmoid: module.load_function("sigmoid_in_place").map_err(error)?,
-                softplus: module.load_function("softplus_in_place").map_err(error)?,
-            });
+            let context = self.stream.context();
+            let loaded = (|| -> Result<Kernels, cudarc::driver::DriverError> {
+                let module = context.load_module(cudarc::nvrtc::Ptx::from_src(STAGE_PTX))?;
+                Ok(Kernels {
+                    prepare: module.load_function("ssm_prepare")?,
+                    scan: module.load_function("affine_scan")?,
+                    scan_apply: module.load_function("scan_apply")?,
+                    materialize: module.load_function("ssm_materialize")?,
+                    backward_maps: module.load_function("ssm_backward_maps")?,
+                    backward_local: module.load_function("ssm_backward_local")?,
+                    memory_forward: module.load_function("memory_forward")?,
+                    memory_backward: module.load_function("memory_backward")?,
+                    memory_backward_local: module.load_function("memory_backward_local")?,
+                    add: module.load_function("add_in_place")?,
+                    sigmoid_mul: module.load_function("sigmoid_mul")?,
+                    sigmoid: module.load_function("sigmoid_in_place")?,
+                    softplus: module.load_function("softplus_in_place")?,
+                })
+            })();
+            match loaded {
+                Ok(kernels) => state.kernels = Some(kernels),
+                Err(error) => {
+                    let message = format!(
+                        "CUDA scan/memory stage module failed to load ({})",
+                        stage_load_error(context, &error)
+                    );
+                    // This is deliberately one diagnostic per context. The
+                    // operation-level fallbacks still receive the same error,
+                    // but a bad PTX is never silent or retried in a loop.
+                    eprintln!("error: {message}");
+                    state.load_error = Some(message.clone());
+                    return Err(message);
+                }
+            }
         }
         Ok(state.kernels.as_ref().unwrap())
     }

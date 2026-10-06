@@ -20,6 +20,25 @@ use crate::linalg::{dot_slice, sigmoid, softplus};
 use crate::memory::HyperbolicEpisodicBankV2;
 use crate::pssa::{PSSAContinuousBlockV2, PSSALayerV2};
 use rayon::prelude::*;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+
+/// Stage module failures are already reported with the driver's JIT log by the
+/// CUDA loader. Suppress repeated fallback chatter for that permanent error;
+/// other transient stage failures are also reported only once per message.
+pub(crate) fn warn_cuda_fallback_once(error: &str, message: String) {
+    if error.contains("stage module failed to load") {
+        return;
+    }
+    static REPORTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let mut reported = REPORTED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reported.insert(message.clone()) {
+        eprintln!("{message}");
+    }
+}
 
 // Parallelize large, independent dense adjoints without shared atomics.
 fn blocked_backward(tokens: usize, rows: usize, cols: usize) -> bool {
@@ -473,7 +492,10 @@ pub fn stage_projections(m: &mut PSSALayerV2, seq_len: usize) {
     if let Some(gpu) = gpu.as_ref() {
         m.tape.delta[..l * d_m].copy_from_slice(&m.tape.delta_raw[..l * d_m]);
         if let Err(error) = gpu.softplus_in_place(&mut m.tape.delta[..l * d_m]) {
-            eprintln!("warning: CUDA softplus failed; using CPU elementwise path: {error}");
+            warn_cuda_fallback_once(
+                &error,
+                format!("warning: CUDA softplus failed; using CPU elementwise path: {error}"),
+            );
             for i in 0..l * d_m {
                 m.tape.delta[i] = softplus(m.tape.delta_raw[i]);
             }
@@ -566,7 +588,10 @@ pub fn stage_ssm_scan(m: &mut PSSALayerV2, seq_len: usize) {
             d_s,
         );
         if let Err(error) = result {
-            eprintln!("warning: CUDA SSM forward failed; using CPU scan: {error}");
+            warn_cuda_fallback_once(
+                &error,
+                format!("warning: CUDA SSM forward failed; using CPU scan: {error}"),
+            );
         } else {
             return;
         }
@@ -774,7 +799,10 @@ pub fn stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
                 &mut m.tape.m_inj[..seq_len * d_m],
             );
             if let Err(direct_error) = direct {
-                eprintln!("warning: CUDA memory forward failed; using host retrieval: {error}; direct path: {direct_error}");
+                warn_cuda_fallback_once(
+                    &error,
+                    format!("warning: CUDA memory forward failed; using host retrieval: {error}; direct path: {direct_error}"),
+                );
             } else {
                 return;
             }
@@ -2033,7 +2061,10 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
             g_m_proj_out,
             g_gate_pre,
         ) {
-            eprintln!("warning: CUDA memory elementwise backward failed; using host path: {error}");
+            warn_cuda_fallback_once(
+                &error,
+                format!("warning: CUDA memory elementwise backward failed; using host path: {error}"),
+            );
             for i in 0..g_zraw.len() {
                 g_m_proj_out[i] = g_zraw[i] * g_mem[i];
                 g_gate_pre[i] = g_zraw[i] * m_proj[i] * g_mem[i] * (1.0 - g_mem[i]);
@@ -2163,7 +2194,10 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
             query_pnc,
             query_euc,
         ) {
-            eprintln!("warning: CUDA memory retrieval backward failed; using host path: {error}");
+            warn_cuda_fallback_once(
+                &error,
+                format!("warning: CUDA memory retrieval backward failed; using host path: {error}"),
+            );
             for (t, (pnc, euc)) in query_pnc
                 .chunks_mut(d_k)
                 .zip(query_euc.chunks_mut(d_k))
@@ -2654,7 +2688,10 @@ pub(crate) fn bwd_stage_ssm_with_input(
     let gpu = gpu_ctx(m).filter(|g| g.accelerates_backward());
     if let Some(gpu) = gpu.as_ref() {
         if let Err(error) = bwd_stage_ssm_cuda(m, seq_len, input_is_embedding, gpu) {
-            eprintln!("warning: CUDA SSM backward failed; using host fallback: {error}");
+            warn_cuda_fallback_once(
+                &error,
+                format!("warning: CUDA SSM backward failed; using host fallback: {error}"),
+            );
             bwd_stage_ssm_sequential_gpu(m, seq_len, input_is_embedding, gpu);
         }
         return;
