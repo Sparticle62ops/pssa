@@ -8,6 +8,79 @@ use ptx_emulator::{
 const PTX: &str = include_str!("../../src/cuda/stages.ptx");
 
 #[test]
+fn cuda_token_local_ptx_training_stride_extreme_activations() {
+    let (rows, dm, width) = (32usize, 3584usize, 1024usize);
+    let values = [
+        -f32::MAX,
+        -104.0,
+        -90.0,
+        -88.0,
+        -87.5,
+        -80.0,
+        -40.0,
+        -24.0,
+        -20.0,
+        -16.0,
+        -10.0,
+        0.0,
+        20.0,
+        21.0,
+        90.0,
+        f32::MAX,
+    ];
+    let len = rows * dm;
+    let mut m = Machine::default();
+    let mut input = vec![0.0; len];
+    // Keep the actual flattened token/channel stride, including both sides of
+    // a launch-block boundary, but do not replay all 114688 identical lanes.
+    let probes = values
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| (i, x))
+        .chain([
+            (dm - 1, -24.0),
+            (dm, -20.0),
+            (16 * dm, 90.0),
+            (len - 1, -80.0),
+        ])
+        .collect::<Vec<_>>();
+    for &(i, x) in &probes {
+        input[i] = x;
+    }
+    for (kernel, cpu) in [
+        ("sigmoid_in_place", pssa::linalg::sigmoid as fn(f32) -> f32),
+        (
+            "softplus_in_place",
+            pssa::linalg::softplus as fn(f32) -> f32,
+        ),
+    ] {
+        m.put("a", &input);
+        for &(i, _) in &probes {
+            m.launch_thread(PTX, kernel, &[B("a"), U(len as u32)], i, width);
+        }
+        m.launch_thread(PTX, kernel, &[B("a"), U(len as u32)], len, width);
+        let actual = m.get("a");
+        for &(i, x) in &probes {
+            let expected = cpu(x);
+            let got = actual[i];
+            assert!(
+                got.is_finite()
+                    && (got - expected).abs() <= 3e-6 * expected.abs() + 2.0 * f32::from_bits(1),
+                "{kernel}[token={},channel={}], x={x}: {got} != {expected}",
+                i / dm,
+                i % dm
+            );
+            if expected > 0.0 {
+                assert!(
+                    got > 0.0,
+                    "{kernel}[{i}] lost a representable positive tail at {x}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn cuda_token_local_ptx_bounds_and_memory_gate_math() {
     let (len, width) = (7usize, 4usize);
     let a = vec![-21., -1., 0., 0.25, 1., 3., 21.];

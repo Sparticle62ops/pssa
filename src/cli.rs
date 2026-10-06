@@ -967,7 +967,14 @@ impl CLIHandler {
                 if total_tokens == 0 {
                     continue;
                 }
-                model.zero_gradients();
+                {
+                    let _trace = crate::training_diagnostics::StageTrace::new(
+                        &model.device,
+                        "update.zero_gradients",
+                        total_tokens,
+                    );
+                    model.zero_gradients();
+                }
                 for microbatch in group {
                     let batch_tokens: usize = microbatch.iter().map(|c| c.len).sum();
                     let loss = if let Some(batch) = &mut sequence_batch {
@@ -980,7 +987,15 @@ impl CLIHandler {
                                 reset: c.start == 0,
                             });
                         }
-                        batch.forward(&mut model, &sequence_views)?
+                        batch
+                            .forward(&mut model, &sequence_views)
+                            .map_err(|error| {
+                                format!(
+                                    "update_index={} global_step={}: {error}",
+                                    update + 1,
+                                    model.step_counter + 1
+                                )
+                            })?
                     } else {
                         let c = microbatch[0];
                         if c.start == 0 {
@@ -999,19 +1014,36 @@ impl CLIHandler {
                         }
                     };
                     if !loss.is_finite() {
-                        return Err("non-finite loss; training aborted without checkpoint".into());
+                        return Err(format!(
+                            "update_index={} global_step={}: {}",
+                            update + 1,
+                            model.step_counter + 1,
+                            crate::training_diagnostics::loss_error(&model, batch_tokens),
+                        ));
                     }
                     let scale = batch_tokens as f32 / total_tokens as f32;
                     if let Some(batch) = &mut sequence_batch {
-                        batch.backward(&mut model, scale)?;
-                        if microbatch
-                            .iter()
-                            .any(|c| batch.state(c.lane).iter().any(|x| !x.is_finite()))
-                        {
-                            return Err(
-                                "non-finite batch carry; training aborted without checkpoint"
-                                    .into(),
-                            );
+                        batch.backward(&mut model, scale).map_err(|error| {
+                            format!(
+                                "update_index={} global_step={}: {error}",
+                                update + 1,
+                                model.step_counter + 1
+                            )
+                        })?;
+                        for c in microbatch {
+                            if let Some((index, value)) = batch
+                                .state(c.lane)
+                                .iter()
+                                .enumerate()
+                                .find(|(_, x)| !x.is_finite())
+                            {
+                                return Err(format!(
+                                    "non-finite batch carry; update_index={} global_step={} stage=ssm tensor=carry lane={} index={index} value={value}; training aborted without checkpoint",
+                                    update + 1,
+                                    model.step_counter + 1,
+                                    c.lane,
+                                ));
+                            }
                         }
                     } else if model.loops() > 1 {
                         model.backward_chunk(batch_tokens, scale);
@@ -1021,6 +1053,11 @@ impl CLIHandler {
                     // All retrieval adjoints see the same bank as forward. Writes
                     // happen only now, in deterministic lane order, using each
                     // chunk's own mean loss and terminal token (not the batch mean).
+                    let _trace = crate::training_diagnostics::StageTrace::new(
+                        &model.device,
+                        "update.memory_writes",
+                        batch_tokens,
+                    );
                     let mut offset = 0;
                     for c in microbatch {
                         let loss = model.tape.losses[offset..offset + c.len]
@@ -1034,6 +1071,11 @@ impl CLIHandler {
                     }
                 }
                 let learning_rate = schedule.lr(update + 1)?;
+                let optimizer_trace = crate::training_diagnostics::StageTrace::new(
+                    &model.device,
+                    "update.optimizer",
+                    total_tokens,
+                );
                 if let Some(max_norm) = options.grad_clip {
                     match model.apply_adamw_with_grad_clip(learning_rate, max_norm) {
                         GradientClipOutcome::Applied { norm } => {
@@ -1050,9 +1092,21 @@ impl CLIHandler {
                 } else {
                     model.apply_adamw(learning_rate);
                 }
+                drop(optimizer_trace);
                 update += 1;
-                if !Self::finite(&model) {
-                    return Err("non-finite parameters; training aborted without checkpoint".into());
+                let finite = {
+                    let _trace = crate::training_diagnostics::StageTrace::new(
+                        &model.device,
+                        "update.parameters_finite",
+                        total_tokens,
+                    );
+                    Self::finite(&model)
+                };
+                if !finite {
+                    return Err(format!(
+                        "non-finite parameters; update_index={update} global_step={} stage=optimizer; training aborted without checkpoint",
+                        model.step_counter
+                    ));
                 }
                 tokens_seen += total_tokens;
                 if let Some(curve) = &mut curve {
@@ -1523,7 +1577,10 @@ impl CLIHandler {
                 "gpu-probe",
                 "check whether a WebGPU compute device is usable",
             ),
-            ("compare", "replay a matched transformer against a PSSA chain"),
+            (
+                "compare",
+                "replay a matched transformer against a PSSA chain",
+            ),
         ] {
             ui::panel_row(&format!(
                 "{}{}",
@@ -1729,7 +1786,10 @@ impl CLIHandler {
                 "gpu-probe",
                 "check whether a WebGPU compute device is usable",
             ),
-            ("compare", "replay a matched transformer against a PSSA chain"),
+            (
+                "compare",
+                "replay a matched transformer against a PSSA chain",
+            ),
             ("help", "show this message"),
         ] {
             println!("    {:<22}{}", ui::cyan(name), ui::dim(blurb));
@@ -1945,9 +2005,15 @@ impl CLIHandler {
                     "      --loops <N>               shared Ouro passes, 1..32 (default: 1; repeat on resume; not checkpointed)"
                 );
                 println!("      --state <N>               recurrent state width (default: 16)");
-                println!("      --backend <NAME>          auto (default), cpu, webgpu, cuda (feature required)");
-                println!("      --threads <N>             opt-in Rayon pool size (default unchanged)");
-                println!("      --ram-mib <N>             Linux prlimit address-space budget, NOT RSS/VRAM");
+                println!(
+                    "      --backend <NAME>          auto (default), cpu, webgpu, cuda (feature required)"
+                );
+                println!(
+                    "      --threads <N>             opt-in Rayon pool size (default unchanged)"
+                );
+                println!(
+                    "      --ram-mib <N>             Linux prlimit address-space budget, NOT RSS/VRAM"
+                );
                 println!("      --key <N>                 memory key width (default: 32)");
                 println!("      --memory <N>              memory capacity (default: 512)");
                 println!("      --chunk <N>               training chunk length (default: 64)");
@@ -2104,9 +2170,15 @@ impl CLIHandler {
             }
             "compare" => {
                 println!("Usage: {bin} compare DATA --chain-dir DIR --out NEW_DIR [OPTIONS]");
-                println!("Replay an existing PSSA chain with the token/update-matched transformer; score both on unseen tokens.");
-                println!("--links 64 --window 200000 --batch-size 8 --accumulate 1 --eval-tokens 200000");
-                println!("--eval-skip-tokens N --link-plan JSON --loss-every 10000 --seed 42 --warmup-steps 0");
+                println!(
+                    "Replay an existing PSSA chain with the token/update-matched transformer; score both on unseen tokens."
+                );
+                println!(
+                    "--links 64 --window 200000 --batch-size 8 --accumulate 1 --eval-tokens 200000"
+                );
+                println!(
+                    "--eval-skip-tokens N --link-plan JSON --loss-every 10000 --seed 42 --warmup-steps 0"
+                );
                 println!("Use the ORIGINAL corpus and training settings. See docs/COMPARISON.md.");
             }
             "benchmark" => {
@@ -2340,12 +2412,14 @@ impl CLIHandler {
                             ));
                         }
                     }
-                    limits.run(|| crate::transformer_training::run_training(
-                        &data,
-                        &opts,
-                        out,
-                        p.string("--tokenizer-from", ""),
-                    ))
+                    limits.run(|| {
+                        crate::transformer_training::run_training(
+                            &data,
+                            &opts,
+                            out,
+                            p.string("--tokenizer-from", ""),
+                        )
+                    })
                 } else {
                     limits.run(|| Self::run_training(&data, &Self::options(&p)?, out))
                 }
@@ -2551,21 +2625,56 @@ impl CLIHandler {
                 run_gpu_probe()
             }
             "compare" => {
-                let p = Parsed::parse(&args[2..], &["--chain-dir", "--out", "-o", "--links", "--window", "--batch-size", "--accumulate", "--link-plan", "--eval-skip-tokens", "--eval-tokens", "--loss-every", "--seed", "--warmup-steps"])?;
-                if p.positional.len() != 1 { return Err("compare requires exactly one original corpus path".into()); }
+                let p = Parsed::parse(
+                    &args[2..],
+                    &[
+                        "--chain-dir",
+                        "--out",
+                        "-o",
+                        "--links",
+                        "--window",
+                        "--batch-size",
+                        "--accumulate",
+                        "--link-plan",
+                        "--eval-skip-tokens",
+                        "--eval-tokens",
+                        "--loss-every",
+                        "--seed",
+                        "--warmup-steps",
+                    ],
+                )?;
+                if p.positional.len() != 1 {
+                    return Err("compare requires exactly one original corpus path".into());
+                }
                 p.reject_duplicate_aliases(&["--out", "-o"], "output")?;
                 let opts = crate::comparison::ComparisonOptions {
-                    chain_dir: p.string("--chain-dir", "").ok_or("compare requires --chain-dir")?.into(),
-                    out_dir: p.string("--out", "-o").ok_or("compare requires --out NEW_DIR")?.into(),
+                    chain_dir: p
+                        .string("--chain-dir", "")
+                        .ok_or("compare requires --chain-dir")?
+                        .into(),
+                    out_dir: p
+                        .string("--out", "-o")
+                        .ok_or("compare requires --out NEW_DIR")?
+                        .into(),
                     links: p.usize_nonzero("--links", "", 64)?,
                     window: p.usize_nonzero("--window", "", 200000)?,
                     batch_size: p.usize_nonzero("--batch-size", "", 8)?,
                     accumulate: p.usize_nonzero("--accumulate", "", 1)?,
                     link_plan: p.string("--link-plan", "").map(str::to_owned),
-                    eval_skip_tokens: p.string("--eval-skip-tokens", "").map(|s|s.parse().map_err(|_|"--eval-skip-tokens must be an unsigned integer")).transpose()?,
+                    eval_skip_tokens: p
+                        .string("--eval-skip-tokens", "")
+                        .map(|s| {
+                            s.parse()
+                                .map_err(|_| "--eval-skip-tokens must be an unsigned integer")
+                        })
+                        .transpose()?,
                     eval_tokens: p.usize_nonzero("--eval-tokens", "", 200000)?,
                     loss_every: p.usize_nonzero("--loss-every", "", 10000)?,
-                    seed: p.string("--seed", "").unwrap_or("42").parse().map_err(|_|"--seed must be an unsigned integer")?,
+                    seed: p
+                        .string("--seed", "")
+                        .unwrap_or("42")
+                        .parse()
+                        .map_err(|_| "--seed must be an unsigned integer")?,
                     legacy_warmup: p.required_usize("--warmup-steps", "", 0)?,
                 };
                 crate::comparison::run(&p.positional[0], &opts)

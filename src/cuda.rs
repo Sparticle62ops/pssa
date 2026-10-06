@@ -27,6 +27,7 @@ const DRIVER_SYMBOLS: &[&str] = &[
     "cuDevicePrimaryCtxRelease_v2",
     "cuCtxGetCurrent",
     "cuCtxSetCurrent",
+    "cuCtxSetFlags",
     "cuGetErrorName",
     "cuGetErrorString",
     "cuMemAlloc_v2",
@@ -161,6 +162,10 @@ impl CudaContext {
     pub fn init() -> Result<Self, String> {
         preflight_libraries()?;
         let ctx = DriverContext::new(0).map_err(|e| format!("no CUDA device ({e:?})"))?;
+        // This backend has synchronous host tape boundaries. Sleeping in the
+        // driver wait avoids pegging a CPU core while long kernels/copies run.
+        ctx.set_blocking_synchronize()
+            .map_err(|e| format!("CUDA blocking synchronization setup failed ({e:?})"))?;
         let name: Arc<str> = ctx
             .name()
             .unwrap_or_else(|_| "unknown CUDA device".to_string())
@@ -457,6 +462,9 @@ impl CudaContext {
         seed_output: bool,
         out: &mut [f32],
     ) -> Result<(), String> {
+        let _trace = crate::training_diagnostics::StageTrace::cuda("gemm.total", gemm.n as usize);
+        let upload_trace =
+            crate::training_diagnostics::StageTrace::cuda("gemm.upload", gemm.n as usize);
         let mut workspace = self
             .workspace
             .lock()
@@ -500,6 +508,9 @@ impl CudaContext {
                 .memcpy_htod(out, &mut c_dev)
                 .map_err(|e| format!("CUDA output seed upload failed ({e:?})"))?;
         }
+        drop(upload_trace);
+        let launch_trace =
+            crate::training_diagnostics::StageTrace::cuda("gemm.submit", gemm.n as usize);
         // SAFETY: exact views, checked signed dimensions/strides and leading
         // dimensions satisfy the row-/column-major identities above.
         if batch == 1 {
@@ -519,6 +530,9 @@ impl CudaContext {
             }
             .map_err(|e| format!("cuBLAS batched sgemm failed ({e:?})"))?;
         }
+        drop(launch_trace);
+        let _readback_trace =
+            crate::training_diagnostics::StageTrace::cuda("gemm.readback_wait", gemm.n as usize);
         self.stream
             .memcpy_dtoh(&c_dev, out)
             .map_err(|e| format!("CUDA readback failed ({e:?})"))?;
