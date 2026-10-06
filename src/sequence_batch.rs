@@ -274,7 +274,10 @@ impl SequenceBatch {
                 }
             }
             if let Some(error) = failed {
-                eprintln!("warning: CUDA packed SSM forward failed; using host scan: {error}");
+                crate::gpu_batch::warn_cuda_fallback_once(
+                    &error,
+                    format!("warning: CUDA packed SSM forward failed; using host scan: {error}"),
+                );
                 self.lanes
                     .iter_mut()
                     .filter(|lane| lane.len > 0)
@@ -337,7 +340,10 @@ impl SequenceBatch {
                 }
             }
             if let Some(error) = failed {
-                eprintln!("warning: CUDA packed SSM backward failed; using host scan: {error}");
+                crate::gpu_batch::warn_cuda_fallback_once(
+                    &error,
+                    format!("warning: CUDA packed SSM backward failed; using host scan: {error}"),
+                );
                 self.lanes
                     .iter_mut()
                     .filter(|lane| lane.len > 0)

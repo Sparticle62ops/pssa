@@ -42,6 +42,7 @@ const DRIVER_SYMBOLS: &[&str] = &[
     "cuEventSynchronize",
     "cuEventDestroy_v2",
     "cuModuleLoadData",
+    "cuModuleLoadDataEx",
     "cuModuleUnload",
     "cuModuleGetFunction",
     "cuLaunchKernel",
