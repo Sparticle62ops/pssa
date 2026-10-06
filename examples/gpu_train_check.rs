@@ -10,6 +10,7 @@ use std::time::Instant;
 use pssa::backend::Device;
 use pssa::gpu_batch::{backward_chunk_batched, forward_train_chunk_batched};
 use pssa::pssa::{PSSAConfigV2, PSSAContinuousBlockV2, PSSALayerV2};
+use pssa::sequence_batch::{Sequence, SequenceBatch};
 
 const SEED: u64 = 0x4750_5543_4845_434b;
 const SMALL_STEPS: usize = 3;
@@ -136,6 +137,135 @@ fn report_gradients(cpu: &PSSALayerV2, gpu: &PSSALayerV2, step: usize) -> Result
     Ok(())
 }
 
+fn compare_loss(label: &str, cpu_loss: f32, gpu_loss: f32) -> Result<(), String> {
+    let abs = (cpu_loss - gpu_loss).abs();
+    let relative = abs / cpu_loss.abs().max(gpu_loss.abs()).max(1e-6);
+    println!(
+        "    {label} loss cpu={cpu_loss:.6} gpu={gpu_loss:.6} max_abs={abs:.3e} relative={relative:.3e}"
+    );
+    if relative > GRAD_REL_TOLERANCE {
+        return Err(format!(
+            "GPU packed loss mismatch: relative error {relative:.3e} exceeds {GRAD_REL_TOLERANCE:.3e}"
+        ));
+    }
+    Ok(())
+}
+
+fn seed_memory(model: &mut PSSALayerV2) {
+    let entries = model.cfg.mem_capacity.min(4);
+    for entry in 0..entries {
+        let key = (0..model.cfg.d_mem_key)
+            .map(|i| ((entry + 2 * i) % 7) as f32 * 0.04 - 0.1)
+            .collect::<Vec<_>>();
+        let value = (0..model.cfg.d_latent)
+            .map(|i| ((3 * entry + i) % 11) as f32 * 0.02 - 0.1)
+            .collect::<Vec<_>>();
+        model.memory.insert(&key, &value);
+    }
+}
+
+fn packed_tokens(
+    cfg: &PSSAConfigV2,
+    step: usize,
+    lane: usize,
+    len: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let inputs = (0..len)
+        .map(|t| (t * 17 + step * 5 + lane * 29 + 3) % cfg.d_vocab)
+        .collect();
+    let targets = (0..len)
+        .map(|t| (t * 23 + step * 7 + lane * 31 + 11) % cfg.d_vocab)
+        .collect();
+    (inputs, targets)
+}
+
+fn run_packed_config(
+    device: &Device,
+    label: &str,
+    cfg: PSSAConfigV2,
+    batch_size: usize,
+) -> Result<(), String> {
+    println!("checking packed path: {label} (batch_size={batch_size})");
+    let mut cpu = PSSALayerV2::new(cfg.clone(), SEED);
+    let mut gpu = PSSALayerV2::new(cfg.clone(), SEED);
+    seed_memory(&mut cpu);
+    seed_memory(&mut gpu);
+    gpu.device = device.clone();
+    let mut cpu_batch = SequenceBatch::new(&mut cpu, batch_size)?;
+    let mut gpu_batch = SequenceBatch::new(&mut gpu, batch_size)?;
+    let mut cpu_seconds = 0.0;
+    let mut gpu_seconds = 0.0;
+
+    // Unequal lane lengths exercise packed offsets as well as independent
+    // carries. The first call resets both lanes; later calls retain them.
+    for step in 0..2 {
+        let lane_len = (cfg.chunk_len * 3 / 4).max(1);
+        let (cpu_inputs0, cpu_targets0) = packed_tokens(&cfg, step, 0, cfg.chunk_len);
+        let (cpu_inputs1, cpu_targets1) = packed_tokens(&cfg, step, 1, lane_len);
+        let (gpu_inputs0, gpu_targets0) = (cpu_inputs0.clone(), cpu_targets0.clone());
+        let (gpu_inputs1, gpu_targets1) = (cpu_inputs1.clone(), cpu_targets1.clone());
+        let cpu_sequences = [
+            Sequence {
+                lane: 0,
+                inputs: &cpu_inputs0,
+                targets: &cpu_targets0,
+                reset: step == 0,
+            },
+            Sequence {
+                lane: 1,
+                inputs: &cpu_inputs1,
+                targets: &cpu_targets1,
+                reset: step == 0,
+            },
+        ];
+        let gpu_sequences = [
+            Sequence {
+                lane: 0,
+                inputs: &gpu_inputs0,
+                targets: &gpu_targets0,
+                reset: step == 0,
+            },
+            Sequence {
+                lane: 1,
+                inputs: &gpu_inputs1,
+                targets: &gpu_targets1,
+                reset: step == 0,
+            },
+        ];
+
+        cpu.zero_gradients();
+        let started = Instant::now();
+        let cpu_loss = cpu_batch.forward(&mut cpu, &cpu_sequences)?;
+        cpu_batch.backward(&mut cpu, 1.0)?;
+        cpu_seconds += started.elapsed().as_secs_f64();
+
+        gpu.zero_gradients();
+        let started = Instant::now();
+        let gpu_loss = gpu_batch.forward(&mut gpu, &gpu_sequences)?;
+        gpu_batch.backward(&mut gpu, 1.0)?;
+        gpu_seconds += started.elapsed().as_secs_f64();
+
+        compare_loss("packed", cpu_loss, gpu_loss)?;
+        report_gradients(&cpu, &gpu, step)?;
+        for lane in 0..batch_size {
+            let (abs, relative) = gradient_error(cpu_batch.state(lane), gpu_batch.state(lane));
+            println!("    carry lane={lane} max_abs={abs:.3e} relative={relative:.3e}");
+            if relative > GRAD_REL_TOLERANCE {
+                return Err(format!(
+                    "GPU packed carry mismatch on lane {lane}: relative error {relative:.3e}"
+                ));
+            }
+        }
+    }
+    let tokens = (2 * (cfg.chunk_len + (cfg.chunk_len * 3 / 4).max(1))) as f64;
+    println!(
+        "  packed {label}: cpu_step_seconds={cpu_seconds:.3} gpu_step_seconds={gpu_seconds:.3} cpu_tok/s={:.1} gpu_tok/s={:.1}",
+        tokens / cpu_seconds.max(f64::MIN_POSITIVE),
+        tokens / gpu_seconds.max(f64::MIN_POSITIVE),
+    );
+    Ok(())
+}
+
 fn run_small_config(device: &Device, depth: usize, loops: usize) -> Result<(), String> {
     let cfg = small_config(depth);
     let mut cpu = PSSALayerV2::new_with_depth_and_loops(cfg.clone(), SEED, depth, loops);
@@ -238,5 +368,24 @@ fn main() -> Result<(), String> {
             run_small_config(&device, depth, loops)?;
         }
     }
+    run_packed_config(&device, "small", small_config(1), 2)?;
+    // These are the molab training widths (depth=1, loops=1, batch=32).
+    // At most two tokens per lane keep the CPU reference bounded while still exercising
+    // every packed forward/backward gradient at the production parameter
+    // shapes; the CLI's chunk length remains independent of this diagnostic.
+    run_packed_config(
+        &device,
+        "molab-training-shape",
+        PSSAConfigV2 {
+            d_vocab: 2048,
+            d_latent: 3584,
+            d_state: 16,
+            d_mem_key: 32,
+            mem_capacity: 512,
+            chunk_len: 2,
+            ..PSSAConfigV2::default()
+        },
+        32,
+    )?;
     run_large_timing(&device)
 }
