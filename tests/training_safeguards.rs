@@ -409,6 +409,12 @@ fn enormous_memory_feedback_is_finite_with_both_safeguards() {
 
 #[path = "support/cuda_ssm_ptx.rs"]
 mod cuda_ssm_ptx;
+#[path = "support/cuda_memory_ptx.rs"]
+mod cuda_memory_ptx;
+#[path = "../src/cuda/stage_bounds.rs"]
+mod cuda_stage_bounds;
+#[path = "support/cuda_stage_local_ptx.rs"]
+mod cuda_stage_local_ptx;
 
 #[test]
 fn embedded_cuda_ptx_assembles_with_ptxas_when_available() {

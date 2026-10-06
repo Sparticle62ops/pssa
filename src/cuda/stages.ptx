@@ -223,21 +223,30 @@ SBL_EXIT: ret;
 MF_NORM: setp.ge.u32 %p1,%r10,%r3; @%p1 bra MF_PROJECT; mul.wide.u32 %rd9,%r10,4; add.u64 %rd9,%rd8,%rd9; ld.global.f32 %f2,[%rd9]; mul.f32 %f3,%f2,%f2; add.f32 %f1,%f1,%f3; add.u32 %r10,%r10,1; bra MF_NORM;
 MF_PROJECT: sqrt.approx.f32 %f4,%f1; mul.wide.u32 %rd9,%r8,4; add.u64 %rd9,%rd5,%rd9; st.global.f32 [%rd9],%f4; add.f32 %f5,%f4,0f3f800000; div.approx.f32 %f5,0f3f800000,%f5; mul.f32 %f13,%f1,%f5; mul.f32 %f13,%f13,%f5; mov.u32 %r10,0;
 MF_P: setp.ge.u32 %p1,%r10,%r3; @%p1 bra MF_COUNT; mul.wide.u32 %rd9,%r10,4; add.u64 %rd9,%rd8,%rd9; ld.global.f32 %f2,[%rd9]; mul.f32 %f2,%f2,%f5; mul.lo.u32 %r11,%r8,%r3; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd10,%r11,4; add.u64 %rd10,%rd4,%rd10; st.global.f32 [%rd10],%f2; add.u32 %r10,%r10,1; bra MF_P;
-MF_COUNT: setp.eq.u32 %p2,%r1,0; @%p2 bra MF_VALUE_ZERO; mov.f32 %f6,0f7f7fffff; mov.f32 %f7,0f00000000; mov.u32 %r10,0;
+MF_COUNT: setp.eq.u32 %p2,%r1,0; @%p2 bra MF_EMPTY; mov.f32 %f6,0f7f7fffff; mov.f32 %f7,0f00000000; mov.u32 %r10,0;
 MF_DIST: setp.ge.u32 %p1,%r10,%r1; @%p1 bra MF_SCORES; mov.f32 %f7,0f00000000; mov.u32 %r11,0;
 MF_DJ: setp.ge.u32 %p3,%r11,%r3; @%p3 bra MF_DDONE; mul.lo.u32 %r12,%r10,%r3; add.u32 %r12,%r12,%r11; mul.wide.u32 %rd9,%r12,4; add.u64 %rd9,%rd1,%rd9; ld.global.f32 %f2,[%rd9]; mul.lo.u32 %r12,%r8,%r3; add.u32 %r12,%r12,%r11; mul.wide.u32 %rd10,%r12,4; add.u64 %rd10,%rd4,%rd10; ld.global.f32 %f3,[%rd10]; sub.f32 %f2,%f3,%f2; mul.f32 %f2,%f2,%f2; add.f32 %f7,%f7,%f2; add.u32 %r11,%r11,1; bra MF_DJ;
 MF_DDONE: mul.wide.u32 %rd9,%r10,4; add.u64 %rd9,%rd2,%rd9; ld.global.f32 %f8,[%rd9]; mov.f32 %f9,0f3f800000; sub.f32 %f9,%f9,%f13; mov.f32 %f10,0f3f800000; sub.f32 %f10,%f10,%f8; mul.f32 %f10,%f10,%f9; div.approx.f32 %f7,%f7,%f10; sqrt.approx.f32 %f7,%f7; mul.f32 %f10,%f7,%f7; add.f32 %f10,%f10,0f3f800000; sqrt.approx.f32 %f10,%f10; add.f32 %f10,%f10,%f7; lg2.approx.f32 %f10,%f10; mul.f32 %f10,%f10,0f3f317218; mul.f32 %f10,%f10,0f40000000; mul.lo.u32 %r11,%r8,%r2; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd9,%r11,4; add.u64 %rd9,%rd7,%rd9; st.global.f32 [%rd9],%f10; min.f32 %f6,%f6,%f10; add.u32 %r10,%r10,1; bra MF_DIST;
 MF_SCORES: mov.f32 %f11,0f00000000; mov.u32 %r10,0;
-MF_SCORE: setp.ge.u32 %p1,%r10,%r1; @%p1 bra MF_VALUE_ZERO; mul.lo.u32 %r11,%r8,%r2; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd9,%r11,4; add.u64 %rd9,%rd7,%rd9; ld.global.f32 %f10,[%rd9]; sub.f32 %f10,%f6,%f10; div.approx.f32 %f10,%f10,%f0; mov.f32 %f12,0f3fb8aa3b; mul.f32 %f10,%f10,%f12; ex2.approx.f32 %f10,%f10; st.global.f32 [%rd9],%f10; add.f32 %f11,%f11,%f10; add.u32 %r10,%r10,1; bra MF_SCORE;
-MF_VALUE_ZERO: mov.u32 %r10,0;
-MF_VZ: setp.ge.u32 %p1,%r10,%r4; @%p1 bra MF_WEIGHTS_ZERO; mul.lo.u32 %r11,%r8,%r4; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd9,%r11,4; add.u64 %rd9,%rd6,%rd9; st.global.f32 [%rd9],0f00000000; add.u32 %r10,%r10,1; bra MF_VZ;
-MF_WEIGHTS_ZERO: mov.u32 %r10,0;
-MF_WZ: setp.ge.u32 %p1,%r10,%r2; @%p1 bra MF_EXIT; mul.lo.u32 %r11,%r8,%r2; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd9,%r11,4; add.u64 %rd9,%rd7,%rd9; st.global.f32 [%rd9],0f00000000; add.u32 %r10,%r10,1; bra MF_WZ;
+MF_SCORE: setp.ge.u32 %p1,%r10,%r1; @%p1 bra MF_NORMALIZE; mul.lo.u32 %r11,%r8,%r2; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd9,%r11,4; add.u64 %rd9,%rd7,%rd9; ld.global.f32 %f10,[%rd9]; sub.f32 %f10,%f6,%f10; div.approx.f32 %f10,%f10,%f0; mov.f32 %f12,0f3fb8aa3b; mul.f32 %f10,%f10,%f12; ex2.approx.f32 %f10,%f10; st.global.f32 [%rd9],%f10; add.f32 %f11,%f11,%f10; add.u32 %r10,%r10,1; bra MF_SCORE;
+MF_EMPTY: mov.f32 %f11,0f3f800000;
+// Normalize active slots, clear inactive slots, then reduce values. The slot
+// index is independent of the value channel (d_val may exceed capacity).
+MF_NORMALIZE: mov.u32 %r10,0;
+MF_WN: setp.ge.u32 %p1,%r10,%r2; @%p1 bra MF_VALUE;
+ mul.lo.u32 %r11,%r8,%r2; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd9,%r11,4; add.u64 %rd9,%rd7,%rd9;
+ mov.f32 %f10,0f00000000; setp.ge.u32 %p1,%r10,%r1; @%p1 bra MF_WS;
+ ld.global.f32 %f10,[%rd9]; div.approx.f32 %f10,%f10,%f11;
+MF_WS: st.global.f32 [%rd9],%f10; add.u32 %r10,%r10,1; bra MF_WN;
 MF_VALUE: mov.u32 %r10,0;
-MF_V: setp.ge.u32 %p1,%r10,%r4; @%p1 bra MF_EXIT; mul.lo.u32 %r11,%r8,%r2; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd9,%r11,4; add.u64 %rd9,%rd7,%rd9; ld.global.f32 %f10,[%rd9]; div.approx.f32 %f10,%f10,%f11; mul.lo.u32 %r11,%r8,%r4; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd9,%r11,4; add.u64 %rd9,%rd6,%rd9; ld.global.f32 %f2,[%rd9]; mov.u32 %r12,0;
-MF_VJ: setp.ge.u32 %p3,%r12,%r1; @%p3 bra MF_VNEXT; mul.lo.u32 %r13,%r12,%r4; add.u32 %r13,%r13,%r12; // r13 is overwritten immediately with the value-row index
- mul.lo.u32 %r13,%r10,%r4; add.u32 %r13,%r13,%r12; mul.wide.u32 %rd10,%r13,4; add.u64 %rd10,%rd3,%rd10; ld.global.f32 %f3,[%rd10]; mul.f32 %f3,%f3,%f10; add.f32 %f2,%f2,%f3; st.global.f32 [%rd9],%f2; add.u32 %r12,%r12,1; bra MF_VJ;
-MF_VNEXT: add.u32 %r10,%r10,1; bra MF_V;
+MF_V: setp.ge.u32 %p1,%r10,%r4; @%p1 bra MF_EXIT;
+ mov.f32 %f2,0f00000000; mov.u32 %r12,0;
+MF_VJ: setp.ge.u32 %p3,%r12,%r1; @%p3 bra MF_VNEXT;
+ mul.lo.u32 %r13,%r8,%r2; add.u32 %r13,%r13,%r12; mul.wide.u32 %rd10,%r13,4; add.u64 %rd10,%rd7,%rd10; ld.global.f32 %f10,[%rd10];
+ mul.lo.u32 %r13,%r12,%r4; add.u32 %r13,%r13,%r10; mul.wide.u32 %rd10,%r13,4; add.u64 %rd10,%rd3,%rd10; ld.global.f32 %f3,[%rd10];
+ mul.f32 %f3,%f3,%f10; add.f32 %f2,%f2,%f3; add.u32 %r12,%r12,1; bra MF_VJ;
+MF_VNEXT: mul.lo.u32 %r11,%r8,%r4; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd9,%r11,4; add.u64 %rd9,%rd6,%rd9; st.global.f32 [%rd9],%f2;
+ add.u32 %r10,%r10,1; bra MF_V;
 MF_EXIT: ret;
 }
 
@@ -251,10 +260,12 @@ MF_EXIT: ret;
  mov.u32 %r5,%tid.x; mov.u32 %r6,%ctaid.x; mov.u32 %r7,%ntid.x; mad.lo.u32 %r8,%r6,%r7,%r5; setp.ge.u32 %p0,%r8,%r0; @%p0 bra MB_EXIT; mul.lo.u32 %r9,%r8,%r3; mul.wide.u32 %rd10,%r9,4; add.u64 %rd10,%rd0,%rd10; mov.f32 %f1,0f00000000; mov.u32 %r10,0;
 MB_QSQ: setp.ge.u32 %p1,%r10,%r3; @%p1 bra MB_ZERO; mul.wide.u32 %rd11,%r10,4; add.u64 %rd11,%rd10,%rd11; ld.global.f32 %f2,[%rd11]; mul.f32 %f3,%f2,%f2; add.f32 %f1,%f1,%f3; add.u32 %r10,%r10,1; bra MB_QSQ;
 MB_ZERO: mov.u32 %r10,0;
-MB_Z: setp.ge.u32 %p1,%r10,%r3; @%p1 bra MB_ENTRY; mul.lo.u32 %r11,%r8,%r3; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd11,%r11,4; add.u64 %rd11,%rd8,%rd11; st.global.f32 [%rd11],0f00000000; add.u64 %rd11,%rd9,%rd11; st.global.f32 [%rd11],0f00000000; add.u32 %r10,%r10,1; bra MB_Z;
+// Rebuild each byte offset independently: never add two allocation bases.
+MB_Z: setp.ge.u32 %p1,%r10,%r3; @%p1 bra MB_ENTRY; mul.lo.u32 %r11,%r8,%r3; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd11,%r11,4; add.u64 %rd11,%rd8,%rd11; st.global.f32 [%rd11],0f00000000; mul.wide.u32 %rd11,%r11,4; add.u64 %rd11,%rd9,%rd11; st.global.f32 [%rd11],0f00000000; add.u32 %r10,%r10,1; bra MB_Z;
 MB_ENTRY: mov.u32 %r10,0;
 MB_E: setp.ge.u32 %p1,%r10,%r1; @%p1 bra MB_PROJECT; mul.lo.u32 %r11,%r8,%r4; add.u32 %r11,%r11,0; mul.wide.u32 %rd11,%r11,4; add.u64 %rd11,%rd2,%rd11; mov.u32 %r12,0; mov.f32 %f4,0f00000000;
-MB_DOT: setp.ge.u32 %p2,%r12,%r4; @%p2 bra MB_SQ; mul.lo.u32 %r13,%r8,%r4; add.u32 %r13,%r13,%r12; mul.wide.u32 %rd12,%r13,4; add.u64 %rd12,%rd11,%rd12; ld.global.f32 %f5,[%rd12]; mul.lo.u32 %r13,%r10,%r4; add.u32 %r13,%r13,%r12; mul.wide.u32 %rd12,%r13,4; add.u64 %rd12,%rd7,%rd12; ld.global.f32 %f6,[%rd12]; mul.lo.u32 %r13,%r8,%r4; add.u32 %r13,%r13,%r12; mul.wide.u32 %rd12,%r13,4; add.u64 %rd12,%rd3,%rd12; ld.global.f32 %f7,[%rd12]; sub.f32 %f6,%f6,%f7; mul.f32 %f6,%f6,%f5; add.f32 %f4,%f4,%f6; add.u32 %r12,%r12,1; bra MB_DOT;
+// rd11 already points at g_m[t,0]; add only the channel offset.
+MB_DOT: setp.ge.u32 %p2,%r12,%r4; @%p2 bra MB_SQ; mul.wide.u32 %rd12,%r12,4; add.u64 %rd12,%rd11,%rd12; ld.global.f32 %f5,[%rd12]; mul.lo.u32 %r13,%r10,%r4; add.u32 %r13,%r13,%r12; mul.wide.u32 %rd12,%r13,4; add.u64 %rd12,%rd7,%rd12; ld.global.f32 %f6,[%rd12]; mul.lo.u32 %r13,%r8,%r4; add.u32 %r13,%r13,%r12; mul.wide.u32 %rd12,%r13,4; add.u64 %rd12,%rd3,%rd12; ld.global.f32 %f7,[%rd12]; sub.f32 %f6,%f6,%f7; mul.f32 %f6,%f6,%f5; add.f32 %f4,%f4,%f6; add.u32 %r12,%r12,1; bra MB_DOT;
 MB_SQ: mov.f32 %f8,0f00000000; mov.u32 %r12,0;
 MB_SQ_LOOP: setp.ge.u32 %p2,%r12,%r3; @%p2 bra MB_COEF; mul.lo.u32 %r13,%r10,%r3; add.u32 %r13,%r13,%r12; mul.wide.u32 %rd12,%r13,4; add.u64 %rd12,%rd5,%rd12; ld.global.f32 %f5,[%rd12]; mul.lo.u32 %r13,%r8,%r3; add.u32 %r13,%r13,%r12; mul.wide.u32 %rd12,%r13,4; add.u64 %rd12,%rd0,%rd12; ld.global.f32 %f6,[%rd12]; sub.f32 %f6,%f6,%f5; mul.f32 %f6,%f6,%f6; add.f32 %f8,%f8,%f6; add.u32 %r12,%r12,1; bra MB_SQ_LOOP;
 MB_COEF: setp.eq.f32 %p3,%f8,0f00000000; @%p3 bra MB_NEXT; mul.wide.u32 %rd12,%r10,4; add.u64 %rd12,%rd6,%rd12; ld.global.f32 %f9,[%rd12]; mov.f32 %f10,0f3f800000; sub.f32 %f10,%f10,%f1; mov.f32 %f16,0f3f800000; sub.f32 %f16,%f16,%f9; mul.f32 %f11,%f10,%f16; div.approx.f32 %f12,%f8,%f11; add.f32 %f13,%f12,0f3f800000; mul.f32 %f13,%f13,%f12; sqrt.approx.f32 %f13,%f13; div.approx.f32 %f13,0f3f800000,%f13; mul.lo.u32 %r13,%r8,%r2; add.u32 %r13,%r13,%r10; mul.wide.u32 %rd12,%r13,4; add.u64 %rd12,%rd4,%rd12; ld.global.f32 %f14,[%rd12]; mul.f32 %f14,%f14,%f4; neg.f32 %f14,%f14; div.approx.f32 %f14,%f14,%f0; mul.f32 %f14,%f14,%f13; mov.u32 %r12,0;
@@ -267,7 +278,7 @@ MB_DOTG: setp.ge.u32 %p1,%r10,%r3; @%p1 bra MB_POUT; mul.lo.u32 %r11,%r8,%r3; ad
 MB_POUT: mov.u32 %r10,0;
 MB_PK: setp.ge.u32 %p1,%r10,%r3; @%p1 bra MB_EXIT; mul.lo.u32 %r11,%r8,%r3; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd11,%r11,4; add.u64 %rd11,%rd1,%rd11; ld.global.f32 %f5,[%rd11]; mul.f32 %f6,%f5,%f12; mov.f32 %f8,0f3f800000; sub.f32 %f8,%f8,%f10; mul.f32 %f6,%f6,%f8; mul.f32 %f6,%f6,%f11; mul.wide.u32 %rd12,%r11,4; add.u64 %rd12,%rd8,%rd12; ld.global.f32 %f7,[%rd12]; sub.f32 %f7,%f7,%f6; mul.f32 %f7,%f7,%f10; mul.wide.u32 %rd12,%r11,4; add.u64 %rd12,%rd9,%rd12; st.global.f32 [%rd12],%f7; add.u32 %r10,%r10,1; bra MB_PK;
 MB_COPY: mov.u32 %r10,0;
-MB_COPY_LOOP: setp.ge.u32 %p1,%r10,%r3; @%p1 bra MB_EXIT; mul.lo.u32 %r11,%r8,%r3; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd11,%r11,4; add.u64 %rd11,%rd9,%rd11; mul.wide.u32 %rd12,%r11,4; add.u64 %rd12,%rd1,%rd12; ld.global.f32 %f7,[%rd12]; st.global.f32 [%rd11],%f7; add.u32 %r10,%r10,1; bra MB_COPY_LOOP;
+MB_COPY_LOOP: setp.ge.u32 %p1,%r10,%r3; @%p1 bra MB_EXIT; mul.lo.u32 %r11,%r8,%r3; add.u32 %r11,%r11,%r10; mul.wide.u32 %rd11,%r11,4; add.u64 %rd11,%rd9,%rd11; mul.wide.u32 %rd12,%r11,4; add.u64 %rd12,%rd8,%rd12; ld.global.f32 %f7,[%rd12]; st.global.f32 [%rd11],%f7; add.u32 %r10,%r10,1; bra MB_COPY_LOOP;
 MB_EXIT: ret;
 }
 
@@ -299,7 +310,7 @@ SIG_EXIT: ret;
  .param .u64 a, .param .u64 b, .param .u64 out, .param .u32 len
 ) {
  .reg .pred %p; .reg .b32 %r<7>; .reg .b64 %rd<7>; .reg .f32 %f<7>;
- ld.param.u64 %rd0,[a]; ld.param.u64 %rd1,[b]; ld.param.u64 %rd2,[out]; ld.param.u32 %r0,[len]; mov.u32 %r1,%tid.x; mov.u32 %r2,%ctaid.x; mov.u32 %r3,%ntid.x; mad.lo.u32 %r4,%r2,%r3,%r1; setp.ge.u32 %p,%r4,%r0; @%p bra SMUL_EXIT; mul.wide.u32 %rd3,%r4,4; add.u64 %rd4,%rd0,%rd3; ld.global.f32 %f0,[%rd4]; neg.f32 %f1,%f0; mov.f32 %f2,0f3fb8aa3b; mul.f32 %f1,%f1,%f2; ex2.approx.f32 %f1,%f1; add.f32 %f1,%f1,0f3f800000; div.approx.f32 %f1,0f3f800000,%f1; add.u64 %rd5,%rd1,%rd3; ld.global.f32 %f3,[%rd5]; mul.f32 %f4,%f0,%f1; mul.f32 %f4,%f4,%f3; add.u64 %rd6,%rd2,%rd3; st.global.f32 [%rd6],%f4;
+ ld.param.u64 %rd0,[a]; ld.param.u64 %rd1,[b]; ld.param.u64 %rd2,[out]; ld.param.u32 %r0,[len]; mov.u32 %r1,%tid.x; mov.u32 %r2,%ctaid.x; mov.u32 %r3,%ntid.x; mad.lo.u32 %r4,%r2,%r3,%r1; setp.ge.u32 %p,%r4,%r0; @%p bra SMUL_EXIT; mul.wide.u32 %rd3,%r4,4; add.u64 %rd4,%rd0,%rd3; ld.global.f32 %f0,[%rd4]; add.u64 %rd5,%rd1,%rd3; ld.global.f32 %f3,[%rd5]; mul.f32 %f4,%f0,%f3; add.u64 %rd6,%rd2,%rd3; st.global.f32 [%rd6],%f4;
 SMUL_EXIT: ret;
 }
 

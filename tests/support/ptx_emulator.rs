@@ -1,4 +1,4 @@
-//! A deliberately small, test-only interpreter for the embedded SSM PTX.
+//! A deliberately small, test-only interpreter for the embedded stage PTX.
 //! Executes the real instructions (including addresses, branches, and barriers),
 //! not a Rust transcription of the algorithm. This is not a CUDA/JIT emulator:
 //! approximate math uses Rust f32 math, and device scheduling/copies need GPU tests.
@@ -223,12 +223,17 @@ impl Thread {
                 "shr.u32" => ((self.value(&a[1]) as u32) >> self.value(&a[2])) as u64,
                 "setp.ge.u32" => (self.value(&a[1]) >= self.value(&a[2])) as u64,
                 "setp.eq.u32" => (self.value(&a[1]) == self.value(&a[2])) as u64,
+                "setp.eq.f32" => (self.float(&a[1]) == self.float(&a[2])) as u64,
+                "setp.gt.f32" => (self.float(&a[1]) > self.float(&a[2])) as u64,
                 "add.f32" => (self.float(&a[1]) + self.float(&a[2])).to_bits() as u64,
                 "sub.f32" => (self.float(&a[1]) - self.float(&a[2])).to_bits() as u64,
                 "mul.f32" => (self.float(&a[1]) * self.float(&a[2])).to_bits() as u64,
                 "div.approx.f32" => (self.float(&a[1]) / self.float(&a[2])).to_bits() as u64,
                 "neg.f32" => (-self.float(&a[1])).to_bits() as u64,
                 "ex2.approx.f32" => self.float(&a[1]).exp2().to_bits() as u64,
+                "sqrt.approx.f32" => self.float(&a[1]).sqrt().to_bits() as u64,
+                "lg2.approx.f32" => self.float(&a[1]).log2().to_bits() as u64,
+                "min.f32" => self.float(&a[1]).min(self.float(&a[2])).to_bits() as u64,
                 op => panic!("unsupported instruction {op}"),
             };
             self.registers.insert(a[0].clone(), result);
@@ -271,6 +276,31 @@ impl Machine {
         grid: (usize, usize),
         width: usize,
     ) {
+        self.launch_selected(source, name, args, grid, width, None);
+    }
+
+    /// Execute a single non-barrier thread at its real flattened launch index.
+    /// Large-shape boundary probes need not execute every intervening token.
+    pub fn launch_thread(
+        &mut self,
+        source: &str,
+        name: &str,
+        args: &[Arg<'_>],
+        index: usize,
+        width: usize,
+    ) {
+        self.launch_selected(source, name, args, (1, 1), width, Some(index));
+    }
+
+    fn launch_selected(
+        &mut self,
+        source: &str,
+        name: &str,
+        args: &[Arg<'_>],
+        grid: (usize, usize),
+        width: usize,
+        selected: Option<usize>,
+    ) {
         let kernel = Kernel::parse(source, name);
         assert_eq!(kernel.params.len(), args.len(), "{name} argument count");
         let params = kernel
@@ -287,11 +317,11 @@ impl Machine {
         for y in 0..grid.1 {
             for x in 0..grid.0 {
                 let mut shared = HashMap::new();
-                let mut threads: Vec<_> = (0..width)
+                let mut threads: Vec<_> = (0..selected.map_or(width, |_| 1))
                     .map(|tid| Thread {
                         registers: HashMap::from([
-                            ("%tid.x".into(), tid as u64),
-                            ("%ctaid.x".into(), x as u64),
+                            ("%tid.x".into(), selected.map_or(tid, |i| i % width) as u64),
+                            ("%ctaid.x".into(), selected.map_or(x, |i| i / width) as u64),
                             ("%ctaid.y".into(), y as u64),
                             ("%ntid.x".into(), width as u64),
                         ]),

@@ -11,6 +11,7 @@ use cudarc::driver::{CudaContext as DriverContext, CudaSlice, CudaStream};
 
 use crate::backend::{checked_gemm_sizes, shared_gemm_rows, zeroed_output};
 mod safeguards;
+mod stage_bounds;
 mod stages;
 
 // cudarc 0.19 lazily loads symbols with unwrap/panic, including error formatting
