@@ -3,6 +3,7 @@ use crate::backend::Device;
 use crate::linalg::{SimpleRng, dot_slice, sigmoid, softplus};
 use crate::memory::HyperbolicEpisodicBankV2;
 use std::f32;
+use std::time::Instant;
 
 // =============================================================================
 // PARAMETER TENSORS WITH INTEGRATED ADAMW MOMENTS
@@ -1488,6 +1489,32 @@ impl PSSAContinuousBlockV2 {
     pub fn ema_consolidate_plasticity(&mut self) {
         self.adapters[0].consolidate(self.cfg.ema_alpha);
     }
+
+    /// Replay one detached episodic value through the continuous block and
+    /// update only the fast plastic adapter.  Main PSSA weights, optimizer
+    /// moments, and the episodic bank remain untouched.  The adapter update is
+    /// a local Hebbian-style VJP: the stored value is the target and the
+    /// adapter activation supplies the presynaptic signal.
+    pub(crate) fn dream_replay_value(&mut self, value: &[f32], output: &mut [f32]) {
+        assert_eq!(value.len(), self.cfg.d_latent);
+        assert_eq!(output.len(), self.cfg.d_latent);
+        self.forward_continuous_inference(value, output);
+        let target_norm = value
+            .iter()
+            .map(|&x| (x as f64) * (x as f64))
+            .sum::<f64>()
+            .sqrt();
+        let rate = 0.02 / (1.0 + target_norm.min(f32::MAX as f64) as f32);
+        let rank = self.adapters[0].rank;
+        for (i, &target) in value.iter().enumerate() {
+            let error = (target - self.inf_ad_out[i]).clamp(-4.0, 4.0);
+            let row = i * rank;
+            for r in 0..rank {
+                self.adapters[0].up_proj.data[row + r] += rate * error * self.inf_ad_act[r];
+            }
+        }
+    }
+
     pub fn parameter_count(&self) -> usize {
         [
             &self.a_mat,
@@ -1801,6 +1828,65 @@ impl PSSALayerV2 {
             // block mutably; this keeps inference allocation-free while the
             // depth residual input remains in the unused prefix of the
             // training workspace.
+            let PSSALayerV2 {
+                extra_blocks,
+                residual_scales,
+                continuous_inputs,
+                inf_features,
+                inf_block_out,
+                ..
+            } = self;
+            for (b, &scale) in extra_blocks.iter_mut().zip(residual_scales.iter()) {
+                continuous_inputs[..d].copy_from_slice(inf_features);
+                for loop_index in 0..loops {
+                    b.forward_inference_loop(inf_features, inf_block_out, loop_index);
+                    for i in 0..d {
+                        inf_features[i] += loop_scale * inf_block_out[i];
+                    }
+                }
+                for i in 0..d {
+                    inf_features[i] = continuous_inputs[i] + scale * inf_features[i];
+                }
+            }
+        }
+        self.unembed_w.matvec(&self.inf_features, logits_out);
+        let logit_scale = 1.0 / (d as f32).sqrt();
+        for logit in logits_out {
+            *logit *= logit_scale;
+        }
+    }
+
+    /// Host-only forward used to turn an episodic latent seed into generation
+    /// logits. It mirrors `forward_inference` without consuming an embedding
+    /// row, so GPU training can fall back explicitly without changing the
+    /// regular inference/training dispatch path.
+    fn forward_dream_input(&mut self, input: &[f32], logits_out: &mut [f32]) {
+        assert_eq!(input.len(), self.cfg.d_latent);
+        assert_eq!(logits_out.len(), self.cfg.d_vocab);
+        let d = self.cfg.d_latent;
+        let loops = self.loops();
+        if loops == 1 {
+            self.block
+                .forward_continuous_inference(input, &mut self.inf_features);
+            for (b, &scale) in self.extra_blocks.iter_mut().zip(&self.residual_scales) {
+                b.forward_continuous_inference(&self.inf_features, &mut self.inf_block_out);
+                for i in 0..d {
+                    self.inf_features[i] += scale * self.inf_block_out[i];
+                }
+            }
+        } else {
+            self.inf_features.copy_from_slice(input);
+            let loop_scale = 1.0 / loops as f32;
+            for loop_index in 0..loops {
+                self.block.forward_inference_loop(
+                    &self.inf_features,
+                    &mut self.inf_block_out,
+                    loop_index,
+                );
+                for i in 0..d {
+                    self.inf_features[i] += loop_scale * self.inf_block_out[i];
+                }
+            }
             let PSSALayerV2 {
                 extra_blocks,
                 residual_scales,
@@ -2379,6 +2465,160 @@ impl PSSALayerV2 {
             ctx.invalidate_weights();
         }
     }
+
+    /// Consolidate the fast adapter after an offline replay and report the
+    /// Euclidean norm of the transferred slow-copy delta.  The consolidation
+    /// itself is shared with the historical EMA path so its coefficient
+    /// transfer remains exact.
+    fn dream_consolidate_plasticity(&mut self) -> f32 {
+        let mut delta_sq = 0.0f64;
+        for b in std::iter::once(&self.block).chain(&self.extra_blocks) {
+            let alpha = b.cfg.ema_alpha as f64;
+            for &fast in &b.adapters[0].up_proj.data {
+                let delta = alpha * fast as f64;
+                delta_sq += delta * delta;
+            }
+        }
+        self.ema_consolidate_plasticity();
+        delta_sq.sqrt() as f32
+    }
+
+    fn dream_replay_latent(&mut self, value: &[f32]) {
+        for block in 0..self.depth() {
+            if block == 0 {
+                self.block.dream_replay_value(value, &mut self.inf_features);
+            } else {
+                self.extra_blocks[block - 1].dream_replay_value(value, &mut self.inf_features);
+            }
+        }
+    }
+
+    fn dream_replay_memory_entry(&mut self, block: usize, value: &[f32]) {
+        if block == 0 {
+            self.block.dream_replay_value(value, &mut self.inf_features);
+        } else {
+            self.extra_blocks[block - 1].dream_replay_value(value, &mut self.inf_features);
+        }
+    }
+
+    fn dream_memory_entries(&self) -> Vec<(usize, usize)> {
+        let mut entries = Vec::new();
+        for (block, b) in std::iter::once(&self.block)
+            .chain(&self.extra_blocks)
+            .enumerate()
+        {
+            entries.extend((0..b.memory.count).map(|entry| (block, entry)));
+        }
+        entries
+    }
+
+    fn dream_entry_value(&self, block: usize, entry: usize) -> Vec<f32> {
+        let b = if block == 0 {
+            &self.block
+        } else {
+            &self.extra_blocks[block - 1]
+        };
+        let start = entry * b.cfg.d_latent;
+        b.memory.values[start..start + b.cfg.d_latent].to_vec()
+    }
+
+    /// Stage 1 API retained for callers that only want memory replay.
+    pub fn dream_replay_memory(
+        &mut self,
+        replay: usize,
+        rng: &mut SimpleRng,
+    ) -> crate::dream::DreamSummary {
+        self.dream_replay(crate::dream::DreamMode::Memory, replay, 0, 0.8, rng)
+    }
+
+    /// Run a host-only offline sleep phase. Memory values are sampled first;
+    /// generate/both modes use each selected value as a continuous seed, sample
+    /// a short token sequence, and replay the resulting latent outputs through
+    /// the plastic adapters. The recurrent carry is restored around both
+    /// generation and replay, and no Adam gradients or main weights are touched.
+    pub fn dream_replay(
+        &mut self,
+        mode: crate::dream::DreamMode,
+        replay: usize,
+        dream_len: usize,
+        temperature: f32,
+        rng: &mut SimpleRng,
+    ) -> crate::dream::DreamSummary {
+        let started = Instant::now();
+        if replay == 0 {
+            return crate::dream::DreamSummary {
+                elapsed_seconds: started.elapsed().as_secs_f64(),
+                ..Default::default()
+            };
+        }
+        if mode.includes_generation() {
+            assert!(dream_len > 0);
+            assert!(temperature.is_finite() && temperature > 0.0);
+        }
+        let mut entries = self.dream_memory_entries();
+        let take = replay.min(entries.len());
+        if take == 0 {
+            return crate::dream::DreamSummary {
+                elapsed_seconds: started.elapsed().as_secs_f64(),
+                ..Default::default()
+            };
+        }
+        for i in 0..take {
+            let remaining = entries.len() - i;
+            let j = i + (rng.next_u32() as usize % remaining);
+            entries.swap(i, j);
+        }
+        let values: Vec<Vec<f32>> = entries[..take]
+            .iter()
+            .map(|&(block, entry)| self.dream_entry_value(block, entry))
+            .collect();
+
+        let mut recurrent = vec![0.0; self.recurrent_state_len()];
+        self.copy_recurrent_state_to(&mut recurrent);
+        let mut generated = Vec::new();
+        if mode.includes_generation() {
+            let mut logits = vec![0.0; self.cfg.d_vocab];
+            for value in &values {
+                // Each memory seed starts from the same live carry. This makes
+                // K sequences independent while retaining deterministic model
+                // state inside each sequence.
+                self.copy_recurrent_state_from(&recurrent);
+                self.forward_dream_input(value, &mut logits);
+                let mut token = crate::dream::sample_token(&logits, temperature, rng);
+                for _ in 0..dream_len {
+                    self.forward_inference(token, &mut logits);
+                    generated.push(self.inf_features.clone());
+                    token = crate::dream::sample_token(&logits, temperature, rng);
+                }
+            }
+        }
+        self.copy_recurrent_state_from(&recurrent);
+
+        if mode.includes_memory() {
+            for (&(block, _), value) in entries[..take].iter().zip(&values) {
+                // A stored entry belongs to the block that captured it. Keep
+                // memory mode's Stage 1 behavior for stacked models rather
+                // than applying every block's adapter to the same value.
+                self.dream_replay_memory_entry(block, value);
+            }
+        }
+        for value in &generated {
+            self.dream_replay_latent(value);
+        }
+        self.copy_recurrent_state_from(&recurrent);
+        let consolidation_delta_norm = if mode.includes_memory() || !generated.is_empty() {
+            self.dream_consolidate_plasticity()
+        } else {
+            0.0
+        };
+        crate::dream::DreamSummary {
+            entries_replayed: take,
+            generated_tokens: generated.len(),
+            consolidation_delta_norm,
+            elapsed_seconds: started.elapsed().as_secs_f64(),
+        }
+    }
+
     pub fn insert_training_memory_at(&mut self, loss: f32, last: usize) {
         if !(loss > 3.5) {
             return;

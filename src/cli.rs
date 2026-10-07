@@ -7,7 +7,9 @@ use crate::checkpoint::{self, CheckpointFormat};
 use crate::dataset::{
     DatasetManager, HuggingFaceDatasetOptions, Tokenizer, TokenizerKind, clean_wikitext,
 };
+use crate::dream::DreamMode;
 use crate::inference::{InferenceConfig, PSSAInferenceEngine};
+use crate::linalg::SimpleRng;
 use crate::pssa::{GradientClipOutcome, PSSAConfigV2, PSSALayerV2};
 use crate::token_cache;
 use crate::ui;
@@ -69,6 +71,14 @@ pub struct TrainingOptions {
     pub grad_clip: Option<f32>,
     /// Runtime-only per-vector episodic memory L2 limit; repeat on resume.
     pub memory_value_cap: Option<f32>,
+    /// Run an offline memory replay after every N optimizer updates; zero is off.
+    pub dream_every: usize,
+    /// Maximum number of occupied episodic entries replayed per dream.
+    pub dream_replay: usize,
+    /// Offline replay source; memory is the Stage 1-compatible default.
+    pub dream_mode: DreamMode,
+    /// Generated tokens per memory seed in generate/both modes.
+    pub dream_len: usize,
     /// Independent document lanes per PSSA microbatch (runtime-only).
     pub batch_size: usize,
     pub warmup_steps: usize,
@@ -121,6 +131,10 @@ impl Default for TrainingOptions {
             accumulate: 8,
             grad_clip: None,
             memory_value_cap: None,
+            dream_every: 0,
+            dream_replay: 32,
+            dream_mode: DreamMode::Memory,
+            dream_len: 64,
             batch_size: 1,
             warmup_steps: 0,
             schedule_total_updates: None,
@@ -391,6 +405,10 @@ impl CLIHandler {
             accumulate: parsed.usize_nonzero("--accumulate", "", 8)?,
             grad_clip: parsed.optional_positive_f32("--grad-clip")?,
             memory_value_cap: parsed.optional_positive_f32("--memory-value-cap")?,
+            dream_every: parsed.required_usize("--dream-every", "", 0)?,
+            dream_replay: parsed.usize_nonzero("--dream-replay", "", 32)?,
+            dream_mode: DreamMode::parse(parsed.string("--dream-mode", "").unwrap_or("memory"))?,
+            dream_len: parsed.usize_nonzero("--dream-len", "", 64)?,
             batch_size: parsed.usize_nonzero("--batch-size", "", 1)?,
             warmup_steps: parsed.required_usize("--warmup-steps", "", 0)?,
             schedule_total_updates: parsed
@@ -485,6 +503,9 @@ impl CLIHandler {
             ("--memory", x.memory, 1_000_000),
             ("--chunk", x.chunk, 65_536),
             ("--accumulate", x.accumulate, 1_000_000),
+            ("--dream-every", x.dream_every, 1_000_000),
+            ("--dream-replay", x.dream_replay, 1_000_000),
+            ("--dream-len", x.dream_len, 100_000),
             ("--batch-size", x.batch_size, 65_536),
         ] {
             if value > maximum {
@@ -688,6 +709,12 @@ impl CLIHandler {
         if options.batch_size > 65_536 {
             return Err("--batch-size must be at most 65536; use fewer document lanes".into());
         }
+        if options.dream_replay == 0 {
+            return Err("--dream-replay must be positive".into());
+        }
+        if options.dream_len == 0 {
+            return Err("--dream-len must be positive".into());
+        }
         if !options.lr.is_finite() || options.lr <= 0.0 {
             return Err("learning rate must be finite and positive".into());
         }
@@ -830,6 +857,16 @@ impl CLIHandler {
                     .set_value_cap_with_device(options.memory_value_cap, &model.device);
             }
         }
+        if options.dream_every > 0 && model.device.is_gpu() {
+            eprintln!(
+                "warning: dream replay is host-only; using an explicit CPU fallback and synchronizing host weights for backend {}",
+                model
+                    .device
+                    .gpu()
+                    .map(|g| g.backend_label())
+                    .unwrap_or_else(|| "gpu".into())
+            );
+        }
         let cache_path = options.token_cache.as_deref().map(Path::new);
         let source_path = options.token_cache_source.as_deref().map(Path::new);
         let docs = Self::documents_with_cache(
@@ -951,6 +988,8 @@ impl CLIHandler {
         let started = Instant::now();
         let mut update = 0;
         let mut skipped = SkippedUpdates::default();
+        let mut dream_rng =
+            (options.dream_every > 0).then(|| SimpleRng::new(options.seed ^ 0xd0e5_5eed_5eed_0001));
         let mut tokens_seen = 0usize;
         let mut progress = ui::Progress::new_with_tui("training", total_updates, !options.no_tui);
         if let Some(path) = options.checkpoint_path.as_deref() {
@@ -1110,6 +1149,30 @@ impl CLIHandler {
                 }
                 drop(optimizer_trace);
                 update += 1;
+                if options.dream_every > 0
+                    && update % options.dream_every == 0
+                    && let Some(rng) = dream_rng.as_mut()
+                {
+                    #[cfg(feature = "cuda")]
+                    if let Some(ctx) = cuda_optimizer.as_ref() {
+                        ctx.sync_safeguarded_weights(&mut model.adam_tensors())?;
+                    }
+                    let summary = model.dream_replay(
+                        options.dream_mode,
+                        options.dream_replay,
+                        options.dream_len,
+                        0.8,
+                        rng,
+                    );
+                    println!(
+                        "dream mode={:?} entries_replayed={} generated_tokens={} consolidation_delta_norm={:.6e} time={:.3}s",
+                        options.dream_mode,
+                        summary.entries_replayed,
+                        summary.generated_tokens,
+                        summary.consolidation_delta_norm,
+                        summary.elapsed_seconds
+                    );
+                }
                 let finite = {
                     let _trace = crate::training_diagnostics::StageTrace::new(
                         &model.device,
@@ -1872,6 +1935,20 @@ impl CLIHandler {
         );
         println!(
             "    {:<48}{}",
+            "  --dream-every n --dream-replay k",
+            ui::dim(
+                "offline replay every n updates; k memory seeds/entries (default 32; off by default)"
+            )
+        );
+        println!(
+            "    {:<48}{}",
+            "  --dream-mode memory|generate|both --dream-len n",
+            ui::dim(
+                "memory, generated, or both; generated length defaults to 64 at temperature 0.8"
+            )
+        );
+        println!(
+            "    {:<48}{}",
             "  --lr f --warmup-steps n --total-updates n",
             ui::dim("optimizer schedule; fixed whole-run horizon for fresh chains")
         );
@@ -2058,7 +2135,19 @@ impl CLIHandler {
                     "      --memory-value-cap <C>    opt-in memory value L2 limit, finite >0; caps loaded banks and writes"
                 );
                 println!(
-                    "                                both default off, runtime-only; repeat flags on resume"
+                    "      --dream-every <N>         memory replay cadence in optimizer updates (default: off)"
+                );
+                println!(
+                    "      --dream-replay <K>        occupied episodic entries/seeds per dream (default: 32)"
+                );
+                println!(
+                    "      --dream-mode <M>          memory, generate, or both (default: memory)"
+                );
+                println!(
+                    "      --dream-len <N>           generated tokens per seed (default: 64; temp 0.8)"
+                );
+                println!(
+                    "                                dream controls are runtime-only; repeat flags on resume"
                 );
                 println!("      --lr <F>                  base learning rate (default: 0.001)");
                 println!("      --warmup-steps <N>        linear warm-up updates (default: 0)");
@@ -2363,6 +2452,10 @@ impl CLIHandler {
                         "--grad-clip",
                         "--memory-value-cap",
                         "--token-cache",
+                        "--dream-every",
+                        "--dream-replay",
+                        "--dream-mode",
+                        "--dream-len",
                     ]);
                 }
                 let p = Parsed::parse(&args[2..], &allowed)?;
