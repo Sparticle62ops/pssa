@@ -79,6 +79,10 @@ pub struct TrainingOptions {
     pub dream_mode: DreamMode,
     /// Generated tokens per memory seed in generate/both modes.
     pub dream_len: usize,
+    /// Learning rate for the separate main-weight SGD rehearsal pass.
+    pub dream_lr: f32,
+    /// Number of SGD rehearsal passes per stored/generated sequence.
+    pub dream_steps: usize,
     /// Independent document lanes per PSSA microbatch (runtime-only).
     pub batch_size: usize,
     pub warmup_steps: usize,
@@ -135,6 +139,8 @@ impl Default for TrainingOptions {
             dream_replay: 32,
             dream_mode: DreamMode::Memory,
             dream_len: 64,
+            dream_lr: crate::dream::DEFAULT_REHEARSAL_LR,
+            dream_steps: crate::dream::DEFAULT_REHEARSAL_STEPS,
             batch_size: 1,
             warmup_steps: 0,
             schedule_total_updates: None,
@@ -409,6 +415,12 @@ impl CLIHandler {
             dream_replay: parsed.usize_nonzero("--dream-replay", "", 32)?,
             dream_mode: DreamMode::parse(parsed.string("--dream-mode", "").unwrap_or("memory"))?,
             dream_len: parsed.usize_nonzero("--dream-len", "", 64)?,
+            dream_lr: parsed.f32("--dream-lr", "", crate::dream::DEFAULT_REHEARSAL_LR)?,
+            dream_steps: parsed.usize_nonzero(
+                "--dream-steps",
+                "",
+                crate::dream::DEFAULT_REHEARSAL_STEPS,
+            )?,
             batch_size: parsed.usize_nonzero("--batch-size", "", 1)?,
             warmup_steps: parsed.required_usize("--warmup-steps", "", 0)?,
             schedule_total_updates: parsed
@@ -506,6 +518,7 @@ impl CLIHandler {
             ("--dream-every", x.dream_every, 1_000_000),
             ("--dream-replay", x.dream_replay, 1_000_000),
             ("--dream-len", x.dream_len, 100_000),
+            ("--dream-steps", x.dream_steps, 1_000_000),
             ("--batch-size", x.batch_size, 65_536),
         ] {
             if value > maximum {
@@ -709,6 +722,12 @@ impl CLIHandler {
         }
         if options.dream_len == 0 {
             return Err("--dream-len must be positive".into());
+        }
+        if !options.dream_lr.is_finite() || options.dream_lr <= 0.0 {
+            return Err("--dream-lr must be finite and positive".into());
+        }
+        if options.dream_steps == 0 {
+            return Err("--dream-steps must be positive".into());
         }
         if !options.lr.is_finite() || options.lr <= 0.0 {
             return Err("learning rate must be finite and positive".into());
@@ -1132,6 +1151,12 @@ impl CLIHandler {
                             .sum::<f32>()
                             / c.len as f32;
                         model.insert_training_memory_at(loss, offset + c.len - 1);
+                        if loss > 3.5 {
+                            let inputs = model.block.tape.x_ids[offset..offset + c.len].to_vec();
+                            let targets =
+                                model.block.tape.target_ids[offset..offset + c.len].to_vec();
+                            model.remember_dream_sequence(&inputs, &targets);
+                        }
                         loss_sum += loss as f64 * c.len as f64;
                         token_sum += c.len;
                         offset += c.len;
@@ -1169,18 +1194,21 @@ impl CLIHandler {
                     if let Some(ctx) = cuda_optimizer.as_ref() {
                         ctx.sync_safeguarded_weights(&mut model.adam_tensors())?;
                     }
-                    let summary = model.dream_replay(
+                    let summary = model.dream_replay_with_options(
                         options.dream_mode,
                         options.dream_replay,
                         options.dream_len,
                         0.8,
+                        options.dream_lr,
+                        options.dream_steps,
                         rng,
                     );
                     println!(
-                        "dream mode={:?} entries_replayed={} generated_tokens={} consolidation_delta_norm={:.6e} time={:.3}s",
+                        "dream mode={:?} entries_replayed={} generated_tokens={} rehearsal_sequences={} consolidation_delta_norm={:.6e} time={:.3}s",
                         options.dream_mode,
                         summary.entries_replayed,
                         summary.generated_tokens,
+                        summary.rehearsal_sequences,
                         summary.consolidation_delta_norm,
                         summary.elapsed_seconds
                     );
@@ -2158,6 +2186,12 @@ impl CLIHandler {
                     "      --dream-len <N>           generated tokens per seed (default: 64; temp 0.8)"
                 );
                 println!(
+                    "      --dream-lr <F>            main-weight rehearsal SGD rate (default: 0.00001)"
+                );
+                println!(
+                    "      --dream-steps <N>         rehearsal passes per sequence (default: 1)"
+                );
+                println!(
                     "                                dream controls are runtime-only; repeat flags on resume"
                 );
                 println!("      --lr <F>                  base learning rate (default: 0.001)");
@@ -2467,6 +2501,8 @@ impl CLIHandler {
                         "--dream-replay",
                         "--dream-mode",
                         "--dream-len",
+                        "--dream-lr",
+                        "--dream-steps",
                     ]);
                 }
                 let p = Parsed::parse(&args[2..], &allowed)?;

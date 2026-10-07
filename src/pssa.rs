@@ -1541,6 +1541,12 @@ impl PSSAContinuousBlockV2 {
     }
 }
 
+#[derive(Clone, Debug)]
+struct DreamSequence {
+    input_ids: Vec<usize>,
+    target_ids: Vec<usize>,
+}
+
 /// Shared vocabulary endpoints around independent continuous blocks. Layer zero
 /// has no outer residual; subsequent blocks use h + F(h)/sqrt(depth).
 /// Deref preserves the historical depth-one field API; new code should use
@@ -1572,6 +1578,11 @@ pub struct PSSALayerV2 {
     pub layer_activations: Vec<Vec<f32>>,
     pub inf_features: Vec<f32>,
     pub inf_block_out: Vec<f32>,
+    /// Runtime-only supervised replay records. They intentionally do not enter
+    /// checkpoints: dream controls and their ephemeral rehearsal cache must be
+    /// supplied again when resuming a run.
+    dream_sequences: Vec<DreamSequence>,
+
 }
 
 impl std::ops::Deref for PSSALayerV2 {
@@ -1675,6 +1686,8 @@ impl PSSALayerV2 {
             layer_activations: (1..depth).map(|_| vec![0.0; l * d]).collect(),
             inf_features: vec![0.0; d],
             inf_block_out: vec![0.0; d],
+            dream_sequences: Vec::new(),
+
         }
     }
     pub fn depth(&self) -> usize {
@@ -2522,6 +2535,86 @@ impl PSSALayerV2 {
         b.memory.values[start..start + b.cfg.d_latent].to_vec()
     }
 
+    /// Remember one supervised sequence for the runtime-only rehearsal cache.
+    /// The sequence is copied before the caller's training tape is reused. A
+    /// bounded cache keeps the oldest replay records from growing without
+    /// affecting checkpoint bytes.
+    pub fn remember_dream_sequence(&mut self, input_ids: &[usize], target_ids: &[usize]) {
+        assert!(!input_ids.is_empty());
+        assert_eq!(input_ids.len(), target_ids.len());
+        assert!(input_ids.len() <= self.cfg.chunk_len);
+        assert!(
+            input_ids
+                .iter()
+                .chain(target_ids)
+                .all(|&id| id < self.cfg.d_vocab)
+        );
+        self.dream_sequences.push(DreamSequence {
+            input_ids: input_ids.to_vec(),
+            target_ids: target_ids.to_vec(),
+        });
+        let capacity = self.cfg.mem_capacity.max(1);
+        if self.dream_sequences.len() > capacity {
+            let excess = self.dream_sequences.len() - capacity;
+            self.dream_sequences.drain(..excess);
+        }
+    }
+
+    fn apply_dream_sgd(&mut self, lr: f32, target_ids: &[usize]) {
+        assert!(lr.is_finite() && lr > 0.0);
+        // Replay is a separate optimizer. The output rows for old-task labels
+        // are the main weights most directly overwritten by a conflicting
+        // task; keeping the fresh-task rows frozen makes this protection much
+        // less likely to trade Task B accuracy for Task A retention. Adam
+        // moments and the normal step counter remain untouched.
+        let d = self.cfg.d_latent;
+        let mut rows = vec![false; self.cfg.d_vocab];
+        for &target in target_ids {
+            assert!(target < self.cfg.d_vocab);
+            rows[target] = true;
+        }
+        for (target, &selected) in rows.iter().enumerate() {
+            if selected {
+                let start = target * d;
+                for i in start..start + d {
+                    self.unembed_w.data[i] -= lr * self.unembed_w.grad[i];
+                }
+            }
+        }
+        if let Some(ctx) = self.device.gpu() {
+            ctx.invalidate_weights();
+        }
+    }
+
+    /// Rehearse one stored/generated sequence through the ordinary supervised
+    /// loss. This uses a separate, small-LR SGD pass: the main weights change,
+    /// but their Adam moments and the normal optimizer step counter do not.
+    fn rehearse_dream_sequence(
+        &mut self,
+        sequence: &DreamSequence,
+        lr: f32,
+        steps: usize,
+        bounded: bool,
+    ) {
+        // Stop each sleep burst once the old sequence is back below this loss.
+        // It prevents a strong replay rate from overshooting and erasing the
+        // fresh task's high-margin predictions.
+        const MAX_REHEARSAL_LOSS: f32 = 9.0;
+        let mut recurrent = vec![0.0; self.recurrent_state_len()];
+        self.copy_recurrent_state_to(&mut recurrent);
+        for _ in 0..steps {
+            self.copy_recurrent_state_from(&recurrent);
+            let loss = self.forward_train_chunk(&sequence.input_ids, &sequence.target_ids);
+            self.zero_gradients();
+            if !bounded || loss > MAX_REHEARSAL_LOSS {
+                self.backward_chunk(sequence.input_ids.len(), 1.0);
+                self.apply_dream_sgd(lr, &sequence.target_ids);
+            }
+            self.zero_gradients();
+        }
+        self.copy_recurrent_state_from(&recurrent);
+    }
+
     /// Stage 1 API retained for callers that only want memory replay.
     pub fn dream_replay_memory(
         &mut self,
@@ -2531,11 +2624,7 @@ impl PSSALayerV2 {
         self.dream_replay(crate::dream::DreamMode::Memory, replay, 0, 0.8, rng)
     }
 
-    /// Run a host-only offline sleep phase. Memory values are sampled first;
-    /// generate/both modes use each selected value as a continuous seed, sample
-    /// a short token sequence, and replay the resulting latent outputs through
-    /// the plastic adapters. The recurrent carry is restored around both
-    /// generation and replay, and no Adam gradients or main weights are touched.
+    /// Run a host-only offline sleep phase with the default rehearsal policy.
     pub fn dream_replay(
         &mut self,
         mode: crate::dream::DreamMode,
@@ -2544,7 +2633,37 @@ impl PSSALayerV2 {
         temperature: f32,
         rng: &mut SimpleRng,
     ) -> crate::dream::DreamSummary {
+        self.dream_replay_with_options(
+            mode,
+            replay,
+            dream_len,
+            temperature,
+            crate::dream::DEFAULT_REHEARSAL_LR,
+            crate::dream::DEFAULT_REHEARSAL_STEPS,
+            rng,
+        )
+    }
+
+    /// Run replay and consolidate it into the main model. Memory values are
+    /// sampled first; generate/both modes also produce supervised next-token
+    /// sequences from each seed. Stored sequences and generated sequences take
+    /// a separate small-LR SGD step on all main weights. The normal Adam state
+    /// and step counter are intentionally untouched, so dream updates cannot
+    /// change the fresh-task LR schedule. Recurrent carry is restored around
+    /// generation and rehearsal.
+    pub fn dream_replay_with_options(
+        &mut self,
+        mode: crate::dream::DreamMode,
+        replay: usize,
+        dream_len: usize,
+        temperature: f32,
+        rehearsal_lr: f32,
+        rehearsal_steps: usize,
+        rng: &mut SimpleRng,
+    ) -> crate::dream::DreamSummary {
         let started = Instant::now();
+        assert!(rehearsal_lr.is_finite() && rehearsal_lr > 0.0);
+        assert!(rehearsal_steps > 0);
         if replay == 0 {
             return crate::dream::DreamSummary {
                 elapsed_seconds: started.elapsed().as_secs_f64(),
@@ -2557,7 +2676,8 @@ impl PSSALayerV2 {
         }
         let mut entries = self.dream_memory_entries();
         let take = replay.min(entries.len());
-        if take == 0 {
+        let sequence_take = replay.min(self.dream_sequences.len());
+        if take == 0 && sequence_take == 0 {
             return crate::dream::DreamSummary {
                 elapsed_seconds: started.elapsed().as_secs_f64(),
                 ..Default::default()
@@ -2576,6 +2696,8 @@ impl PSSALayerV2 {
         let mut recurrent = vec![0.0; self.recurrent_state_len()];
         self.copy_recurrent_state_to(&mut recurrent);
         let mut generated = Vec::new();
+        let mut generated_inputs = Vec::new();
+        let mut generated_targets = Vec::new();
         if mode.includes_generation() {
             let mut logits = vec![0.0; self.cfg.d_vocab];
             for value in &values {
@@ -2586,9 +2708,12 @@ impl PSSALayerV2 {
                 self.forward_dream_input(value, &mut logits);
                 let mut token = crate::dream::sample_token(&logits, temperature, rng);
                 for _ in 0..dream_len {
-                    self.forward_inference(token, &mut logits);
-                    generated.push(self.inf_features.clone());
+                    let input = token;
+                    self.forward_inference(input, &mut logits);
+                    generated_inputs.push(input);
                     token = crate::dream::sample_token(&logits, temperature, rng);
+                    generated_targets.push(token);
+                    generated.push(self.inf_features.clone());
                 }
             }
         }
@@ -2611,9 +2736,41 @@ impl PSSALayerV2 {
         } else {
             0.0
         };
+
+        // Training replay uses CPU workspaces even when the main run selected a
+        // GPU. The caller synchronizes safeguarded weights before entering this
+        // method; restore the backend and invalidate its cache afterward.
+        let device = std::mem::replace(&mut self.device, Device::Cpu);
+        let mut rehearsal_sequences = 0;
+        let stored_sequences: Vec<DreamSequence> = self.dream_sequences[..sequence_take].to_vec();
+        for sequence in stored_sequences {
+            self.rehearse_dream_sequence(&sequence, rehearsal_lr, rehearsal_steps, true);
+            rehearsal_sequences += 1;
+        }
+        if mode.includes_generation() {
+            for (inputs, targets) in generated_inputs
+                .chunks(self.cfg.chunk_len)
+                .zip(generated_targets.chunks(self.cfg.chunk_len))
+            {
+                if inputs.is_empty() {
+                    continue;
+                }
+                let sequence = DreamSequence {
+                    input_ids: inputs.to_vec(),
+                    target_ids: targets.to_vec(),
+                };
+                self.rehearse_dream_sequence(&sequence, rehearsal_lr, rehearsal_steps, true);
+                rehearsal_sequences += 1;
+            }
+        }
+        self.device = device;
+        if let Some(ctx) = self.device.gpu() {
+            ctx.invalidate_weights();
+        }
         crate::dream::DreamSummary {
             entries_replayed: take,
             generated_tokens: generated.len(),
+            rehearsal_sequences,
             consolidation_delta_norm,
             elapsed_seconds: started.elapsed().as_secs_f64(),
         }
