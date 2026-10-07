@@ -21,6 +21,8 @@ pseudo-terminal sessions at 80x24, 120x40, and 60x20.
 | A transformer-resume wizard accepted shared `Max batch lanes` values and emitted `--batch-size`, which `train-transformer` does not accept; even an explicit single lane failed after starting the child. | Wizard/CLI argument audit; `transformer_resume_rejects_multi_lane_batches_and_omits_cpu_only_flag` failed on the old flag emission through csrun. | `d18e2fa` |
 | The completed-child cleanup ran before the sweep controller could read its result, permanently leaving the first trial `Running` and blocking the remaining queue. | Independent code audit; `shell_completion_order_records_trial_before_releasing_slot_and_advances_queue` uses an inert `/bin/true` child, the shell's actual ordering, and recorded metrics. | This commit: let the queue consume completion before releasing the child slot; preserve any newly installed active trial. |
 
+| Runs only looked for `train.log` beside `model.pssa`; wizard-produced `model.trfm` checkpoints incorrectly lost their recorded history and claimed it was not recoverable. | Independent code audit; wizard-history regression now reopens both formats and checks loss, throughput, samples and no missing-history warning. | This commit: recognize both wizard checkpoint filenames for the durable-log fallback. |
+
 ## Checks and non-findings
 
 - WebGPU parity software-adapter skip is tracked in `76073a9`.
