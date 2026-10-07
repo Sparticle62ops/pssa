@@ -30,8 +30,8 @@ pseudo-terminal sessions at 80x24, 120x40, and 60x20.
 - Final checks through `/workspace/bin/csrun`: TUI unit/TestBackend suite
   passed **275 tests**; `tests/tui_chain_args.rs` passed **5 tests** and
   `tests/tui_preview.rs` passed **2 tests**. `tests/wgpu_parity.rs` passed
-  with adapter skips on this no-GPU host. All four device-picker tests also
-  pass with `--features cuda`, including CPU/CUDA/WebGPU application and labels.
+  with **3 adapter skips** on this no-GPU host. All four device-picker tests
+  also pass with `--features cuda`, including CPU/CUDA/WebGPU application and labels.
   `cargo check --features cuda`, `cargo clippy --lib --tests`, and
   `cargo build --release` passed. Clippy reports repository-wide warnings;
   this is not a warning-free clippy result.
@@ -42,7 +42,15 @@ pseudo-terminal sessions at 80x24, 120x40, and 60x20.
   scoped editors, graph controls, function keys, CPU selection, loud unavailable
   WebGPU/CUDA rows, implicit CLI launch, q/Ctrl+C/Escape quit and editor cancel.
   Screens are saved on the codespace in `/tmp/pssa-tui-audit-screens-final.txt`.
+  A second `cargo build --release --features cuda` and the same 111-screen PTY
+  sweep passed. CUDA reported `CUDA driver library unavailable; install the
+  driver or use CPU/WebGPU`, and refused the selection without changing CPU.
+  Its screens are in `/tmp/pssa-tui-audit-screens-cuda.txt`. The compact tab
+  screens were also dumped to stdout for inspection.
   No live trainer, upload or authenticated service call was launched.
+- `git diff --check` passes. Commits use `sparticle62ops
+  <sparticle62@gmail.com>` and the existing executable pre-commit hook. No push
+  was made. `/workspace` remains at approximately 1.3 GiB free.
 
 ## Coverage limits / not fixed + why
 
