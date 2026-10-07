@@ -831,7 +831,7 @@ impl Setup {
     }
 }
 
-fn visible_tail(value: &str, cells: usize) -> &str {
+pub(super) fn visible_tail(value: &str, cells: usize) -> &str {
     let mut start = value.len();
     let mut used = 0;
     let mut bytes = [0; 4];
