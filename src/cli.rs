@@ -9,9 +9,11 @@ use crate::dataset::{
 };
 use crate::inference::{InferenceConfig, PSSAInferenceEngine};
 use crate::pssa::{GradientClipOutcome, PSSAConfigV2, PSSALayerV2};
+use crate::token_cache;
 use crate::ui;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Write};
+use std::path::Path;
 use std::time::Instant;
 
 /// Keep command-line generation requests bounded before inference preallocates
@@ -88,6 +90,10 @@ pub struct TrainingOptions {
     pub resume: Option<String>,
     /// Skip this many encoded tokens from the front of the corpus before training.
     pub skip_tokens: usize,
+    /// Optional persistent token cache. Runtime-only; never checkpointed.
+    pub token_cache: Option<String>,
+    /// Local source used for the cache's size/mtime fingerprint.
+    pub token_cache_source: Option<String>,
     /// Optional append-only, target-token-weighted training curve.
     pub loss_csv: Option<String>,
     pub loss_every: usize,
@@ -125,6 +131,8 @@ impl Default for TrainingOptions {
             hf_split: "train".into(),
             hf_field: "text".into(),
             skip_tokens: 0,
+            token_cache: None,
+            token_cache_source: None,
             tokenizer: TokenizerKind::Bpe,
             vocab_size: 2048,
             resume: None,
@@ -304,6 +312,23 @@ impl CLIHandler {
             "science".into()
         }
     }
+    fn local_cache_source(source: &str) -> Option<String> {
+        if source == "science"
+            || source.contains(',')
+            || source.starts_with("hf:")
+            || source.starts_with("http://")
+            || source.starts_with("https://")
+        {
+            return None;
+        }
+        let path = source
+            .strip_prefix("file:")
+            .or_else(|| source.strip_prefix("dir:"))
+            .or_else(|| source.strip_prefix("local:"))
+            .unwrap_or(source);
+        let path = Path::new(path);
+        path.is_file().then(|| path.to_string_lossy().into_owned())
+    }
     fn run_clean_wikitext(input_path: &str, output_path: &str) -> Result<(), String> {
         let input = std::fs::File::open(input_path).map_err(|e| {
             format!("cannot open input '{input_path}': {e}; provide a readable UTF-8 file")
@@ -400,6 +425,8 @@ impl CLIHandler {
             vocab_size: parsed.usize_nonzero("--vocab-size", "", 2048)?,
             resume: parsed.string("--resume", "").map(str::to_string),
             skip_tokens: parsed.required_usize("--skip-tokens", "", 0)?,
+            token_cache: parsed.string("--token-cache", "").map(str::to_string),
+            token_cache_source: None,
             loss_csv: parsed.string("--loss-csv", "").map(str::to_string),
             loss_every: parsed.usize_nonzero("--loss-every", "", 10_000)?,
             tokens_seen: parsed
@@ -520,56 +547,34 @@ impl CLIHandler {
         limit: Option<usize>,
         skip: usize,
     ) -> Result<Vec<Vec<usize>>, String> {
-        // Tokenize once, then walk the nonempty documents cyclically.  A
-        // chained Kaggle window may cross EOF; returning a second segment from
-        // the beginning is preferable to silently training on fewer tokens.
-        let encoded: Vec<Vec<usize>> = raw
-            .lines()
-            .map(|line| tokenizer.try_encode(line, true))
-            .collect::<Result<_, _>>()?;
-        let nonempty: Vec<&[usize]> = encoded
-            .iter()
-            .map(Vec::as_slice)
-            .filter(|ids| !ids.is_empty())
-            .collect();
-        let total = nonempty.iter().try_fold(0usize, |sum, ids| {
-            sum.checked_add(ids.len())
-                .ok_or_else(|| "dataset token count overflow".to_string())
-        })?;
-        if total < 2 {
-            return Err("dataset has no token transitions".into());
-        }
+        Ok(token_cache::documents(raw, tokenizer, limit, skip, None, None)?.docs)
+    }
 
-        let mut remaining = limit.unwrap_or(total.saturating_sub(skip % total));
-        if remaining == 0 {
-            return Err("dataset has no token transitions in the selected window".into());
-        }
-        let mut offset = skip % total;
-        let mut doc_index = 0;
-        while offset >= nonempty[doc_index].len() {
-            offset -= nonempty[doc_index].len();
-            doc_index = (doc_index + 1) % nonempty.len();
-        }
-
-        let mut docs = Vec::new();
-        while remaining > 0 {
-            let ids = nonempty[doc_index];
-            let take = (ids.len() - offset).min(remaining);
-            if take >= 2 {
-                docs.push(ids[offset..offset + take].to_vec());
-            }
-            remaining -= take;
-            doc_index = (doc_index + 1) % nonempty.len();
-            offset = 0;
-            if limit.is_none() && doc_index == 0 {
-                break;
-            }
-        }
-        if docs.is_empty() {
-            Err("dataset has no token transitions in the selected window".into())
-        } else {
-            Ok(docs)
-        }
+    /// Select a training window and optionally load/build its persistent token
+    /// cache. The source path is used only for the cache fingerprint; raw text
+    /// remains the single source of training behavior.
+    pub fn documents_with_cache(
+        raw: &str,
+        tokenizer: &Tokenizer,
+        limit: Option<usize>,
+        skip: usize,
+        cache_path: Option<&Path>,
+        source_path: Option<&Path>,
+    ) -> Result<Vec<Vec<usize>>, String> {
+        let result = token_cache::documents(
+            raw,
+            tokenizer,
+            limit,
+            skip,
+            cache_path,
+            source_path,
+        )?;
+        println!(
+            "token_cache={} token_window_seconds={:.3}",
+            result.status.label(),
+            result.elapsed.as_secs_f64()
+        );
+        Ok(result.docs)
     }
     fn memory_occupancy(model: &PSSALayerV2) -> Option<(usize, usize)> {
         let banks = std::iter::once(&model.block).chain(model.extra_blocks.iter());
@@ -825,7 +830,16 @@ impl CLIHandler {
                     .set_value_cap_with_device(options.memory_value_cap, &model.device);
             }
         }
-        let docs = Self::documents(raw, &tokenizer, options.max_tokens, options.skip_tokens)?;
+        let cache_path = options.token_cache.as_deref().map(Path::new);
+        let source_path = options.token_cache_source.as_deref().map(Path::new);
+        let docs = Self::documents_with_cache(
+            raw,
+            &tokenizer,
+            options.max_tokens,
+            options.skip_tokens,
+            cache_path,
+            source_path,
+        )?;
         // Feed metadata is derived from the actual selected training window,
         // never estimated from row lengths. Local training keeps its old path.
         let mut feed_rows_consumed = 0usize;
@@ -1219,6 +1233,15 @@ impl CLIHandler {
         };
         let mut run_options = options.clone();
         run_options.checkpoint_path = Some(out.to_string());
+        if run_options.token_cache_source.is_none() {
+            run_options.token_cache_source = Self::local_cache_source(data);
+        }
+        if run_options.token_cache.is_none() {
+            run_options.token_cache = run_options
+                .token_cache_source
+                .as_deref()
+                .map(|source| format!("{source}.pssatok"));
+        }
         let (model, _) = Self::train_corpus(&raw, &run_options)?;
         Self::save_model_v2(&model, out)
             .map_err(|e| format!("cannot save checkpoint '{out}': {e}"))?;
@@ -1879,6 +1902,11 @@ impl CLIHandler {
         );
         println!(
             "    {:<48}{}",
+            "  --token-cache path",
+            ui::dim("persistent binary token cache; defaults to SOURCE.pssatok for local files")
+        );
+        println!(
+            "    {:<48}{}",
             "  --resume path",
             ui::dim("continue from an existing checkpoint")
         );
@@ -2048,6 +2076,9 @@ impl CLIHandler {
                     "      --hf-field <FIELD>        text field, including dotted paths (default text)"
                 );
                 println!("      --skip-tokens <N>         offset into the corpus; wraps at EOF");
+                println!(
+                    "      --token-cache <PATH>      persistent binary cache (default: SOURCE.pssatok for local files)"
+                );
                 println!(
                     "      --resume <PATH>            continue optimizer/model state from a checkpoint"
                 );
@@ -2331,6 +2362,7 @@ impl CLIHandler {
                         "--backend",
                         "--grad-clip",
                         "--memory-value-cap",
+                        "--token-cache",
                     ]);
                 }
                 let p = Parsed::parse(&args[2..], &allowed)?;
