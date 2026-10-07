@@ -72,7 +72,16 @@ fn run(
     for _ in 0..b_steps {
         update(&mut m, &B_IN, &B_TG, 5e-3);
         if let Some(md) = mode {
-            m.dream_replay_with_options(md, replay, 8, 0.8, 3e-3, 1, &mut rng);
+            m.dream_replay_with_options_and_guard(
+                md,
+                replay,
+                8,
+                0.8,
+                3e-3,
+                1,
+                Some((&B_IN, &B_TG)),
+                &mut rng,
+            );
         }
     }
     (a0, loss(&mut m, &A_IN, &A_TG), loss(&mut m, &B_IN, &B_TG))

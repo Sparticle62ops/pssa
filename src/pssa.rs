@@ -2589,13 +2589,164 @@ impl PSSALayerV2 {
     /// Rehearse one stored/generated sequence through the ordinary supervised
     /// loss. This uses a separate, small-LR SGD pass: the main weights change,
     /// but their Adam moments and the normal optimizer step counter do not.
+    fn dream_gradient(
+        &mut self,
+        sequence: &DreamSequence,
+        recurrent: &[f32],
+    ) -> (f32, Vec<Vec<f32>>) {
+        self.copy_recurrent_state_from(recurrent);
+        let loss = self.forward_train_chunk(&sequence.input_ids, &sequence.target_ids);
+        self.zero_gradients();
+        self.backward_chunk(sequence.input_ids.len(), 1.0);
+        let gradients = self
+            .adam_tensors()
+            .into_iter()
+            .map(|tensor| tensor.grad.to_vec())
+            .collect();
+        self.zero_gradients();
+        self.copy_recurrent_state_from(recurrent);
+        (loss, gradients)
+    }
+
+    fn dream_loss(&mut self, sequence: &DreamSequence, recurrent: &[f32]) -> f32 {
+        self.copy_recurrent_state_from(recurrent);
+        let loss = self.forward_train_chunk(&sequence.input_ids, &sequence.target_ids);
+        self.copy_recurrent_state_from(recurrent);
+        loss
+    }
+
+    fn dream_parameter_snapshot(&mut self) -> Vec<Vec<f32>> {
+        self.adam_tensors()
+            .into_iter()
+            .map(|tensor| tensor.data.to_vec())
+            .collect()
+    }
+
+    fn dream_restore_parameters(&mut self, snapshot: &[Vec<f32>]) {
+        for (tensor, saved) in self.adam_tensors().into_iter().zip(snapshot) {
+            assert_eq!(tensor.data.len(), saved.len());
+            tensor.data.copy_from_slice(saved);
+        }
+    }
+
+    /// Apply an old-task step after removing the component that would increase
+    /// the current-task loss to first order. The exact current-task loss is
+    /// checked by the caller as well: nonlinear effects are backtracked rather
+    /// than being allowed to turn a projection into a regression.
+    fn apply_dream_projected_sgd(
+        &mut self,
+        lr: f32,
+        old_gradients: &[Vec<f32>],
+        fresh_gradients: &[Vec<f32>],
+        selected_output_targets: Option<&[usize]>,
+    ) {
+        assert_eq!(old_gradients.len(), fresh_gradients.len());
+        let selected_rows = selected_output_targets.map(|targets| {
+            let mut rows = vec![false; self.cfg.d_vocab];
+            for &target in targets {
+                assert!(target < rows.len());
+                rows[target] = true;
+            }
+            rows
+        });
+        let mut dot = 0.0f64;
+        let mut fresh_norm_sq = 0.0f64;
+        for (tensor_index, (old, fresh)) in old_gradients.iter().zip(fresh_gradients).enumerate() {
+            assert_eq!(old.len(), fresh.len());
+            for (index, (&old, &fresh)) in old.iter().zip(fresh).enumerate() {
+                let selected = selected_rows.as_ref().is_none_or(|rows| {
+                    tensor_index == 1 && rows[index / self.cfg.d_latent]
+                });
+                if selected {
+                    dot += old as f64 * fresh as f64;
+                    fresh_norm_sq += fresh as f64 * fresh as f64;
+                }
+            }
+        }
+        // Gradient descent on the old loss uses -old_grad. If old_grad and
+        // fresh_grad have a negative dot product, its component along the
+        // fresh gradient would raise fresh loss; remove exactly that component.
+        let projection = if dot < 0.0 && fresh_norm_sq > 0.0 {
+            dot / fresh_norm_sq
+        } else {
+            0.0
+        };
+        let d_latent = self.cfg.d_latent;
+        for (tensor_index, (tensor, (old, fresh))) in self
+            .adam_tensors()
+            .into_iter()
+            .zip(old_gradients.iter().zip(fresh_gradients))
+            .enumerate()
+        {
+            for (index, ((weight, &old), &fresh)) in
+                tensor.data.iter_mut().zip(old).zip(fresh).enumerate()
+            {
+                let selected = selected_rows.as_ref().is_none_or(|rows| {
+                    tensor_index == 1 && rows[index / d_latent]
+                });
+                if selected {
+                    let projected = old as f64 - projection * fresh as f64;
+                    *weight -= lr * projected as f32;
+                }
+            }
+        }
+        if let Some(ctx) = self.device.gpu() {
+            ctx.invalidate_weights();
+        }
+    }
+
+    fn rehearse_dream_sequence_guarded(
+        &mut self,
+        sequence: &DreamSequence,
+        guard: &DreamSequence,
+        lr: f32,
+        steps: usize,
+    ) {
+        const LOSS_TOLERANCE: f32 = 1e-6;
+        let mut recurrent = vec![0.0; self.recurrent_state_len()];
+        self.copy_recurrent_state_to(&mut recurrent);
+        for _ in 0..steps {
+            let (baseline, fresh_gradients) = self.dream_gradient(guard, &recurrent);
+            let (_, old_gradients) = self.dream_gradient(sequence, &recurrent);
+            let snapshot = self.dream_parameter_snapshot();
+            let mut step_lr = lr;
+            let mut accepted = false;
+            // Projection is a first-order safeguard. Backtracking makes the
+            // contract exact for this nonlinear recurrent model.
+            for _ in 0..10 {
+                self.dream_restore_parameters(&snapshot);
+                self.apply_dream_projected_sgd(
+                    step_lr,
+                    &old_gradients,
+                    &fresh_gradients,
+                    Some(&sequence.target_ids),
+                );
+                let candidate = self.dream_loss(guard, &recurrent);
+                if candidate.is_finite() && candidate <= baseline + LOSS_TOLERANCE {
+                    accepted = true;
+                    break;
+                }
+                step_lr *= 0.5;
+            }
+            if !accepted {
+                self.dream_restore_parameters(&snapshot);
+            }
+            self.zero_gradients();
+        }
+        self.copy_recurrent_state_from(&recurrent);
+    }
+
     fn rehearse_dream_sequence(
         &mut self,
         sequence: &DreamSequence,
+        guard: Option<&DreamSequence>,
         lr: f32,
         steps: usize,
-        bounded: bool,
     ) {
+        if let Some(guard) = guard {
+            self.rehearse_dream_sequence_guarded(sequence, guard, lr, steps);
+            return;
+        }
         // Stop each sleep burst once the old sequence is back below this loss.
         // It prevents a strong replay rate from overshooting and erasing the
         // fresh task's high-margin predictions.
@@ -2606,7 +2757,7 @@ impl PSSALayerV2 {
             self.copy_recurrent_state_from(&recurrent);
             let loss = self.forward_train_chunk(&sequence.input_ids, &sequence.target_ids);
             self.zero_gradients();
-            if !bounded || loss > MAX_REHEARSAL_LOSS {
+            if loss > MAX_REHEARSAL_LOSS {
                 self.backward_chunk(sequence.input_ids.len(), 1.0);
                 self.apply_dream_sgd(lr, &sequence.target_ids);
             }
@@ -2661,6 +2812,49 @@ impl PSSALayerV2 {
         rehearsal_steps: usize,
         rng: &mut SimpleRng,
     ) -> crate::dream::DreamSummary {
+        self.dream_replay_with_options_and_guard(
+            mode,
+            replay,
+            dream_len,
+            temperature,
+            rehearsal_lr,
+            rehearsal_steps,
+            None,
+            rng,
+        )
+    }
+
+    /// Replay with an optional fresh-task guard. Guarded replay projects each
+    /// old-task gradient away from the fresh-task gradient and then backtracks
+    /// against the exact fresh-task cross-entropy. This is opt-in so callers
+    /// that do not provide a fresh sequence retain the historical rehearsal
+    /// behavior.
+    pub fn dream_replay_with_options_and_guard(
+        &mut self,
+        mode: crate::dream::DreamMode,
+        replay: usize,
+        dream_len: usize,
+        temperature: f32,
+        rehearsal_lr: f32,
+        rehearsal_steps: usize,
+        fresh_task: Option<(&[usize], &[usize])>,
+        rng: &mut SimpleRng,
+    ) -> crate::dream::DreamSummary {
+        let guard = fresh_task.map(|(input_ids, target_ids)| {
+            assert!(!input_ids.is_empty());
+            assert_eq!(input_ids.len(), target_ids.len());
+            assert!(input_ids.len() <= self.cfg.chunk_len);
+            assert!(
+                input_ids
+                    .iter()
+                    .chain(target_ids)
+                    .all(|&id| id < self.cfg.d_vocab)
+            );
+            DreamSequence {
+                input_ids: input_ids.to_vec(),
+                target_ids: target_ids.to_vec(),
+            }
+        });
         let started = Instant::now();
         assert!(rehearsal_lr.is_finite() && rehearsal_lr > 0.0);
         assert!(rehearsal_steps > 0);
@@ -2744,7 +2938,12 @@ impl PSSALayerV2 {
         let mut rehearsal_sequences = 0;
         let stored_sequences: Vec<DreamSequence> = self.dream_sequences[..sequence_take].to_vec();
         for sequence in stored_sequences {
-            self.rehearse_dream_sequence(&sequence, rehearsal_lr, rehearsal_steps, true);
+            self.rehearse_dream_sequence(
+                &sequence,
+                guard.as_ref(),
+                rehearsal_lr,
+                rehearsal_steps,
+            );
             rehearsal_sequences += 1;
         }
         if mode.includes_generation() {
@@ -2759,7 +2958,12 @@ impl PSSALayerV2 {
                     input_ids: inputs.to_vec(),
                     target_ids: targets.to_vec(),
                 };
-                self.rehearse_dream_sequence(&sequence, rehearsal_lr, rehearsal_steps, true);
+                self.rehearse_dream_sequence(
+                    &sequence,
+                    guard.as_ref(),
+                    rehearsal_lr,
+                    rehearsal_steps,
+                );
                 rehearsal_sequences += 1;
             }
         }
