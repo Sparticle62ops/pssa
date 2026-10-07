@@ -9,6 +9,7 @@ mod benchmark;
 pub(crate) mod benchmark_replay;
 mod charts;
 mod chat;
+mod comparison;
 mod depth_zoom;
 mod device;
 mod eval;
@@ -189,6 +190,7 @@ struct RunState {
     graph_pan: usize,
     comparison_series: Vec<MetricSample>,
     comparison_label: Option<String>,
+    comparison_error: Option<String>,
     // Health checks are presentation-only; they never affect training.
     problem: Option<String>,
     warning: Option<String>,
@@ -946,7 +948,7 @@ fn run_app(
     };
     let mut tab = 0usize;
     let mut last_chain_scan = std::time::Instant::now() - Duration::from_secs(60);
-    let mut last_compare_scan = std::time::Instant::now() - Duration::from_secs(60);
+    let mut comparison = compare_path.map(|path| (path, comparison::ComparisonLog::default()));
     let mut input_closed = false;
     let mut next_frame = Instant::now();
 
@@ -976,11 +978,8 @@ fn run_app(
             state.refresh_chain();
             last_chain_scan = std::time::Instant::now();
         }
-        if let Some(path) = compare_path.as_deref()
-            && last_compare_scan.elapsed() > Duration::from_secs(1)
-        {
-            reload_comparison(&mut state, path);
-            last_compare_scan = std::time::Instant::now();
+        if let Some((path, loader)) = &mut comparison {
+            loader.poll(path, &mut state);
         }
 
         if Instant::now() >= next_frame
@@ -1259,22 +1258,6 @@ fn poll_training_queue(
     let started = poll_queue(training);
     release_finished_training(training, finished);
     started
-}
-
-fn reload_comparison(state: &mut RunState, path: &std::path::Path) {
-    let Ok(file) = std::fs::File::open(path) else {
-        state.comparison_series.clear();
-        state.comparison_label = None;
-        return;
-    };
-    let mut comparison = RunState::default();
-    for line in io::BufReader::new(file).lines().map_while(Result::ok) {
-        comparison.ingest(&line);
-    }
-    state.comparison_series = comparison.metric_series;
-    state.comparison_label = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned());
 }
 
 fn accent() -> Style {
@@ -2408,10 +2391,18 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
     let (start, end) = state.visible_graph_range();
     if end == 0 {
         let waiting_area = panel_area(f, area);
-        f.render_widget(
-            Paragraph::new("Waiting for progress samples").block(panel(" graph / waiting ")),
-            waiting_area,
-        );
+        if view == GraphView::Comparison && let Some(error) = &state.comparison_error {
+            f.render_widget(
+                Paragraph::new(error.as_str()).wrap(Wrap { trim: false })
+                    .block(panel(" graph / comparison unavailable ")),
+                waiting_area,
+            );
+        } else {
+            f.render_widget(
+                Paragraph::new("Waiting for progress samples").block(panel(" graph / waiting ")),
+                waiting_area,
+            );
+        }
         return;
     }
 
@@ -2656,7 +2647,9 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
         GraphView::TokensPerSecond => " graph / tokens per second ",
         GraphView::LearningRate => " graph / learning rate ",
         GraphView::Comparison => {
-            if state.comparison_series.is_empty() {
+            if state.comparison_error.is_some() {
+                " graph / comparison unavailable "
+            } else if state.comparison_series.is_empty() {
                 " graph / comparison (use --compare LOG) "
             } else {
                 " graph / comparison "
@@ -2694,6 +2687,11 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
             "Own ranges: green loss / blue surprise / purple speed / gold rate",
         ),
         GraphView::Memory => unreachable!(),
+    };
+    let caption = if view == GraphView::Comparison {
+        state.comparison_error.as_deref().unwrap_or(caption)
+    } else {
+        caption
     };
     charts::draw(
         f,
@@ -3194,6 +3192,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
         }
         i += 1;
+    }
+
+    if let Some(path) = compare_path.as_deref()
+        && std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file())
+    {
+        return Err("--compare requires a regular log file, not a directory/device/pipe".into());
     }
 
     if io::stdin().is_terminal() {

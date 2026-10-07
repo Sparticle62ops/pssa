@@ -961,6 +961,7 @@ impl TrainingRun {
     pub(super) fn initialize(&self, state: &mut RunState) {
         let comparison_series = std::mem::take(&mut state.comparison_series);
         let comparison_label = state.comparison_label.take();
+        let comparison_error = state.comparison_error.take();
         *state = RunState {
             chain_dir: self.output.clone(),
             training_active: true,
@@ -974,6 +975,7 @@ impl TrainingRun {
             ),
             comparison_series,
             comparison_label,
+            comparison_error,
             ..RunState::default()
         };
         state.ingest(&format!(
