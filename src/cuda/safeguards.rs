@@ -151,7 +151,9 @@ impl CudaContext {
                 .tensors
                 .get(&(t.grad.as_ptr() as usize))
                 .ok_or("CUDA optimizer tensor registration changed")?;
-            self.stream.memcpy_dtoh(&device.data, t.data).map_err(error)?;
+            self.stream
+                .memcpy_dtoh(&device.data, t.data)
+                .map_err(error)?;
         }
         self.stream.synchronize().map_err(error)
     }

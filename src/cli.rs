@@ -855,7 +855,11 @@ impl CLIHandler {
         if options.dream_every > 0 && model.device.is_gpu() {
             eprintln!(
                 "warning: dream replay is host-only; using an explicit CPU fallback and synchronizing host weights for backend {}",
-                model.device.gpu().map(|g| g.backend_label()).unwrap_or_else(|| "gpu".into())
+                model
+                    .device
+                    .gpu()
+                    .map(|g| g.backend_label())
+                    .unwrap_or_else(|| "gpu".into())
             );
         }
         let docs = Self::documents(raw, &tokenizer, options.max_tokens, options.skip_tokens)?;
@@ -970,8 +974,8 @@ impl CLIHandler {
         let started = Instant::now();
         let mut update = 0;
         let mut skipped = SkippedUpdates::default();
-        let mut dream_rng = (options.dream_every > 0)
-            .then(|| SimpleRng::new(options.seed ^ 0xd0e5_5eed_5eed_0001));
+        let mut dream_rng =
+            (options.dream_every > 0).then(|| SimpleRng::new(options.seed ^ 0xd0e5_5eed_5eed_0001));
         let mut tokens_seen = 0usize;
         let mut progress = ui::Progress::new_with_tui("training", total_updates, !options.no_tui);
         if let Some(path) = options.checkpoint_path.as_deref() {
@@ -1909,12 +1913,16 @@ impl CLIHandler {
         println!(
             "    {:<48}{}",
             "  --dream-every n --dream-replay k",
-            ui::dim("offline replay every n updates; k memory seeds/entries (default 32; off by default)")
+            ui::dim(
+                "offline replay every n updates; k memory seeds/entries (default 32; off by default)"
+            )
         );
         println!(
             "    {:<48}{}",
             "  --dream-mode memory|generate|both --dream-len n",
-            ui::dim("memory, generated, or both; generated length defaults to 64 at temperature 0.8")
+            ui::dim(
+                "memory, generated, or both; generated length defaults to 64 at temperature 0.8"
+            )
         );
         println!(
             "    {:<48}{}",

@@ -2488,8 +2488,7 @@ impl PSSALayerV2 {
             if block == 0 {
                 self.block.dream_replay_value(value, &mut self.inf_features);
             } else {
-                self.extra_blocks[block - 1]
-                    .dream_replay_value(value, &mut self.inf_features);
+                self.extra_blocks[block - 1].dream_replay_value(value, &mut self.inf_features);
             }
         }
     }
@@ -2529,13 +2528,7 @@ impl PSSALayerV2 {
         replay: usize,
         rng: &mut SimpleRng,
     ) -> crate::dream::DreamSummary {
-        self.dream_replay(
-            crate::dream::DreamMode::Memory,
-            replay,
-            0,
-            0.8,
-            rng,
-        )
+        self.dream_replay(crate::dream::DreamMode::Memory, replay, 0, 0.8, rng)
     }
 
     /// Run a host-only offline sleep phase. Memory values are sampled first;

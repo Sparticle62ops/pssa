@@ -55,7 +55,10 @@ pub(crate) fn sample_token(logits: &[f32], temperature: f32, rng: &mut SimpleRng
         .iter()
         .copied()
         .fold(f32::NEG_INFINITY, f32::max);
-    assert!(max.is_finite(), "dream generation received non-finite logits");
+    assert!(
+        max.is_finite(),
+        "dream generation received non-finite logits"
+    );
     let mut weights = Vec::with_capacity(logits.len() - first);
     let mut total = 0.0f32;
     for &logit in &logits[first..] {
@@ -190,7 +193,10 @@ mod tests {
         let sa = a.dream_replay_memory(1, &mut SimpleRng::new(1234));
         let sb = b.dream_replay_memory(1, &mut SimpleRng::new(1234));
         assert_eq!(sa.entries_replayed, sb.entries_replayed);
-        assert_eq!(sa.consolidation_delta_norm.to_bits(), sb.consolidation_delta_norm.to_bits());
+        assert_eq!(
+            sa.consolidation_delta_norm.to_bits(),
+            sb.consolidation_delta_norm.to_bits()
+        );
         assert_eq!(
             a.block.adapters[0].up_proj.data,
             b.block.adapters[0].up_proj.data
@@ -212,13 +218,7 @@ mod tests {
         };
         let fast = model.block.adapters[0].up_proj.data.clone();
         let slow = model.block.adapters[0].consolidated_up.clone();
-        let summary = model.dream_replay(
-            DreamMode::Generate,
-            1,
-            4,
-            0.8,
-            &mut SimpleRng::new(77),
-        );
+        let summary = model.dream_replay(DreamMode::Generate, 1, 4, 0.8, &mut SimpleRng::new(77));
         assert_eq!(summary.entries_replayed, 1);
         assert_eq!(summary.generated_tokens, 4);
         assert!(summary.consolidation_delta_norm > 0.0);
@@ -238,9 +238,18 @@ mod tests {
         let sb = b.dream_replay(DreamMode::Generate, 1, 5, 0.8, &mut SimpleRng::new(88));
         assert_eq!(sa.entries_replayed, sb.entries_replayed);
         assert_eq!(sa.generated_tokens, sb.generated_tokens);
-        assert_eq!(sa.consolidation_delta_norm.to_bits(), sb.consolidation_delta_norm.to_bits());
-        assert_eq!(a.block.adapters[0].up_proj.data, b.block.adapters[0].up_proj.data);
-        assert_eq!(a.block.adapters[0].consolidated_up, b.block.adapters[0].consolidated_up);
+        assert_eq!(
+            sa.consolidation_delta_norm.to_bits(),
+            sb.consolidation_delta_norm.to_bits()
+        );
+        assert_eq!(
+            a.block.adapters[0].up_proj.data,
+            b.block.adapters[0].up_proj.data
+        );
+        assert_eq!(
+            a.block.adapters[0].consolidated_up,
+            b.block.adapters[0].consolidated_up
+        );
     }
 
     #[test]

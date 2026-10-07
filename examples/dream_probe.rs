@@ -53,8 +53,7 @@ fn run(dream: bool) -> (f32, f32) {
 
     // Keep one detached A representation in the episodic bank while B is
     // trained. This makes the probe independent of the surprise-write gate.
-    let a_value = model.block.tape.z_final[7 * model.cfg.d_latent..8 * model.cfg.d_latent]
-        .to_vec();
+    let a_value = model.block.tape.z_final[7 * model.cfg.d_latent..8 * model.cfg.d_latent].to_vec();
     model.block.memory.insert(&[0.25, -0.25], &a_value);
 
     let mut rng = SimpleRng::new(0xD0EA_2026);
