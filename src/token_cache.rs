@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 8] = b"PSSATOK\0";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HASH_PREFIX_BYTES: usize = 1024 * 1024;
 const TOKEN_BYTES: usize = 4;
 
@@ -59,7 +59,7 @@ pub(crate) fn documents(
     let result = match cache_path {
         Some(path) => {
             let key = cache_key(raw, tokenizer, source_path);
-            if let Some(encoded) = read_cache(path, key) {
+            if let Some(encoded) = read_cache(path, key, tokenizer.vocab_size) {
                 let docs = select_documents(&encoded, limit, skip)?;
                 WindowResult {
                     docs,
@@ -222,14 +222,28 @@ fn cache_key(raw: &str, tokenizer: &Tokenizer, source_path: Option<&Path>) -> Ca
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
+    hash_update(&mut hash, bytes);
     hash
 }
 
-fn read_cache(path: &Path, expected: CacheKey) -> Option<Vec<Vec<usize>>> {
+fn hash_update(hash: &mut u64, bytes: &[u8]) {
+    for &byte in bytes {
+        *hash ^= u64::from(byte);
+        *hash = (*hash).wrapping_mul(0x100000001b3);
+    }
+}
+
+fn cache_content_hash(index: &[(usize, usize)], payload: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &(offset, len) in index {
+        hash_update(&mut hash, &(offset as u64).to_le_bytes());
+        hash_update(&mut hash, &(len as u64).to_le_bytes());
+    }
+    hash_update(&mut hash, payload);
+    hash
+}
+
+fn read_cache(path: &Path, expected: CacheKey, vocab_size: usize) -> Option<Vec<Vec<usize>>> {
     let bytes = fs::read(path).ok()?;
     let mut cursor = 0usize;
     if take(&bytes, &mut cursor, MAGIC.len())? != MAGIC {
@@ -254,6 +268,7 @@ fn read_cache(path: &Path, expected: CacheKey) -> Option<Vec<Vec<usize>>> {
     }
     let doc_count = usize::try_from(take_u64(&bytes, &mut cursor)?).ok()?;
     let total = usize::try_from(take_u64(&bytes, &mut cursor)?).ok()?;
+    let content_hash = take_u64(&bytes, &mut cursor)?;
     if doc_count > total || (doc_count == 0 && total != 0) {
         return None;
     }
@@ -278,9 +293,17 @@ fn read_cache(path: &Path, expected: CacheKey) -> Option<Vec<Vec<usize>>> {
     if bytes.len() - cursor != token_bytes {
         return None;
     }
+    let payload = &bytes[cursor..];
+    if cache_content_hash(&index, payload) != content_hash {
+        return None;
+    }
     let mut tokens = Vec::with_capacity(total);
-    for chunk in bytes[cursor..].chunks_exact(TOKEN_BYTES) {
-        tokens.push(u32::from_le_bytes(chunk.try_into().ok()?) as usize);
+    for chunk in payload.chunks_exact(TOKEN_BYTES) {
+        let id = u32::from_le_bytes(chunk.try_into().ok()?);
+        if usize::try_from(id).ok()? >= vocab_size {
+            return None;
+        }
+        tokens.push(id as usize);
     }
     index
         .into_iter()
@@ -341,6 +364,7 @@ fn write_cache_file(
         key.tokenizer_hash,
         docs.len() as u64,
         total as u64,
+        docs_content_hash(docs),
     ] {
         write_u64(&mut writer, value, path)?;
     }
@@ -365,6 +389,25 @@ fn write_cache_file(
         .map_err(|error| io_error(path, error.into_error()))?
         .sync_all()
         .map_err(|error| io_error(path, error))
+}
+
+fn docs_content_hash(docs: &[&[usize]]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut offset = 0usize;
+    for ids in docs {
+        hash_update(&mut hash, &(offset as u64).to_le_bytes());
+        hash_update(&mut hash, &(ids.len() as u64).to_le_bytes());
+        offset += ids.len();
+    }
+    for ids in docs {
+        for &id in *ids {
+            hash_update(
+                &mut hash,
+                &u32::try_from(id).unwrap_or(u32::MAX).to_le_bytes(),
+            );
+        }
+    }
+    hash
 }
 
 fn write_u32(writer: &mut BufWriter<File>, value: u32, path: &Path) -> Result<(), String> {
