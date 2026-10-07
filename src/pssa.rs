@@ -2448,6 +2448,12 @@ impl PSSALayerV2 {
             entries.extend((0..b.memory.count).map(|entry| (block, entry)));
         }
         let take = replay.min(entries.len());
+        if take == 0 {
+            return crate::dream::DreamSummary {
+                elapsed_seconds: started.elapsed().as_secs_f64(),
+                ..Default::default()
+            };
+        }
         for i in 0..take {
             let remaining = entries.len() - i;
             let j = i + (rng.next_u32() as usize % remaining);
