@@ -1264,13 +1264,11 @@ fn divider(width: u16) -> Line<'static> {
 fn status_badge(health: &HealthStatus) -> Line<'static> {
     let label = match health.level {
         HealthLevel::Problem => "ERROR",
-        HealthLevel::Warning | HealthLevel::Normal => {
-            if health.normal_label == "DONE" {
-                "DONE"
-            } else {
-                "TRAINING"
-            }
-        }
+        HealthLevel::Warning | HealthLevel::Normal => match health.normal_label {
+            "DONE" => "DONE",
+            "WAITING" => "WAITING",
+            _ => "TRAINING",
+        },
     };
     let mut spans = vec![Span::styled(
         format!("[ {label} ]"),
@@ -3604,7 +3602,7 @@ mod tests {
         assert!(row(7).contains("╌"));
         assert!(row(1).contains("┌"));
         assert!(row(5).contains("└"));
-        assert!(row(2).contains("[ TRAINING ]"));
+        assert!(row(2).contains("[ WAITING ]"));
     }
 
     #[test]
