@@ -754,8 +754,7 @@ impl Lane {
             &mut self.h[..(l + 1) * hs],
             &mut self.y[..l * d],
         )?;
-        self.carry
-            .copy_from_slice(&self.h[l * hs..(l + 1) * hs]);
+        self.carry.copy_from_slice(&self.h[l * hs..(l + 1) * hs]);
         Ok(())
     }
 

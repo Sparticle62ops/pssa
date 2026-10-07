@@ -1397,10 +1397,10 @@ impl GpuDispatch {
         }
     }
 
-    /// Whether this backend actually accelerates the backward-pass GEMM shapes.
-    /// The WGSL kernel only implements the forward X * W^T layout, so on WebGPU
-    /// the backward pass stays on its fused CPU loops instead of paying to
-    /// materialize intermediates for a CPU twin.
+    /// Whether this backend has device-native recurrent and memory backward
+    /// stages. WebGPU's dense transpose helpers still use the deterministic CPU
+    /// implementation, but the SSM reverse scan and memory VJPs are dispatched
+    /// on the device when this returns true.
     pub fn accelerates_backward(&self) -> bool {
         match self {
             GpuDispatch::Wgpu(_) => true,
