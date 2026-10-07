@@ -126,6 +126,10 @@ fn cached_hf_training_emits_real_feed_and_matches_local_checkpoint() {
         hf_checkpoint, local_checkpoint,
         "feed metadata must not affect training bits"
     );
+    assert!(
+        !root.join("local.txt.pssatok").exists(),
+        "omitting --token-cache must not enable the persistent cache"
+    );
     assert!(!plain.contains("feed_"));
     let tokenizer = Tokenizer::from_corpus(raw, true).unwrap();
     let docs = CLIHandler::documents(raw, &tokenizer, Some(30), 3).unwrap();

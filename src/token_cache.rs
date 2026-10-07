@@ -1,5 +1,4 @@
 use crate::dataset::Tokenizer;
-use rayon::prelude::*;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -9,6 +8,7 @@ const MAGIC: &[u8; 8] = b"PSSATOK\0";
 const VERSION: u32 = 2;
 const HASH_PREFIX_BYTES: usize = 1024 * 1024;
 const TOKEN_BYTES: usize = 4;
+const CACHE_BUILD_CHUNK_LINES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CacheStatus {
@@ -45,8 +45,8 @@ struct CacheKey {
 
 /// Select training documents, using an optional persistent cache. Without a
 /// cache this intentionally stops tokenizing as soon as a non-wrapping window
-/// is known to be complete. A cache build is the one full, parallel pass that
-/// makes subsequent chained windows independent of the corpus size.
+/// is known to be complete. A cache build is the one full pass that makes
+/// subsequent chained windows independent of the corpus size.
 pub(crate) fn documents(
     raw: &str,
     tokenizer: &Tokenizer,
@@ -67,8 +67,16 @@ pub(crate) fn documents(
                     elapsed: started.elapsed(),
                 }
             } else {
-                let encoded = tokenize_all_parallel(raw, tokenizer)?;
-                write_cache(path, key, &encoded)?;
+                // The Hugging Face tokenizer contains mutable added-vocabulary
+                // state despite its shared API. Do not call it concurrently:
+                // tokenizers 0.22 can corrupt its allocation state when one
+                // instance is shared by rayon workers. A cache is opt-in, so a
+                // bounded serial build is safer than changing the uncached path
+                // or cloning a tokenizer per line.
+                write_cache_serial(path, key, raw, tokenizer)?;
+                let encoded = read_cache(path, key, tokenizer.vocab_size).ok_or_else(|| {
+                    "token cache could not be read after it was built".to_string()
+                })?;
                 let docs = select_documents(&encoded, limit, skip)?;
                 WindowResult {
                     docs,
@@ -88,16 +96,6 @@ pub(crate) fn documents(
         }
     };
     Ok(result)
-}
-
-/// Tokenize lines in input order. Rayon gives each line an independent work
-/// item, while its indexed collection preserves the historical document order.
-fn tokenize_all_parallel(raw: &str, tokenizer: &Tokenizer) -> Result<Vec<Vec<usize>>, String> {
-    raw.lines()
-        .collect::<Vec<_>>()
-        .par_iter()
-        .map(|line| tokenizer.try_encode(line, true))
-        .collect()
 }
 
 fn tokenize_until_window(
@@ -311,16 +309,16 @@ fn read_cache(path: &Path, expected: CacheKey, vocab_size: usize) -> Option<Vec<
         .collect()
 }
 
-fn write_cache(path: &Path, key: CacheKey, encoded: &[Vec<usize>]) -> Result<(), String> {
-    let nonempty: Vec<&[usize]> = encoded
-        .iter()
-        .map(Vec::as_slice)
-        .filter(|ids| !ids.is_empty())
-        .collect();
-    let total = nonempty.iter().try_fold(0usize, |sum, ids| {
-        sum.checked_add(ids.len())
-            .ok_or_else(|| "dataset token count overflow".to_string())
-    })?;
+/// Build the v2 cache without retaining the whole encoded corpus. The index
+/// and token payload are staged separately because v2 places the complete index
+/// before the payload; only a bounded line chunk and buffered file writes stay
+/// live during tokenization.
+fn write_cache_serial(
+    path: &Path,
+    key: CacheKey,
+    raw: &str,
+    tokenizer: &Tokenizer,
+) -> Result<(), String> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
@@ -329,85 +327,146 @@ fn write_cache(path: &Path, key: CacheKey, encoded: &[Vec<usize>]) -> Result<(),
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
-    let temp_path = parent.join(format!(".{name}.tmp-{}-{stamp}", std::process::id()));
-    let result = write_cache_file(&temp_path, key, &nonempty, total)
-        .and_then(|()| fs::rename(&temp_path, path).map_err(|error| io_error(path, error)));
+    let suffix = format!("{}-{stamp}", std::process::id());
+    let temp_path = parent.join(format!(".{name}.tmp-{suffix}"));
+    let index_path = parent.join(format!(".{name}.index-{suffix}"));
+    let payload_path = parent.join(format!(".{name}.payload-{suffix}"));
+
+    let result = (|| {
+        let index_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&index_path)
+            .map_err(|error| io_error(&index_path, error))?;
+        let payload_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&payload_path)
+            .map_err(|error| io_error(&payload_path, error))?;
+        let mut index = BufWriter::new(index_file);
+        let mut payload = BufWriter::new(payload_file);
+        let mut doc_count = 0usize;
+        let mut total = 0usize;
+        let mut lines = Vec::with_capacity(CACHE_BUILD_CHUNK_LINES);
+
+        let mut append_chunk = |lines: &mut Vec<&str>| -> Result<(), String> {
+            for line in lines.drain(..) {
+                let ids = tokenizer.try_encode(line, true)?;
+                if ids.is_empty() {
+                    continue;
+                }
+                let offset = total;
+                let len = ids.len();
+                let new_total = total
+                    .checked_add(len)
+                    .ok_or_else(|| "dataset token count overflow".to_string())?;
+                write_u64(&mut index, offset as u64, &index_path)?;
+                write_u64(&mut index, len as u64, &index_path)?;
+                for &id in &ids {
+                    let id = u32::try_from(id)
+                        .map_err(|_| "token ID does not fit the token cache format".to_string())?;
+                    let bytes = id.to_le_bytes();
+                    payload
+                        .write_all(&bytes)
+                        .map_err(|error| io_error(&payload_path, error))?;
+                }
+                doc_count = doc_count
+                    .checked_add(1)
+                    .ok_or_else(|| "token cache document count overflow".to_string())?;
+                total = new_total;
+            }
+            Ok(())
+        };
+
+        for line in raw.lines() {
+            lines.push(line);
+            if lines.len() == CACHE_BUILD_CHUNK_LINES {
+                append_chunk(&mut lines)?;
+            }
+        }
+        append_chunk(&mut lines)?;
+        index
+            .flush()
+            .map_err(|error| io_error(&index_path, error))?;
+        payload
+            .flush()
+            .map_err(|error| io_error(&payload_path, error))?;
+        index
+            .into_inner()
+            .map_err(|error| io_error(&index_path, error.into_error()))?
+            .sync_all()
+            .map_err(|error| io_error(&index_path, error))?;
+        payload
+            .into_inner()
+            .map_err(|error| io_error(&payload_path, error.into_error()))?
+            .sync_all()
+            .map_err(|error| io_error(&payload_path, error))?;
+
+        // The v2 content hash covers the whole index, then the whole payload,
+        // exactly as read_cache verifies it, so hash the staged files in order.
+        let mut content_hash = 0xcbf29ce484222325u64;
+        for staged in [&index_path, &payload_path] {
+            let mut file = File::open(staged).map_err(|error| io_error(staged, error))?;
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n =
+                    io::Read::read(&mut file, &mut buf).map_err(|error| io_error(staged, error))?;
+                if n == 0 {
+                    break;
+                }
+                hash_update(&mut content_hash, &buf[..n]);
+            }
+        }
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|error| io_error(&temp_path, error))?;
+        let mut writer = BufWriter::new(file);
+        writer
+            .write_all(MAGIC)
+            .map_err(|error| io_error(&temp_path, error))?;
+        write_u32(&mut writer, VERSION, &temp_path)?;
+        write_u32(&mut writer, 0, &temp_path)?;
+        for value in [
+            key.dataset_size,
+            key.mtime_secs,
+            key.mtime_nanos,
+            key.first_hash,
+            key.last_hash,
+            key.tokenizer_hash,
+            u64::try_from(doc_count)
+                .map_err(|_| "token cache document count does not fit the format".to_string())?,
+            u64::try_from(total)
+                .map_err(|_| "token cache token count does not fit the format".to_string())?,
+            content_hash,
+        ] {
+            write_u64(&mut writer, value, &temp_path)?;
+        }
+        let mut index_file =
+            File::open(&index_path).map_err(|error| io_error(&index_path, error))?;
+        io::copy(&mut index_file, &mut writer).map_err(|error| io_error(&temp_path, error))?;
+        let mut payload_file =
+            File::open(&payload_path).map_err(|error| io_error(&payload_path, error))?;
+        io::copy(&mut payload_file, &mut writer).map_err(|error| io_error(&temp_path, error))?;
+        writer
+            .flush()
+            .map_err(|error| io_error(&temp_path, error))?;
+        writer
+            .into_inner()
+            .map_err(|error| io_error(&temp_path, error.into_error()))?
+            .sync_all()
+            .map_err(|error| io_error(&temp_path, error))?;
+        fs::rename(&temp_path, path).map_err(|error| io_error(path, error))
+    })();
+
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
+    let _ = fs::remove_file(&index_path);
+    let _ = fs::remove_file(&payload_path);
     result
-}
-
-fn write_cache_file(
-    path: &Path,
-    key: CacheKey,
-    docs: &[&[usize]],
-    total: usize,
-) -> Result<(), String> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| io_error(path, error))?;
-    let mut writer = BufWriter::new(file);
-    writer
-        .write_all(MAGIC)
-        .map_err(|error| io_error(path, error))?;
-    write_u32(&mut writer, VERSION, path)?;
-    write_u32(&mut writer, 0, path)?;
-    for value in [
-        key.dataset_size,
-        key.mtime_secs,
-        key.mtime_nanos,
-        key.first_hash,
-        key.last_hash,
-        key.tokenizer_hash,
-        docs.len() as u64,
-        total as u64,
-        docs_content_hash(docs),
-    ] {
-        write_u64(&mut writer, value, path)?;
-    }
-    let mut offset = 0usize;
-    for ids in docs {
-        write_u64(&mut writer, offset as u64, path)?;
-        write_u64(&mut writer, ids.len() as u64, path)?;
-        offset += ids.len();
-    }
-    for ids in docs {
-        for &id in *ids {
-            let id = u32::try_from(id)
-                .map_err(|_| "token ID does not fit the token cache format".to_string())?;
-            writer
-                .write_all(&id.to_le_bytes())
-                .map_err(|error| io_error(path, error))?;
-        }
-    }
-    writer.flush().map_err(|error| io_error(path, error))?;
-    writer
-        .into_inner()
-        .map_err(|error| io_error(path, error.into_error()))?
-        .sync_all()
-        .map_err(|error| io_error(path, error))
-}
-
-fn docs_content_hash(docs: &[&[usize]]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    let mut offset = 0usize;
-    for ids in docs {
-        hash_update(&mut hash, &(offset as u64).to_le_bytes());
-        hash_update(&mut hash, &(ids.len() as u64).to_le_bytes());
-        offset += ids.len();
-    }
-    for ids in docs {
-        for &id in *ids {
-            hash_update(
-                &mut hash,
-                &u32::try_from(id).unwrap_or(u32::MAX).to_le_bytes(),
-            );
-        }
-    }
-    hash
 }
 
 fn write_u32(writer: &mut BufWriter<File>, value: u32, path: &Path) -> Result<(), String> {
