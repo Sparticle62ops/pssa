@@ -1021,6 +1021,10 @@ impl CLIHandler {
         let mut skipped = SkippedUpdates::default();
         let mut dream_rng =
             (options.dream_every > 0).then(|| SimpleRng::new(options.seed ^ 0xd0e5_5eed_5eed_0001));
+        // The last fresh chunk is an ephemeral guard for projected replay. It
+        // is populated only when dreaming is enabled, so the default path does
+        // not allocate or copy any additional training data.
+        let mut dream_fresh_task: Option<(Vec<usize>, Vec<usize>)> = None;
         let mut tokens_seen = 0usize;
         let mut progress = ui::Progress::new_with_tui("training", total_updates, !options.no_tui);
         if let Some(path) = options.checkpoint_path.as_deref() {
@@ -1063,6 +1067,14 @@ impl CLIHandler {
                 }
                 for microbatch in group {
                     let batch_tokens: usize = microbatch.iter().map(|c| c.len).sum();
+                    if options.dream_every > 0
+                        && let Some(c) = microbatch.last()
+                    {
+                        dream_fresh_task = Some((
+                            docs[c.doc][c.start..c.start + c.len].to_vec(),
+                            docs[c.doc][c.start + 1..c.start + 1 + c.len].to_vec(),
+                        ));
+                    }
                     let loss = if let Some(batch) = &mut sequence_batch {
                         sequence_views.clear();
                         for c in microbatch {
@@ -1194,13 +1206,17 @@ impl CLIHandler {
                     if let Some(ctx) = cuda_optimizer.as_ref() {
                         ctx.sync_safeguarded_weights(&mut model.adam_tensors())?;
                     }
-                    let summary = model.dream_replay_with_options(
+                    let fresh_task = dream_fresh_task
+                        .as_ref()
+                        .map(|(inputs, targets)| (inputs.as_slice(), targets.as_slice()));
+                    let summary = model.dream_replay_with_options_and_guard(
                         options.dream_mode,
                         options.dream_replay,
                         options.dream_len,
                         0.8,
                         options.dream_lr,
                         options.dream_steps,
+                        fresh_task,
                         rng,
                     );
                     println!(

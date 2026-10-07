@@ -216,6 +216,36 @@ mod tests {
     }
 
     #[test]
+    fn guarded_replay_projects_and_backtracks_without_advancing_adam() {
+        let mut model = seeded_model();
+        let inputs = [1usize, 2, 1, 2];
+        let targets = [2usize, 1, 2, 1];
+        model.remember_dream_sequence(&inputs, &targets);
+        model.reset_recurrent_state();
+        let before_loss = model.forward_train_chunk(&inputs, &targets);
+        model.zero_gradients();
+        let before = main_weight_bits(&model);
+        let step = model.step_counter;
+        let summary = model.dream_replay_with_options_and_guard(
+            DreamMode::Memory,
+            1,
+            0,
+            0.8,
+            1e-3,
+            1,
+            Some((&inputs, &targets)),
+            &mut SimpleRng::new(91),
+        );
+        assert_eq!(summary.rehearsal_sequences, 1);
+        assert_eq!(model.step_counter, step);
+        assert_ne!(main_weight_bits(&model), before);
+        model.reset_recurrent_state();
+        let after_loss = model.forward_train_chunk(&inputs, &targets);
+        assert!(after_loss <= before_loss + 1e-5);
+        model.zero_gradients();
+    }
+
+    #[test]
     fn generated_dream_replays_sampled_tokens_without_main_weight_updates() {
         let mut model = seeded_model();
         let before = main_weight_bits(&model);
