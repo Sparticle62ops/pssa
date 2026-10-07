@@ -15,10 +15,10 @@ impl TrainingBackend {
         match value {
             "auto" => Ok(Self::Auto),
             "cpu" => Ok(Self::Cpu),
-            "webgpu" => Ok(Self::WebGpu),
+            "webgpu" | "wgpu" => Ok(Self::WebGpu),
             "cuda" if cfg!(feature = "cuda") => Ok(Self::Cuda),
             "cuda" => Err("CUDA requires a binary built with --features cuda".into()),
-            _ => Err("--backend must be auto, cpu, webgpu, or cuda".into()),
+            _ => Err("--backend must be auto, cpu, webgpu (or wgpu), or cuda".into()),
         }
     }
 
