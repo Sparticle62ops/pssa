@@ -931,15 +931,8 @@ impl Chat {
         );
         let title = format!(" input • {} attachment(s) ", self.attachments.len());
         let input = clean(&self.input);
-        let tail = input
-            .chars()
-            .rev()
-            .take(chunks[2].width.saturating_sub(4) as usize)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<String>();
         let input_area = panel_area(f, chunks[2]);
+        let tail = super::setup::visible_tail(&input, input_area.width.saturating_sub(4) as usize);
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("> ", accent()),
@@ -1029,6 +1022,22 @@ mod tests {
             PathBuf::from("missing"),
         )
     }
+    #[test]
+    fn long_wide_unicode_drafts_keep_the_end_visible_in_single_and_ab_inputs() {
+        let mut chat = fixture();
+        chat.input = format!("{}終END", "世界".repeat(100));
+        for ab in [false, true] {
+            chat.ab.command(if ab { "on" } else { "off" }, "").unwrap();
+            for (width, height) in [(80, 24), (120, 40), (60, 20)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| chat.draw(f, f.area())).unwrap();
+                let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+                // Wide glyphs reserve a second blank TestBackend cell.
+                assert!(text.contains("END"), "draft end hidden at {width}x{height}, ab={ab}: {text}");
+            }
+        }
+    }
+
     #[test]
     fn model_picker_follows_setup_output_without_replacing_conversation() {
         let mut chat = fixture();

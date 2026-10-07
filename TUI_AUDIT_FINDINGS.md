@@ -27,6 +27,8 @@ pseudo-terminal sessions at 80x24, 120x40, and 60x20.
 
 | `--compare` opened and parsed an unbounded file on the raw-mode event-loop thread; a FIFO could hang the UI indefinitely and large logs blocked redraw/input. Errors were silently discarded. | Independent audit; a timeout-guarded FIFO subprocess regression, bounded loader tests, and a TestBackend unavailable-comparison assertion pass through csrun. | This commit: reject nonregular sources before terminal setup, reload one bounded 8 MiB log off-thread, and visibly report errors. |
 
+| Single-chat and A/B prompt tails were clipped by character count rather than terminal-cell width, so long CJK drafts hid the newest text off the right edge. | TestBackend regression with a long `世界` draft ending in `END` at 80x24, 120x40 and 60x20, in both modes. | This commit: reuse cell-width-aware tail clipping after accounting for the actual panel/shadow width. |
+
 ## Checks and non-findings
 
 - WebGPU parity software-adapter skip is tracked in `76073a9`.
