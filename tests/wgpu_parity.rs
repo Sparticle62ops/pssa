@@ -5,6 +5,7 @@
 use pssa::backend::{Device, WgpuContext};
 use pssa::gpu_batch::{backward_chunk_batched, forward_train_chunk_batched};
 use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
+use pssa::sequence_batch::{Sequence, SequenceBatch};
 
 fn webgpu() -> Option<WgpuContext> {
     match WgpuContext::init_with_software_policy(true) {
@@ -177,6 +178,47 @@ fn wgpu_small_forward_and_all_gradients_match_cpu() {
     cpu.backward_chunk(inputs.len(), 0.75);
     backward_chunk_batched(&mut gpu, inputs.len(), 0.75);
     compare_grads(&cpu, &gpu);
+}
+
+#[test]
+fn wgpu_packed_sequence_batch_matches_cpu() {
+    let Some(ctx) = webgpu() else { return };
+    let mut cpu = model();
+    let mut gpu = model();
+    let mut cpu_batch = SequenceBatch::new(&mut cpu, 2).expect("CPU batch workspace");
+    let mut gpu_batch = SequenceBatch::new(&mut gpu, 2).expect("WGSL batch workspace");
+    let sequences = [
+        Sequence {
+            lane: 1,
+            inputs: &[1, 4, 3, 2],
+            targets: &[4, 3, 2, 1],
+            reset: true,
+        },
+        Sequence {
+            lane: 0,
+            inputs: &[5, 6, 7],
+            targets: &[6, 7, 8],
+            reset: true,
+        },
+    ];
+    let cpu_loss = cpu_batch
+        .forward(&mut cpu, &sequences)
+        .expect("CPU packed forward");
+    gpu.device = Device::Gpu(ctx);
+    let gpu_loss = gpu_batch
+        .forward(&mut gpu, &sequences)
+        .expect("WGSL packed forward");
+    assert_close("packed loss", &[cpu_loss], &[gpu_loss]);
+    cpu_batch
+        .backward(&mut cpu, 0.75)
+        .expect("CPU packed backward");
+    gpu_batch
+        .backward(&mut gpu, 0.75)
+        .expect("WGSL packed backward");
+    compare_grads(&cpu, &gpu);
+    for lane in 0..2 {
+        assert_close("packed carry", cpu_batch.state(lane), gpu_batch.state(lane));
+    }
 }
 
 #[test]
