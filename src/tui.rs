@@ -592,6 +592,7 @@ impl RunState {
     /// recorded on disk in sibling `.loss` files (written by future runs).
     fn refresh_chain(&mut self) {
         let Ok(entries) = std::fs::read_dir(&self.chain_dir) else {
+            self.checkpoints.clear();
             return;
         };
         let mut names: Vec<(String, Option<f64>)> = Vec::new();
@@ -605,17 +606,7 @@ impl RunState {
             }
         }
         names.sort_by_key(|(name, _)| checkpoint_sort_key(name));
-        for (name, loss) in names {
-            if let Some(existing) = self.checkpoints.iter_mut().find(|(n, _)| *n == name) {
-                if loss.is_some() {
-                    existing.1 = loss;
-                }
-            } else {
-                self.checkpoints.push((name, loss));
-            }
-        }
-        self.checkpoints
-            .sort_by_key(|(name, _)| checkpoint_sort_key(name));
+        self.checkpoints = names;
     }
 
     fn record_problem(&mut self, reason: impl Into<String>) {
@@ -3198,6 +3189,33 @@ mod tests {
             feature_area(Rect::new(0, 0, 80, 24)),
             Rect::new(2, 8, 76, 15),
         );
+    }
+
+    #[test]
+    fn refresh_chain_drops_deleted_checkpoints_and_missing_directories() {
+        let chain = std::env::temp_dir().join(format!(
+            "pssa-tui-chain-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&chain).unwrap();
+        std::fs::write(chain.join("ck01.pssa"), b"fixture").unwrap();
+        let mut state = RunState {
+            chain_dir: chain.clone(),
+            ..RunState::default()
+        };
+        state.refresh_chain();
+        assert_eq!(state.checkpoints, [("ck01.pssa".into(), None)]);
+        std::fs::remove_file(chain.join("ck01.pssa")).unwrap();
+        state.refresh_chain();
+        assert!(state.checkpoints.is_empty());
+        state.checkpoints.push(("stale.pssa".into(), None));
+        std::fs::remove_dir(&chain).unwrap();
+        state.refresh_chain();
+        assert!(state.checkpoints.is_empty());
     }
 
     #[test]
