@@ -8,6 +8,7 @@ pub mod cuda;
 pub mod dataset;
 pub mod defense;
 pub mod diagnostics;
+pub mod dream;
 pub mod evaluation;
 pub mod feature_benchmark;
 pub mod gpu_batch;
