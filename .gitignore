@@ -23,3 +23,7 @@ docs/PROJECT-HANDOFF-*
 # Agent run scratch (never commit)
 .loops-fix/
 *_findings.md
+
+# agent scratch notes, keep out of the repo
+*_FINDINGS.md
+FINDINGS*.md
