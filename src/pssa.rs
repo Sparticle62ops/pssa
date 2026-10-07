@@ -1506,8 +1506,8 @@ impl PSSAContinuousBlockV2 {
             .sqrt();
         let rate = 0.02 / (1.0 + target_norm.min(f32::MAX as f64) as f32);
         let rank = self.adapters[0].rank;
-        for i in 0..self.cfg.d_latent {
-            let error = (value[i] - self.inf_ad_out[i]).clamp(-4.0, 4.0);
+        for (i, &target) in value.iter().enumerate() {
+            let error = (target - self.inf_ad_out[i]).clamp(-4.0, 4.0);
             let row = i * rank;
             for r in 0..rank {
                 self.adapters[0].up_proj.data[row + r] += rate * error * self.inf_ad_act[r];
