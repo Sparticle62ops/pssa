@@ -12,15 +12,17 @@ pseudo-terminal sessions at 80x24, 120x40, and 60x20.
 | `RunState::refresh_chain` only added scanned checkpoints and retained files deleted from disk or from a missing chain directory, leaving stale chain entries and preview candidates. | Read-only audit of `refresh_chain` and `preview::candidate`; regression test creates, scans, deletes, and rescans a checkpoint plus a missing directory. | `fb5d677` |
 | Escape was documented as quitting network browse tabs but routed `Context::Network` and `Context::Timeline` to no-op handlers; only editors should consume Escape to cancel. | Read-only keybinding audit plus headless pty navigation of network/timeline tabs; regression assertions cover browse, timeline, and editor contexts. | `e8693de` |
 | The empty/no-input dashboard rendered `[ TRAINING ]` because `status_badge` treated every non-DONE normal state as training, hiding the documented waiting state. | Headless pty launch with an empty chain at 80x24/120x40/60x20 showed `[ TRAINING ]` before any producer log; the default `HealthStatus` was `WAITING`. | `f629582` |
-| A wizard-launched child was polled to completion but retained in `training`, so a piped TUI never reached its EOF exit predicate and stayed open after the final frame. | Read-only event-loop audit and setup child lifecycle trace: `TrainingRun::active()` became false, but `training` stayed `Some`; the loop exits only when it is `None`. | Pending (this change) |
+| A wizard-launched child was polled to completion but retained in `training`, so a piped TUI never reached its EOF exit predicate and stayed open after the final frame. | Read-only event-loop audit and setup child lifecycle trace: `TrainingRun::active()` became false, but `training` stayed `Some`; the loop exits only when it is `None`. | `35f4480` |
+| Repeating `--chain`/`-c`, `--chats-dir`, or `--compare` silently overwrote the earlier TUI launch setting, making a typo select a different chain or log. | CLI argument audit plus `tests/tui_chain_args.rs::tui_rejects_repeated_options_and_mixed_chain_aliases`; duplicate spellings now return an error before TTY detection. | `34c2012` |
 
 ## Checks and non-findings
 
 - WebGPU parity software-adapter skip is tracked in `76073a9`.
-- The existing TUI unit/TestBackend suite covered 266 passing tests before the
-  hardware fix; its one failure was the bug listed above. The targeted hardware
-  and checkpoint regressions, the Escape routing regression, and the full TUI
-  module suite are being rerun after these fixes.
+- The TUI unit/TestBackend suite now reports 268 passing tests through
+  `/workspace/bin/csrun`; `tests/tui_chain_args.rs` reports 4 passing tests.
+  The targeted hardware and checkpoint regressions, the Escape routing
+  regression, and the full TUI module suite all pass; only the repository's
+  existing dead-code warnings remain.
 - Headless pty sweeps rendered all 27 tabs, every requested size, the help and
   palette overlays, the setup review/CLI preview, device picker unavailable
   rows, limits, math, sample, and empty/no-checkpoint states without a crash.
