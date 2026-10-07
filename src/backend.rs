@@ -3,6 +3,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[path = "wgpu_stages.rs"]
+mod wgpu_stages;
+
 /// Validate all element and byte counts before allocation or backend calls.
 /// Shared by CUDA, WebGPU and the allocation-free CPU kernel.
 pub(crate) fn checked_gemm_sizes(
@@ -324,6 +327,17 @@ pub struct WgpuContext {
     pub norm_pipeline: Arc<wgpu::ComputePipeline>,
     pub silu_pipeline: Arc<wgpu::ComputePipeline>,
     pub adamw_pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) scan_pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) scan_apply_pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) ssm_prepare_pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) ssm_materialize_pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) ssm_backward_maps_pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) ssm_backward_local_pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) memory_forward_pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) memory_backward_local_pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) memory_backward_retrieval_pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) softplus_pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) stages: Arc<Mutex<wgpu_stages::WgpuStageState>>,
     /// Weight matrices resident on the device, keyed by (host pointer, len).
     /// Weights only change when the optimizer steps, so every GEMM between two
     /// steps reuses the uploaded copy instead of re-sending it. Cleared by
@@ -339,7 +353,10 @@ impl WgpuContext {
         Self::init_with_software_policy(false)
     }
 
-    fn init_with_software_policy(allow_software: bool) -> Result<Self, String> {
+    /// Initialize WebGPU, optionally accepting a software adapter for parity
+    /// tests and portable validation. Production `--backend wgpu` keeps the
+    /// default hardware-only policy.
+    pub fn init_with_software_policy(allow_software: bool) -> Result<Self, String> {
         // Library initialization may run after Rayon or other application
         // threads start. Configure XDG_RUNTIME_DIR externally when needed;
         // mutating process-wide environment here is not thread-safe on Unix.
@@ -379,9 +396,14 @@ impl WgpuContext {
         .map_err(|e| format!("Failed to create WebGPU device: {}", e))?;
 
         begin_error_scopes(&device);
+        let shader_source = format!(
+            "{}\n{}",
+            WGSL_COMPUTE_KERNELS,
+            wgpu_stages::WGSL_STAGE_KERNELS
+        );
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("PSSA V2 Compute Shaders"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(WGSL_COMPUTE_KERNELS)),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source)),
         });
 
         let gemm_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -411,6 +433,74 @@ impl WgpuContext {
             module: &shader_module,
             entry_point: "adamw_main",
         });
+        let scan_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("WGSL affine scan Pipeline"),
+            layout: None,
+            module: &shader_module,
+            entry_point: "affine_scan_main",
+        });
+        let scan_apply_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("WGSL affine scan apply Pipeline"),
+                layout: None,
+                module: &shader_module,
+                entry_point: "affine_scan_apply_main",
+            });
+        let ssm_prepare_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("WGSL SSM prepare Pipeline"),
+                layout: None,
+                module: &shader_module,
+                entry_point: "ssm_prepare_main",
+            });
+        let ssm_materialize_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("WGSL SSM materialize Pipeline"),
+                layout: None,
+                module: &shader_module,
+                entry_point: "ssm_materialize_main",
+            });
+        let ssm_backward_maps_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("WGSL SSM backward maps Pipeline"),
+                layout: None,
+                module: &shader_module,
+                entry_point: "ssm_backward_maps_main",
+            });
+        let ssm_backward_local_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("WGSL SSM backward local Pipeline"),
+                layout: None,
+                module: &shader_module,
+                entry_point: "ssm_backward_local_main",
+            });
+        let memory_forward_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("WGSL memory forward Pipeline"),
+                layout: None,
+                module: &shader_module,
+                entry_point: "memory_forward_main",
+            });
+        let memory_backward_local_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("WGSL memory backward local Pipeline"),
+                layout: None,
+                module: &shader_module,
+                entry_point: "memory_backward_local_main",
+            });
+        let memory_backward_retrieval_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("WGSL memory retrieval backward Pipeline"),
+                layout: None,
+                module: &shader_module,
+                entry_point: "memory_backward_retrieval_main",
+            });
+        let softplus_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("WGSL softplus Pipeline"),
+            layout: None,
+            module: &shader_module,
+            entry_point: "softplus_main",
+        });
 
         finish_error_scopes(&device)?;
         Ok(Self {
@@ -420,6 +510,17 @@ impl WgpuContext {
             norm_pipeline: Arc::new(norm_pipeline),
             silu_pipeline: Arc::new(silu_pipeline),
             adamw_pipeline: Arc::new(adamw_pipeline),
+            scan_pipeline: Arc::new(scan_pipeline),
+            scan_apply_pipeline: Arc::new(scan_apply_pipeline),
+            ssm_prepare_pipeline: Arc::new(ssm_prepare_pipeline),
+            ssm_materialize_pipeline: Arc::new(ssm_materialize_pipeline),
+            ssm_backward_maps_pipeline: Arc::new(ssm_backward_maps_pipeline),
+            ssm_backward_local_pipeline: Arc::new(ssm_backward_local_pipeline),
+            memory_forward_pipeline: Arc::new(memory_forward_pipeline),
+            memory_backward_local_pipeline: Arc::new(memory_backward_local_pipeline),
+            memory_backward_retrieval_pipeline: Arc::new(memory_backward_retrieval_pipeline),
+            softplus_pipeline: Arc::new(softplus_pipeline),
+            stages: Arc::new(Mutex::new(wgpu_stages::WgpuStageState::default())),
             weight_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace: Arc::new(Mutex::new(WgpuWorkspace::default())),
         })
@@ -1073,9 +1174,13 @@ impl GpuDispatch {
         d_s: usize,
     ) -> Result<(), String> {
         match self {
-            Self::Wgpu(_) => Err("WGSL SSM scan is not enabled".into()),
+            Self::Wgpu(ctx) => ctx.ssm_forward_resident_wgpu(
+                delta, delta_raw, b_proj, x_norm, rates, c_proj, initial, seq_len, d_m, d_s,
+            ),
             #[cfg(feature = "cuda")]
-            Self::Cuda(ctx) => ctx.ssm_forward_resident(delta, delta_raw, b_proj, x_norm, rates, c_proj, initial, seq_len, d_m, d_s),
+            Self::Cuda(ctx) => ctx.ssm_forward_resident(
+                delta, delta_raw, b_proj, x_norm, rates, c_proj, initial, seq_len, d_m, d_s,
+            ),
         }
     }
 
@@ -1099,37 +1204,75 @@ impl GpuDispatch {
         y_ssm: &mut [f32],
     ) -> Result<(), String> {
         match self {
-            Self::Wgpu(_) => Err("WGSL SSM scan is not enabled".into()),
+            Self::Wgpu(ctx) => ctx.ssm_forward_wgpu(
+                delta, delta_raw, b_proj, x_norm, rates, rate_deriv, c_proj, initial, seq_len, d_m,
+                d_s, bar_a, bar_b, states, y_ssm,
+            ),
             #[cfg(feature = "cuda")]
-            Self::Cuda(ctx) => ctx.ssm_forward(delta, delta_raw, b_proj, x_norm, rates, rate_deriv, c_proj, initial, seq_len, d_m, d_s, bar_a, bar_b, states, y_ssm),
+            Self::Cuda(ctx) => ctx.ssm_forward(
+                delta, delta_raw, b_proj, x_norm, rates, rate_deriv, c_proj, initial, seq_len, d_m,
+                d_s, bar_a, bar_b, states, y_ssm,
+            ),
         }
     }
 
     pub fn memory_forward_after_ssm(
         &self,
         x_norm: &[f32],
-        w_qx: &[f32], w_qh: &[f32], w_gate: &[f32], w_proj: &[f32],
-        keys: &[f32], norm_sq: &[f32], values: &[f32],
-        seq_len: usize, d_m: usize, d_k: usize, d_val: usize,
-        capacity: usize, count: usize, tau: f32,
-        bar_a: &mut [f32], bar_b: &mut [f32], states: &mut [f32], y_ssm: &mut [f32],
-        q_euc: &mut [f32], q_pnc: &mut [f32], q_norm: &mut [f32], weights: &mut [f32],
-        m_val: &mut [f32], g_mem: &mut [f32], m_proj: &mut [f32], m_inj: &mut [f32],
+        w_qx: &[f32],
+        w_qh: &[f32],
+        w_gate: &[f32],
+        w_proj: &[f32],
+        keys: &[f32],
+        norm_sq: &[f32],
+        values: &[f32],
+        seq_len: usize,
+        d_m: usize,
+        d_k: usize,
+        d_val: usize,
+        capacity: usize,
+        count: usize,
+        tau: f32,
+        bar_a: &mut [f32],
+        bar_b: &mut [f32],
+        states: &mut [f32],
+        y_ssm: &mut [f32],
+        q_euc: &mut [f32],
+        q_pnc: &mut [f32],
+        q_norm: &mut [f32],
+        weights: &mut [f32],
+        m_val: &mut [f32],
+        g_mem: &mut [f32],
+        m_proj: &mut [f32],
+        m_inj: &mut [f32],
     ) -> Result<(), String> {
         match self {
-            Self::Wgpu(_) => Err("WGSL resident memory stage is not enabled".into()),
+            Self::Wgpu(ctx) => ctx.memory_forward_after_ssm_wgpu(
+                x_norm, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len, d_m, d_k,
+                d_val, capacity, count, tau, bar_a, bar_b, states, y_ssm, q_euc, q_pnc, q_norm,
+                weights, m_val, g_mem, m_proj, m_inj,
+            ),
             #[cfg(feature = "cuda")]
-            Self::Cuda(ctx) => ctx.memory_forward_after_ssm(x_norm, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len, d_m, d_k, d_val, capacity, count, tau, bar_a, bar_b, states, y_ssm, q_euc, q_pnc, q_norm, weights, m_val, g_mem, m_proj, m_inj),
+            Self::Cuda(ctx) => ctx.memory_forward_after_ssm(
+                x_norm, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len, d_m, d_k,
+                d_val, capacity, count, tau, bar_a, bar_b, states, y_ssm, q_euc, q_pnc, q_norm,
+                weights, m_val, g_mem, m_proj, m_inj,
+            ),
         }
     }
 
     pub fn memory_backward_local(
         &self,
-        g_zraw: &[f32], g_mem: &[f32], m_proj: &[f32],
-        g_m_proj: &mut [f32], g_gate: &mut [f32],
+        g_zraw: &[f32],
+        g_mem: &[f32],
+        m_proj: &[f32],
+        g_m_proj: &mut [f32],
+        g_gate: &mut [f32],
     ) -> Result<(), String> {
         match self {
-            Self::Wgpu(_) => Err("WGSL memory backward is not enabled".into()),
+            Self::Wgpu(ctx) => {
+                ctx.memory_backward_local_wgpu(g_zraw, g_mem, m_proj, g_m_proj, g_gate)
+            }
             #[cfg(feature = "cuda")]
             Self::Cuda(ctx) => ctx.memory_backward_local(g_zraw, g_mem, m_proj, g_m_proj, g_gate),
         }
@@ -1160,55 +1303,107 @@ impl GpuDispatch {
         g_x: &mut [f32],
     ) -> Result<(), String> {
         match self {
-            Self::Wgpu(_) => Err("WGSL SSM backward scan is not enabled".into()),
+            Self::Wgpu(ctx) => ctx.ssm_backward_wgpu(
+                delta, delta_raw, b_proj, c_proj, rates, rate_deriv, x_norm, states, bar_a, bar_b,
+                g_zraw, g_ysm, seq_len, d_m, d_s, scale, g_delta, g_b, g_c, g_a, g_x,
+            ),
             #[cfg(feature = "cuda")]
-            Self::Cuda(ctx) => ctx.ssm_backward(delta, delta_raw, b_proj, c_proj, rates, rate_deriv, x_norm, states, bar_a, bar_b, g_zraw, g_ysm, seq_len, d_m, d_s, scale, g_delta, g_b, g_c, g_a, g_x),
+            Self::Cuda(ctx) => ctx.ssm_backward(
+                delta, delta_raw, b_proj, c_proj, rates, rate_deriv, x_norm, states, bar_a, bar_b,
+                g_zraw, g_ysm, seq_len, d_m, d_s, scale, g_delta, g_b, g_c, g_a, g_x,
+            ),
         }
     }
 
     pub fn memory_forward(
         &self,
-        x_norm: &[f32], y_ssm: &[f32], w_qx: &[f32], w_qh: &[f32], w_gate: &[f32], w_proj: &[f32],
-        keys: &[f32], norm_sq: &[f32], values: &[f32], seq_len: usize, d_m: usize, d_k: usize,
-        d_val: usize, capacity: usize, count: usize, tau: f32, q_euc: &mut [f32], q_pnc: &mut [f32],
-        q_norm: &mut [f32], weights: &mut [f32], m_val: &mut [f32], g_mem: &mut [f32],
-        m_proj: &mut [f32], m_inj: &mut [f32],
+        x_norm: &[f32],
+        y_ssm: &[f32],
+        w_qx: &[f32],
+        w_qh: &[f32],
+        w_gate: &[f32],
+        w_proj: &[f32],
+        keys: &[f32],
+        norm_sq: &[f32],
+        values: &[f32],
+        seq_len: usize,
+        d_m: usize,
+        d_k: usize,
+        d_val: usize,
+        capacity: usize,
+        count: usize,
+        tau: f32,
+        q_euc: &mut [f32],
+        q_pnc: &mut [f32],
+        q_norm: &mut [f32],
+        weights: &mut [f32],
+        m_val: &mut [f32],
+        g_mem: &mut [f32],
+        m_proj: &mut [f32],
+        m_inj: &mut [f32],
     ) -> Result<(), String> {
         match self {
-            Self::Wgpu(_) => Err("WGSL memory stage is not enabled".into()),
+            Self::Wgpu(ctx) => ctx.memory_forward_wgpu(
+                x_norm, y_ssm, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len, d_m,
+                d_k, d_val, capacity, count, tau, q_euc, q_pnc, q_norm, weights, m_val, g_mem,
+                m_proj, m_inj,
+            ),
             #[cfg(feature = "cuda")]
-            Self::Cuda(ctx) => ctx.memory_forward(x_norm, y_ssm, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len, d_m, d_k, d_val, capacity, count, tau, q_euc, q_pnc, q_norm, weights, m_val, g_mem, m_proj, m_inj),
+            Self::Cuda(ctx) => ctx.memory_forward(
+                x_norm, y_ssm, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len, d_m,
+                d_k, d_val, capacity, count, tau, q_euc, q_pnc, q_norm, weights, m_val, g_mem,
+                m_proj, m_inj,
+            ),
         }
     }
 
     pub fn memory_backward_retrieval(
         &self,
-        q_pnc: &[f32], q_euc: &[f32], g_m: &[f32], m_val: &[f32], weights: &[f32], keys: &[f32], norm_sq: &[f32],
-        values: &[f32], seq_len: usize, count: usize, capacity: usize, d_key: usize, d_val: usize, tau: f32,
-        query_pnc: &mut [f32], query_euc: &mut [f32],
+        q_pnc: &[f32],
+        q_euc: &[f32],
+        g_m: &[f32],
+        m_val: &[f32],
+        weights: &[f32],
+        keys: &[f32],
+        norm_sq: &[f32],
+        values: &[f32],
+        seq_len: usize,
+        count: usize,
+        capacity: usize,
+        d_key: usize,
+        d_val: usize,
+        tau: f32,
+        query_pnc: &mut [f32],
+        query_euc: &mut [f32],
     ) -> Result<(), String> {
         match self {
-            Self::Wgpu(_) => Err("WGSL memory backward is not enabled".into()),
+            Self::Wgpu(ctx) => ctx.memory_backward_retrieval_wgpu(
+                q_pnc, q_euc, g_m, m_val, weights, keys, norm_sq, values, seq_len, count, capacity,
+                d_key, d_val, tau, query_pnc, query_euc,
+            ),
             #[cfg(feature = "cuda")]
-            Self::Cuda(ctx) => ctx.memory_backward_retrieval(q_pnc, q_euc, g_m, m_val, weights, keys, norm_sq, values, seq_len, count, capacity, d_key, d_val, tau, query_pnc, query_euc),
+            Self::Cuda(ctx) => ctx.memory_backward_retrieval(
+                q_pnc, q_euc, g_m, m_val, weights, keys, norm_sq, values, seq_len, count, capacity,
+                d_key, d_val, tau, query_pnc, query_euc,
+            ),
         }
     }
 
     pub fn softplus_in_place(&self, values: &mut [f32]) -> Result<(), String> {
         match self {
-            Self::Wgpu(_) => Err("WGSL softplus is not enabled".into()),
+            Self::Wgpu(ctx) => ctx.softplus_wgpu(values),
             #[cfg(feature = "cuda")]
             Self::Cuda(ctx) => ctx.softplus_in_place(values),
         }
     }
 
-    /// Whether this backend actually accelerates the backward-pass GEMM shapes.
-    /// The WGSL kernel only implements the forward X * W^T layout, so on WebGPU
-    /// the backward pass stays on its fused CPU loops instead of paying to
-    /// materialize intermediates for a CPU twin.
+    /// Whether this backend has device-native recurrent and memory backward
+    /// stages. WebGPU's dense transpose helpers still use the deterministic CPU
+    /// implementation, but the SSM reverse scan and memory VJPs are dispatched
+    /// on the device when this returns true.
     pub fn accelerates_backward(&self) -> bool {
         match self {
-            GpuDispatch::Wgpu(_) => false,
+            GpuDispatch::Wgpu(_) => true,
             #[cfg(feature = "cuda")]
             GpuDispatch::Cuda(_) => true,
         }

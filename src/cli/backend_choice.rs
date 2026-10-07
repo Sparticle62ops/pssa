@@ -15,10 +15,10 @@ impl TrainingBackend {
         match value {
             "auto" => Ok(Self::Auto),
             "cpu" => Ok(Self::Cpu),
-            "webgpu" => Ok(Self::WebGpu),
+            "webgpu" | "wgpu" => Ok(Self::WebGpu),
             "cuda" if cfg!(feature = "cuda") => Ok(Self::Cuda),
             "cuda" => Err("CUDA requires a binary built with --features cuda".into()),
-            _ => Err("--backend must be auto, cpu, webgpu, or cuda".into()),
+            _ => Err("--backend must be auto, cpu, webgpu (or wgpu), or cuda".into()),
         }
     }
 
@@ -55,6 +55,7 @@ mod tests {
         for value in ["auto", "cpu", "webgpu"] {
             assert_eq!(TrainingBackend::parse(value).unwrap().as_str(), value);
         }
+        assert_eq!(TrainingBackend::parse("wgpu"), Ok(TrainingBackend::WebGpu));
         assert!(TrainingBackend::parse("tpu").is_err());
         assert_eq!(
             TrainingBackend::parse("cuda").is_ok(),

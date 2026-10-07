@@ -293,35 +293,29 @@ impl SequenceBatch {
             self.tokens = end;
         }
         stages::stage_embed_norm(m, self.tokens);
-        m.refresh_ssm_rates();
-        let mut cuda_failed = false;
-        self.cuda_pending = match self.forward_cuda(m) {
-            Ok(resident) => resident,
-            Err(error) => {
-                eprintln!("warning: CUDA packed forward failed; replaying CPU stages: {error}");
-                cuda_failed = true;
-                false
+        // CUDA has a packed resident implementation. WebGPU does not yet
+        // share one queue submission across independent lane carries, so run
+        // the same device SSM dispatcher once per active lane and keep the
+        // packed memory stage on device. A failed WebGPU dispatch is loud and
+        // falls back only for that lane.
+        let wgpu = match m.device.gpu() {
+            Some(crate::backend::GpuDispatch::Wgpu(ctx)) => {
+                Some(crate::backend::GpuDispatch::Wgpu(ctx))
             }
+            _ => None,
         };
-        if !self.cuda_pending {
+        if let Some(gpu) = wgpu.as_ref() {
+            self.cuda_pending = false;
             self.cuda_carry_dirty = true;
-            // A failed CUDA transaction publishes no lane carries. Explicitly
-            // use CPU stages for recovery rather than retry a damaged stream.
-            let device =
-                cuda_failed.then(|| std::mem::replace(&mut m.device, crate::backend::Device::Cpu));
+            m.refresh_ssm_rates();
             stages::stage_projections(m, self.tokens);
-            if self.parallel_lanes(m) {
-                m.scan_executor.run(|| {
-                    self.lanes
-                        .par_iter_mut()
-                        .filter(|lane| lane.len > 0)
-                        .for_each(|lane| lane.forward(m));
-                });
-            } else {
-                self.lanes
-                    .iter_mut()
-                    .filter(|lane| lane.len > 0)
-                    .for_each(|lane| lane.forward(m));
+            for lane in self.lanes.iter_mut().filter(|lane| lane.len > 0) {
+                if let Err(error) = lane.forward_wgpu(m, gpu) {
+                    eprintln!(
+                        "warning: WebGPU packed SSM forward failed; using CPU lane scan: {error}"
+                    );
+                    lane.forward(m);
+                }
             }
             for lane in self.lanes.iter().filter(|lane| lane.len > 0) {
                 let start = lane.offset * m.cfg.d_latent;
@@ -329,8 +323,46 @@ impl SequenceBatch {
                     .copy_from_slice(&lane.y[..lane.len * m.cfg.d_latent]);
             }
             stages::stage_memory_packed(m, self.tokens);
-            if let Some(device) = device {
-                m.device = device;
+        } else {
+            m.refresh_ssm_rates();
+            let mut cuda_failed = false;
+            self.cuda_pending = match self.forward_cuda(m) {
+                Ok(resident) => resident,
+                Err(error) => {
+                    eprintln!("warning: CUDA packed forward failed; replaying CPU stages: {error}");
+                    cuda_failed = true;
+                    false
+                }
+            };
+            if !self.cuda_pending {
+                self.cuda_carry_dirty = true;
+                // A failed CUDA transaction publishes no lane carries. Explicitly
+                // use CPU stages for recovery rather than retry a damaged stream.
+                let device = cuda_failed
+                    .then(|| std::mem::replace(&mut m.device, crate::backend::Device::Cpu));
+                stages::stage_projections(m, self.tokens);
+                if self.parallel_lanes(m) {
+                    m.scan_executor.run(|| {
+                        self.lanes
+                            .par_iter_mut()
+                            .filter(|lane| lane.len > 0)
+                            .for_each(|lane| lane.forward(m));
+                    });
+                } else {
+                    self.lanes
+                        .iter_mut()
+                        .filter(|lane| lane.len > 0)
+                        .for_each(|lane| lane.forward(m));
+                }
+                for lane in self.lanes.iter().filter(|lane| lane.len > 0) {
+                    let start = lane.offset * m.cfg.d_latent;
+                    m.block.tape.y_ssm[start..start + lane.len * m.cfg.d_latent]
+                        .copy_from_slice(&lane.y[..lane.len * m.cfg.d_latent]);
+                }
+                stages::stage_memory_packed(m, self.tokens);
+                if let Some(device) = device {
+                    m.device = device;
+                }
             }
         }
         stages::stage_adapter(m, self.tokens);
@@ -400,7 +432,22 @@ impl SequenceBatch {
         };
         self.cuda_pending = false;
         if !resident_backward {
-            if self.parallel_lanes(m) {
+            let wgpu = match m.device.gpu() {
+                Some(crate::backend::GpuDispatch::Wgpu(ctx)) => {
+                    Some(crate::backend::GpuDispatch::Wgpu(ctx))
+                }
+                _ => None,
+            };
+            if let Some(gpu) = wgpu.as_ref() {
+                for lane in self.lanes.iter_mut().filter(|lane| lane.len > 0) {
+                    if let Err(error) = lane.backward_wgpu(m, gpu) {
+                        eprintln!(
+                            "warning: WebGPU packed SSM backward failed; using CPU lane scan: {error}"
+                        );
+                        lane.backward(m);
+                    }
+                }
+            } else if self.parallel_lanes(m) {
                 m.scan_executor.run(|| {
                     self.lanes
                         .par_iter_mut()
@@ -678,6 +725,83 @@ impl SequenceBatch {
 }
 
 impl Lane {
+    fn forward_wgpu(
+        &mut self,
+        m: &PSSALayerV2,
+        gpu: &crate::backend::GpuDispatch,
+    ) -> Result<(), String> {
+        let d = m.cfg.d_latent;
+        let s = m.cfg.d_state;
+        let hs = d * s;
+        let l = self.len;
+        let row_d = self.offset * d;
+        let row_s = self.offset * s;
+        let block = &m.block;
+        gpu.ssm_forward(
+            &block.tape.delta[row_d..row_d + l * d],
+            &block.tape.delta_raw[row_d..row_d + l * d],
+            &block.tape.b_proj[row_s..row_s + l * s],
+            &block.tape.x_norm[row_d..row_d + l * d],
+            &block.ssm_rates,
+            &block.ssm_rate_derivatives,
+            &block.tape.c_proj[row_s..row_s + l * s],
+            &self.carry,
+            l,
+            d,
+            s,
+            &mut self.bar_a[..l * hs],
+            &mut self.bar_b[..l * hs],
+            &mut self.h[..(l + 1) * hs],
+            &mut self.y[..l * d],
+        )?;
+        self.carry.copy_from_slice(&self.h[l * hs..(l + 1) * hs]);
+        Ok(())
+    }
+
+    fn backward_wgpu(
+        &mut self,
+        m: &PSSALayerV2,
+        gpu: &crate::backend::GpuDispatch,
+    ) -> Result<(), String> {
+        let d = m.cfg.d_latent;
+        let s = m.cfg.d_state;
+        let hs = d * s;
+        let l = self.len;
+        let row_d = self.offset * d;
+        let row_s = self.offset * s;
+        let block = &m.block;
+        gpu.ssm_backward(
+            &block.tape.delta[row_d..row_d + l * d],
+            &block.tape.delta_raw[row_d..row_d + l * d],
+            &block.tape.b_proj[row_s..row_s + l * s],
+            &block.tape.c_proj[row_s..row_s + l * s],
+            &block.ssm_rates,
+            &block.ssm_rate_derivatives,
+            &block.tape.x_norm[row_d..row_d + l * d],
+            &self.h[..(l + 1) * hs],
+            &self.bar_a[..l * hs],
+            &self.bar_b[..l * hs],
+            &block.bwd_g_zraw[row_d..row_d + l * d],
+            &block.bwd_g_ysm[row_d..row_d + l * d],
+            l,
+            d,
+            s,
+            1.0 / (s as f32).sqrt(),
+            &mut self.gd[..l * d],
+            &mut self.gb[..l * s],
+            &mut self.gc[..l * s],
+            &mut self.ga_tokens[..l * hs],
+            &mut self.gx[..l * d],
+        )?;
+        self.ga.fill(0.0);
+        for token in self.ga_tokens[..l * hs].chunks_exact(hs).rev() {
+            for (dst, src) in self.ga.iter_mut().zip(token) {
+                *dst += src;
+            }
+        }
+        Ok(())
+    }
+
     /// Ordered lane recurrence for short sequences. The packed dense stages
     /// still run as usual; only the scan itself stays serial when its tree
     /// would cost more than the recurrence it replaces.

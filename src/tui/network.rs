@@ -370,10 +370,20 @@ impl Network {
     pub(super) fn deliveries_pending(&self) -> bool {
         self.backup.pending() || self.notify.pending()
     }
-    pub(super) fn stream_eof(&mut self) {
+    pub(super) fn stream_eof(&mut self) -> Option<bool> {
         // Piped logs have no child exit status. Require the completion summary
         // AND a successful save, not presentation-only loss/spike health flags.
-        self.eof(self.local_events.completed && self.local_events.saved && !self.local_events.died);
+        let active = self.local_events.active
+            || self.local_events.completed
+            || self.local_events.died;
+        if !active {
+            return None;
+        }
+        let success = self.local_events.completed
+            && self.local_events.saved
+            && !self.local_events.died;
+        self.eof(success);
+        Some(success)
     }
     pub(super) fn eof(&mut self, success: bool) {
         if self.local_closed
@@ -669,7 +679,7 @@ mod tests {
             if saved {
                 ui.ingest("saved_checkpoint=path with spaces/model.pssa");
             }
-            ui.stream_eof();
+            assert_eq!(ui.stream_eof(), Some(saved));
             assert_eq!(ui.local_events.died, !saved);
             assert!(
                 !ui.deliveries_pending(),

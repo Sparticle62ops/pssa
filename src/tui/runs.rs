@@ -322,7 +322,9 @@ impl Runs {
                 ..Default::default()
             };
             let mut log = path.with_extension("log");
-            if !log.exists() && path.file_name().is_some_and(|name| name == "model.pssa") {
+            if !log.exists()
+                && path.file_name().is_some_and(|name| name == "model.pssa" || name == "model.trfm")
+            {
                 log = path.with_file_name("train.log");
             }
             let result = if log.exists() {
@@ -568,28 +570,40 @@ mod tests {
     fn wizard_output_is_discoverable_and_reopens_train_log() {
         let dir = std::env::temp_dir().join(format!("pssa-runs-wizard-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("model.pssa");
-        fs::write(&path, "not loaded for history").unwrap();
         fs::write(
             dir.join("train.log"),
             "progress_schema=1\nloss=2.5 tokens_per_second=50\ntraining_seconds=2\n",
         )
         .unwrap();
-        let mut runs = Runs::new("missing-chain".into());
-        runs.add_root(dir.clone());
-        runs.open_monitor(path.clone());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while (runs.action.is_none() || runs.scan.is_some()) && std::time::Instant::now() < deadline
-        {
-            runs.poll(false);
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        for name in ["model.pssa", "model.trfm"] {
+            let path = dir.join(name);
+            fs::write(&path, "not loaded for history").unwrap();
+            let mut runs = Runs::new("missing-chain".into());
+            runs.add_root(dir.clone());
+            runs.open_monitor(path.clone());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while (runs.action.is_none() || runs.scan.is_some()) && std::time::Instant::now() < deadline
+            {
+                runs.poll(false);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(runs.entries.iter().any(|entry| entry.path == path));
+            let Some(Action::Monitor(state)) = runs.action.take() else {
+                panic!("wizard history did not open: {name}")
+            };
+            assert_eq!(state.live_loss, Some(2.5));
+            assert_eq!(state.tok_s, Some(50.0));
+            assert_eq!(state.metric_series.len(), 1);
+            assert!(state.warning.is_none());
+            assert!(!state.training_active);
+            assert!(state.last_progress_at.is_none(), "recorded history has no stall clock");
+            assert_eq!(state.health_status().normal_label, "DONE");
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|f| super::super::draw(f, &state, 0)).unwrap();
+            let screen: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+            assert!(screen.contains("[ DONE ]"));
+            fs::remove_file(path).unwrap();
         }
-        assert!(runs.entries.iter().any(|entry| entry.path == path));
-        let Some(Action::Monitor(state)) = runs.action.take() else {
-            panic!("wizard history did not open")
-        };
-        assert_eq!(state.live_loss, Some(2.5));
-        assert!(!state.training_active);
         fs::remove_dir_all(dir).unwrap();
     }
 

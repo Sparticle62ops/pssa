@@ -448,15 +448,9 @@ impl Comparison {
                 .style(ratatui::style::Style::new().fg(AMBER)),
             chunks[2],
         );
-        let tail: String = clean(input)
-            .chars()
-            .rev()
-            .take(chunks[3].width.saturating_sub(4) as usize)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
         let prompt_area = panel_area(f, chunks[3]);
+        let input = clean(input);
+        let tail = super::setup::visible_tail(&input, prompt_area.width.saturating_sub(4) as usize);
         f.render_widget(
             Paragraph::new(format!("> {tail}")).block(panel(" shared prompt / command ")),
             prompt_area,

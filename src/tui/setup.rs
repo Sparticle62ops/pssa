@@ -511,8 +511,13 @@ impl Setup {
         }
         TrainingBackend::parse(self.value(Backend))?;
         self.limits()?;
-        if self.transformer_resume() && self.value(Source) != "local" {
-            return Err("Transformer resume requires a local dataset".into());
+        if self.transformer_resume() {
+            if self.value(Source) != "local" {
+                return Err("Transformer resume requires a local dataset".into());
+            }
+            if self.limits()?.batch_size.is_some_and(|n| n != 1) {
+                return Err("Transformer resume does not support batch lanes; Max batch lanes must be blank or 1".into());
+            }
         }
         if !self.value(Resume).is_empty() {
             let path = Path::new(self.value(Resume));
@@ -583,7 +588,9 @@ impl Setup {
             (Threads, "--threads"),
             (Ram, "--ram-mib"),
         ] {
-            if !self.value(field).is_empty() {
+            // train-transformer is a single-lane CPU baseline and does not
+            // accept --batch-size, even when the shared draft explicitly says 1.
+            if !(transformer && field == Batch) && !self.value(field).is_empty() {
                 push(flag, self.value(field).into());
             }
         }
@@ -824,7 +831,7 @@ impl Setup {
     }
 }
 
-fn visible_tail(value: &str, cells: usize) -> &str {
+pub(super) fn visible_tail(value: &str, cells: usize) -> &str {
     let mut start = value.len();
     let mut used = 0;
     let mut bytes = [0; 4];
@@ -882,7 +889,7 @@ impl RunSpec {
         self.start(&executable)
     }
 
-    fn start(self, executable: &Path) -> Result<TrainingRun, String> {
+    pub(super) fn start(self, executable: &Path) -> Result<TrainingRun, String> {
         fs::create_dir_all(&self.output)
             .map_err(|e| format!("Cannot create output directory: {e}"))?;
         let path = self.output.join("train.log");
@@ -954,6 +961,7 @@ impl TrainingRun {
     pub(super) fn initialize(&self, state: &mut RunState) {
         let comparison_series = std::mem::take(&mut state.comparison_series);
         let comparison_label = state.comparison_label.take();
+        let comparison_error = state.comparison_error.take();
         *state = RunState {
             chain_dir: self.output.clone(),
             training_active: true,
@@ -967,6 +975,7 @@ impl TrainingRun {
             ),
             comparison_series,
             comparison_label,
+            comparison_error,
             ..RunState::default()
         };
         state.ingest(&format!(
@@ -1143,6 +1152,25 @@ mod tests {
             assert!(!args.iter().any(|s| s == flag));
         }
         assert!(setup.command().contains("model.trfm"));
+    }
+
+    #[test]
+    fn transformer_resume_rejects_multi_lane_batches_and_omits_cpu_only_flag() {
+        let fixture = Fixture::new();
+        let mut setup = fixture.setup();
+        let resume = fixture.0.join("model.trfm");
+        fs::write(&resume, b"child validates checkpoint").unwrap();
+        setup.set_resume(resume);
+        for batch in ["", "1"] {
+            setup.values[Batch as usize] = batch.into();
+            let args = setup.validate().unwrap().args;
+            assert!(!args.iter().any(|arg| arg == "--batch-size"));
+        }
+        setup.values[Batch as usize] = "2".into();
+        let error = setup.validate().err().expect("unsupported batch must fail preflight");
+        assert!(error.contains("Transformer resume"));
+        assert!(error.contains("batch"));
+        assert!(error.contains("blank or 1"));
     }
 
     #[test]
@@ -1594,6 +1622,9 @@ mod tests {
         assert!(!run.active());
         assert!(!state.training_active);
         assert_eq!(run.succeeded(), Some(true));
+        let mut slot = Some(run);
+        assert!(super::super::release_finished_training(&mut slot, true));
+        assert!(slot.is_none());
         assert_eq!(state.live_loss, Some(4.0));
         assert!(
             state
