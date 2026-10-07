@@ -15,3 +15,8 @@ token_cache=built|reused token_window_seconds=<seconds>
 ```
 
 The cache key includes dataset size, mtime, first/last 1 MiB FNV-1a hashes, and tokenizer identity. Corrupt or stale files are ignored and rebuilt through a temporary file followed by rename, so an interrupted build cannot replace a valid cache.
+
+## Checks run (Fo, 2026-10-07 08:50 UTC, codespace zany-halibut, tarball copy since csrun's piped tar kept failing)
+- `cargo test --release --test token_cache`: 3 passed (lazy windows match old selection, round trip reuse, stale/corrupt rebuilt atomically).
+- `cargo test --release --lib`: 377 passed, 0 failed, 2 ignored.
+- `cargo build --release --features cuda`: OK (10 warnings).
