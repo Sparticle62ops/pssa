@@ -1939,11 +1939,18 @@ fn draw_with_background(
             keybindings::MATH_TAB => "PSSA equations / live dimensions / enlarge to read".into(),
             keybindings::DEVICE_TAB => "CPU / CUDA / WebGPU / Enter selects".into(),
             keybindings::LIMITS_TAB => "Threads / RAM / batch / tokens / Enter edits".into(),
-            0 => format!(
-                "{:.0}%  loss {:.4}",
-                state.progress_pct.unwrap_or(0.0),
-                state.live_loss.or(state.epoch_loss).unwrap_or(0.0)
-            ),
+            0 => {
+                let progress = state
+                    .progress_pct
+                    .map(|pct| format!("{pct:.0}%"))
+                    .unwrap_or_else(|| "-".into());
+                let loss = state
+                    .live_loss
+                    .or(state.epoch_loss)
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_else(|| "-".into());
+                format!("{progress}  loss {loss}")
+            }
             1 => format!(
                 "{} checkpoints in {}",
                 state.checkpoints.len(),
@@ -2837,14 +2844,29 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         (_, Some(path)) => path.to_string(),
         _ => "not configured".into(),
     };
+    let speed = state
+        .tok_s
+        .map(|value| format!("{value:.0}"))
+        .unwrap_or_else(|| "-".into());
+    let epoch_loss = state
+        .epoch_loss
+        .map(charts::number)
+        .unwrap_or_else(|| "-".into());
+    let epoch_tokens = state
+        .epoch_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".into());
+    let epoch_updates = state
+        .epoch_updates
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".into());
     let lines = vec![
         Line::from(vec![
             Span::raw("status      "),
             Span::styled(health.label(), health_style),
         ]),
         Line::from(format!(
-            "speed       {:.0} tokens/s  ETA {}",
-            state.tok_s.unwrap_or(0.0),
+            "speed       {speed} tokens/s  ETA {}",
             state.eta.as_deref().unwrap_or("-")
         )),
         Line::from(format!(
@@ -2868,10 +2890,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
                 .unwrap_or("not written yet")
         )),
         Line::from(format!(
-            "last epoch  loss {:.4}   tokens {}   updates {}",
-            state.epoch_loss.unwrap_or(0.0),
-            state.epoch_tokens.unwrap_or(0),
-            state.epoch_updates.unwrap_or(0)
+            "last epoch  loss {epoch_loss}   tokens {epoch_tokens}   updates {epoch_updates}"
         )),
         Line::from(format!(
             "run         wall {}   resumed from {}   prior steps {}",
@@ -3729,6 +3748,22 @@ mod tests {
                 assert!(text.contains(expected));
             }
         }
+        // Empty monitor metrics must not turn missing measurements into zeros.
+        let mut tiny = Terminal::new(TestBackend::new(20, 8)).unwrap();
+        tiny.draw(|f| draw(f, &RunState::default(), 0)).unwrap();
+        let tiny_text: String = tiny
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(tiny_text.contains("WAITING"));
+        assert!(tiny_text.contains("loss -"));
+        assert!(!tiny_text.contains("loss 0.0000"));
+        assert!(!tiny_text.contains("0 tokens/s"));
+        assert!(!tiny_text.contains("last epoch  loss 0"));
+
         // Invalid measurements do not become a plausible zero-valued trace.
         state.loss_series = vec![f64::NAN, 2.0, f64::INFINITY];
         let trace = loss_trace(&state);
