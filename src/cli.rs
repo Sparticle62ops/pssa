@@ -854,7 +854,7 @@ impl CLIHandler {
         }
         if options.dream_every > 0 && model.device.is_gpu() {
             eprintln!(
-                "warning: dream replay is host-only; using an explicit CPU fallback and synchronizing adapter weights for backend {}",
+                "warning: dream replay is host-only; using an explicit CPU fallback and synchronizing host weights for backend {}",
                 model.device.gpu().map(|g| g.backend_label()).unwrap_or_else(|| "gpu".into())
             );
         }
@@ -1135,6 +1135,10 @@ impl CLIHandler {
                     && update % options.dream_every == 0
                     && let Some(rng) = dream_rng.as_mut()
                 {
+                    #[cfg(feature = "cuda")]
+                    if let Some(ctx) = cuda_optimizer.as_ref() {
+                        ctx.sync_safeguarded_weights(&mut model.adam_tensors())?;
+                    }
                     let summary = model.dream_replay(
                         options.dream_mode,
                         options.dream_replay,

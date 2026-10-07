@@ -135,6 +135,27 @@ impl CudaContext {
         Ok(())
     }
 
+    /// Publish device-resident Adam weights to their host mirrors before the
+    /// host-only dream phase. The optimizer remains resident; its adapter is
+    /// refreshed again after dream consolidation.
+    pub(crate) fn sync_safeguarded_weights(
+        &self,
+        tensors: &mut [AdamTensor<'_>],
+    ) -> Result<(), String> {
+        let state = self.safeguards.lock().map_err(error)?;
+        if !state.resident {
+            return Ok(());
+        }
+        for t in tensors {
+            let device = state
+                .tensors
+                .get(&(t.grad.as_ptr() as usize))
+                .ok_or("CUDA optimizer tensor registration changed")?;
+            self.stream.memcpy_dtoh(&device.data, t.data).map_err(error)?;
+        }
+        self.stream.synchronize().map_err(error)
+    }
+
     pub(crate) fn finish_safeguarded_training(
         &self,
         tensors: &mut [AdamTensor<'_>],
