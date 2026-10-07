@@ -4,6 +4,37 @@
 //! checkpoint therefore remains byte-compatible whether or not a caller uses
 //! the training-time replay phase.
 
+use crate::linalg::SimpleRng;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DreamMode {
+    #[default]
+    Memory,
+    Generate,
+    Both,
+}
+
+impl DreamMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "memory" => Ok(Self::Memory),
+            "generate" => Ok(Self::Generate),
+            "both" => Ok(Self::Both),
+            _ => Err(format!(
+                "--dream-mode must be memory, generate, or both; got '{value}'"
+            )),
+        }
+    }
+
+    pub const fn includes_memory(self) -> bool {
+        matches!(self, Self::Memory | Self::Both)
+    }
+
+    pub const fn includes_generation(self) -> bool {
+        matches!(self, Self::Generate | Self::Both)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DreamSummary {
     pub entries_replayed: usize,
@@ -12,9 +43,42 @@ pub struct DreamSummary {
     pub elapsed_seconds: f64,
 }
 
+/// Sample a non-unknown vocabulary ID from a finite logit vector. Dream
+/// generation deliberately keeps this sampler small and deterministic: it does
+/// not share inference's top-k/top-p policy, so changing interactive generation
+/// cannot change an offline training run.
+pub(crate) fn sample_token(logits: &[f32], temperature: f32, rng: &mut SimpleRng) -> usize {
+    assert!(!logits.is_empty());
+    assert!(temperature.is_finite() && temperature > 0.0);
+    let first = usize::from(logits.len() > 1);
+    let max = logits[first..]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    assert!(max.is_finite(), "dream generation received non-finite logits");
+    let mut weights = Vec::with_capacity(logits.len() - first);
+    let mut total = 0.0f32;
+    for &logit in &logits[first..] {
+        let weight = ((logit - max) / temperature).exp();
+        assert!(weight.is_finite());
+        weights.push(weight);
+        total += weight;
+    }
+    assert!(total.is_finite() && total > 0.0);
+    let draw = rng.gen_range_f32(0.0, total);
+    let mut cumulative = 0.0;
+    for (offset, weight) in weights.into_iter().enumerate() {
+        cumulative += weight;
+        if draw <= cumulative {
+            return first + offset;
+        }
+    }
+    logits.len() - 1
+}
+
 #[cfg(test)]
 mod tests {
-    use super::DreamSummary;
+    use super::{DreamMode, DreamSummary};
     use crate::linalg::SimpleRng;
     use crate::pssa::{PSSAConfigV2, PSSALayerV2};
 
@@ -135,6 +199,27 @@ mod tests {
             a.block.adapters[0].consolidated_up,
             b.block.adapters[0].consolidated_up
         );
+    }
+
+    #[test]
+    fn generated_dream_replays_sampled_tokens_without_main_weight_updates() {
+        let mut model = seeded_model();
+        let before = main_weight_bits(&model);
+        let fast = model.block.adapters[0].up_proj.data.clone();
+        let slow = model.block.adapters[0].consolidated_up.clone();
+        let summary = model.dream_replay(
+            DreamMode::Generate,
+            1,
+            4,
+            0.8,
+            &mut SimpleRng::new(77),
+        );
+        assert_eq!(summary.entries_replayed, 1);
+        assert_eq!(summary.generated_tokens, 4);
+        assert!(summary.consolidation_delta_norm > 0.0);
+        assert_eq!(main_weight_bits(&model), before);
+        assert_ne!(model.block.adapters[0].up_proj.data, fast);
+        assert_ne!(model.block.adapters[0].consolidated_up, slow);
     }
 
     #[test]
