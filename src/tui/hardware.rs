@@ -82,7 +82,7 @@ fn parse_ram(text: &str) -> Option<(u64, u64)> {
     };
     let total = value("MemTotal:")?;
     let available = value("MemAvailable:")?;
-    (total > 0 && available <= total).then_some((total - available, total))
+    (total > 0 && available <= total).then(|| (total - available, total))
 }
 fn cpu_usage(old: &Cpu, new: &Cpu) -> Option<f64> {
     let total = new.total.checked_sub(old.total)?;
