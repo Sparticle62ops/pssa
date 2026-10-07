@@ -989,16 +989,24 @@ fn run_app(
             background.advance(now.saturating_duration_since(last_frame));
             last_frame = now;
             chat.poll();
-            if let Some(run) = &mut training {
+            let training_finished = if let Some(run) = &mut training {
                 let was_active = run.active();
                 run.poll_with(&mut state, |line| {
                     extras.ingest(line);
                     network.ingest(line);
                 });
-                if was_active && !run.active() {
-                    extras.eof(&state);
+                was_active && !run.active()
+            } else {
+                false
+            };
+            if training_finished {
+                extras.eof(&state);
+                if let Some(run) = training.as_ref() {
                     network.eof(run.succeeded().unwrap_or(false));
                 }
+                // A completed wizard child must no longer keep a piped TUI
+                // alive. Leave the final frame visible while deliveries drain.
+                release_finished_training(&mut training, true);
             }
             hf_login.poll();
             extras.poll_with(&mut state, &mut tab, &mut chat, |line| {
@@ -1218,6 +1226,18 @@ fn run_app(
         }
     }
     Ok(())
+}
+
+fn release_finished_training(
+    training: &mut Option<setup::TrainingRun>,
+    was_active: bool,
+) -> bool {
+    if was_active && training.as_ref().is_some_and(|run| !run.active()) {
+        *training = None;
+        true
+    } else {
+        false
+    }
 }
 
 fn reload_comparison(state: &mut RunState, path: &std::path::Path) {
