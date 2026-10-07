@@ -15,6 +15,19 @@ fn chats_directory_requires_a_value() {
 }
 
 #[test]
+fn tui_rejects_repeated_options_and_mixed_chain_aliases() {
+    for args in [
+        vec!["--chain", "first", "--chain", "second"],
+        vec!["-c", "first", "--chain", "second"],
+        vec!["--chats-dir", "first", "--chats-dir", "second"],
+        vec!["--compare", "first.log", "--compare", "second.log"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
+        assert!(tui::run(&args).is_err(), "accepted duplicate TUI args: {args:?}");
+    }
+}
+
+#[test]
 fn non_tty_tui_still_passes_plain_logs_without_creating_chats() {
     use std::{
         io::Write,
