@@ -13,7 +13,8 @@ use std::{ffi::CString, ptr};
 
 use super::stage_bounds::{MemoryShape, SsmShape, elems, gemm_shape, lengths, product, scan_shape};
 
-struct Kernels {
+pub(super) struct Kernels {
+    pub(super) module: Arc<cudarc::driver::CudaModule>,
     prepare: CudaFunction,
     scan: CudaFunction,
     scan_apply: CudaFunction,
@@ -140,7 +141,7 @@ fn stage_load_error(
 }
 
 impl CudaContext {
-    fn stage_kernels<'a>(&self, state: &'a mut StageState) -> Result<&'a Kernels, String> {
+    pub(super) fn stage_kernels<'a>(&self, state: &'a mut StageState) -> Result<&'a Kernels, String> {
         if let Some(error) = state.load_error.as_ref() {
             return Err(error.clone());
         }
@@ -149,6 +150,7 @@ impl CudaContext {
             let loaded = (|| -> Result<Kernels, cudarc::driver::DriverError> {
                 let module = context.load_module(cudarc::nvrtc::Ptx::from_src(STAGE_PTX))?;
                 Ok(Kernels {
+                    module: module.clone(),
                     prepare: module.load_function("ssm_prepare")?,
                     scan: module.load_function("affine_scan")?,
                     scan_apply: module.load_function("scan_apply")?,

@@ -495,6 +495,10 @@ fn resumed_nonfinite_loss_reports_update_stage_and_tensor_without_saving() {
 
 #[path = "support/cuda_memory_ptx.rs"]
 mod cuda_memory_ptx;
+#[path = "support/cuda_packed_ptx.rs"]
+mod cuda_packed_ptx;
+#[path = "support/cuda_packed_reduce_ptx.rs"]
+mod cuda_packed_reduce_ptx;
 #[path = "support/cuda_ssm_ptx.rs"]
 mod cuda_ssm_ptx;
 #[path = "../src/cuda/stage_bounds.rs"]
@@ -540,7 +544,7 @@ fn embedded_cuda_ptx_assembles_with_ptxas_when_available() {
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/cuda");
     let tmp = TempDir::new();
-    for source in ["stages.ptx", "safeguards.ptx"] {
+    for source in ["stages.ptx", "safeguards.ptx", "packed.ptx"] {
         for arch in ["sm_120", "sm_90", "sm_80"] {
             let output = tmp.path(&format!("{source}-{arch}.cubin"));
             let result = Command::new(&ptxas)

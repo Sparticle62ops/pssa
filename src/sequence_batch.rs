@@ -70,6 +70,11 @@ pub struct SequenceBatch {
     gb: Vec<f32>,
     gc: Vec<f32>,
     gx: Vec<f32>,
+    #[cfg(feature = "cuda")]
+    cuda: Option<crate::cuda::packed::PackedWorkspace>,
+    cuda_pending: bool,
+    last_cuda_step: bool,
+    cuda_carry_dirty: bool,
 }
 
 fn shape(m: &PSSALayerV2) -> [usize; 8] {
@@ -163,7 +168,18 @@ impl SequenceBatch {
             gb: vec![0.0; rows * s],
             gc: vec![0.0; rows * s],
             gx: vec![0.0; rows * d],
+            #[cfg(feature = "cuda")]
+            cuda: None,
+            cuda_pending: false,
+            last_cuda_step: false,
+            cuda_carry_dirty: true,
         })
+    }
+
+    /// Diagnostic: the most recent packed forward/backward used the resident
+    /// CUDA stages without replaying their CPU fallback. False for CPU/replay.
+    pub fn last_step_used_cuda(&self) -> bool {
+        self.last_cuda_step
     }
 
     /// Flattened recurrent carries in layer order (depth * latent * state).
@@ -171,9 +187,11 @@ impl SequenceBatch {
         &self.lanes[lane].carry
     }
     pub fn state_mut(&mut self, lane: usize) -> &mut [f32] {
+        self.cuda_carry_dirty = true;
         &mut self.lanes[lane].carry
     }
     pub fn reset_states(&mut self) {
+        self.cuda_carry_dirty = true;
         for lane in &mut self.lanes {
             lane.carry.fill(0.0);
         }
@@ -247,6 +265,7 @@ impl SequenceBatch {
                 return Err("batch token ID is outside the model vocabulary".into());
             }
         }
+        self.last_cuda_step = false;
         if m.depth() > 1 || m.loops() > 1 {
             let loss = self.forward_stacked(m, sequences);
             if !loss.is_finite() {
@@ -255,7 +274,7 @@ impl SequenceBatch {
             }
             return Ok(loss);
         }
-        let mut cuda_packed_stages = false;
+        self.cuda_pending = false;
         self.tokens = 0;
         for lane in &mut self.lanes {
             lane.len = 0;
@@ -266,6 +285,7 @@ impl SequenceBatch {
             lane.len = seq.inputs.len();
             if seq.reset {
                 lane.carry.fill(0.0);
+                self.cuda_carry_dirty = true;
             }
             let end = self.tokens + lane.len;
             m.tape.x_ids[self.tokens..end].copy_from_slice(seq.inputs);
@@ -273,79 +293,45 @@ impl SequenceBatch {
             self.tokens = end;
         }
         stages::stage_embed_norm(m, self.tokens);
-        stages::stage_projections(m, self.tokens);
         m.refresh_ssm_rates();
-        let gpu = m.device.gpu().filter(|g| g.accelerates_backward());
-        if let Some(gpu) = gpu.as_ref() {
-            let _trace = crate::training_diagnostics::StageTrace::new(
-                &m.device,
-                "batch.forward.ssm",
-                self.tokens,
-            );
-            // A CUDA lane publishes its carry before the next lane starts. If a
-            // later launch fails, restore every carry before replaying the whole
-            // packed batch on CPU; otherwise successful lanes would advance twice.
-            let carry_snapshots = self
-                .lanes
-                .iter()
-                .filter(|lane| lane.len > 0)
-                .map(|lane| (lane.offset, lane.carry.clone()))
-                .collect::<Vec<_>>();
-            let mut failed = None;
-            for lane_index in 0..self.lanes.len() {
-                if self.lanes[lane_index].len == 0 {
-                    continue;
-                }
-                if let Err(error) = self.forward_lane_cuda(m, gpu, lane_index) {
-                    failed = Some(error);
-                    break;
-                }
+        let mut cuda_failed = false;
+        self.cuda_pending = match self.forward_cuda(m) {
+            Ok(resident) => resident,
+            Err(error) => {
+                eprintln!("warning: CUDA packed forward failed; replaying CPU stages: {error}");
+                cuda_failed = true;
+                false
             }
-            if let Some(error) = failed {
-                crate::gpu_batch::warn_cuda_fallback_once(
-                    &error,
-                    format!(
-                        "warning: CUDA packed SSM/memory forward failed; using host stages: {error}"
-                    ),
-                );
-                for (offset, carry) in carry_snapshots {
-                    let lane = self
-                        .lanes
-                        .iter_mut()
-                        .find(|lane| lane.offset == offset && lane.len > 0)
-                        .expect("snapshotted lane still exists");
-                    lane.carry.copy_from_slice(&carry);
-                }
+        };
+        if !self.cuda_pending {
+            self.cuda_carry_dirty = true;
+            // A failed CUDA transaction publishes no lane carries. Explicitly
+            // use CPU stages for recovery rather than retry a damaged stream.
+            let device =
+                cuda_failed.then(|| std::mem::replace(&mut m.device, crate::backend::Device::Cpu));
+            stages::stage_projections(m, self.tokens);
+            if self.parallel_lanes(m) {
+                m.scan_executor.run(|| {
+                    self.lanes
+                        .par_iter_mut()
+                        .filter(|lane| lane.len > 0)
+                        .for_each(|lane| lane.forward(m));
+                });
+            } else {
                 self.lanes
                     .iter_mut()
                     .filter(|lane| lane.len > 0)
                     .for_each(|lane| lane.forward(m));
-            } else {
-                // Each lane's resident SSM result was consumed immediately by
-                // CUDA memory_forward_after_ssm. Do not run the packed host
-                // memory stage a second time.
-                cuda_packed_stages = true;
             }
-        } else if self.parallel_lanes(m) {
-            m.scan_executor.run(|| {
-                self.lanes
-                    .par_iter_mut()
-                    .filter(|lane| lane.len > 0)
-                    .for_each(|lane| lane.forward(m));
-            });
-        } else {
-            self.lanes
-                .iter_mut()
-                .filter(|lane| lane.len > 0)
-                .for_each(|lane| lane.forward(m));
-        }
-        for lane in self.lanes.iter().filter(|lane| lane.len > 0) {
-            let start = lane.offset * m.cfg.d_latent;
-            m.block.tape.y_ssm[start..start + lane.len * m.cfg.d_latent]
-                .copy_from_slice(&lane.y[..lane.len * m.cfg.d_latent]);
-        }
-        if !cuda_packed_stages {
+            for lane in self.lanes.iter().filter(|lane| lane.len > 0) {
+                let start = lane.offset * m.cfg.d_latent;
+                m.block.tape.y_ssm[start..start + lane.len * m.cfg.d_latent]
+                    .copy_from_slice(&lane.y[..lane.len * m.cfg.d_latent]);
+            }
             stages::stage_memory_packed(m, self.tokens);
+            if let Some(device) = device {
+                m.device = device;
+            }
         }
         stages::stage_adapter(m, self.tokens);
         stages::stage_mlp(m, self.tokens);
@@ -378,44 +364,55 @@ impl SequenceBatch {
         stages::bwd_stage_mlp(m, n);
         stages::bwd_stage_adapter(m, n);
         stages::bwd_stage_adapter_down(m, n);
-        stages::bwd_stage_memory(m, n);
         m.refresh_ssm_rates();
-        let gpu = m.device.gpu().filter(|g| g.accelerates_backward());
-        if let Some(gpu) = gpu.as_ref() {
-            let _trace = crate::training_diagnostics::StageTrace::new(
-                &m.device,
-                "batch.backward.ssm",
-                self.tokens,
-            );
-            let mut failed = None;
-            for lane in self.lanes.iter_mut().filter(|lane| lane.len > 0) {
-                if let Err(error) = lane.backward_gpu(m, gpu) {
-                    failed = Some(error);
-                    break;
+        let mut recovery_device = None;
+        let resident_backward = if self.cuda_pending {
+            match self.backward_cuda(m) {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!(
+                        "warning: CUDA packed backward failed; replaying CPU tapes/adjoints: {error}"
+                    );
+                    self.cuda_carry_dirty = true;
+                    // Resident optimizer gradients still hold only PRIOR
+                    // successful transactions. Recover them before CPU replay;
+                    // inability to recover is an error, never a wrong gradient.
+                    #[cfg(feature = "cuda")]
+                    if let Some(workspace) = self.cuda.as_ref() {
+                        workspace.recover_host_gradients(m).map_err(|failure| {
+                            workspace.finish_failed_transaction(format!(
+                                "cannot recover prior CUDA gradients for CPU replay: {failure}"
+                            ))
+                        })?;
+                    }
+                    recovery_device = Some(std::mem::replace(
+                        &mut m.device,
+                        crate::backend::Device::Cpu,
+                    ));
+                    self.rebuild_host_tapes(m);
+                    stages::bwd_stage_memory(m, n);
+                    false
                 }
             }
-            if let Some(error) = failed {
-                crate::gpu_batch::warn_cuda_fallback_once(
-                    &error,
-                    format!("warning: CUDA packed SSM backward failed; using host scan: {error}"),
-                );
+        } else {
+            stages::bwd_stage_memory(m, n);
+            false
+        };
+        self.cuda_pending = false;
+        if !resident_backward {
+            if self.parallel_lanes(m) {
+                m.scan_executor.run(|| {
+                    self.lanes
+                        .par_iter_mut()
+                        .filter(|lane| lane.len > 0)
+                        .for_each(|lane| lane.backward(m));
+                });
+            } else {
                 self.lanes
                     .iter_mut()
                     .filter(|lane| lane.len > 0)
                     .for_each(|lane| lane.backward(m));
             }
-        } else if self.parallel_lanes(m) {
-            m.scan_executor.run(|| {
-                self.lanes
-                    .par_iter_mut()
-                    .filter(|lane| lane.len > 0)
-                    .for_each(|lane| lane.backward(m));
-            });
-        } else {
-            self.lanes
-                .iter_mut()
-                .filter(|lane| lane.len > 0)
-                .for_each(|lane| lane.backward(m));
         }
         let _trace = crate::training_diagnostics::StageTrace::new(
             &m.device,
@@ -424,56 +421,58 @@ impl SequenceBatch {
         );
         let d = m.cfg.d_latent;
         let s = m.cfg.d_state;
-        for lane in self.lanes.iter().filter(|lane| lane.len > 0) {
-            let start = lane.offset * d;
-            let end = start + lane.len * d;
-            self.gd[start..end].copy_from_slice(&lane.gd[..lane.len * d]);
-            self.gb[lane.offset * s..(lane.offset + lane.len) * s]
-                .copy_from_slice(&lane.gb[..lane.len * s]);
-            self.gc[lane.offset * s..(lane.offset + lane.len) * s]
-                .copy_from_slice(&lane.gc[..lane.len * s]);
-            for (dst, src) in m.bwd_g_xnorm[start..end].iter_mut().zip(&lane.gx) {
-                *dst += src;
+        if !resident_backward {
+            for lane in self.lanes.iter().filter(|lane| lane.len > 0) {
+                let start = lane.offset * d;
+                let end = start + lane.len * d;
+                self.gd[start..end].copy_from_slice(&lane.gd[..lane.len * d]);
+                self.gb[lane.offset * s..(lane.offset + lane.len) * s]
+                    .copy_from_slice(&lane.gb[..lane.len * s]);
+                self.gc[lane.offset * s..(lane.offset + lane.len) * s]
+                    .copy_from_slice(&lane.gc[..lane.len * s]);
+                for (dst, src) in m.bwd_g_xnorm[start..end].iter_mut().zip(&lane.gx) {
+                    *dst += src;
+                }
+                for (dst, src) in m.a_mat.grad.iter_mut().zip(&lane.ga) {
+                    *dst += src;
+                }
             }
-            for (dst, src) in m.a_mat.grad.iter_mut().zip(&lane.ga) {
-                *dst += src;
-            }
-        }
-        // Projection adjoints share weights across ALL sequences, like the
-        // head. CUDA uses the same packed GEMMs as single-lane backward;
-        // WebGPU keeps the deterministic CPU twin until it has transposed
-        // backward kernels.
-        let gpu = m.device.gpu().filter(|g| g.accelerates_backward());
-        for (g, w, rows) in [
-            (&self.gd[..n * d], &mut m.block.w_delta, d),
-            (&self.gb[..n * s], &mut m.block.w_b, s),
-            (&self.gc[..n * s], &mut m.block.w_c, s),
-        ] {
-            if let Some(gpu) = gpu.as_ref() {
-                gpu.gemm_nn_into(g, &w.data, n, rows, d, &mut self.gx[..n * d])
+            // Projection adjoints share weights across ALL sequences, like the
+            // head. CUDA uses the same packed GEMMs as single-lane backward;
+            // WebGPU keeps the deterministic CPU twin until it has transposed
+            // backward kernels.
+            let gpu = m.device.gpu().filter(|g| g.accelerates_backward());
+            for (g, w, rows) in [
+                (&self.gd[..n * d], &mut m.block.w_delta, d),
+                (&self.gb[..n * s], &mut m.block.w_b, s),
+                (&self.gc[..n * s], &mut m.block.w_c, s),
+            ] {
+                if let Some(gpu) = gpu.as_ref() {
+                    gpu.gemm_nn_into(g, &w.data, n, rows, d, &mut self.gx[..n * d])
+                        .expect("validated model GEMM dimensions");
+                    gpu.gemm_tn_accumulate_into(
+                        g,
+                        &m.block.tape.x_norm[..n * d],
+                        n,
+                        rows,
+                        d,
+                        &mut w.grad,
+                    )
                     .expect("validated model GEMM dimensions");
-                gpu.gemm_tn_accumulate_into(
-                    g,
-                    &m.block.tape.x_norm[..n * d],
-                    n,
-                    rows,
-                    d,
-                    &mut w.grad,
-                )
-                .expect("validated model GEMM dimensions");
-            } else {
-                stages::dense_input_adjoint(g, &w.data, n, rows, d, &mut self.gx[..n * d]);
-                stages::dense_weight_adjoint(
-                    g,
-                    &m.block.tape.x_norm[..n * d],
-                    n,
-                    rows,
-                    d,
-                    &mut w.grad,
-                );
-            }
-            for (dst, src) in m.block.bwd_g_xnorm[..n * d].iter_mut().zip(&self.gx) {
-                *dst += src;
+                } else {
+                    stages::dense_input_adjoint(g, &w.data, n, rows, d, &mut self.gx[..n * d]);
+                    stages::dense_weight_adjoint(
+                        g,
+                        &m.block.tape.x_norm[..n * d],
+                        n,
+                        rows,
+                        d,
+                        &mut w.grad,
+                    );
+                }
+                for (dst, src) in m.block.bwd_g_xnorm[..n * d].iter_mut().zip(&self.gx) {
+                    *dst += src;
+                }
             }
         }
         for t in (0..n).rev() {
@@ -493,6 +492,10 @@ impl SequenceBatch {
                     * (gx[i] * m.block.norm_gamma.data[i] - e[i] * (dot * inv * inv / d as f32));
             }
         }
+        if let Some(device) = recovery_device {
+            m.device = device;
+        }
+        self.last_cuda_step = resident_backward;
         self.pending = false;
         Ok(())
     }
@@ -603,120 +606,78 @@ fn copy_carry_to_model(carry: &[f32], m: &mut PSSALayerV2) {
 }
 
 impl SequenceBatch {
-    /// Run one independent lane's resident CUDA SSM and consume it immediately
-    /// with the memory kernels. The existing scan is single-sequence, so the
-    /// lane boundary is explicit: no carry can leak into a neighboring lane.
-    fn forward_lane_cuda(
-        &mut self,
-        m: &mut PSSALayerV2,
-        gpu: &crate::backend::GpuDispatch,
-        lane_index: usize,
-    ) -> Result<(), String> {
-        let lane = &mut self.lanes[lane_index];
-        let d = m.cfg.d_latent;
-        let s = m.cfg.d_state;
-        let hs = d * s;
-        let k = m.cfg.d_mem_key;
-        let l = lane.len;
-        let offset = lane.offset;
-        lane.h[..hs].copy_from_slice(&lane.carry);
-        gpu.ssm_forward_resident(
-            &m.block.tape.delta[offset * d..(offset + l) * d],
-            &m.block.tape.delta_raw[offset * d..(offset + l) * d],
-            &m.block.tape.b_proj[offset * s..(offset + l) * s],
-            &m.block.tape.x_norm[offset * d..(offset + l) * d],
-            &m.block.ssm_rates,
-            &m.block.tape.c_proj[offset * s..(offset + l) * s],
-            &lane.carry[..hs],
-            l,
-            d,
-            s,
-        )?;
+    fn forward_cuda(&mut self, m: &mut PSSALayerV2) -> Result<bool, String> {
+        #[cfg(feature = "cuda")]
+        if let Some(crate::backend::GpuDispatch::Cuda(ctx)) = m.device.gpu() {
+            if self
+                .cuda
+                .as_ref()
+                .is_none_or(|workspace| !workspace.matches(&ctx))
+            {
+                self.cuda = Some(crate::cuda::packed::PackedWorkspace::new(
+                    &ctx,
+                    m,
+                    self.lanes.len(),
+                )?);
+                self.cuda_carry_dirty = true;
+            }
+            let workspace = self
+                .cuda
+                .as_mut()
+                .expect("initialized packed CUDA workspace");
+            let hs = m.cfg.d_latent * m.cfg.d_state;
+            for (index, lane) in self.lanes.iter_mut().enumerate() {
+                // CPU replay uses only this small initial row; all normal CUDA
+                // forward/backward tapes stay resident in the workspace.
+                lane.h[..hs].copy_from_slice(&lane.carry);
+                workspace.offsets[index] = lane.offset as u32;
+                workspace.lengths[index] = lane.len as u32;
+                if self.cuda_carry_dirty {
+                    workspace.carries[index * hs..(index + 1) * hs].copy_from_slice(&lane.carry);
+                }
+            }
+            if let Err(error) = workspace.forward(m, self.tokens, self.cuda_carry_dirty) {
+                return Err(workspace.finish_failed_transaction(error));
+            }
+            for (index, lane) in self.lanes.iter_mut().enumerate() {
+                lane.carry
+                    .copy_from_slice(&workspace.carries[index * hs..(index + 1) * hs]);
+            }
+            self.cuda_carry_dirty = false;
+            return Ok(true);
+        }
+        let _ = m;
+        Ok(false)
+    }
 
-        let block = &mut m.block;
-        gpu.memory_forward_after_ssm(
-            &block.tape.x_norm[offset * d..(offset + l) * d],
-            &block.w_qx.data,
-            &block.w_qh.data,
-            &block.w_gate.data,
-            &block.w_proj.data,
-            &block.memory.keys,
-            &block.memory.norm_sq,
-            &block.memory.values,
-            l,
-            d,
-            k,
-            d,
-            block.memory.capacity,
-            block.memory.count,
-            block.cfg.tau_mem,
-            &mut lane.bar_a[..l * hs],
-            &mut lane.bar_b[..l * hs],
-            &mut lane.h[..(l + 1) * hs],
-            &mut lane.y[..l * d],
-            &mut block.tape.q_euc[offset * k..(offset + l) * k],
-            &mut block.tape.q_poincare[offset * k..(offset + l) * k],
-            &mut block.tape.q_norm[offset..offset + l],
-            &mut block.tape.mem_weights
-                [offset * block.memory.capacity..(offset + l) * block.memory.capacity],
-            &mut block.tape.m_val[offset * d..(offset + l) * d],
-            &mut block.tape.g_mem[offset * d..(offset + l) * d],
-            &mut block.tape.m_proj[offset * d..(offset + l) * d],
-            &mut block.tape.m_inj[offset * d..(offset + l) * d],
-        )?;
-        lane.carry.copy_from_slice(&lane.h[l * hs..(l + 1) * hs]);
-        Ok(())
+    fn backward_cuda(&mut self, m: &mut PSSALayerV2) -> Result<(), String> {
+        #[cfg(feature = "cuda")]
+        if let Some(workspace) = self.cuda.as_mut() {
+            return workspace
+                .backward(m, self.tokens)
+                .map_err(|error| workspace.finish_failed_transaction(error));
+        }
+        let _ = m;
+        Err("CUDA packed forward workspace is unavailable".into())
+    }
+
+    fn rebuild_host_tapes(&mut self, m: &mut PSSALayerV2) {
+        stages::stage_projections(m, self.tokens);
+        let hs = m.cfg.d_latent * m.cfg.d_state;
+        for lane in self.lanes.iter_mut().filter(|lane| lane.len > 0) {
+            lane.gh.copy_from_slice(&lane.carry);
+            lane.carry.copy_from_slice(&lane.h[..hs]);
+            lane.forward(m);
+            lane.carry.copy_from_slice(&lane.gh);
+            let start = lane.offset * m.cfg.d_latent;
+            m.block.tape.y_ssm[start..start + lane.len * m.cfg.d_latent]
+                .copy_from_slice(&lane.y[..lane.len * m.cfg.d_latent]);
+        }
+        stages::stage_memory_packed(m, self.tokens);
     }
 }
 
 impl Lane {
-    fn backward_gpu(
-        &mut self,
-        m: &PSSALayerV2,
-        gpu: &crate::backend::GpuDispatch,
-    ) -> Result<(), String> {
-        let d = m.cfg.d_latent;
-        let s = m.cfg.d_state;
-        let hs = d * s;
-        let l = self.len;
-        let offset = self.offset;
-        self.gd[..l * d].fill(0.0);
-        self.gb[..l * s].fill(0.0);
-        self.gc[..l * s].fill(0.0);
-        self.ga_tokens[..l * hs].fill(0.0);
-        self.gx[..l * d].fill(0.0);
-        gpu.ssm_backward(
-            &m.tape.delta[offset * d..(offset + l) * d],
-            &m.tape.delta_raw[offset * d..(offset + l) * d],
-            &m.tape.b_proj[offset * s..(offset + l) * s],
-            &m.tape.c_proj[offset * s..(offset + l) * s],
-            &m.ssm_rates,
-            &m.ssm_rate_derivatives,
-            &m.tape.x_norm[offset * d..(offset + l) * d],
-            &self.h[..(l + 1) * hs],
-            &self.bar_a[..l * hs],
-            &self.bar_b[..l * hs],
-            &m.bwd_g_zraw[offset * d..(offset + l) * d],
-            &m.bwd_g_ysm[offset * d..(offset + l) * d],
-            l,
-            d,
-            s,
-            1.0 / (s as f32).sqrt(),
-            &mut self.gd[..l * d],
-            &mut self.gb[..l * s],
-            &mut self.gc[..l * s],
-            &mut self.ga_tokens[..l * hs],
-            &mut self.gx[..l * d],
-        )?;
-        self.ga.fill(0.0);
-        for row in self.ga_tokens[..l * hs].chunks_exact(hs).rev() {
-            for (dst, src) in self.ga.iter_mut().zip(row) {
-                *dst += src;
-            }
-        }
-        Ok(())
-    }
-
     /// Ordered lane recurrence for short sequences. The packed dense stages
     /// still run as usual; only the scan itself stays serial when its tree
     /// would cost more than the recurrence it replaces.
@@ -936,5 +897,89 @@ impl Lane {
                 *dst += src;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::pssa::PSSAConfigV2;
+
+    #[test]
+    fn failed_resident_backward_replays_once_and_preserves_carry_edits() {
+        let cfg = PSSAConfigV2 {
+            d_vocab: 11,
+            d_latent: 7,
+            d_state: 3,
+            d_mem_key: 4,
+            mem_capacity: 4,
+            chunk_len: 6,
+            ..Default::default()
+        };
+        let mut reference = PSSALayerV2::new(cfg.clone(), 7);
+        let mut recovered = PSSALayerV2::new(cfg, 7);
+        for model in [&mut reference, &mut recovered] {
+            model.memory.insert(&[0.1, -0.1, 0.05, 0.0], &[0.03; 7]);
+            model.w_delta.grad.fill(0.125); // Accumulation must not be cleared.
+        }
+        let mut a = SequenceBatch::new(&mut reference, 3).unwrap();
+        let mut b = SequenceBatch::new(&mut recovered, 3).unwrap();
+        for batch in [&mut a, &mut b] {
+            batch.state_mut(0).fill(0.04);
+            batch.state_mut(2).fill(-0.02);
+        }
+        let sequences = [
+            Sequence {
+                lane: 2,
+                inputs: &[1, 4, 3],
+                targets: &[4, 3, 2],
+                reset: false,
+            },
+            Sequence {
+                lane: 0,
+                inputs: &[5, 6],
+                targets: &[6, 7],
+                reset: false,
+            },
+        ];
+        assert_eq!(
+            a.forward(&mut reference, &sequences).unwrap(),
+            b.forward(&mut recovered, &sequences).unwrap()
+        );
+        // Model the failure boundary without a CUDA device: the private CUDA
+        // workspace is absent, so backward emits a warning and replays tapes.
+        b.cuda_pending = true;
+        a.state_mut(2).fill(0.3);
+        b.state_mut(2).fill(0.3);
+        a.backward(&mut reference, 0.7).unwrap();
+        b.backward(&mut recovered, 0.7).unwrap();
+        for lane in 0..3 {
+            assert_eq!(a.state(lane), b.state(lane));
+        }
+        macro_rules! equal { ($($field:ident),*) => { $(assert_eq!(reference.$field.grad, recovered.$field.grad, stringify!($field));)* }; }
+        equal!(
+            embed_w, norm_gamma, norm_beta, a_mat, w_delta, w_b, w_c, w_qx, w_qh, w_gate, w_proj,
+            mlp_w1, mlp_w2, unembed_w
+        );
+        assert_eq!(
+            reference.adapters[0].down_proj.grad,
+            recovered.adapters[0].down_proj.grad
+        );
+        assert_eq!(
+            reference.adapters[0].up_proj.grad,
+            recovered.adapters[0].up_proj.grad
+        );
+        assert!(!b.last_step_used_cuda());
+        // A following sparse forward must start from the preserved carry, not
+        // advance it a second time or resurrect a stale resident carry.
+        assert_eq!(
+            a.forward(&mut reference, &sequences).unwrap(),
+            b.forward(&mut recovered, &sequences).unwrap()
+        );
+        a.backward(&mut reference, 1.0).unwrap();
+        b.backward(&mut recovered, 1.0).unwrap();
+        equal!(
+            embed_w, a_mat, w_delta, w_b, w_c, w_qx, w_qh, w_gate, w_proj
+        );
     }
 }

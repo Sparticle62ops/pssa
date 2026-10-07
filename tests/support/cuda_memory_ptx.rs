@@ -406,8 +406,8 @@ fn replay_memory_forward(m: &mut pssa::pssa::PSSALayerV2, l: usize) -> Memory {
         PTX,
         "memory_forward",
         &s.forward_args(m.cfg.tau_mem),
-        (1, 1),
-        32,
+        (l + 1, 1), // Packed retrieval spreads serial token walks across blocks.
+        1, // The extra block checks the first out-of-range row.
     );
     s.qp = machine.get("qp");
     s.norms = machine.get("norms");
@@ -505,7 +505,7 @@ fn replay_memory_backward(m: &mut pssa::pssa::PSSALayerV2, s: &mut Memory) {
     machine.put("gm", &s.gm);
     let mut args = s.backward_args();
     args[15] = F(b.cfg.tau_mem);
-    machine.launch(PTX, "memory_backward", &args, (1, 1), 32);
+    machine.launch(PTX, "memory_backward", &args, (l + 1, 1), 1);
     b.bwd_g_query_pnc[..l * dk].copy_from_slice(&machine.get("gqp"));
     let ge = machine.get("gqe");
     b.bwd_g_query_euc[..l * dk].copy_from_slice(&ge);
