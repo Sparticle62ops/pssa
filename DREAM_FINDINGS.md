@@ -52,4 +52,4 @@ its two output lines. The example itself was release-checked successfully.
 
 - `CARGO_BUILD_JOBS=1 csrun 'cargo test --release --lib dream'` — 8 passed.
 - `CARGO_BUILD_JOBS=1 csrun 'cargo check --release --example dream_probe'` — passed.
-- A CUDA all-target check remains part of the final verification pass.
+- Final CUDA all-target, library test, clippy-baseline, and example-build checks remain part of the verification pass.
