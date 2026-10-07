@@ -9,6 +9,7 @@ mod benchmark;
 pub(crate) mod benchmark_replay;
 mod charts;
 mod chat;
+mod comparison;
 mod depth_zoom;
 mod device;
 mod eval;
@@ -189,6 +190,7 @@ struct RunState {
     graph_pan: usize,
     comparison_series: Vec<MetricSample>,
     comparison_label: Option<String>,
+    comparison_error: Option<String>,
     // Health checks are presentation-only; they never affect training.
     problem: Option<String>,
     warning: Option<String>,
@@ -592,6 +594,7 @@ impl RunState {
     /// recorded on disk in sibling `.loss` files (written by future runs).
     fn refresh_chain(&mut self) {
         let Ok(entries) = std::fs::read_dir(&self.chain_dir) else {
+            self.checkpoints.clear();
             return;
         };
         let mut names: Vec<(String, Option<f64>)> = Vec::new();
@@ -605,17 +608,7 @@ impl RunState {
             }
         }
         names.sort_by_key(|(name, _)| checkpoint_sort_key(name));
-        for (name, loss) in names {
-            if let Some(existing) = self.checkpoints.iter_mut().find(|(n, _)| *n == name) {
-                if loss.is_some() {
-                    existing.1 = loss;
-                }
-            } else {
-                self.checkpoints.push((name, loss));
-            }
-        }
-        self.checkpoints
-            .sort_by_key(|(name, _)| checkpoint_sort_key(name));
+        self.checkpoints = names;
     }
 
     fn record_problem(&mut self, reason: impl Into<String>) {
@@ -697,7 +690,9 @@ impl RunState {
     fn health_status_at(&self, now: Instant) -> HealthStatus {
         let normal_label = if self.training_active {
             "TRAINING"
-        } else if self.last_progress_at.is_some() {
+        } else if self.last_progress_at.is_some() || self.training_seconds.is_some() {
+            // Recorded history deliberately has no live stall-clock timestamp.
+            // Its completion summary still distinguishes it from an empty TUI.
             "DONE"
         } else {
             "WAITING"
@@ -953,7 +948,7 @@ fn run_app(
     };
     let mut tab = 0usize;
     let mut last_chain_scan = std::time::Instant::now() - Duration::from_secs(60);
-    let mut last_compare_scan = std::time::Instant::now() - Duration::from_secs(60);
+    let mut comparison = compare_path.map(|path| (path, comparison::ComparisonLog::default()));
     let mut input_closed = false;
     let mut next_frame = Instant::now();
 
@@ -973,8 +968,7 @@ fn run_app(
                     input_closed = true;
                     if training.is_none() {
                         extras.eof(&state);
-                        network.stream_eof();
-                        state.training_active = false;
+                        finish_piped_stream(&mut state, network.stream_eof());
                     }
                     break;
                 }
@@ -984,11 +978,8 @@ fn run_app(
             state.refresh_chain();
             last_chain_scan = std::time::Instant::now();
         }
-        if let Some(path) = compare_path.as_deref()
-            && last_compare_scan.elapsed() > Duration::from_secs(1)
-        {
-            reload_comparison(&mut state, path);
-            last_compare_scan = std::time::Instant::now();
+        if let Some((path, loader)) = &mut comparison {
+            loader.poll(path, &mut state);
         }
 
         if Instant::now() >= next_frame
@@ -998,14 +989,19 @@ fn run_app(
             background.advance(now.saturating_duration_since(last_frame));
             last_frame = now;
             chat.poll();
-            if let Some(run) = &mut training {
+            let training_finished = if let Some(run) = &mut training {
                 let was_active = run.active();
                 run.poll_with(&mut state, |line| {
                     extras.ingest(line);
                     network.ingest(line);
                 });
-                if was_active && !run.active() {
-                    extras.eof(&state);
+                was_active && !run.active()
+            } else {
+                false
+            };
+            if training_finished {
+                extras.eof(&state);
+                if let Some(run) = training.as_ref() {
                     network.eof(run.succeeded().unwrap_or(false));
                 }
             }
@@ -1013,13 +1009,15 @@ fn run_app(
             extras.poll_with(&mut state, &mut tab, &mut chat, |line| {
                 network.remote_line(line)
             });
-            if network.poll(
-                &mut state,
-                tab,
-                &mut training,
-                extras.training_busy(),
-                extras.remote_monitor(),
-            ) {
+            if poll_training_queue(&mut training, training_finished, |training| {
+                network.poll(
+                    &mut state,
+                    tab,
+                    training,
+                    extras.training_busy(),
+                    extras.remote_monitor(),
+                )
+            }) {
                 chat.set_model_dir(state.chain_dir.clone());
                 extras.set_chain_dir(state.chain_dir.clone());
             }
@@ -1229,20 +1227,37 @@ fn run_app(
     Ok(())
 }
 
-fn reload_comparison(state: &mut RunState, path: &std::path::Path) {
-    let Ok(file) = std::fs::File::open(path) else {
-        state.comparison_series.clear();
-        state.comparison_label = None;
-        return;
-    };
-    let mut comparison = RunState::default();
-    for line in io::BufReader::new(file).lines().map_while(Result::ok) {
-        comparison.ingest(&line);
+fn finish_piped_stream(state: &mut RunState, completion: Option<bool>) {
+    if completion == Some(false) {
+        state.record_problem(
+            "Training stream ended without a completion summary and saved checkpoint",
+        );
     }
-    state.comparison_series = comparison.metric_series;
-    state.comparison_label = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned());
+    state.training_active = false;
+}
+
+fn release_finished_training(
+    training: &mut Option<setup::TrainingRun>,
+    was_active: bool,
+) -> bool {
+    if was_active && training.as_ref().is_some_and(|run| !run.active()) {
+        *training = None;
+        true
+    } else {
+        false
+    }
+}
+
+// Let the sweep consume completion before freeing the shared child slot. It may
+// install the next trial, in which case release_finished_training keeps it alive.
+fn poll_training_queue(
+    training: &mut Option<setup::TrainingRun>,
+    finished: bool,
+    poll_queue: impl FnOnce(&mut Option<setup::TrainingRun>) -> bool,
+) -> bool {
+    let started = poll_queue(training);
+    release_finished_training(training, finished);
+    started
 }
 
 fn accent() -> Style {
@@ -1273,13 +1288,11 @@ fn divider(width: u16) -> Line<'static> {
 fn status_badge(health: &HealthStatus) -> Line<'static> {
     let label = match health.level {
         HealthLevel::Problem => "ERROR",
-        HealthLevel::Warning | HealthLevel::Normal => {
-            if health.normal_label == "DONE" {
-                "DONE"
-            } else {
-                "TRAINING"
-            }
-        }
+        HealthLevel::Warning | HealthLevel::Normal => match health.normal_label {
+            "DONE" => "DONE",
+            "WAITING" => "WAITING",
+            _ => "TRAINING",
+        },
     };
     let mut spans = vec![Span::styled(
         format!("[ {label} ]"),
@@ -1922,11 +1935,18 @@ fn draw_with_background(
             keybindings::MATH_TAB => "PSSA equations / live dimensions / enlarge to read".into(),
             keybindings::DEVICE_TAB => "CPU / CUDA / WebGPU / Enter selects".into(),
             keybindings::LIMITS_TAB => "Threads / RAM / batch / tokens / Enter edits".into(),
-            0 => format!(
-                "{:.0}%  loss {:.4}",
-                state.progress_pct.unwrap_or(0.0),
-                state.live_loss.or(state.epoch_loss).unwrap_or(0.0)
-            ),
+            0 => {
+                let progress = state
+                    .progress_pct
+                    .map(|pct| format!("{pct:.0}%"))
+                    .unwrap_or_else(|| "-".into());
+                let loss = state
+                    .live_loss
+                    .or(state.epoch_loss)
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_else(|| "-".into());
+                format!("{progress}  loss {loss}")
+            }
             1 => format!(
                 "{} checkpoints in {}",
                 state.checkpoints.len(),
@@ -2371,10 +2391,18 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
     let (start, end) = state.visible_graph_range();
     if end == 0 {
         let waiting_area = panel_area(f, area);
-        f.render_widget(
-            Paragraph::new("Waiting for progress samples").block(panel(" graph / waiting ")),
-            waiting_area,
-        );
+        if view == GraphView::Comparison && let Some(error) = &state.comparison_error {
+            f.render_widget(
+                Paragraph::new(error.as_str()).wrap(Wrap { trim: false })
+                    .block(panel(" graph / comparison unavailable ")),
+                waiting_area,
+            );
+        } else {
+            f.render_widget(
+                Paragraph::new("Waiting for progress samples").block(panel(" graph / waiting ")),
+                waiting_area,
+            );
+        }
         return;
     }
 
@@ -2619,7 +2647,9 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
         GraphView::TokensPerSecond => " graph / tokens per second ",
         GraphView::LearningRate => " graph / learning rate ",
         GraphView::Comparison => {
-            if state.comparison_series.is_empty() {
+            if state.comparison_error.is_some() {
+                " graph / comparison unavailable "
+            } else if state.comparison_series.is_empty() {
                 " graph / comparison (use --compare LOG) "
             } else {
                 " graph / comparison "
@@ -2657,6 +2687,11 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
             "Own ranges: green loss / blue surprise / purple speed / gold rate",
         ),
         GraphView::Memory => unreachable!(),
+    };
+    let caption = if view == GraphView::Comparison {
+        state.comparison_error.as_deref().unwrap_or(caption)
+    } else {
+        caption
     };
     charts::draw(
         f,
@@ -2820,14 +2855,29 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         (_, Some(path)) => path.to_string(),
         _ => "not configured".into(),
     };
+    let speed = state
+        .tok_s
+        .map(|value| format!("{value:.0}"))
+        .unwrap_or_else(|| "-".into());
+    let epoch_loss = state
+        .epoch_loss
+        .map(charts::number)
+        .unwrap_or_else(|| "-".into());
+    let epoch_tokens = state
+        .epoch_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".into());
+    let epoch_updates = state
+        .epoch_updates
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".into());
     let lines = vec![
         Line::from(vec![
             Span::raw("status      "),
             Span::styled(health.label(), health_style),
         ]),
         Line::from(format!(
-            "speed       {:.0} tokens/s  ETA {}",
-            state.tok_s.unwrap_or(0.0),
+            "speed       {speed} tokens/s  ETA {}",
             state.eta.as_deref().unwrap_or("-")
         )),
         Line::from(format!(
@@ -2851,10 +2901,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
                 .unwrap_or("not written yet")
         )),
         Line::from(format!(
-            "last epoch  loss {:.4}   tokens {}   updates {}",
-            state.epoch_loss.unwrap_or(0.0),
-            state.epoch_tokens.unwrap_or(0),
-            state.epoch_updates.unwrap_or(0)
+            "last epoch  loss {epoch_loss}   tokens {epoch_tokens}   updates {epoch_updates}"
         )),
         Line::from(format!(
             "run         wall {}   resumed from {}   prior steps {}",
@@ -3089,10 +3136,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut chain_dir = PathBuf::from("chain");
     let mut compare_path = None;
     let mut chats_dir = PathBuf::from("chats");
+    let mut seen_options = std::collections::HashSet::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--chain" | "-c" => {
+                if !seen_options.insert("--chain") {
+                    return Err("option '--chain' was specified more than once".into());
+                }
                 let value = args.get(i + 1).ok_or_else(|| {
                     "option '--chain' requires a directory; usage: pssa tui [-c|--chain DIR]"
                         .to_string()
@@ -3107,6 +3158,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 i += 1;
             }
             "--chats-dir" => {
+                if !seen_options.insert("--chats-dir") {
+                    return Err("option '--chats-dir' was specified more than once".into());
+                }
                 let value = args
                     .get(i + 1)
                     .filter(|v| !v.starts_with('-'))
@@ -3115,6 +3169,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 i += 1;
             }
             "--compare" => {
+                if !seen_options.insert("--compare") {
+                    return Err("option '--compare' was specified more than once".into());
+                }
                 let value = args.get(i + 1).ok_or_else(|| {
                     "option '--compare' requires a log file; usage: pssa tui [--compare LOG]"
                         .to_string()
@@ -3135,6 +3192,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
         }
         i += 1;
+    }
+
+    if let Some(path) = compare_path.as_deref()
+        && std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file())
+    {
+        return Err("--compare requires a regular log file, not a directory/device/pipe".into());
     }
 
     if io::stdin().is_terminal() {
@@ -3198,6 +3261,33 @@ mod tests {
             feature_area(Rect::new(0, 0, 80, 24)),
             Rect::new(2, 8, 76, 15),
         );
+    }
+
+    #[test]
+    fn refresh_chain_drops_deleted_checkpoints_and_missing_directories() {
+        let chain = std::env::temp_dir().join(format!(
+            "pssa-tui-chain-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&chain).unwrap();
+        std::fs::write(chain.join("ck01.pssa"), b"fixture").unwrap();
+        let mut state = RunState {
+            chain_dir: chain.clone(),
+            ..RunState::default()
+        };
+        state.refresh_chain();
+        assert_eq!(state.checkpoints, [("ck01.pssa".into(), None)]);
+        std::fs::remove_file(chain.join("ck01.pssa")).unwrap();
+        state.refresh_chain();
+        assert!(state.checkpoints.is_empty());
+        state.checkpoints.push(("stale.pssa".into(), None));
+        std::fs::remove_dir(&chain).unwrap();
+        state.refresh_chain();
+        assert!(state.checkpoints.is_empty());
     }
 
     #[test]
@@ -3405,6 +3495,20 @@ mod tests {
     }
 
     #[test]
+    fn truncated_piped_stream_is_not_reported_as_done() {
+        let mut state = RunState::default();
+        state.ingest("progress_schema=2");
+        finish_piped_stream(&mut state, Some(false));
+        assert_eq!(state.health_status().level, HealthLevel::Problem);
+        assert!(state.health_status().label().contains("stream ended"));
+
+        let mut empty = RunState::default();
+        finish_piped_stream(&mut empty, None);
+        assert_eq!(empty.health_status().level, HealthLevel::Normal);
+        assert_eq!(empty.health_status().normal_label, "WAITING");
+    }
+
+    #[test]
     fn health_uses_one_green_and_explains_red_conditions() {
         let mut state = RunState::default();
         for _ in 0..3 {
@@ -3586,7 +3690,7 @@ mod tests {
         assert!(row(7).contains("╌"));
         assert!(row(1).contains("┌"));
         assert!(row(5).contains("└"));
-        assert!(row(2).contains("[ TRAINING ]"));
+        assert!(row(2).contains("[ WAITING ]"));
     }
 
     #[test]
@@ -3661,6 +3765,22 @@ mod tests {
                 assert!(text.contains(expected));
             }
         }
+        // Empty monitor metrics must not turn missing measurements into zeros.
+        let mut tiny = Terminal::new(TestBackend::new(20, 8)).unwrap();
+        tiny.draw(|f| draw(f, &RunState::default(), 0)).unwrap();
+        let tiny_text: String = tiny
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(tiny_text.contains("WAITING"));
+        assert!(tiny_text.contains("loss -"));
+        assert!(!tiny_text.contains("loss 0.0000"));
+        assert!(!tiny_text.contains("0 tokens/s"));
+        assert!(!tiny_text.contains("last epoch  loss 0"));
+
         // Invalid measurements do not become a plausible zero-valued trace.
         state.loss_series = vec![f64::NAN, 2.0, f64::INFINITY];
         let trace = loss_trace(&state);
