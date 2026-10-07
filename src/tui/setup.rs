@@ -1594,6 +1594,9 @@ mod tests {
         assert!(!run.active());
         assert!(!state.training_active);
         assert_eq!(run.succeeded(), Some(true));
+        let mut slot = Some(run);
+        assert!(super::super::release_finished_training(&mut slot, true));
+        assert!(slot.is_none());
         assert_eq!(state.live_loss, Some(4.0));
         assert!(
             state
