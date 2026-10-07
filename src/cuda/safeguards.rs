@@ -1,8 +1,8 @@
 //! CUDA safeguard arithmetic. Embedded PTX needs the driver, not libnvrtc.
 //! Training may retain dense gradients and Adam moments between updates; host
 //! weights remain current because recurrence/retrieval are still host-owned.
-use super::*;
 use super::stage_bounds::{cap_shape, optimizer_shape, product};
+use super::*;
 use crate::pssa::{AdamTensor, PSSAConfigV2};
 use cudarc::driver::{CudaFunction, DevicePtr, LaunchConfig, PushKernelArg};
 
@@ -23,11 +23,20 @@ struct TensorState {
     dense: bool,
 }
 
+struct NormWorkspace {
+    descriptors: CudaSlice<u64>,
+    partials: CudaSlice<f64>,
+    norm: CudaSlice<f64>,
+    invalid: CudaSlice<u32>,
+}
+
 #[derive(Default)]
 pub(super) struct Safeguards {
     kernels: Option<Kernels>,
     tensors: HashMap<usize, TensorState>,
     cap_workspace: Option<CudaSlice<f32>>,
+    cap_invalid: Option<CudaSlice<u32>>,
+    norm_workspace: Option<NormWorkspace>,
     resident: bool,
     fresh_gradients: bool,
     finite: bool,
@@ -43,6 +52,27 @@ impl Safeguards {
             .find(|t| t.host_data == host.as_ptr() as usize && t.data.len() == host.len())
             .map(|t| &t.data)
     }
+}
+
+fn validate_packed_gradients(
+    state: &Safeguards,
+    gradients: &[&[f32]],
+    private: &[CudaSlice<f32>],
+) -> Result<(), String> {
+    if gradients.len() != private.len() {
+        return Err("CUDA packed gradient count changed".into());
+    }
+    for (index, (host, buffer)) in gradients.iter().zip(private).enumerate() {
+        let key = host.as_ptr() as usize;
+        if gradients[..index].iter().any(|prior| prior.as_ptr() as usize == key) {
+            return Err("CUDA packed gradients alias; refusing publication".into());
+        }
+        let device = state.tensors.get(&key).ok_or("unregistered packed CUDA gradient")?;
+        if device.grad.len() != host.len() || buffer.len() != host.len() {
+            return Err("packed CUDA gradient length changed".into());
+        }
+    }
+    Ok(())
 }
 
 fn error(e: impl std::fmt::Debug) -> String {
@@ -68,7 +98,12 @@ impl CudaContext {
     }
 
     fn upload_tensor(&self, tensor: &AdamTensor<'_>) -> Result<TensorState, String> {
-        optimizer_shape(tensor.data.len(), tensor.grad.len(), tensor.m.len(), tensor.v.len())?;
+        optimizer_shape(
+            tensor.data.len(),
+            tensor.grad.len(),
+            tensor.m.len(),
+            tensor.v.len(),
+        )?;
         Ok(TensorState {
             host_data: tensor.data.as_ptr() as usize,
             data: self.stream.clone_htod(tensor.data).map_err(error)?,
@@ -169,6 +204,88 @@ impl CudaContext {
         Ok(())
     }
 
+    /// Packed stages publish these gradients transactionally to their host
+    /// mirrors. Recover any prior resident-TN contribution before changing
+    /// ownership; clipping must subsequently upload, not ignore, the mirror.
+    pub(super) fn host_owned_gradients(&self, gradients: &mut [&mut [f32]]) -> Result<(), String> {
+        let mut state = self.safeguards.lock().map_err(error)?;
+        if !state.resident {
+            return Ok(());
+        }
+        let mut copied = false;
+        for host in gradients.iter_mut() {
+            let device = state
+                .tensors
+                .get(&(host.as_ptr() as usize))
+                .ok_or("unregistered packed CUDA gradient")?;
+            if device.grad.len() != host.len() {
+                return Err("packed CUDA gradient length changed".into());
+            }
+            if device.dense {
+                self.stream
+                    .memcpy_dtoh(&device.grad, *host)
+                    .map_err(error)?;
+                copied = true;
+            }
+        }
+        if copied {
+            self.stream.synchronize().map_err(error)?;
+        }
+        for host in gradients {
+            state
+                .tensors
+                .get_mut(&(host.as_ptr() as usize))
+                .unwrap()
+                .dense = false;
+        }
+        Ok(())
+    }
+
+    /// Seed private packed adjoints without modifying the optimizer's current
+    /// gradients. Their allocations can be swapped only after the entire CUDA
+    /// transaction succeeds, so a failed kernel never requires GPU rollback.
+    pub(super) fn seed_packed_gradients(
+        &self,
+        gradients: &[&[f32]],
+        private: &mut [CudaSlice<f32>],
+    ) -> Result<bool, String> {
+        let state = self.safeguards.lock().map_err(error)?;
+        if !state.resident {
+            return Ok(false);
+        }
+        validate_packed_gradients(&state, gradients, private)?;
+        for (host, buffer) in gradients.iter().zip(private) {
+            let device = &state.tensors[&(host.as_ptr() as usize)];
+            if device.dense {
+                self.stream.memcpy_dtod(&device.grad, buffer).map_err(error)?;
+            } else {
+                self.stream.memcpy_htod(*host, buffer).map_err(error)?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// No driver operation occurs during publication. Validate ALL entries
+    /// before swapping any allocation; the old optimizer buffers become the
+    /// next packed transaction's scratch, without allocating or copying.
+    pub(super) fn publish_packed_gradients(
+        &self,
+        gradients: &[&[f32]],
+        private: &mut [CudaSlice<f32>],
+    ) -> Result<(), String> {
+        let mut state = self.safeguards.lock().map_err(error)?;
+        if !state.resident {
+            return Err("CUDA training scope ended during packed backward".into());
+        }
+        validate_packed_gradients(&state, gradients, private)?;
+        for (host, buffer) in gradients.iter().zip(private) {
+            let device = state.tensors.get_mut(&(host.as_ptr() as usize)).unwrap();
+            std::mem::swap(&mut device.grad, buffer);
+            device.dense = true;
+        }
+        Ok(())
+    }
+
     // False preserves the historical host-slice GEMM API outside scoped training.
     pub(super) fn resident_tn(
         &self,
@@ -196,6 +313,11 @@ impl CudaContext {
         self.stream.memcpy_htod(a, &mut a_dev).map_err(error)?;
         let mut b_dev = rhs.as_mut().unwrap().slice_mut(..b.len());
         self.stream.memcpy_htod(b, &mut b_dev).map_err(error)?;
+        // A packed CPU replay may have accumulated into the host mirror after
+        // handing ownership back. Do not resurrect a stale device contribution.
+        if !device.dense {
+            self.stream.memcpy_htod(out, &mut device.grad).map_err(error)?;
+        }
         // SAFETY: caller performed exact cuBLAS shape validation; device grad
         // stays alive under the optimizer guard and all operations use one stream.
         unsafe { self.blas.gemm(cfg, &b_dev, &a_dev, &mut device.grad) }.map_err(error)?;
@@ -215,15 +337,20 @@ impl CudaContext {
         max_norm: f32,
         embedding_rows: &[usize],
     ) -> Result<f64, String> {
-        let count = u32::try_from(tensors.len()).map_err(|_| "CUDA optimizer tensor count exceeds u32; refusing launch")?;
+        let count = u32::try_from(tensors.len())
+            .map_err(|_| "CUDA optimizer tensor count exceeds u32; refusing launch")?;
         for t in tensors.iter() {
             optimizer_shape(t.data.len(), t.grad.len(), t.m.len(), t.v.len())?;
         }
         for &row in embedding_rows {
-            let rows = row.checked_add(1).ok_or("CUDA embedding row overflow; refusing launch")?;
+            let rows = row
+                .checked_add(1)
+                .ok_or("CUDA embedding row overflow; refusing launch")?;
             let end = product(rows, cfg.d_latent, "embedding row end")?;
             if cfg.d_latent == 0 || tensors.first().is_none_or(|t| end > t.grad.len()) {
-                return Err(format!("CUDA embedding row {row} is out of bounds; refusing launch"));
+                return Err(format!(
+                    "CUDA embedding row {row} is out of bounds; refusing launch"
+                ));
             }
         }
         let mut state = self.safeguards.lock().map_err(error)?;
@@ -244,7 +371,12 @@ impl CudaContext {
                 if device.grad.len() != t.grad.len() {
                     return Err("CUDA registered gradient length changed; refusing launch".into());
                 }
-                optimizer_shape(device.data.len(), device.grad.len(), device.m.len(), device.v.len())?;
+                optimizer_shape(
+                    device.data.len(),
+                    device.grad.len(),
+                    device.m.len(),
+                    device.v.len(),
+                )?;
                 if index == 0 {
                     // Embedding scatter is host-owned, but only used rows have
                     // gradients. Device zeroing already cleared all other rows.
@@ -274,19 +406,47 @@ impl CudaContext {
             descriptors.extend([ptr, t.grad.len() as u64]);
             drop(record);
         }
-        let descriptors_dev = self.stream.clone_htod(&descriptors).map_err(error)?;
-        let mut partials = self.stream.alloc_zeros::<f64>(256).map_err(error)?;
-        let mut norm_dev = self.stream.alloc_zeros::<f64>(1).map_err(error)?;
-        let kernels = state.kernels.as_ref().unwrap();
+        if state
+            .norm_workspace
+            .as_ref()
+            .is_none_or(|w| w.descriptors.len() < descriptors.len())
+        {
+            state.norm_workspace = Some(NormWorkspace {
+                descriptors: self
+                    .stream
+                    .alloc_zeros::<u64>(descriptors.len())
+                    .map_err(error)?,
+                partials: self.stream.alloc_zeros::<f64>(256).map_err(error)?,
+                norm: self.stream.alloc_zeros::<f64>(1).map_err(error)?,
+                invalid: self.stream.alloc_zeros::<u32>(1).map_err(error)?,
+            });
+        }
+        let resident = state.resident;
+        let Safeguards {
+            kernels,
+            tensors: device_tensors,
+            norm_workspace,
+            ..
+        } = &mut *state;
+        let NormWorkspace {
+            descriptors: descriptors_dev,
+            partials,
+            norm: norm_dev,
+            invalid,
+        } = norm_workspace.as_mut().unwrap();
+        self.stream
+            .memcpy_htod(&descriptors, descriptors_dev)
+            .map_err(error)?;
+        let kernels = kernels.as_ref().unwrap();
         // SAFETY: descriptors reference exactly the registered, live gradient
         // allocations. Fixed 256-thread blocks match PTX shared storage; the
         // second stage reads exactly 256 partials. No unordered atomic FP sums.
         unsafe {
             self.stream
                 .launch_builder(&kernels.partials)
-                .arg(&descriptors_dev)
+                .arg(&*descriptors_dev)
                 .arg(&count)
-                .arg(&mut partials)
+                .arg(&mut *partials)
                 .launch(LaunchConfig {
                     grid_dim: (256, 1, 1),
                     block_dim: (256, 1, 1),
@@ -295,8 +455,8 @@ impl CudaContext {
                 .map_err(error)?;
             self.stream
                 .launch_builder(&kernels.finish)
-                .arg(&partials)
-                .arg(&mut norm_dev)
+                .arg(&*partials)
+                .arg(&mut *norm_dev)
                 .launch(LaunchConfig {
                     grid_dim: (1, 1, 1),
                     block_dim: (1, 1, 1),
@@ -306,7 +466,7 @@ impl CudaContext {
         }
         let mut norm = [0.0f64];
         self.stream
-            .memcpy_dtoh(&norm_dev, &mut norm)
+            .memcpy_dtoh(&*norm_dev, &mut norm)
             .map_err(error)?;
         self.stream.synchronize().map_err(error)?;
         if !norm[0].is_finite() {
@@ -320,22 +480,23 @@ impl CudaContext {
         let step = step.ok_or("optimizer step counter overflow")?;
         let bias1 = 1.0 - cfg.beta1.powf(step as f32);
         let bias2 = 1.0 - cfg.beta2.powf(step as f32);
-        let mut invalid = self.stream.alloc_zeros::<u32>(1).map_err(error)?;
-        let resident = state.resident;
-        let Safeguards {
-            kernels,
-            tensors: device_tensors,
-            ..
-        } = &mut *state;
+        // Norm kernels assign every partial/result. Only the atomic invalid
+        // flag must be explicitly reset when these buffers are reused.
+        self.stream.memset_zeros(invalid).map_err(error)?;
         for t in tensors.iter_mut() {
             let device = device_tensors.get_mut(&(t.grad.as_ptr() as usize)).unwrap();
             let len = t.grad.len() as u64;
-            let launch_len = optimizer_shape(device.data.len(), device.grad.len(), device.m.len(), device.v.len())?;
+            let launch_len = optimizer_shape(
+                device.data.len(),
+                device.grad.len(),
+                device.m.len(),
+                device.v.len(),
+            )?;
             // SAFETY: all four allocations have len elements, kernel bounds
             // checks every access; f64 scale rounds to f32 before Adam moments.
             unsafe {
                 self.stream
-                    .launch_builder(&kernels.as_ref().unwrap().adam)
+                    .launch_builder(&kernels.adam)
                     .arg(&mut device.data)
                     .arg(&mut device.grad)
                     .arg(&mut device.m)
@@ -349,7 +510,7 @@ impl CudaContext {
                     .arg(&bias1)
                     .arg(&bias2)
                     .arg(&scale)
-                    .arg(&mut invalid)
+                    .arg(&mut *invalid)
                     .launch(LaunchConfig::for_num_elems(launch_len))
                     .map_err(error)?;
             }
@@ -368,7 +529,7 @@ impl CudaContext {
         }
         let mut invalid_host = [0u32];
         self.stream
-            .memcpy_dtoh(&invalid, &mut invalid_host)
+            .memcpy_dtoh(&*invalid, &mut invalid_host)
             .map_err(error)?;
         self.stream.synchronize().map_err(error)?;
         state.finite = invalid_host[0] == 0;
@@ -393,6 +554,7 @@ impl CudaContext {
         let Safeguards {
             kernels,
             cap_workspace,
+            cap_invalid,
             ..
         } = &mut *state;
         reserve_device(cap_workspace, &self.stream, values.len())?;
@@ -401,7 +563,11 @@ impl CudaContext {
             .memcpy_htod(values, &mut values_dev)
             .map_err(error)?;
         let kernels = kernels.as_ref().unwrap();
-        let mut invalid = self.stream.alloc_zeros::<u32>(1).map_err(error)?;
+        if cap_invalid.is_none() {
+            *cap_invalid = Some(self.stream.alloc_zeros::<u32>(1).map_err(error)?);
+        }
+        let invalid = cap_invalid.as_mut().unwrap();
+        self.stream.memset_zeros(invalid).map_err(error)?;
         let width = width_arg;
         let cap = cap as f64;
         // SAFETY: validated whole rows, positive width/cap, live allocations;
@@ -413,12 +579,12 @@ impl CudaContext {
                 .arg(&rows)
                 .arg(&width)
                 .arg(&cap)
-                .arg(&mut invalid)
+                .arg(&mut *invalid)
                 .launch(LaunchConfig::for_num_elems(rows))
                 .map_err(error)?;
         }
         let mut bad = [0u32];
-        self.stream.memcpy_dtoh(&invalid, &mut bad).map_err(error)?;
+        self.stream.memcpy_dtoh(&*invalid, &mut bad).map_err(error)?;
         self.stream.synchronize().map_err(error)?;
         if bad[0] != 0 {
             return Err("capped memory value must be finite".into());

@@ -51,6 +51,9 @@ fn max_abs(values: &[f32]) -> f32 {
 
 fn gradient_error(cpu: &[f32], gpu: &[f32]) -> (f32, f32) {
     assert_eq!(cpu.len(), gpu.len(), "gradient length mismatch");
+    if cpu.iter().chain(gpu).any(|value| !value.is_finite()) {
+        return (f32::INFINITY, f32::INFINITY);
+    }
     let abs = cpu
         .iter()
         .zip(gpu)
@@ -129,7 +132,7 @@ fn report_gradients(cpu: &PSSALayerV2, gpu: &PSSALayerV2, step: usize) -> Result
         worst_rel = worst_rel.max(relative);
     }
     println!("    gradient summary: max_abs={worst_abs:.3e} max_relative={worst_rel:.3e}");
-    if worst_rel > GRAD_REL_TOLERANCE {
+    if worst_rel >= GRAD_REL_TOLERANCE {
         return Err(format!(
             "GPU gradient mismatch at step {step}: relative error {worst_rel:.3e} exceeds {GRAD_REL_TOLERANCE:.3e}"
         ));
@@ -138,12 +141,15 @@ fn report_gradients(cpu: &PSSALayerV2, gpu: &PSSALayerV2, step: usize) -> Result
 }
 
 fn compare_loss(label: &str, cpu_loss: f32, gpu_loss: f32) -> Result<(), String> {
+    if !cpu_loss.is_finite() || !gpu_loss.is_finite() {
+        return Err("nonfinite CPU/GPU loss".into());
+    }
     let abs = (cpu_loss - gpu_loss).abs();
     let relative = abs / cpu_loss.abs().max(gpu_loss.abs()).max(1e-6);
     println!(
         "    {label} loss cpu={cpu_loss:.6} gpu={gpu_loss:.6} max_abs={abs:.3e} relative={relative:.3e}"
     );
-    if relative > GRAD_REL_TOLERANCE {
+    if relative >= GRAD_REL_TOLERANCE {
         return Err(format!(
             "GPU packed loss mismatch: relative error {relative:.3e} exceeds {GRAD_REL_TOLERANCE:.3e}"
         ));
@@ -195,69 +201,78 @@ fn run_packed_config(
     let mut gpu_batch = SequenceBatch::new(&mut gpu, batch_size)?;
     let mut cpu_seconds = 0.0;
     let mut gpu_seconds = 0.0;
+    let mut measured_tokens = 0usize;
 
-    // Unequal lane lengths exercise packed offsets as well as independent
-    // carries. The first call resets both lanes; later calls retain them.
+    // Exercise EVERY configured lane, not just two out of a 32-lane workspace.
+    // Reverse packing order on the retained-carry step: stable lane IDs must
+    // not be confused with packed row offsets. Step zero is a checked warmup.
     for step in 0..2 {
-        let lane_len = (cfg.chunk_len * 3 / 4).max(1);
-        let (cpu_inputs0, cpu_targets0) = packed_tokens(&cfg, step, 0, cfg.chunk_len);
-        let (cpu_inputs1, cpu_targets1) = packed_tokens(&cfg, step, 1, lane_len);
-        let (gpu_inputs0, gpu_targets0) = (cpu_inputs0.clone(), cpu_targets0.clone());
-        let (gpu_inputs1, gpu_targets1) = (cpu_inputs1.clone(), cpu_targets1.clone());
-        let cpu_sequences = [
-            Sequence {
-                lane: 0,
-                inputs: &cpu_inputs0,
-                targets: &cpu_targets0,
+        let data = (0..batch_size)
+            .map(|lane| {
+                let len = if lane % 2 == 0 {
+                    cfg.chunk_len
+                } else {
+                    (cfg.chunk_len * 3 / 4).max(1)
+                };
+                packed_tokens(&cfg, step, lane, len)
+            })
+            .collect::<Vec<_>>();
+        let mut order = (0..batch_size).collect::<Vec<_>>();
+        if step == 1 {
+            order.reverse();
+        }
+        let sequences = order
+            .iter()
+            .map(|&lane| Sequence {
+                lane,
+                inputs: &data[lane].0,
+                targets: &data[lane].1,
                 reset: step == 0,
-            },
-            Sequence {
-                lane: 1,
-                inputs: &cpu_inputs1,
-                targets: &cpu_targets1,
-                reset: step == 0,
-            },
-        ];
-        let gpu_sequences = [
-            Sequence {
-                lane: 0,
-                inputs: &gpu_inputs0,
-                targets: &gpu_targets0,
-                reset: step == 0,
-            },
-            Sequence {
-                lane: 1,
-                inputs: &gpu_inputs1,
-                targets: &gpu_targets1,
-                reset: step == 0,
-            },
-        ];
+            })
+            .collect::<Vec<_>>();
 
         cpu.zero_gradients();
         let started = Instant::now();
-        let cpu_loss = cpu_batch.forward(&mut cpu, &cpu_sequences)?;
+        let cpu_loss = cpu_batch.forward(&mut cpu, &sequences)?;
         cpu_batch.backward(&mut cpu, 1.0)?;
-        cpu_seconds += started.elapsed().as_secs_f64();
+        let cpu_elapsed = started.elapsed().as_secs_f64();
 
         gpu.zero_gradients();
         let started = Instant::now();
-        let gpu_loss = gpu_batch.forward(&mut gpu, &gpu_sequences)?;
+        let gpu_loss = gpu_batch.forward(&mut gpu, &sequences)?;
         gpu_batch.backward(&mut gpu, 1.0)?;
-        gpu_seconds += started.elapsed().as_secs_f64();
+        if std::env::var_os("PSSA_REQUIRE_CUDA").is_some() && !gpu_batch.last_step_used_cuda() {
+            return Err(
+                "packed check fell back from CUDA; refusing a CPU parity false positive".into(),
+            );
+        }
+        let gpu_elapsed = started.elapsed().as_secs_f64();
+        println!(
+            "  packed step={step} warm={} cpu_step_seconds={cpu_elapsed:.6} gpu_step_seconds={gpu_elapsed:.6}",
+            step != 0
+        );
+        if step != 0 {
+            cpu_seconds += cpu_elapsed;
+            gpu_seconds += gpu_elapsed;
+            measured_tokens += sequences
+                .iter()
+                .map(|sequence| sequence.inputs.len())
+                .sum::<usize>();
+        }
 
         compare_loss("packed", cpu_loss, gpu_loss)?;
         report_gradients(&cpu, &gpu, step)?;
         for lane in 0..batch_size {
             let (abs, relative) = gradient_error(cpu_batch.state(lane), gpu_batch.state(lane));
             println!("    carry lane={lane} max_abs={abs:.3e} relative={relative:.3e}");
-            if relative > GRAD_REL_TOLERANCE {
+            if relative >= GRAD_REL_TOLERANCE {
                 return Err(format!(
                     "GPU packed carry mismatch on lane {lane}: relative error {relative:.3e}"
                 ));
             }
         }
     }
-    let tokens = (2 * (cfg.chunk_len + (cfg.chunk_len * 3 / 4).max(1))) as f64;
+    let tokens = measured_tokens as f64;
     println!(
         "  packed {label}: cpu_step_seconds={cpu_seconds:.3} gpu_step_seconds={gpu_seconds:.3} cpu_tok/s={:.1} gpu_tok/s={:.1}",
         tokens / cpu_seconds.max(f64::MIN_POSITIVE),
@@ -353,6 +368,9 @@ fn main() -> Result<(), String> {
     let device = match Device::try_gpu() {
         Ok(device) => device,
         Err(error) => {
+            if std::env::var_os("PSSA_REQUIRE_CUDA").is_some() {
+                return Err(error);
+            }
             println!("No GPU present; skipping gpu_train_check ({error})");
             return Ok(());
         }
@@ -360,6 +378,14 @@ fn main() -> Result<(), String> {
     let context = device
         .gpu()
         .ok_or("GPU initialization returned a CPU device")?;
+    if std::env::var_os("PSSA_REQUIRE_CUDA").is_some() {
+        #[cfg(feature = "cuda")]
+        if !matches!(context, pssa::backend::GpuDispatch::Cuda(_)) {
+            return Err("PSSA_REQUIRE_CUDA requires the CUDA backend, not WebGPU".into());
+        }
+        #[cfg(not(feature = "cuda"))]
+        return Err("PSSA_REQUIRE_CUDA requires --features cuda".into());
+    }
     println!("GPU training check: {}", context.backend_label());
 
     for depth in [1, 2] {

@@ -169,7 +169,7 @@ impl Thread {
                     "sb" => 4096,
                     _ => panic!("unknown shared symbol"),
                 },
-                "ld.global.f32" | "ld.shared.f32" => {
+                "ld.global.f32" | "ld.global.u32" | "ld.shared.f32" => {
                     let address = self.value(&a[1]);
                     let memory = if ins.op.contains("global") {
                         &*global
@@ -286,10 +286,20 @@ impl Thread {
 
 impl Machine {
     pub fn put(&mut self, name: &str, data: &[f32]) {
+        self.put_words(name, &data.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+    }
+
+    /// Metadata allocations are raw u32 words, not numeric f32 conversions.
+    #[allow(dead_code)] // Used by packed modules, not the shared scalar suites.
+    pub fn put_u32(&mut self, name: &str, data: &[u32]) {
+        self.put_words(name, data);
+    }
+
+    fn put_words(&mut self, name: &str, data: &[u32]) {
         if let Some((base, len)) = self.buffers.get(name).copied() {
             assert_eq!(data.len(), len);
             for (i, value) in data.iter().enumerate() {
-                self.global.insert(base + i as u64 * 4, value.to_bits());
+                self.global.insert(base + i as u64 * 4, *value);
             }
         } else {
             // Distinct, widely separated nonzero bases catch pointer+pointer bugs.
@@ -297,7 +307,7 @@ impl Machine {
             let base = self.next;
             self.buffers.insert(name.to_owned(), (base, data.len()));
             for (i, value) in data.iter().enumerate() {
-                self.global.insert(base + i as u64 * 4, value.to_bits());
+                self.global.insert(base + i as u64 * 4, *value);
             }
         }
     }
@@ -331,7 +341,29 @@ impl Machine {
         index: usize,
         width: usize,
     ) {
-        self.launch_selected(source, name, args, (1, 1), width, Some(index));
+        self.launch_threads(source, name, args, &[(0, index)], width);
+    }
+
+    /// Execute sparse (grid.y lane, flattened x thread) probes in one launch.
+    /// Bounds and overlapping-write checks remain active across selected lanes.
+    #[allow(dead_code)] // Used by packed probes, not every scalar suite.
+    pub fn launch_threads(
+        &mut self,
+        source: &str,
+        name: &str,
+        args: &[Arg<'_>],
+        indices: &[(usize, usize)],
+        width: usize,
+    ) {
+        let grid = (
+            indices
+                .iter()
+                .map(|(_, i)| i / width + 1)
+                .max()
+                .unwrap_or(0),
+            indices.iter().map(|(lane, _)| lane + 1).max().unwrap_or(0),
+        );
+        self.launch_selected(source, name, args, grid, width, Some(indices));
     }
 
     fn launch_selected(
@@ -341,7 +373,7 @@ impl Machine {
         args: &[Arg<'_>],
         grid: (usize, usize),
         width: usize,
-        selected: Option<usize>,
+        selected: Option<&[(usize, usize)]>,
     ) {
         let kernel = Kernel::parse(source, name);
         assert_eq!(kernel.params.len(), args.len(), "{name} argument count");
@@ -359,11 +391,20 @@ impl Machine {
         for y in 0..grid.1 {
             for x in 0..grid.0 {
                 let mut shared = HashMap::new();
-                let mut threads: Vec<_> = (0..selected.map_or(width, |_| 1))
+                let tids: Vec<_> = match selected {
+                    None => (0..width).collect(),
+                    Some(indices) => indices
+                        .iter()
+                        .filter(|(lane, i)| *lane == y && i / width == x)
+                        .map(|(_, i)| i % width)
+                        .collect(),
+                };
+                let mut threads: Vec<_> = tids
+                    .into_iter()
                     .map(|tid| Thread {
                         registers: HashMap::from([
-                            ("%tid.x".into(), selected.map_or(tid, |i| i % width) as u64),
-                            ("%ctaid.x".into(), selected.map_or(x, |i| i / width) as u64),
+                            ("%tid.x".into(), tid as u64),
+                            ("%ctaid.x".into(), x as u64),
                             ("%ctaid.y".into(), y as u64),
                             ("%ntid.x".into(), width as u64),
                         ]),
@@ -371,12 +412,8 @@ impl Machine {
                     })
                     .collect();
                 loop {
-                    for (tid, thread) in threads
-                        .iter_mut()
-                        .enumerate()
-                        .filter(|(_, thread)| !thread.exited)
-                    {
-                        let owner = (y * grid.0 + x) * width + tid;
+                    for thread in threads.iter_mut().filter(|thread| !thread.exited) {
+                        let owner = (y * grid.0 + x) * width + thread.value("%tid.x") as usize;
                         thread.until_barrier(
                             &kernel,
                             &params,

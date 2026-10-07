@@ -10,6 +10,7 @@ use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::{CudaContext as DriverContext, CudaSlice, CudaStream};
 
 use crate::backend::{checked_gemm_sizes, shared_gemm_rows, zeroed_output};
+pub(crate) mod packed;
 mod safeguards;
 mod stage_bounds;
 mod stages;
@@ -36,6 +37,7 @@ const DRIVER_SYMBOLS: &[&str] = &[
     "cuMemFreeAsync",
     "cuMemcpyHtoDAsync_v2",
     "cuMemcpyDtoHAsync_v2",
+    "cuMemcpyDtoDAsync_v2",
     "cuMemsetD8Async",
     "cuStreamSynchronize",
     "cuStreamWaitEvent",
@@ -145,6 +147,11 @@ fn reserve_device(
     Ok(())
 }
 
+struct CachedWeight {
+    buffer: Arc<CudaSlice<f32>>,
+    current: bool,
+}
+
 /// A live CUDA device, cuBLAS handle, resident weights and bounded high-water
 /// workspaces. Clones serialize dispatch so scratch and the handle remain safe.
 #[derive(Clone)]
@@ -152,7 +159,7 @@ pub struct CudaContext {
     stream: Arc<CudaStream>,
     blas: Arc<CudaBlas>,
     name: Arc<str>,
-    weight_cache: Arc<Mutex<HashMap<(usize, usize), Arc<CudaSlice<f32>>>>>,
+    weight_cache: Arc<Mutex<HashMap<(usize, usize), CachedWeight>>>,
     workspace: Arc<Mutex<Workspace>>,
     safeguards: Arc<Mutex<safeguards::Safeguards>>,
     stages: Arc<Mutex<stages::StageState>>,
@@ -194,24 +201,42 @@ impl CudaContext {
             .weight_cache
             .lock()
             .map_err(|_| "CUDA weight cache lock poisoned")?;
-        if let Some(buf) = cache.get(&key) {
-            return Ok(buf.clone());
+        if let Some(entry) = cache.get_mut(&key) {
+            if !entry.current {
+                let buffer = Arc::get_mut(&mut entry.buffer)
+                    .ok_or("CUDA cached weight is still borrowed during refresh")?;
+                self.stream
+                    .memcpy_htod(w, buffer)
+                    .map_err(|e| format!("weight refresh failed ({e:?})"))?;
+                entry.current = true;
+            }
+            return Ok(entry.buffer.clone());
         }
         let buf = Arc::new(
             self.stream
                 .clone_htod(w)
                 .map_err(|e| format!("weight upload failed ({e:?})"))?,
         );
-        cache.insert(key, buf.clone());
+        cache.insert(
+            key,
+            CachedWeight {
+                buffer: buf.clone(),
+                current: true,
+            },
+        );
         Ok(buf)
     }
 
     /// Call whenever cached host weights change (normally after AdamW).
     pub fn invalidate_weights(&self) {
-        self.weight_cache
+        for entry in self
+            .weight_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clear();
+            .values_mut()
+        {
+            entry.current = false;
+        }
     }
 
     pub fn dispatch_gemm(
