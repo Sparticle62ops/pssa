@@ -164,17 +164,31 @@ impl Preview {
             .as_deref()
             .or(state.resumed_from.as_deref())
         {
-            return Path::new(path)
-                .extension()
-                .is_some_and(|x| x == "pssa")
-                .then(|| PathBuf::from(path));
+            let path = PathBuf::from(path);
+            if path.extension().is_some_and(|x| x == "pssa") && path.is_file() {
+                return Some(path);
+            }
         }
         state
             .checkpoints
             .iter()
             .rev()
-            .find(|(name, _)| name.ends_with(".pssa"))
+            .filter(|(name, _)| name.ends_with(".pssa"))
             .map(|(name, _)| state.chain_dir.join(name))
+            .find(|path| path.is_file())
+    }
+
+    fn clear_missing_sample(&mut self) {
+        self.job = None;
+        self.revision = None;
+        self.text.clear();
+        self.marks.clear();
+        self.checkpoint.clear();
+        self.note = if self.enabled {
+            "No checkpoint yet / waiting for a saved .pssa model".into()
+        } else {
+            "Preview paused / F7 resumes".into()
+        };
     }
     pub(super) fn toggle(&mut self) {
         self.enabled = !self.enabled;
@@ -208,6 +222,15 @@ impl Preview {
                     .into();
             return;
         }
+        if path.is_none() {
+            self.clear_missing_sample();
+            return;
+        }
+        let source_exists = path.as_ref().is_some_and(|path| path.is_file());
+        if !source_exists && self.job.is_some() {
+            self.clear_missing_sample();
+            return;
+        }
         if let Some(job) = &mut self.job {
             if let Some(result) = job.poll() {
                 self.job = None;
@@ -238,9 +261,11 @@ impl Preview {
             return;
         };
         let Ok(metadata) = path.metadata() else {
+            self.clear_missing_sample();
             return;
         };
         if !metadata.is_file() {
+            self.clear_missing_sample();
             return;
         }
         let revision = Revision {
@@ -475,14 +500,28 @@ mod tests {
         preview.poll(Some(PathBuf::from("missing.pssa")), 1, false);
         assert!(preview.job.is_none());
         assert!(preview.last_attempt.is_none());
+        preview.poll(None, 1, false);
+        assert!(preview.note.contains("paused"));
+        let candidate = std::env::temp_dir().join(format!(
+            "pssa-preview-candidate-{}.pssa",
+            std::process::id()
+        ));
+        std::fs::write(&candidate, b"fixture").unwrap();
         let mut state = RunState::default();
-        state.last_checkpoint = Some("path with spaces/a.pssa".into());
-        assert_eq!(
-            Preview::candidate(&state),
-            Some(PathBuf::from("path with spaces/a.pssa"))
-        );
+        state.last_checkpoint = Some(candidate.to_string_lossy().into_owned());
+        assert_eq!(Preview::candidate(&state), Some(candidate.clone()));
+        std::fs::remove_file(&candidate).unwrap();
+        assert!(Preview::candidate(&state).is_none());
         state.last_checkpoint = Some("a.trfm".into());
         assert!(Preview::candidate(&state).is_none());
+
+        let mut stale = Preview::default();
+        stale.text = "old sample".into();
+        stale.checkpoint = "deleted.pssa".into();
+        stale.poll(Preview::candidate(&state), 1, false);
+        assert!(stale.text.is_empty());
+        assert!(stale.checkpoint.is_empty());
+        assert!(stale.note.contains("No checkpoint"));
     }
 
     #[cfg(unix)]
