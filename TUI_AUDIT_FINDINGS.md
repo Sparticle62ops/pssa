@@ -14,6 +14,7 @@ pseudo-terminal sessions at 80x24, 120x40, and 60x20.
 | The empty/no-input dashboard rendered `[ TRAINING ]` because `status_badge` treated every non-DONE normal state as training, hiding the documented waiting state. | Headless pty launch with an empty chain at 80x24/120x40/60x20 showed `[ TRAINING ]` before any producer log; the default `HealthStatus` was `WAITING`. | `f629582` |
 | A wizard-launched child was polled to completion but retained in `training`, so a piped TUI never reached its EOF exit predicate and stayed open after the final frame. | Read-only event-loop audit and setup child lifecycle trace: `TrainingRun::active()` became false, but `training` stayed `Some`; the loop exits only when it is `None`. | `35f4480` |
 | Repeating `--chain`/`-c`, `--chats-dir`, or `--compare` silently overwrote the earlier TUI launch setting, making a typo select a different chain or log. | CLI argument audit plus `tests/tui_chain_args.rs::tui_rejects_repeated_options_and_mixed_chain_aliases`; duplicate spellings now return an error before TTY detection. | `34c2012` |
+| A piped producer that closed without a completion summary and saved checkpoint was shown with the green `DONE` badge because EOF only cleared `training_active`; the alert layer reported an error at the same time. | Code audit of the stdin-disconnect path and `Network::stream_eof`; regression test `tui::tests::truncated_piped_stream_is_not_reported_as_done` exercises an incomplete stream and keeps an empty TUI in `WAITING`. | `916fdbb` |
 
 ## Checks and non-findings
 
