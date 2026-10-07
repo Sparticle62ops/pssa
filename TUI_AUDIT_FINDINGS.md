@@ -17,31 +17,41 @@ pseudo-terminal sessions at 80x24, 120x40, and 60x20.
 | A piped producer that closed without a completion summary and saved checkpoint was shown with the green `DONE` badge because EOF only cleared `training_active`; the alert layer reported an error at the same time. | Code audit of the stdin-disconnect path and `Network::stream_eof`; regression test `tui::tests::truncated_piped_stream_is_not_reported_as_done` exercises an incomplete stream and keeps an empty TUI in `WAITING`. | `916fdbb` |
 | An empty monitor fabricated `0 tokens/s`, `loss 0.0000`, and zero epoch counters even though no producer had reported measurements; the tiny fallback also showed `0% loss 0.0000`. | Read-only monitor audit plus `tui::tests::test_backend_header_shows_live_stats_on_every_tab_and_missing_values` at 20x8; missing values now render as `-`. | `18759e8` |
 | After a sampled checkpoint was deleted, the stale `last_checkpoint` candidate and generated sample remained visible; missing metadata returned without clearing preview state. | Preview/state audit plus `tui::preview::tests::errors_retain_last_sample_and_pausing_never_starts_work`: a real temporary `.pssa` candidate is deleted, candidate resolution becomes `None`, and the old text/checkpoint are cleared. | `cf41510` |
-
 | A transformer-resume wizard accepted shared `Max batch lanes` values and emitted `--batch-size`, which `train-transformer` does not accept; even an explicit single lane failed after starting the child. | Wizard/CLI argument audit; `transformer_resume_rejects_multi_lane_batches_and_omits_cpu_only_flag` failed on the old flag emission through csrun. | `d18e2fa` |
-| The completed-child cleanup ran before the sweep controller could read its result, permanently leaving the first trial `Running` and blocking the remaining queue. | Independent code audit; `shell_completion_order_records_trial_before_releasing_slot_and_advances_queue` uses an inert `/bin/true` child, the shell's actual ordering, and recorded metrics. | This commit: let the queue consume completion before releasing the child slot; preserve any newly installed active trial. |
-
-| Runs only looked for `train.log` beside `model.pssa`; wizard-produced `model.trfm` checkpoints incorrectly lost their recorded history and claimed it was not recoverable. | Independent code audit; wizard-history regression now reopens both formats and checks loss, throughput, samples and no missing-history warning. | This commit: recognize both wizard checkpoint filenames for the durable-log fallback. |
-
-| Successfully reopened run history always showed `[ WAITING ]`, because the history loader clears the live stall timestamp and the status label ignored the restored completion summary. | Independent audit plus the wizard-history TestBackend regression for both checkpoint formats. | This commit: recognize the completion summary without adding a live stall clock; empty input remains WAITING and truncated input remains a problem. |
-
-| `--compare` opened and parsed an unbounded file on the raw-mode event-loop thread; a FIFO could hang the UI indefinitely and large logs blocked redraw/input. Errors were silently discarded. | Independent audit; a timeout-guarded FIFO subprocess regression, bounded loader tests, and a TestBackend unavailable-comparison assertion pass through csrun. | This commit: reject nonregular sources before terminal setup, reload one bounded 8 MiB log off-thread, and visibly report errors. |
-
-| Single-chat and A/B prompt tails were clipped by character count rather than terminal-cell width, so long CJK drafts hid the newest text off the right edge. | TestBackend regression with a long `世界` draft ending in `END` at 80x24, 120x40 and 60x20, in both modes. | This commit: reuse cell-width-aware tail clipping after accounting for the actual panel/shadow width. |
+| The completed-child cleanup ran before the sweep controller could read its result, permanently leaving the first trial `Running` and blocking the remaining queue. | Independent code audit; `shell_completion_order_records_trial_before_releasing_slot_and_advances_queue` uses an inert `/bin/true` child, the shell's actual ordering, and recorded metrics. | `d8dfae5` |
+| Runs only looked for `train.log` beside `model.pssa`; wizard-produced `model.trfm` checkpoints incorrectly lost their recorded history and claimed it was not recoverable. | Independent code audit; wizard-history regression now reopens both formats and checks loss, throughput, samples and no missing-history warning. | `ab70842` |
+| Successfully reopened run history always showed `[ WAITING ]`, because the history loader clears the live stall timestamp and the status label ignored the restored completion summary. | Independent audit plus the wizard-history TestBackend regression for both checkpoint formats. | `8544b9c` |
+| `--compare` opened and parsed an unbounded file on the raw-mode event-loop thread; a FIFO could hang the UI indefinitely and large logs blocked redraw/input. Errors were silently discarded. | Independent audit; a timeout-guarded FIFO subprocess regression, bounded loader tests, and a TestBackend unavailable-comparison assertion pass through csrun. | `e66aed5` |
+| Single-chat and A/B prompt tails were clipped by character count rather than terminal-cell width, so long CJK drafts hid the newest text off the right edge. | TestBackend regression with a long `世界` draft ending in `END` at 80x24, 120x40 and 60x20, in both modes. | `c2a3012` |
 
 ## Checks and non-findings
 
 - WebGPU parity software-adapter skip is tracked in `76073a9`.
-- The TUI unit/TestBackend suite now reports 268 passing tests through
-  `/workspace/bin/csrun`; `tests/tui_chain_args.rs` reports 4 passing tests.
-  The targeted hardware and checkpoint regressions, the Escape routing
-  regression, and the full TUI module suite all pass; only the repository's
-  existing dead-code warnings remain.
-- Headless pty sweeps rendered all 27 tabs, every requested size, the help and
-  palette overlays, the setup review/CLI preview, device picker unavailable
-  rows, limits, math, sample, and empty/no-checkpoint states without a crash.
-  Escape-to-quit behavior was also exercised deliberately.
+- Final checks through `/workspace/bin/csrun`: TUI unit/TestBackend suite
+  passed **275 tests**; `tests/tui_chain_args.rs` passed **5 tests** and
+  `tests/tui_preview.rs` passed **2 tests**. `tests/wgpu_parity.rs` passed
+  with adapter skips on this no-GPU host. All four device-picker tests also
+  pass with `--features cuda`, including CPU/CUDA/WebGPU application and labels.
+  `cargo check --features cuda`, `cargo clippy --lib --tests`, and
+  `cargo build --release` passed. Clippy reports repository-wide warnings;
+  this is not a warning-free clippy result.
+- `scripts/tui_audit_pty.py` drives the release binary with an incremental VT
+  screen reader and private temporary HOME/config/chain/chat paths. The final
+  default-feature run passed: 111 captured screens, all 27 tabs at 80x24,
+  120x40 and 60x20, plus 20x8; help/palette, wizard pages/command preview,
+  scoped editors, graph controls, function keys, CPU selection, loud unavailable
+  WebGPU/CUDA rows, implicit CLI launch, q/Ctrl+C/Escape quit and editor cancel.
+  Screens are saved on the codespace in `/tmp/pssa-tui-audit-screens-final.txt`.
+  No live trainer, upload or authenticated service call was launched.
 
-## Not fixed + why
+## Coverage limits / not fixed + why
 
-None yet.
+- No remaining confirmed TUI bug is intentionally left unfixed.
+- Codespace checks cannot verify a successful real CUDA/WebGPU device binding
+  or numerical GPU parity. CPU/CUDA/WebGPU selection and labels have
+  deterministic TestBackend fixtures; real no-GPU refusal is exercised in the
+  release PTY sessions. Hardware-backed execution still needs molab.
+- Authenticated Kaggle/HF/GitHub uploads, live cloud delivery and actual training
+  launches were not performed. Their validation, lifecycle and error paths are
+  covered by the existing offline/injected tests and the PTY editor/navigation
+  sweep; this is not an end-to-end production-service verification.
