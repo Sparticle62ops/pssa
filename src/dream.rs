@@ -93,6 +93,19 @@ mod tests {
     }
 
     #[test]
+    fn empty_memory_dream_is_an_exact_no_op() {
+        let mut model = model();
+        model.block.adapters[0].up_proj.data[0] = 0.25;
+        model.block.adapters[0].consolidated_up[0] = -0.5;
+        let fast = model.block.adapters[0].up_proj.data.clone();
+        let slow = model.block.adapters[0].consolidated_up.clone();
+        let summary = model.dream_replay_memory(4, &mut SimpleRng::new(9));
+        assert_eq!(summary.entries_replayed, 0);
+        assert_eq!(model.block.adapters[0].up_proj.data, fast);
+        assert_eq!(model.block.adapters[0].consolidated_up, slow);
+    }
+
+    #[test]
     fn memory_dream_changes_only_fast_and_consolidated_adapter_state() {
         let mut model = seeded_model();
         let before = main_weight_bits(&model);
