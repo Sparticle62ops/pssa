@@ -11,6 +11,8 @@ ML framework of any kind underneath it.
 At matched parameters and on the same corpus, it learns faster than a
 transformer and generates text about twelve times quicker on the same CPU.
 
+![The PSSA terminal dashboard during a live training run](docs/img/tui-demo.gif)
+
 ## Why Rust, and why that is not the point
 Not for speed points, and not because the language makes the architecture
 better. PSSA needed per-token weight updates, a memory bank written during the
@@ -254,12 +256,109 @@ over-read:
 ```bash
 git clone https://github.com/Sparticle62ops/pssa.git
 cd pssa
-cargo install --path .
+cargo install --path .                    # CPU build
+cargo install --path . --features cuda    # NVIDIA GPU build (cuBLAS)
 pssa
 ```
 
-Running it with no arguments gives you a home screen listing every command plus
-any checkpoint and corpus it finds in the working directory.
+Running it with no arguments opens the dashboard. Everything the dashboard does
+is also a plain CLI command, so it works the same over SSH, in a notebook
+terminal, or in a script.
+
+## Using the TUI
+
+`pssa tui` is the main way to use the project: watch a training run, chat with a
+checkpoint, set up a new run, and inspect the memory bank, all in one terminal.
+Pipe a training run into it to watch it live:
+
+```bash
+pssa train data/corpus.txt -o chain/ck001.pssa --backend cuda --no-tui | pssa tui --chain chain
+```
+
+**Monitor.** Loss and its moving average, speed, ETA, optimizer progress, memory
+occupancy, and a live sample from the newest checkpoint. Press `g` or `1`-`7` to
+switch the graph (loss, perplexity, tokens/s, learning rate, comparison, all
+metrics, memory) and `+`/`-` to zoom.
+
+![Monitor tab: live loss curve and run metrics](docs/img/tui-monitor.png)
+
+The memory graph (`7`) plots which episodic memory slots are in use on the
+Poincare disk the model reads from.
+
+![Monitor tab: episodic memory occupancy](docs/img/tui-memory.png)
+
+**Inference.** Chat with any checkpoint. `/model PATH` loads one, and
+`/temp`, `/top-p`, `/top-k`, `/max-tokens` and `/repetition-penalty` change
+sampling. `/ab` puts PSSA and the transformer baseline side by side, and `F6`
+colors each token by the model's confidence.
+
+![Inference tab: chatting with a checkpoint](docs/img/tui-chat.png)
+
+**Setup.** A step-by-step wizard for a new run (dataset, model size, depth and
+loops, schedule, backend). It shows the exact equivalent CLI command at the
+bottom, so you can copy it into a script.
+
+![Setup tab: new-run wizard with the equivalent CLI command](docs/img/tui-setup.png)
+
+**Model, chain and feed.** The model tab shows the configuration the run
+reported. The chain tab lists saved checkpoints with their loss, and the feed tab
+shows the text and token ids being trained on when streaming from Hugging Face.
+
+![Model tab: run configuration](docs/img/tui-model.png)
+
+**Extras.** `Ctrl+K` opens the command palette, which reaches Hugging Face
+login, Kaggle launch and logs, the memory inspector, past runs and the matched
+benchmark. `F8` shows hardware telemetry, `F9` picks the training device, `F10`
+sets resource limits, and `F11` opens a live math reference for the layer.
+
+`F1` shows every key at any time:
+
+![Key reference overlay](docs/img/tui-keys.png)
+
+## Using the CLI
+
+```bash
+# train a fresh checkpoint on a local file (GPU)
+pssa train data/corpus.txt -o chain/ck001.pssa --backend cuda --token-cache data/corpus.txt.tok
+
+# continue the chain on the next slice of the corpus
+pssa train data/corpus.txt --resume chain/ck001.pssa -o chain/ck002.pssa --backend cuda
+
+# stream a Hugging Face dataset instead of a local file
+pssa train --hf-dataset OWNER/NAME -o chain/ck001.pssa --backend cuda
+
+# generate text
+pssa generate "The history of science" -m chain/ck002.pssa --max-new-tokens 64 -t 0.8
+
+# chat, score on held-out text, and list what is in this directory
+pssa chat
+pssa score
+pssa status
+```
+
+![pssa generate output](docs/img/cli-generate.png)
+
+`pssa help` prints every command and flag. The full reference is in
+[CLI Reference](#cli-reference) below.
+
+## What we are working on right now
+
+- **The first big training run.** A larger prototype is training on a single
+  NVIDIA RTX Pro 6000 (Blackwell) through the CUDA backend, as a resume chain:
+  each link trains on the next 500,000 tokens of a mixed corpus and saves a
+  checkpoint, so the run survives restarts. A sample from every checkpoint is
+  being collected to show how the model improves over time.
+- **Sleep and dreaming.** An opt-in sleep phase (`--dream-every`) replays stored
+  memories between updates. In the first version, replay only updated the small
+  fast adapter, and on a sequential-task probe it did not reduce forgetting.
+  It is being reworked so replay also reaches the main weights.
+- **Depth and loops.** Stacked PSSA blocks (`--depth`) and shared repeated passes
+  (`--loops`), with notes in [docs/STACKED-DEPTH.md](docs/STACKED-DEPTH.md).
+- **WebGPU training.** The recurrent scan and memory stage are being ported to
+  WebGPU so AMD, Intel and Apple GPUs can train too. It still needs testing on a
+  real hardware adapter.
+- **Next up.** Tests of the model on a small symbolic world (does it learn the
+  rules, not just the text), and a longer demo video of the dashboard.
 
 ## Where the project needs help
 
@@ -960,15 +1059,11 @@ Integration tests live in `tests/`: `allocations.rs`, `bpe_repair.rs`, `checkpoi
 
 ## Limitations
 
-- CPU-oriented prototype with hand-written linear algebra. `gpu-probe` verifies a WebGPU device and a GEMM against the CPU reference, but training and inference still run the layer math on the CPU.
-- The CLI parser is intentionally minimal: no shell-style quoting, and little validation beyond numeric parsing.
-- A missing or unreadable dataset silently falls back to the built-in science corpus in several loading paths.
-- Model and tokenizer vocabularies must remain compatible; a size warning does not repair a mismatch.
-- Model shape cannot change across a resume chain: latent, state, key, memory and vocabulary must match the checkpoint being resumed.
-- Downloaded content can be large and may contain JSON, malformed text, or data unsuitable for training.
-- The REPL temperature command changes the active sampling temperature for later turns.
-- Benchmark output is milestone-oriented and does not measure perplexity, factuality, latency, or safety.
-- Serialized `.pssa` files are project-specific binary artifacts without version migration tooling.
+- Early model: samples from current checkpoints are still not coherent text.
+  The architecture results above are from small matched runs.
+- Dreaming is experimental and off by default (see above).
+- WebGPU training is not yet verified on hardware; CUDA and CPU are the tested
+  paths. Software WebGPU adapters are refused because they are slower than CPU.
 
 ## License
 
