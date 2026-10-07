@@ -26,7 +26,7 @@ use std::sync::{Mutex, OnceLock};
 /// Stage module failures are already reported with the driver's JIT log by the
 /// CUDA loader. Suppress repeated fallback chatter for that permanent error;
 /// other transient stage failures are also reported only once per message.
-pub(crate) fn warn_cuda_fallback_once(error: &str, message: String) {
+pub(crate) fn warn_gpu_fallback_once(error: &str, message: String) {
     if error.contains("stage module failed to load") {
         return;
     }
@@ -496,9 +496,9 @@ pub fn stage_projections(m: &mut PSSALayerV2, seq_len: usize) {
     if let Some(gpu) = gpu.as_ref() {
         m.tape.delta[..l * d_m].copy_from_slice(&m.tape.delta_raw[..l * d_m]);
         if let Err(error) = gpu.softplus_in_place(&mut m.tape.delta[..l * d_m]) {
-            warn_cuda_fallback_once(
+            warn_gpu_fallback_once(
                 &error,
-                format!("warning: CUDA softplus failed; using CPU elementwise path: {error}"),
+                format!("warning: GPU softplus failed; using CPU elementwise path: {error}"),
             );
             for i in 0..l * d_m {
                 m.tape.delta[i] = softplus(m.tape.delta_raw[i]);
@@ -593,9 +593,9 @@ pub fn stage_ssm_scan(m: &mut PSSALayerV2, seq_len: usize) {
             d_s,
         );
         if let Err(error) = result {
-            warn_cuda_fallback_once(
+            warn_gpu_fallback_once(
                 &error,
-                format!("warning: CUDA SSM forward failed; using CPU scan: {error}"),
+                format!("warning: GPU SSM forward failed; using CPU scan: {error}"),
             );
         } else {
             return;
@@ -820,10 +820,10 @@ fn stage_memory_impl(m: &mut PSSALayerV2, seq_len: usize, resident_ssm: bool) {
             &mut m.tape.m_inj[..seq_len * d_m],
         );
         if let Err(direct_error) = direct {
-            warn_cuda_fallback_once(
+            warn_gpu_fallback_once(
                 &direct_error,
                 format!(
-                    "warning: CUDA memory forward failed; using host retrieval: {direct_error}; resident path: {resident_error:?}"
+                    "warning: GPU memory forward failed; using host retrieval: {direct_error}; resident path: {resident_error:?}"
                 ),
             );
         } else {
@@ -2088,10 +2088,10 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
         if let Err(error) =
             gpu.memory_backward_local(g_zraw, g_mem, m_proj, g_m_proj_out, g_gate_pre)
         {
-            warn_cuda_fallback_once(
+            warn_gpu_fallback_once(
                 &error,
                 format!(
-                    "warning: CUDA memory elementwise backward failed; using host path: {error}"
+                    "warning: GPU memory elementwise backward failed; using host path: {error}"
                 ),
             );
             for i in 0..g_zraw.len() {
@@ -2207,9 +2207,9 @@ pub fn bwd_stage_memory(m: &mut PSSALayerV2, seq_len: usize) {
             query_pnc,
             query_euc,
         ) {
-            warn_cuda_fallback_once(
+            warn_gpu_fallback_once(
                 &error,
-                format!("warning: CUDA memory retrieval backward failed; using host path: {error}"),
+                format!("warning: GPU memory retrieval backward failed; using host path: {error}"),
             );
             for (t, (pnc, euc)) in query_pnc
                 .chunks_mut(d_k)
@@ -2699,9 +2699,9 @@ pub(crate) fn bwd_stage_ssm_with_input(
     let gpu = gpu_ctx(m).filter(|g| g.accelerates_backward());
     if let Some(gpu) = gpu.as_ref() {
         if let Err(error) = bwd_stage_ssm_cuda(m, seq_len, input_is_embedding, gpu) {
-            warn_cuda_fallback_once(
+            warn_gpu_fallback_once(
                 &error,
-                format!("warning: CUDA SSM backward failed; using host fallback: {error}"),
+                format!("warning: GPU SSM backward failed; using host fallback: {error}"),
             );
             bwd_stage_ssm_sequential_gpu(m, seq_len, input_is_embedding, gpu);
         }

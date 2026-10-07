@@ -761,7 +761,6 @@ impl WgpuContext {
             "SSM",
         )?;
         let delta_buf = buffer(self, delta, token_m, "wgpu_ssm_delta", false)?;
-        let raw_buf = buffer(self, delta_raw, token_m, "wgpu_ssm_raw", false)?;
         let b_buf = buffer(self, b_proj, token_s, "wgpu_ssm_b", false)?;
         let x_buf = buffer(self, x_norm, token_m, "wgpu_ssm_x", false)?;
         let rates_buf = buffer(self, rates, stride, "wgpu_ssm_rates", false)?;
