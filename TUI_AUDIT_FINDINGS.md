@@ -18,6 +18,8 @@ pseudo-terminal sessions at 80x24, 120x40, and 60x20.
 | An empty monitor fabricated `0 tokens/s`, `loss 0.0000`, and zero epoch counters even though no producer had reported measurements; the tiny fallback also showed `0% loss 0.0000`. | Read-only monitor audit plus `tui::tests::test_backend_header_shows_live_stats_on_every_tab_and_missing_values` at 20x8; missing values now render as `-`. | `18759e8` |
 | After a sampled checkpoint was deleted, the stale `last_checkpoint` candidate and generated sample remained visible; missing metadata returned without clearing preview state. | Preview/state audit plus `tui::preview::tests::errors_retain_last_sample_and_pausing_never_starts_work`: a real temporary `.pssa` candidate is deleted, candidate resolution becomes `None`, and the old text/checkpoint are cleared. | `cf41510` |
 
+| A transformer-resume wizard accepted shared `Max batch lanes` values and emitted `--batch-size`, which `train-transformer` does not accept; even an explicit single lane failed after starting the child. | Wizard/CLI argument audit; `transformer_resume_rejects_multi_lane_batches_and_omits_cpu_only_flag` failed on the old flag emission through csrun. | This commit: omit the unsupported flag for blank/1; reject multi-lane drafts clearly before launch. |
+
 ## Checks and non-findings
 
 - WebGPU parity software-adapter skip is tracked in `76073a9`.

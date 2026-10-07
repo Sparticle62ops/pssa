@@ -511,8 +511,13 @@ impl Setup {
         }
         TrainingBackend::parse(self.value(Backend))?;
         self.limits()?;
-        if self.transformer_resume() && self.value(Source) != "local" {
-            return Err("Transformer resume requires a local dataset".into());
+        if self.transformer_resume() {
+            if self.value(Source) != "local" {
+                return Err("Transformer resume requires a local dataset".into());
+            }
+            if self.limits()?.batch_size.is_some_and(|n| n != 1) {
+                return Err("Transformer resume does not support batch lanes; Max batch lanes must be blank or 1".into());
+            }
         }
         if !self.value(Resume).is_empty() {
             let path = Path::new(self.value(Resume));
@@ -583,7 +588,9 @@ impl Setup {
             (Threads, "--threads"),
             (Ram, "--ram-mib"),
         ] {
-            if !self.value(field).is_empty() {
+            // train-transformer is a single-lane CPU baseline and does not
+            // accept --batch-size, even when the shared draft explicitly says 1.
+            if !(transformer && field == Batch) && !self.value(field).is_empty() {
                 push(flag, self.value(field).into());
             }
         }
@@ -1143,6 +1150,25 @@ mod tests {
             assert!(!args.iter().any(|s| s == flag));
         }
         assert!(setup.command().contains("model.trfm"));
+    }
+
+    #[test]
+    fn transformer_resume_rejects_multi_lane_batches_and_omits_cpu_only_flag() {
+        let fixture = Fixture::new();
+        let mut setup = fixture.setup();
+        let resume = fixture.0.join("model.trfm");
+        fs::write(&resume, b"child validates checkpoint").unwrap();
+        setup.set_resume(resume);
+        for batch in ["", "1"] {
+            setup.values[Batch as usize] = batch.into();
+            let args = setup.validate().unwrap().args;
+            assert!(!args.iter().any(|arg| arg == "--batch-size"));
+        }
+        setup.values[Batch as usize] = "2".into();
+        let error = setup.validate().err().expect("unsupported batch must fail preflight");
+        assert!(error.contains("Transformer resume"));
+        assert!(error.contains("batch"));
+        assert!(error.contains("blank or 1"));
     }
 
     #[test]
