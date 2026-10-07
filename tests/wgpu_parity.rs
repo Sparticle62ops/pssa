@@ -8,8 +8,15 @@ use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
 use pssa::sequence_batch::{Sequence, SequenceBatch};
 
 fn webgpu() -> Option<WgpuContext> {
-    match WgpuContext::init_with_software_policy(true) {
+    let allow_software = std::env::var("PSSA_WGPU_ALLOW_SOFTWARE").as_deref() == Ok("1");
+    match WgpuContext::init_with_software_policy(allow_software) {
         Ok(ctx) => Some(ctx),
+        Err(error) if !allow_software && error.contains("software GPU adapter refused") => {
+            eprintln!(
+                "WebGPU parity skipped: software adapter (CPU/llvmpipe/lavapipe/swiftshader) is disabled; set PSSA_WGPU_ALLOW_SOFTWARE=1 to override ({error})"
+            );
+            None
+        }
         Err(error) => {
             eprintln!("WebGPU parity skipped: no adapter ({error})");
             None

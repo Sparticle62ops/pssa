@@ -44,14 +44,17 @@ CARGO_TARGET_DIR=/tmp/pssa-wgpu-target CARGO_BUILD_JOBS=1 \
   cargo test --test wgpu_parity -- --nocapture
 ```
 
-Measured result: **2 passed, 0 failed, 2 adapter skips**. Consequently, no
+Measured result: **3 passed, 0 failed, 3 adapter skips**. Consequently, no
 numerical GPU relative-error number was measured in this environment; the
 required `< 1e-3` forward/gradient number remains unverified here. The test
 contains the small full-model forward/all-gradient comparison and a separate
 latent-3584, vocabulary-2048, depth-1, loops-1, batch-2 SSM/memory/vocabulary
-shape smoke. On a software or discrete adapter, both tests execute rather than
-skip, and the small test asserts every model gradient and forward tape result
-at relative error `< 1e-3`.
+shape smoke. On a discrete adapter, both tests execute and the small test asserts every
+model gradient and forward tape result at relative error `< 1e-3`. A software-
+only adapter (reported as `Cpu`, including llvmpipe, lavapipe, or SwiftShader)
+is now reported as a parity skip instead of failing device initialization. Set
+`PSSA_WGPU_ALLOW_SOFTWARE=1` when deliberately exercising the parity kernels on
+such an adapter.
 
 The post-change Rust check also passed:
 
