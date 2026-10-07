@@ -596,6 +596,12 @@ mod tests {
             assert_eq!(state.metric_series.len(), 1);
             assert!(state.warning.is_none());
             assert!(!state.training_active);
+            assert!(state.last_progress_at.is_none(), "recorded history has no stall clock");
+            assert_eq!(state.health_status().normal_label, "DONE");
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|f| super::super::draw(f, &state, 0)).unwrap();
+            let screen: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+            assert!(screen.contains("[ DONE ]"));
             fs::remove_file(path).unwrap();
         }
         fs::remove_dir_all(dir).unwrap();

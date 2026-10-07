@@ -688,7 +688,9 @@ impl RunState {
     fn health_status_at(&self, now: Instant) -> HealthStatus {
         let normal_label = if self.training_active {
             "TRAINING"
-        } else if self.last_progress_at.is_some() {
+        } else if self.last_progress_at.is_some() || self.training_seconds.is_some() {
+            // Recorded history deliberately has no live stall-clock timestamp.
+            // Its completion summary still distinguishes it from an empty TUI.
             "DONE"
         } else {
             "WAITING"

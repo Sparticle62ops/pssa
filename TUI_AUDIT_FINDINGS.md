@@ -23,6 +23,8 @@ pseudo-terminal sessions at 80x24, 120x40, and 60x20.
 
 | Runs only looked for `train.log` beside `model.pssa`; wizard-produced `model.trfm` checkpoints incorrectly lost their recorded history and claimed it was not recoverable. | Independent code audit; wizard-history regression now reopens both formats and checks loss, throughput, samples and no missing-history warning. | This commit: recognize both wizard checkpoint filenames for the durable-log fallback. |
 
+| Successfully reopened run history always showed `[ WAITING ]`, because the history loader clears the live stall timestamp and the status label ignored the restored completion summary. | Independent audit plus the wizard-history TestBackend regression for both checkpoint formats. | This commit: recognize the completion summary without adding a live stall clock; empty input remains WAITING and truncated input remains a problem. |
+
 ## Checks and non-findings
 
 - WebGPU parity software-adapter skip is tracked in `76073a9`.
