@@ -1495,9 +1495,10 @@ impl PSSAContinuousBlockV2 {
     /// moments, and the episodic bank remain untouched.  The adapter update is
     /// a local Hebbian-style VJP: the stored value is the target and the
     /// adapter activation supplies the presynaptic signal.
-    pub(crate) fn dream_replay_value(&mut self, value: &[f32]) {
+    pub(crate) fn dream_replay_value(&mut self, value: &[f32], output: &mut [f32]) {
         assert_eq!(value.len(), self.cfg.d_latent);
-        self.forward_continuous_inference(value, &mut self.inf_features);
+        assert_eq!(output.len(), self.cfg.d_latent);
+        self.forward_continuous_inference(value, output);
         let target_norm = value
             .iter()
             .map(|&x| (x as f64) * (x as f64))
@@ -1509,8 +1510,7 @@ impl PSSAContinuousBlockV2 {
             let error = (value[i] - self.inf_ad_out[i]).clamp(-4.0, 4.0);
             let row = i * rank;
             for r in 0..rank {
-                self.adapters[0].up_proj.data[row + r] +=
-                    rate * error * self.inf_ad_act[r];
+                self.adapters[0].up_proj.data[row + r] += rate * error * self.inf_ad_act[r];
             }
         }
     }
@@ -2466,12 +2466,11 @@ impl PSSALayerV2 {
                 let start = entry * b.cfg.d_latent;
                 b.memory.values[start..start + b.cfg.d_latent].to_vec()
             };
-            let b = if block == 0 {
-                &mut self.block
+            if block == 0 {
+                self.block.dream_replay_value(&value, &mut self.inf_features);
             } else {
-                &mut self.extra_blocks[block - 1]
-            };
-            b.dream_replay_value(&value);
+                self.extra_blocks[block - 1].dream_replay_value(&value, &mut self.inf_features);
+            }
         }
         self.copy_recurrent_state_from(&recurrent);
         let consolidation_delta_norm = self.dream_consolidate_plasticity();
