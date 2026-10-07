@@ -205,6 +205,11 @@ mod tests {
     fn generated_dream_replays_sampled_tokens_without_main_weight_updates() {
         let mut model = seeded_model();
         let before = main_weight_bits(&model);
+        let carry = {
+            let mut state = vec![0.0; model.recurrent_state_len()];
+            model.copy_recurrent_state_to(&mut state);
+            state
+        };
         let fast = model.block.adapters[0].up_proj.data.clone();
         let slow = model.block.adapters[0].consolidated_up.clone();
         let summary = model.dream_replay(
@@ -218,8 +223,32 @@ mod tests {
         assert_eq!(summary.generated_tokens, 4);
         assert!(summary.consolidation_delta_norm > 0.0);
         assert_eq!(main_weight_bits(&model), before);
+        let mut restored = vec![0.0; model.recurrent_state_len()];
+        model.copy_recurrent_state_to(&mut restored);
+        assert_eq!(restored, carry);
         assert_ne!(model.block.adapters[0].up_proj.data, fast);
         assert_ne!(model.block.adapters[0].consolidated_up, slow);
+    }
+
+    #[test]
+    fn generated_dream_is_deterministic_for_a_fixed_seed() {
+        let mut a = seeded_model();
+        let mut b = seeded_model();
+        let sa = a.dream_replay(DreamMode::Generate, 1, 5, 0.8, &mut SimpleRng::new(88));
+        let sb = b.dream_replay(DreamMode::Generate, 1, 5, 0.8, &mut SimpleRng::new(88));
+        assert_eq!(sa.entries_replayed, sb.entries_replayed);
+        assert_eq!(sa.generated_tokens, sb.generated_tokens);
+        assert_eq!(sa.consolidation_delta_norm.to_bits(), sb.consolidation_delta_norm.to_bits());
+        assert_eq!(a.block.adapters[0].up_proj.data, b.block.adapters[0].up_proj.data);
+        assert_eq!(a.block.adapters[0].consolidated_up, b.block.adapters[0].consolidated_up);
+    }
+
+    #[test]
+    fn dream_mode_parser_rejects_unknown_sources() {
+        assert_eq!(DreamMode::parse("memory"), Ok(DreamMode::Memory));
+        assert_eq!(DreamMode::parse("generate"), Ok(DreamMode::Generate));
+        assert_eq!(DreamMode::parse("both"), Ok(DreamMode::Both));
+        assert!(DreamMode::parse("tokens").is_err());
     }
 
     #[test]
