@@ -2494,6 +2494,14 @@ impl PSSALayerV2 {
         }
     }
 
+    fn dream_replay_memory_entry(&mut self, block: usize, value: &[f32]) {
+        if block == 0 {
+            self.block.dream_replay_value(value, &mut self.inf_features);
+        } else {
+            self.extra_blocks[block - 1].dream_replay_value(value, &mut self.inf_features);
+        }
+    }
+
     fn dream_memory_entries(&self) -> Vec<(usize, usize)> {
         let mut entries = Vec::new();
         for (block, b) in std::iter::once(&self.block)
@@ -2594,8 +2602,11 @@ impl PSSALayerV2 {
         self.copy_recurrent_state_from(&recurrent);
 
         if mode.includes_memory() {
-            for value in &values {
-                self.dream_replay_latent(value);
+            for (&(block, _), value) in entries[..take].iter().zip(&values) {
+                // A stored entry belongs to the block that captured it. Keep
+                // memory mode's Stage 1 behavior for stacked models rather
+                // than applying every block's adapter to the same value.
+                self.dream_replay_memory_entry(block, value);
             }
         }
         for value in &generated {
