@@ -35,10 +35,18 @@ impl DreamMode {
     }
 }
 
+/// Default learning rate for the separate SGD rehearsal optimizer.  It is
+/// deliberately much smaller than the normal training rate because replay is
+/// interleaved with fresh-task updates.
+pub const DEFAULT_REHEARSAL_LR: f32 = 1e-5;
+pub const DEFAULT_REHEARSAL_STEPS: usize = 1;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DreamSummary {
     pub entries_replayed: usize,
     pub generated_tokens: usize,
+    /// Number of supervised token sequences replayed through the main model.
+    pub rehearsal_sequences: usize,
     pub consolidation_delta_norm: f32,
     pub elapsed_seconds: f64,
 }
