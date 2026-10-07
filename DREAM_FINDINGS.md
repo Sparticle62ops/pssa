@@ -50,6 +50,12 @@ its two output lines. The example itself was release-checked successfully.
 
 ## Checks run
 
-- `CARGO_BUILD_JOBS=1 csrun 'cargo test --release --lib dream'` — 8 passed.
+- `CARGO_BUILD_JOBS=1 csrun 'cargo test --release --lib dream'` — 8 passed (the focused dream test pass).
 - `CARGO_BUILD_JOBS=1 csrun 'cargo check --release --example dream_probe'` — passed.
-- Final CUDA all-target, library test, clippy-baseline, and example-build checks remain part of the verification pass.
+- `CARGO_BUILD_JOBS=1 csrun 'cargo test --release --lib'` — 385 passed, 0 failed, 2 ignored.
+- `CARGO_BUILD_JOBS=1 csrun 'cargo check --release --features cuda --all-targets'` — passed. The CUDA-feature check emitted the repository's existing warnings but no errors.
+- `CARGO_BUILD_JOBS=1 csrun 'cargo clippy --release --all-targets'` — passed (exit 0). Clippy still reports the repository's existing warning set; this was not a zero-warning run, and no clippy error was introduced by dream replay.
+- `CARGO_BUILD_JOBS=1 csrun 'cargo build --release --examples'` — passed. The CPU example build emitted existing warnings.
+- `CARGO_BUILD_JOBS=1 csrun 'cargo build --release --features cuda --examples'` — passed. The CUDA example build emitted existing CUDA dead-code/no-op-clone warnings.
+
+All final verification commands above were run serially with `CARGO_BUILD_JOBS=1`. No training run or `dream_probe` execution was started, per the task restriction.
