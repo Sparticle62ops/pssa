@@ -55,6 +55,7 @@ mod tests {
         for value in ["auto", "cpu", "webgpu"] {
             assert_eq!(TrainingBackend::parse(value).unwrap().as_str(), value);
         }
+        assert_eq!(TrainingBackend::parse("wgpu"), Ok(TrainingBackend::WebGpu));
         assert!(TrainingBackend::parse("tpu").is_err());
         assert_eq!(
             TrainingBackend::parse("cuda").is_ok(),
