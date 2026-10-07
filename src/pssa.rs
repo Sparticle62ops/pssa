@@ -3,6 +3,7 @@ use crate::backend::Device;
 use crate::linalg::{SimpleRng, dot_slice, sigmoid, softplus};
 use crate::memory::HyperbolicEpisodicBankV2;
 use std::f32;
+use std::time::Instant;
 
 // =============================================================================
 // PARAMETER TENSORS WITH INTEGRATED ADAMW MOMENTS
@@ -1488,6 +1489,32 @@ impl PSSAContinuousBlockV2 {
     pub fn ema_consolidate_plasticity(&mut self) {
         self.adapters[0].consolidate(self.cfg.ema_alpha);
     }
+
+    /// Replay one detached episodic value through the continuous block and
+    /// update only the fast plastic adapter.  Main PSSA weights, optimizer
+    /// moments, and the episodic bank remain untouched.  The adapter update is
+    /// a local Hebbian-style VJP: the stored value is the target and the
+    /// adapter activation supplies the presynaptic signal.
+    pub(crate) fn dream_replay_value(&mut self, value: &[f32]) {
+        assert_eq!(value.len(), self.cfg.d_latent);
+        self.forward_continuous_inference(value, &mut self.inf_features);
+        let target_norm = value
+            .iter()
+            .map(|&x| (x as f64) * (x as f64))
+            .sum::<f64>()
+            .sqrt();
+        let rate = 0.02 / (1.0 + target_norm.min(f32::MAX as f64) as f32);
+        let rank = self.adapters[0].rank;
+        for i in 0..self.cfg.d_latent {
+            let error = (value[i] - self.inf_ad_out[i]).clamp(-4.0, 4.0);
+            let row = i * rank;
+            for r in 0..rank {
+                self.adapters[0].up_proj.data[row + r] +=
+                    rate * error * self.inf_ad_act[r];
+            }
+        }
+    }
+
     pub fn parameter_count(&self) -> usize {
         [
             &self.a_mat,
@@ -2379,6 +2406,83 @@ impl PSSALayerV2 {
             ctx.invalidate_weights();
         }
     }
+
+    /// Consolidate the fast adapter after an offline replay and report the
+    /// Euclidean norm of the transferred slow-copy delta.  The consolidation
+    /// itself is shared with the historical EMA path so its coefficient
+    /// transfer remains exact.
+    fn dream_consolidate_plasticity(&mut self) -> f32 {
+        let mut delta_sq = 0.0f64;
+        for b in std::iter::once(&self.block).chain(&self.extra_blocks) {
+            let alpha = b.cfg.ema_alpha as f64;
+            for &fast in &b.adapters[0].up_proj.data {
+                let delta = alpha * fast as f64;
+                delta_sq += delta * delta;
+            }
+        }
+        self.ema_consolidate_plasticity();
+        delta_sq.sqrt() as f32
+    }
+
+    /// Run a CPU-host replay of occupied episodic values.  This is deliberately
+    /// runtime-only: neither the selected indices nor the RNG state are part of
+    /// checkpoint serialization.  The live recurrent carry is restored after
+    /// sleep so dreaming cannot change the external training stream.
+    pub fn dream_replay_memory(
+        &mut self,
+        replay: usize,
+        rng: &mut SimpleRng,
+    ) -> crate::dream::DreamSummary {
+        let started = Instant::now();
+        if replay == 0 {
+            return crate::dream::DreamSummary {
+                elapsed_seconds: started.elapsed().as_secs_f64(),
+                ..Default::default()
+            };
+        }
+        let mut entries = Vec::new();
+        for (block, b) in std::iter::once(&self.block)
+            .chain(&self.extra_blocks)
+            .enumerate()
+        {
+            entries.extend((0..b.memory.count).map(|entry| (block, entry)));
+        }
+        let take = replay.min(entries.len());
+        for i in 0..take {
+            let remaining = entries.len() - i;
+            let j = i + (rng.next_u32() as usize % remaining);
+            entries.swap(i, j);
+        }
+
+        let mut recurrent = vec![0.0; self.recurrent_state_len()];
+        self.copy_recurrent_state_to(&mut recurrent);
+        for &(block, entry) in &entries[..take] {
+            let value = {
+                let b = if block == 0 {
+                    &self.block
+                } else {
+                    &self.extra_blocks[block - 1]
+                };
+                let start = entry * b.cfg.d_latent;
+                b.memory.values[start..start + b.cfg.d_latent].to_vec()
+            };
+            let b = if block == 0 {
+                &mut self.block
+            } else {
+                &mut self.extra_blocks[block - 1]
+            };
+            b.dream_replay_value(&value);
+        }
+        self.copy_recurrent_state_from(&recurrent);
+        let consolidation_delta_norm = self.dream_consolidate_plasticity();
+        crate::dream::DreamSummary {
+            entries_replayed: take,
+            generated_tokens: 0,
+            consolidation_delta_norm,
+            elapsed_seconds: started.elapsed().as_secs_f64(),
+        }
+    }
+
     pub fn insert_training_memory_at(&mut self, loss: f32, last: usize) {
         if !(loss > 3.5) {
             return;
