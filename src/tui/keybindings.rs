@@ -250,7 +250,7 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('?'), "?", "Open/close help outside text input; type normally in editors", BROWSE | HELP => ToggleHelp),
     bind!(Char('q'), "q", "Quit outside text input; close help", BROWSE => Quit, HELP => ToggleHelp),
     bind!(Esc, "Esc", "Dashboard/setup/local/network: quit; editors: cancel/clear; chat/extras: stop (Kaggle detaches); overlays: close",
-        MONITOR | PAGES | SETUP | LOCAL_BROWSE => Quit, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, NETWORK | NETWORK_EDIT | TIMELINE => Network, PALETTE => Palette, HELP => ToggleHelp),
+        MONITOR | PAGES | SETUP | LOCAL_BROWSE => Quit, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, NETWORK => Quit, NETWORK_EDIT => Network, TIMELINE => Quit, PALETTE => Palette, HELP => ToggleHelp),
     bind!(Left, "Left", "Monitor: pan older; timeline: older checkpoint; other browse tabs: previous tab; setup: previous page",
         MONITOR => Pan(false), PAGES | EXTRA_BROWSE | LOCAL_BROWSE | NETWORK => PreviousTab, SETUP => Setup, TIMELINE => Network),
     bind!(Right, "Right", "Monitor: pan newer; timeline: newer checkpoint; other browse tabs: next tab; setup: next page",
@@ -467,6 +467,18 @@ mod tests {
                 Context::Network
             ),
             Some(Quit)
+        );
+        assert_eq!(
+            action(KeyEvent::new(Esc, KeyModifiers::NONE), Context::Network),
+            Some(Quit)
+        );
+        assert_eq!(
+            action(KeyEvent::new(Esc, KeyModifiers::NONE), Context::Timeline),
+            Some(Quit)
+        );
+        assert_eq!(
+            action(KeyEvent::new(Esc, KeyModifiers::NONE), Context::NetworkEdit),
+            Some(Network)
         );
         assert_eq!(
             action(
