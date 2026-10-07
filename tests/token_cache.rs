@@ -1,5 +1,6 @@
 use pssa::cli::CLIHandler;
 use pssa::dataset::Tokenizer;
+use rayon::ThreadPoolBuilder;
 use std::fs;
 use std::path::PathBuf;
 
@@ -131,5 +132,32 @@ fn stale_and_corrupt_caches_are_rebuilt_atomically() {
             .unwrap();
     assert_eq!(rebuilt, expected_changed);
     assert_ne!(fs::read(&cache).unwrap(), b"not a token cache");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn large_bpe_training_window_is_safe_with_and_without_cache_on_rayon_threads() {
+    const LINE_COUNT: usize = 250_000;
+    let mut raw = String::with_capacity(LINE_COUNT * 30);
+    for _ in 0..LINE_COUNT {
+        raw.push_str("alpha beta gamma delta\n");
+    }
+    let tokenizer = Tokenizer::from_corpus_bpe("alpha beta gamma delta epsilon\n", 300).unwrap();
+    let (root, cache) = scratch("large-bpe");
+    let pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+
+    let (uncached, cached) = pool.install(|| {
+        assert_eq!(rayon::current_num_threads(), 4);
+        let uncached =
+            CLIHandler::documents_with_cache(&raw, &tokenizer, None, 37, None, None).unwrap();
+        let cached =
+            CLIHandler::documents_with_cache(&raw, &tokenizer, None, 37, Some(&cache), None)
+                .unwrap();
+        (uncached, cached)
+    });
+
+    // Skipping 37 tokens drops the first few documents, so expect almost every line.
+    assert!(uncached.len() > LINE_COUNT - 64 && uncached.len() <= LINE_COUNT);
+    assert_eq!(cached, uncached);
     fs::remove_dir_all(root).unwrap();
 }

@@ -582,19 +582,14 @@ impl CLIHandler {
         cache_path: Option<&Path>,
         source_path: Option<&Path>,
     ) -> Result<Vec<Vec<usize>>, String> {
-        let result = token_cache::documents(
-            raw,
-            tokenizer,
-            limit,
-            skip,
-            cache_path,
-            source_path,
-        )?;
-        println!(
-            "token_cache={} token_window_seconds={:.3}",
-            result.status.label(),
-            result.elapsed.as_secs_f64()
-        );
+        let result = token_cache::documents(raw, tokenizer, limit, skip, cache_path, source_path)?;
+        if cache_path.is_some() {
+            println!(
+                "token_cache={} token_window_seconds={:.3}",
+                result.status.label(),
+                result.elapsed.as_secs_f64()
+            );
+        }
         Ok(result.docs)
     }
     fn memory_occupancy(model: &PSSALayerV2) -> Option<(usize, usize)> {
@@ -1296,14 +1291,11 @@ impl CLIHandler {
         };
         let mut run_options = options.clone();
         run_options.checkpoint_path = Some(out.to_string());
-        if run_options.token_cache_source.is_none() {
+        // Token caching is explicitly opt-in. In particular, do not infer a
+        // cache path for local files: omitting --token-cache must retain the
+        // historical lazy serial tokenization path.
+        if run_options.token_cache.is_some() && run_options.token_cache_source.is_none() {
             run_options.token_cache_source = Self::local_cache_source(data);
-        }
-        if run_options.token_cache.is_none() {
-            run_options.token_cache = run_options
-                .token_cache_source
-                .as_deref()
-                .map(|source| format!("{source}.pssatok"));
         }
         let (model, _) = Self::train_corpus(&raw, &run_options)?;
         Self::save_model_v2(&model, out)
@@ -1980,7 +1972,9 @@ impl CLIHandler {
         println!(
             "    {:<48}{}",
             "  --token-cache path",
-            ui::dim("persistent binary token cache; defaults to SOURCE.pssatok for local files")
+            ui::dim(
+                "opt-in persistent binary token cache; local files provide a source fingerprint"
+            )
         );
         println!(
             "    {:<48}{}",
@@ -2166,7 +2160,7 @@ impl CLIHandler {
                 );
                 println!("      --skip-tokens <N>         offset into the corpus; wraps at EOF");
                 println!(
-                    "      --token-cache <PATH>      persistent binary cache (default: SOURCE.pssatok for local files)"
+                    "      --token-cache <PATH>      opt-in persistent binary cache (local source fingerprinted)"
                 );
                 println!(
                     "      --resume <PATH>            continue optimizer/model state from a checkpoint"
