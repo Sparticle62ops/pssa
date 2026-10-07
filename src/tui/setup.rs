@@ -889,7 +889,7 @@ impl RunSpec {
         self.start(&executable)
     }
 
-    fn start(self, executable: &Path) -> Result<TrainingRun, String> {
+    pub(super) fn start(self, executable: &Path) -> Result<TrainingRun, String> {
         fs::create_dir_all(&self.output)
             .map_err(|e| format!("Cannot create output directory: {e}"))?;
         let path = self.output.join("train.log");

@@ -1003,21 +1003,20 @@ fn run_app(
                 if let Some(run) = training.as_ref() {
                     network.eof(run.succeeded().unwrap_or(false));
                 }
-                // A completed wizard child must no longer keep a piped TUI
-                // alive. Leave the final frame visible while deliveries drain.
-                release_finished_training(&mut training, true);
             }
             hf_login.poll();
             extras.poll_with(&mut state, &mut tab, &mut chat, |line| {
                 network.remote_line(line)
             });
-            if network.poll(
-                &mut state,
-                tab,
-                &mut training,
-                extras.training_busy(),
-                extras.remote_monitor(),
-            ) {
+            if poll_training_queue(&mut training, training_finished, |training| {
+                network.poll(
+                    &mut state,
+                    tab,
+                    training,
+                    extras.training_busy(),
+                    extras.remote_monitor(),
+                )
+            }) {
                 chat.set_model_dir(state.chain_dir.clone());
                 extras.set_chain_dir(state.chain_dir.clone());
             }
@@ -1246,6 +1245,18 @@ fn release_finished_training(
     } else {
         false
     }
+}
+
+// Let the sweep consume completion before freeing the shared child slot. It may
+// install the next trial, in which case release_finished_training keeps it alive.
+fn poll_training_queue(
+    training: &mut Option<setup::TrainingRun>,
+    finished: bool,
+    poll_queue: impl FnOnce(&mut Option<setup::TrainingRun>) -> bool,
+) -> bool {
+    let started = poll_queue(training);
+    release_finished_training(training, finished);
+    started
 }
 
 fn reload_comparison(state: &mut RunState, path: &std::path::Path) {

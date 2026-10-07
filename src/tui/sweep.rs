@@ -563,6 +563,43 @@ mod tests {
         assert_ne!(sweep.trials[0].output, first_path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn shell_completion_order_records_trial_before_releasing_slot_and_advances_queue() {
+        let fixture = Fixture::new();
+        let setup = fixture.setup();
+        let mut sweep = Sweep {
+            grid: ["0.001,0.002".into(), "32".into(), "1".into()],
+            ..Default::default()
+        };
+        sweep.queue(&setup).unwrap();
+        let spec = sweep.begin_next(false).unwrap();
+        // An inert child tests lifecycle wiring; never launch a trainer.
+        let run = spec.start(Path::new("/bin/true")).unwrap();
+        let mut state = RunState::default();
+        run.initialize(&mut state);
+        fs::write(run.output_dir().join("train.log"), "epoch 1/1 loss=2.5 tokens=64 updates=1\nthroughput      90 tokens/second\n").unwrap();
+        let mut training = Some(run);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while training.as_ref().unwrap().active() {
+            training.as_mut().unwrap().poll(&mut state);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Use the actual shell ordering; block launch until assertions complete.
+        assert!(!super::super::poll_training_queue(&mut training, true, |slot| {
+            sweep.poll(slot, &mut state, true)
+        }));
+        assert!(training.is_none());
+        assert_eq!(sweep.trials[0].status, Status::Done);
+        assert_eq!(sweep.trials[0].loss, Some(2.5));
+        assert_eq!(sweep.trials[0].speed, Some(90.0));
+        assert!(sweep.current.is_none());
+        assert!(sweep.begin_next(false).is_some());
+        assert_eq!(sweep.current, Some(1));
+        assert_eq!(sweep.trials[1].status, Status::Running);
+    }
+
     #[test]
     fn invalid_or_excessive_grid_is_atomic_and_edit_shortcuts_do_not_launch() {
         let fixture = Fixture::new();
