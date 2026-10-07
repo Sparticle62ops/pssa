@@ -24,6 +24,7 @@ pub mod transformer;
 pub mod transformer_checkpoint;
 pub mod transformer_inference;
 pub mod transformer_training;
+mod token_cache;
 pub mod tui;
 pub mod ui;
 

@@ -180,6 +180,46 @@ impl Tokenizer {
         self.kind
     }
 
+    /// Stable identity for artifacts derived from this tokenizer. BPE caches
+    /// include the serialized merge table, not only the visible vocabulary.
+    pub(crate) fn cache_identity_hash(&self) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        let mut feed = |bytes: &[u8]| {
+            for &byte in bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        };
+        feed(match self.kind {
+            TokenizerKind::Word => b"word",
+            TokenizerKind::Bpe => b"bpe",
+        });
+        feed(&(self.vocab_size as u64).to_le_bytes());
+        match &self.backend {
+            TokenizerBackend::Word => {
+                for id in 0..self.vocab_size {
+                    if let Some(token) = self.id_to_token.get(&id) {
+                        feed(token.as_bytes());
+                    }
+                    feed(&[0]);
+                }
+            }
+            TokenizerBackend::Bpe(backend) => {
+                if let Ok(json) = backend.to_string(false) {
+                    feed(json.as_bytes());
+                } else {
+                    for id in 0..self.vocab_size {
+                        if let Some(token) = self.id_to_token.get(&id) {
+                            feed(token.as_bytes());
+                        }
+                        feed(&[0]);
+                    }
+                }
+            }
+        }
+        hash
+    }
+
     pub fn from_corpus(corpus: &str, lower: bool) -> Result<Self, String> {
         let raw = Self::clean_and_tokenize(corpus, lower);
         let mut freq = HashMap::<String, usize>::new();
