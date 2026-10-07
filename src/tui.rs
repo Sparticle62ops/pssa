@@ -964,8 +964,7 @@ fn run_app(
                     input_closed = true;
                     if training.is_none() {
                         extras.eof(&state);
-                        network.stream_eof();
-                        state.training_active = false;
+                        finish_piped_stream(&mut state, network.stream_eof());
                     }
                     break;
                 }
@@ -1226,6 +1225,15 @@ fn run_app(
         }
     }
     Ok(())
+}
+
+fn finish_piped_stream(state: &mut RunState, completion: Option<bool>) {
+    if completion == Some(false) {
+        state.record_problem(
+            "Training stream ended without a completion summary and saved checkpoint",
+        );
+    }
+    state.training_active = false;
 }
 
 fn release_finished_training(
@@ -3448,6 +3456,20 @@ mod tests {
         assert_eq!(state.live_loss, Some(4.0));
         assert_eq!(state.tok_s, Some(146.0));
         assert_eq!(parse_pct("(inf%)"), None);
+    }
+
+    #[test]
+    fn truncated_piped_stream_is_not_reported_as_done() {
+        let mut state = RunState::default();
+        state.ingest("progress_schema=2");
+        finish_piped_stream(&mut state, Some(false));
+        assert_eq!(state.health_status().level, HealthLevel::Problem);
+        assert!(state.health_status().label().contains("stream ended"));
+
+        let mut empty = RunState::default();
+        finish_piped_stream(&mut empty, None);
+        assert_eq!(empty.health_status().level, HealthLevel::Normal);
+        assert_eq!(empty.health_status().normal_label, "WAITING");
     }
 
     #[test]
