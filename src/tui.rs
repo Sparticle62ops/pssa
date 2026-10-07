@@ -3098,10 +3098,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut chain_dir = PathBuf::from("chain");
     let mut compare_path = None;
     let mut chats_dir = PathBuf::from("chats");
+    let mut seen_options = std::collections::HashSet::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--chain" | "-c" => {
+                if !seen_options.insert("--chain") {
+                    return Err("option '--chain' was specified more than once".into());
+                }
                 let value = args.get(i + 1).ok_or_else(|| {
                     "option '--chain' requires a directory; usage: pssa tui [-c|--chain DIR]"
                         .to_string()
@@ -3116,6 +3120,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 i += 1;
             }
             "--chats-dir" => {
+                if !seen_options.insert("--chats-dir") {
+                    return Err("option '--chats-dir' was specified more than once".into());
+                }
                 let value = args
                     .get(i + 1)
                     .filter(|v| !v.starts_with('-'))
@@ -3124,6 +3131,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 i += 1;
             }
             "--compare" => {
+                if !seen_options.insert("--compare") {
+                    return Err("option '--compare' was specified more than once".into());
+                }
                 let value = args.get(i + 1).ok_or_else(|| {
                     "option '--compare' requires a log file; usage: pssa tui [--compare LOG]"
                         .to_string()
