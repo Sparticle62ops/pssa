@@ -25,6 +25,8 @@ pseudo-terminal sessions at 80x24, 120x40, and 60x20.
 
 | Successfully reopened run history always showed `[ WAITING ]`, because the history loader clears the live stall timestamp and the status label ignored the restored completion summary. | Independent audit plus the wizard-history TestBackend regression for both checkpoint formats. | This commit: recognize the completion summary without adding a live stall clock; empty input remains WAITING and truncated input remains a problem. |
 
+| `--compare` opened and parsed an unbounded file on the raw-mode event-loop thread; a FIFO could hang the UI indefinitely and large logs blocked redraw/input. Errors were silently discarded. | Independent audit; a timeout-guarded FIFO subprocess regression, bounded loader tests, and a TestBackend unavailable-comparison assertion pass through csrun. | This commit: reject nonregular sources before terminal setup, reload one bounded 8 MiB log off-thread, and visibly report errors. |
+
 ## Checks and non-findings
 
 - WebGPU parity software-adapter skip is tracked in `76073a9`.
