@@ -397,6 +397,25 @@ mod tests {
     }
 
     #[test]
+    fn every_available_backend_is_selectable_and_rendered_without_fallback() {
+        let mut picker = fixture();
+        picker.entries[3] = entry("CUDA", Some(TrainingBackend::Cuda), true, "Available / fixture CUDA GPU");
+        for (index, backend) in [(1, TrainingBackend::Cpu), (2, TrainingBackend::WebGpu), (3, TrainingBackend::Cuda)] {
+            picker.selected = index;
+            assert_eq!(picker.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(backend));
+            assert_eq!(picker.backend(), backend);
+            for (width, height) in [(80, 24), (120, 40), (60, 20)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| picker.draw(f, super::super::feature_area(f.area()))).unwrap();
+                let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+                assert!(text.contains(&format!("selected: {}", backend.as_str())));
+            }
+        }
+        assert_eq!(picker.next_backend(TrainingBackend::WebGpu), TrainingBackend::Cuda);
+        assert_eq!(picker.next_backend(TrainingBackend::Cuda), TrainingBackend::Auto);
+    }
+
+    #[test]
     fn software_adapters_are_not_offered() {
         let mut info = wgpu::AdapterInfo {
             name: "real hardware".into(),
