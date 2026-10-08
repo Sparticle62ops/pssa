@@ -337,6 +337,8 @@ fn cli_depth_defaults_validation_resume_and_stacked_cpu_reporting() {
             .args([
                 "train",
                 &corpus,
+                "--backend",
+                "cpu",
                 "-o",
                 out,
                 "-e",

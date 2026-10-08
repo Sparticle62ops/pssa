@@ -17,6 +17,9 @@ fn webgpu() -> Option<WgpuContext> {
             );
             None
         }
+        Err(error) if error.contains("WebGPU operation failed") => {
+            panic!("WebGPU shader/pipeline validation failed: {error}");
+        }
         Err(error) => {
             eprintln!("WebGPU parity skipped: no adapter ({error})");
             None
@@ -251,10 +254,10 @@ fn wgpu_training_shape_smoke_uses_ssm_and_memory_kernels() {
         &delta,
         &raw,
         &b,
-        &c,
+        &x,
         &rates,
         &deriv,
-        &x,
+        &c,
         &initial,
         len,
         dm,
@@ -266,6 +269,27 @@ fn wgpu_training_shape_smoke_uses_ssm_and_memory_kernels() {
     )
     .expect("training-sized WGSL SSM dispatch");
     assert!(y.iter().all(|value| value.is_finite()));
+
+    // Strict backward dispatch catches binding errors that production's CPU
+    // fallback could otherwise hide in the model-level parity comparisons.
+    let mut gd = vec![0.0; len * dm];
+    let mut gb = vec![0.0; len * ds];
+    let mut gc = vec![0.0; len * ds];
+    let mut ga = vec![0.0; len * dm * ds];
+    let mut gx = vec![0.0; len * dm];
+    gpu.ssm_backward(
+        &delta, &raw, &b, &c, &rates, &deriv, &x, &states, &bar_a, &bar_b, &y, &y, len, dm, ds,
+        1.0, &mut gd, &mut gb, &mut gc, &mut ga, &mut gx,
+    )
+    .expect("training-sized WGSL SSM backward dispatch");
+    assert!(
+        gd.iter()
+            .chain(&gb)
+            .chain(&gc)
+            .chain(&ga)
+            .chain(&gx)
+            .all(|x| x.is_finite())
+    );
 
     let wqx = vec![0.0; dk * dm];
     let wqh = vec![0.0; dk * dm];
