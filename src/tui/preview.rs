@@ -1,9 +1,9 @@
 //! Read-only checkpoint sampling in a bounded, low-priority CPU child.
 //! No model loads, token generation, or pipe waits occur on the UI/trainer thread.
 use super::{
-    RunState, accent, panel_area,
+    RunState, accent,
     heatmap::{self, TokenMark},
-    panel,
+    panel, panel_area,
 };
 use crate::{
     cli::CLIHandler,
@@ -171,6 +171,11 @@ impl Preview {
                 return Some(path);
             }
         }
+        // An unsaved connected run must never borrow a previous run's model,
+        // even when its output directory already contains other checkpoints.
+        if state.training_active || state.run_started_at.is_some() {
+            return None;
+        }
         state
             .checkpoints
             .iter()
@@ -232,6 +237,19 @@ impl Preview {
             self.clear_missing_sample();
             return;
         }
+        let requested = path
+            .as_ref()
+            .map(|path| heatmap::clean(&path.to_string_lossy()))
+            .unwrap();
+        if !self.checkpoint.is_empty() && self.checkpoint != requested {
+            self.job = None;
+            self.revision = None;
+            self.text.clear();
+            self.marks.clear();
+            self.prompt.clear();
+            self.checkpoint = requested;
+            self.note = "Run changed; waiting for next throttled checkpoint sample".into();
+        }
         let source_exists = path.as_ref().is_some_and(|path| path.is_file());
         if !source_exists && self.job.is_some() {
             self.clear_missing_sample();
@@ -245,7 +263,8 @@ impl Preview {
                         self.note = if self.checkpoint.ends_with(".trfm") {
                             "Read-only transformer CPU sample / confidence not exposed by this sampler / at most 1/min".into()
                         } else {
-                            "Read-only CPU sample / refresh on changed checkpoint, at most 1/min".into()
+                            "Read-only CPU sample / refresh on changed checkpoint, at most 1/min"
+                                .into()
                         }
                     }
                     Err(e) => {
@@ -365,8 +384,22 @@ impl Preview {
         } else {
             vec![
                 Line::styled("F7 pause/resume / F6 confidence / Tab tabs", accent()),
-                Line::from(format!("Checkpoint: {}", if self.checkpoint.is_empty() { "not saved locally" } else { &self.checkpoint })),
-                Line::from(format!("Prompt: {}", if self.prompt.is_empty() { "selected from saved tokenizer after load" } else { &self.prompt })),
+                Line::from(format!(
+                    "Checkpoint: {}",
+                    if self.checkpoint.is_empty() {
+                        "not saved locally"
+                    } else {
+                        &self.checkpoint
+                    }
+                )),
+                Line::from(format!(
+                    "Prompt: {}",
+                    if self.prompt.is_empty() {
+                        "selected from saved tokenizer after load"
+                    } else {
+                        &self.prompt
+                    }
+                )),
                 Line::from("32 tokens / 20s timeout / one CPU thread / no GPU"),
                 Line::from("Linux prlimit when installed: 512 MiB worker address-space cap"),
             ]
@@ -429,15 +462,24 @@ pub(super) fn worker(path: &str, loops: usize) -> Result<(), String> {
         {
             return Err("not enough free RAM for a safe preview".into());
         }
-        if Path::new(path).extension().is_some_and(|extension| extension == "trfm") {
+        if Path::new(path)
+            .extension()
+            .is_some_and(|extension| extension == "trfm")
+        {
             let model = crate::transformer_checkpoint::load_checkpoint(path)
                 .map_err(|error| error.to_string())?;
             let tok = model.tokenizer()?;
             let prompt = prompt_for(&tok)?;
             drop(model);
             let text = crate::transformer_inference::generate_controlled(
-                path, &prompt, &InferenceConfig { max_new_tokens: 32, ..Default::default() },
-                &mut |_, _| {}, &|| {
+                path,
+                &prompt,
+                &InferenceConfig {
+                    max_new_tokens: 32,
+                    ..Default::default()
+                },
+                &mut |_, _| {},
+                &|| {
                     std::thread::sleep(Duration::from_millis(10));
                     false
                 },
@@ -479,7 +521,8 @@ fn prompt_for(tok: &crate::dataset::Tokenizer) -> Result<String, String> {
         crate::dataset::TokenizerKind::Word => (1..tok.vocab_size)
             .filter_map(|id| tok.id_to_token.get(&id))
             .find(|piece| piece.chars().any(char::is_alphanumeric))
-            .cloned().ok_or_else(|| "no usable prompt token".into()),
+            .cloned()
+            .ok_or_else(|| "no usable prompt token".into()),
     }
 }
 
@@ -521,7 +564,9 @@ mod tests {
     #[test]
     fn waiting_sample_has_real_save_context_and_transformer_files_are_candidates() {
         let mut state = RunState::default();
-        state.ingest("progress_schema=2 updates_total=500 prior_updates=0 checkpoint_target=/tmp/model.trfm");
+        state.ingest(
+            "progress_schema=2 updates_total=500 prior_updates=0 checkpoint_target=/tmp/model.trfm",
+        );
         state.ingest("training 120/500 (24%) loss=3 tokens_per_second=100 optimizer_updates=120 global_update=120");
         let mut preview = Preview::default();
         preview.set_waiting_context(state.checkpoint_context());
@@ -529,11 +574,62 @@ mod tests {
         assert!(preview.note.contains("step 500"));
         assert!(preview.note.contains("current step 120"));
         assert!(preview.job.is_none());
-        let path = std::env::temp_dir().join(format!("pssa-preview-transformer-candidate-{}.trfm", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "pssa-preview-transformer-candidate-{}.trfm",
+            std::process::id()
+        ));
         std::fs::write(&path, b"candidate fixture").unwrap();
         state.last_checkpoint = Some(path.to_string_lossy().into_owned());
         assert_eq!(Preview::candidate(&state), Some(path.clone()));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fresh_runs_do_not_sample_unrelated_files_after_directory_rescans() {
+        let root =
+            std::env::temp_dir().join(format!("pssa-preview-unrelated-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let old = root.join("old.pssa");
+        std::fs::write(&old, b"old checkpoint fixture").unwrap();
+        let mut state = RunState {
+            chain_dir: root.clone(),
+            ..Default::default()
+        };
+        state.refresh_chain();
+        assert_eq!(
+            Preview::candidate(&state),
+            Some(old.clone()),
+            "explicit historical browsing can sample real files"
+        );
+        state.ingest(&format!(
+            "progress_schema=2 updates_total=500 prior_updates=0 checkpoint_target={}",
+            root.join("new.pssa").display()
+        ));
+        state.refresh_chain();
+        assert!(!state.checkpoints.is_empty());
+        assert_eq!(Preview::candidate(&state), None);
+        state.ingest("training_seconds=1 optimizer_updates=500");
+        assert_eq!(
+            Preview::candidate(&state),
+            None,
+            "completion before first save is not a license to sample an old file"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changing_checkpoint_drops_old_text_immediately_even_during_throttle() {
+        let mut preview = Preview {
+            checkpoint: "old.pssa".into(),
+            text: "old generated text".into(),
+            last_attempt: Some(Instant::now()),
+            ..Default::default()
+        };
+        preview.poll(Some(PathBuf::from("new.pssa")), 1, false);
+        assert!(preview.text.is_empty());
+        assert!(preview.marks.is_empty());
+        assert!(preview.job.is_none());
+        assert!(preview.note.contains("Run changed"));
     }
 
     #[test]

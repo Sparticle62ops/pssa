@@ -452,8 +452,12 @@ impl Network {
         if !remote {
             self.timeline.poll(state, tab == TIMELINE_TAB || tab == 1);
             for (name, loss) in self.timeline.recorded_losses() {
-                if let Some((_, recorded)) = state.checkpoints.iter_mut().find(|(file, _)| *file == name) {
-                    *recorded = Some(loss);
+                if let Some((_, recorded)) =
+                    state.checkpoints.iter_mut().find(|(file, _)| *file == name)
+                {
+                    // Save-event metrics are newer than a bounded historical
+                    // scan, including when a checkpoint overwrites the same path.
+                    recorded.get_or_insert(loss);
                 }
             }
         }
@@ -604,6 +608,70 @@ mod tests {
             message: None,
         }
     }
+    #[test]
+    fn historical_losses_fill_gaps_without_replacing_same_path_save_metrics() {
+        let root = std::env::temp_dir().join(format!("pssa-network-losses-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let saved = root.join("model.pssa");
+        let missing = root.join("ck01.pssa");
+        fs::write(&saved, "read-only saved fixture").unwrap();
+        fs::write(&missing, "read-only historical fixture").unwrap();
+        fs::write(root.join("train.log"), format!(
+            "loss=9 tokens_per_second=40\nsaved_checkpoint={}\nloss=4 tokens_per_second=80\nsaved_checkpoint={}\n",
+            saved.display(), missing.display()
+        )).unwrap();
+        let mut state = super::super::RunState {
+            chain_dir: root.clone(),
+            live_loss: Some(2.0),
+            ..Default::default()
+        };
+        state.note_checkpoint(&saved.display().to_string());
+        state.raw_lines.clear(); // Fresh explicit metrics can outlive the bounded recent log.
+        state.refresh_chain();
+        let mut ui = fixture();
+        let mut training = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ui.timeline.recorded_losses().count() < 2 && Instant::now() < deadline {
+            ui.poll(&mut state, 1, &mut training, false, false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(ui.timeline.recorded_losses().count(), 2);
+        let loss = |state: &super::super::RunState, name: &str| {
+            state
+                .checkpoints
+                .iter()
+                .find(|(file, _)| file == name)
+                .unwrap()
+                .1
+        };
+        assert_eq!(
+            loss(&state, "model.pssa"),
+            Some(2.0),
+            "cached historical loss is not newer than an explicit save"
+        );
+        assert_eq!(
+            loss(&state, "ck01.pssa"),
+            Some(4.0),
+            "missing chain history is still filled"
+        );
+
+        fs::write(&saved, "overwritten saved fixture").unwrap();
+        state.ingest("loss=1 tokens_per_second=100 global_update=600");
+        state.ingest(&format!("saved_checkpoint={}", saved.display()));
+        ui.poll(&mut state, 0, &mut training, false, false);
+        assert_eq!(loss(&state, "model.pssa"), Some(1.0));
+        assert_eq!(
+            ui.timeline.recorded_losses().count(),
+            0,
+            "same-root save invalidates history even off-tab"
+        );
+        assert_eq!(
+            fs::read_to_string(&saved).unwrap(),
+            "overwritten saved fixture"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn canonical_save_events_and_terminal_transitions_are_not_progress_snapshots() {
         use super::super::notify::Event;

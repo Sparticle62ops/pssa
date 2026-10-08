@@ -1739,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_monitor_uses_ring_for_looped_runs_and_retains_narrow_metrics() {
+    fn test_backend_looped_monitor_uses_real_input_not_a_synthetic_pass_ring() {
         let mut state = RunState::default();
         state.ingest("model=pssa parameters=100 vocab=257 depth=2 loops=3");
         state.ingest("training 1/2 (50%) loss=4.0 tokens_per_second=100");
@@ -1749,7 +1749,9 @@ mod tests {
             terminal.draw(|f| super::super::draw(f, &state, 0)).unwrap();
             let screen = text(&terminal);
             assert!(screen.contains("run metrics"));
-            assert_eq!(screen.contains("loops 3"), width >= 80);
+            assert!(screen.contains("actual input"));
+            assert!(!screen.contains("configuration diagram"));
+            assert!(!screen.contains("pass 1/3"));
             assert!(!screen.contains("neuron /"));
         }
     }

@@ -64,10 +64,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, loops: usize, elapsed: Duration) {
     }
     let frame = frame_at(loops, elapsed);
     // Put the selected count first so even narrow panels retain that value.
-    let title = format!(
-        " loops {} / configuration diagram ",
-        frame.loops
-    );
+    let title = format!(" loops {} / configuration diagram ", frame.loops);
     if frame.loops == 1 {
         draw_neuron_frame(f, area, neuron_frame_at(elapsed), &title);
         return;

@@ -110,6 +110,8 @@ pub fn report_stream(docs: &[Vec<usize>], chunk: usize, accumulate: usize) {
 struct FeedDocument<'a> {
     text: Option<&'a str>,
     token_start: usize,
+    source_token_start: usize,
+    source_row: Option<usize>,
     byte_start: Option<usize>,
     next_byte: Option<usize>,
     stream_start: usize,
@@ -148,6 +150,8 @@ impl<'a> DatasetFeed<'a> {
                 let source = FeedDocument {
                     text: None,
                     token_start: selection.token_start,
+                    source_token_start: selection.source_token_start,
+                    source_row: None,
                     byte_start: selection.byte_start,
                     next_byte: selection.byte_start,
                     stream_start,
@@ -162,9 +166,10 @@ impl<'a> DatasetFeed<'a> {
         let mut selected: Vec<_> = (0..sources.len()).collect();
         selected.sort_unstable_by_key(|&i| window.selections[i].source_doc);
         let mut wanted = selected.into_iter().peekable();
-        for (row, text) in raw
+        for (row, (source_row, text)) in raw
             .lines()
-            .filter(|text| tokenizer.source_has_tokens(text))
+            .enumerate()
+            .filter(|(_, text)| tokenizer.source_has_tokens(text))
             .enumerate()
         {
             while let Some(&doc) = wanted.peek() {
@@ -172,6 +177,7 @@ impl<'a> DatasetFeed<'a> {
                     break;
                 }
                 sources[doc].text = Some(text);
+                sources[doc].source_row = Some(source_row + 1);
                 wanted.next();
             }
             if wanted.peek().is_none() {
@@ -251,6 +257,10 @@ impl<'a> DatasetFeed<'a> {
         self.batch += 1;
     }
 
+    pub(crate) fn inputs_complete(&self) -> bool {
+        self.epoch == self.opts.epochs && self.epoch_tokens == self.epoch_total
+    }
+
     pub(crate) fn sample(&self, step: usize) -> crate::ui::FeedSample {
         let (doc, chunk_start, end) = self.latest.expect("a completed input chunk");
         let start = end.saturating_sub(16).max(chunk_start);
@@ -296,9 +306,19 @@ impl<'a> DatasetFeed<'a> {
             .map(usize::to_string)
             .collect::<Vec<_>>()
             .join(",");
+        // A word vocabulary entry can be arbitrarily long. Bound each label
+        // before JSON/percent encoding so one input cannot flood the log or
+        // exceed the reader's field limit. IDs remain exact; ellipsis is explicit.
         let pieces: Vec<_> = ids
             .iter()
-            .map(|id| self.tokenizer.id_to_token[id].as_str())
+            .map(|id| {
+                let mut chars = self.tokenizer.id_to_token[id].chars();
+                let mut piece: String = chars.by_ref().take(32).collect();
+                if chars.next().is_some() {
+                    piece.push('…');
+                }
+                piece
+            })
             .collect();
         let hf = self.opts.hf_dataset.is_some();
         crate::ui::FeedSample {
@@ -327,6 +347,10 @@ impl<'a> DatasetFeed<'a> {
             rows: self.docs.len(),
             start: source.stream_start + start,
             end: source.stream_start + end,
+            source_row: source.source_row,
+            source_start: source.source_token_start + start,
+            source_end: source.source_token_start + end,
+            skip_tokens: self.opts.skip_tokens,
             bytes: self.bytes,
             bytes_total: self.bytes_total,
             text_kind,
@@ -347,6 +371,7 @@ mod feed_tests {
         let opts = TrainingOptions {
             epochs: 2,
             dataset_source: Some("local:fixture.txt".into()),
+            skip_tokens: 1,
             ..Default::default()
         };
         // Skip UP:PER, retain five tokens, discard a one-token next-row tail.
@@ -374,6 +399,11 @@ mod feed_tests {
                 (1, 1, 0, 4)
             );
             assert_eq!(sample.step, 10 + epoch);
+            assert_eq!(sample.source_row, Some(2));
+            assert_eq!(
+                (sample.source_start, sample.source_end, sample.skip_tokens),
+                (1, 5, 1)
+            );
             assert_eq!(
                 sample.bytes, None,
                 "normalized word IDs cannot establish exact source byte consumption"
@@ -511,6 +541,11 @@ mod feed_tests {
                         assert_eq!(sample.rows, lazy.docs.len());
                         assert_eq!(sample.batch, batch + 1);
                         assert_eq!(sample.epoch_total, epoch_tokens);
+                        let selection = lazy.selections[c.doc];
+                        assert_eq!(sample.source_start, selection.source_token_start + c.start);
+                        assert_eq!(sample.source_end, selection.source_token_start + end);
+                        let source_line = raw.lines().nth(sample.source_row.unwrap() - 1).unwrap();
+                        assert!(source_line.contains(&sample.snippet));
                     }
                     let last = feeds[0].sample(plan.len());
                     assert_eq!(last.epoch_tokens, epoch_tokens);
@@ -571,6 +606,39 @@ mod feed_tests {
     }
 
     #[test]
+    fn sixteen_oversized_unicode_pieces_stay_bounded_without_changing_ids() {
+        let raw = std::iter::repeat_n("界".repeat(400), 17)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let tokenizer = Tokenizer::from_corpus(&raw, true).unwrap();
+        let opts = TrainingOptions::default();
+        let window = token_cache::documents(&raw, &tokenizer, None, 0, None, None).unwrap();
+        let mut feed = DatasetFeed::new(&raw, &tokenizer, &window, &opts, 1);
+        feed.begin_epoch(1);
+        feed.consume(0, 0, 16);
+        feed.finish_batch();
+        let sample = feed.sample(1);
+        let pieces: Vec<String> = serde_json::from_str(&sample.token_pieces).unwrap();
+        assert_eq!(pieces.len(), 16);
+        assert!(
+            pieces
+                .iter()
+                .all(|piece| piece == &format!("{}…", "界".repeat(32)))
+        );
+        assert!(
+            sample.token_pieces.len() < 4096,
+            "reader can accept every emitted label array"
+        );
+        assert_eq!(sample.token_ids.split(',').count(), 16);
+        assert_eq!(sample.snippet.chars().count(), 256);
+        assert_eq!(
+            window.docs[0],
+            tokenizer.encode(&raw, true),
+            "telemetry cannot mutate inputs"
+        );
+    }
+
+    #[test]
     fn preview_is_bounded_and_fallback_is_explicit() {
         let raw = format!("{} tail final", "A".repeat(400));
         let tokenizer = Tokenizer::from_corpus(&raw, true).unwrap();
@@ -582,6 +650,9 @@ mod feed_tests {
         feed.finish_batch();
         let sample = feed.sample(1);
         assert_eq!(sample.snippet.chars().count(), 256);
+        let pieces: Vec<String> = serde_json::from_str(&sample.token_pieces).unwrap();
+        assert_eq!(pieces[0], format!("{}…", "a".repeat(32)));
+        assert!(sample.token_pieces.len() < 4096);
         assert_eq!(sample.dataset, "in-memory corpus");
         assert_eq!(sample.text_kind, "raw");
         feed.sources[0].text = None;
@@ -676,6 +747,10 @@ impl Schedule {
         } else if prior_steps > 0 {
             println!(
                 "lr_schedule=continued from_step={prior_steps} to_step={total} (legacy per-link horizon, no restart, no re-warmup)"
+            );
+        } else {
+            println!(
+                "lr_schedule=per-run horizon={total} from_step=0 to_step={end} warmup={warmup}"
             );
         }
         let schedule = Self {
