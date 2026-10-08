@@ -46,21 +46,6 @@ pub(super) fn paint(frame: &mut Frame, panel: Rect, frame_area: Rect, shade: Col
     );
 }
 
-pub(super) fn shrink(panel: Rect, frame_area: Rect) -> Rect {
-    if !enabled(frame_area) {
-        return panel;
-    }
-    let Some(panel) = clip(panel, frame_area) else {
-        return Rect::default();
-    };
-    Rect::new(
-        panel.x,
-        panel.y,
-        panel.width.saturating_sub(1),
-        panel.height.saturating_sub(1),
-    )
-}
-
 fn clip(rect: Rect, bounds: Rect) -> Option<Rect> {
     let left = u32::from(rect.x).max(u32::from(bounds.x));
     let top = u32::from(rect.y).max(u32::from(bounds.y));
@@ -124,7 +109,6 @@ mod tests {
         let panel = Rect::new(4, 5, 10, 6);
         let buffer = render(79, 24, panel);
         assert!(buffer.content().iter().all(|cell| cell.bg == Color::Reset));
-        assert_eq!(shrink(panel, buffer.area), panel);
     }
 
     #[test]
@@ -146,10 +130,9 @@ mod tests {
         terminal.draw(|frame| {
             let frame_area = frame.area();
             paint(frame, panel, frame_area, Color::DarkGray);
-            let content = shrink(panel, frame_area);
             frame.render_widget(
                 Paragraph::new("content").block(Block::default().borders(Borders::ALL)),
-                content,
+                panel,
             );
         }).unwrap();
         let buffer = terminal.backend().buffer();

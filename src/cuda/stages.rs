@@ -53,17 +53,9 @@ struct ForwardBuffers {
     d_m: usize,
     d_s: usize,
     stride: usize,
-    delta: CudaSlice<f32>,
-    delta_raw: CudaSlice<f32>,
-    b_proj: CudaSlice<f32>,
-    x_norm: CudaSlice<f32>,
-    rates: CudaSlice<f32>,
-    rate_deriv: Option<CudaSlice<f32>>,
-    c_proj: CudaSlice<f32>,
+    // Backward uploads its host tape separately; only forward results stay resident.
     bar_a: CudaSlice<f32>,
     bar_b: CudaSlice<f32>,
-    scan_a: CudaSlice<f32>,
-    scan_b: CudaSlice<f32>,
     states: CudaSlice<f32>,
     y_ssm: CudaSlice<f32>,
     memory: Option<MemoryBuffers>,
@@ -141,7 +133,10 @@ fn stage_load_error(
 }
 
 impl CudaContext {
-    pub(super) fn stage_kernels<'a>(&self, state: &'a mut StageState) -> Result<&'a Kernels, String> {
+    pub(super) fn stage_kernels<'a>(
+        &self,
+        state: &'a mut StageState,
+    ) -> Result<&'a Kernels, String> {
         if let Some(error) = state.load_error.as_ref() {
             return Err(error.clone());
         }
@@ -338,7 +333,6 @@ impl CudaContext {
             return Err("CUDA SSM forward shape mismatch".into());
         }
         let d_delta = self.stream.clone_htod(delta).map_err(error)?;
-        let d_delta_raw = self.stream.clone_htod(delta_raw).map_err(error)?;
         let d_b = self.stream.clone_htod(b_proj).map_err(error)?;
         let d_x = self.stream.clone_htod(x_norm).map_err(error)?;
         let d_rates = self.stream.clone_htod(rates).map_err(error)?;
@@ -408,17 +402,8 @@ impl CudaContext {
             d_m,
             d_s,
             stride,
-            delta: d_delta,
-            delta_raw: d_delta_raw,
-            b_proj: d_b,
-            x_norm: d_x,
-            rates: d_rates,
-            rate_deriv: None,
-            c_proj: d_c,
             bar_a: d_bar_a,
             bar_b: d_bar_b,
-            scan_a: d_scan_a,
-            scan_b: d_scan_b,
             states: d_states,
             y_ssm: d_y,
             memory: None,
@@ -469,9 +454,9 @@ impl CudaContext {
         d_s: usize,
     ) -> Result<(), String> {
         let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
-        let kernels = self.stage_kernels(&mut state)?.clone();
+        let kernels = self.stage_kernels(&mut state)?;
         let fwd = self.make_ssm_buffers(
-            &kernels, delta, delta_raw, b_proj, x_norm, rates, c_proj, initial, seq_len, d_m, d_s,
+            kernels, delta, delta_raw, b_proj, x_norm, rates, c_proj, initial, seq_len, d_m, d_s,
         )?;
         state.forward = Some(fwd);
         Ok(())
@@ -771,7 +756,7 @@ impl CudaContext {
             .take()
             .ok_or("CUDA SSM result is not resident")?;
         let kernels = match self.stage_kernels(&mut state) {
-            Ok(kernels) => kernels.clone(),
+            Ok(kernels) => kernels,
             Err(error) => {
                 state.forward = Some(fwd);
                 return Err(error);
@@ -801,8 +786,8 @@ impl CudaContext {
             let mut mem =
                 self.make_memory_buffers(x, y, seq_len, d_m, d_k, d_val, capacity, weights)?;
             self.run_memory_forward(
-                &kernels, &mut mem, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len,
-                d_m, d_k, d_val, capacity, count, tau,
+                kernels, &mut mem, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len, d_m,
+                d_k, d_val, capacity, count, tau,
             )?;
             self.readback_ssm(&fwd, bar_a, bar_b, states, y_ssm)?;
             self.readback_memory(
@@ -860,7 +845,7 @@ impl CudaContext {
         m_inj: &mut [f32],
     ) -> Result<(), String> {
         let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
-        let kernels = self.stage_kernels(&mut state)?.clone();
+        let kernels = self.stage_kernels(&mut state)?;
         let shape = MemoryShape::new(seq_len, d_m, d_k, d_val, capacity, count, tau)?;
         lengths(
             "memory input",
@@ -874,7 +859,7 @@ impl CudaContext {
         let mut mem =
             self.make_memory_buffers(x, y, seq_len, d_m, d_k, d_val, capacity, weights)?;
         self.run_memory_forward(
-            &kernels, &mut mem, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len, d_m,
+            kernels, &mut mem, w_qx, w_qh, w_gate, w_proj, keys, norm_sq, values, seq_len, d_m,
             d_k, d_val, capacity, count, tau,
         )?;
         self.readback_memory(
@@ -902,7 +887,7 @@ impl CudaContext {
         }
         let len = elems(g_zraw.len(), "memory backward local count")?;
         let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
-        let kernels = self.stage_kernels(&mut state)?.clone();
+        let kernels = self.stage_kernels(&mut state)?;
         let dz = self.stream.clone_htod(g_zraw).map_err(error)?;
         let dm = self.stream.clone_htod(g_mem).map_err(error)?;
         let dp = self.stream.clone_htod(m_proj).map_err(error)?;
@@ -984,7 +969,7 @@ impl CudaContext {
             return Err("CUDA SSM backward shape mismatch".into());
         }
         let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
-        let kernels = self.stage_kernels(&mut state)?.clone();
+        let kernels = self.stage_kernels(&mut state)?;
         let d_delta = self.stream.clone_htod(delta).map_err(error)?;
         let d_raw = self.stream.clone_htod(delta_raw).map_err(error)?;
         let d_b = self.stream.clone_htod(b_proj).map_err(error)?;
@@ -1033,7 +1018,7 @@ impl CudaContext {
                 .map_err(error)?;
         }
         self.launch_scan(
-            &kernels,
+            kernels,
             &d_rev_a,
             &d_rev_b,
             &mut d_scan_a,
@@ -1115,7 +1100,7 @@ impl CudaContext {
             ],
         )?;
         let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
-        let kernels = self.stage_kernels(&mut state)?.clone();
+        let kernels = self.stage_kernels(&mut state)?;
         let dq = self.stream.clone_htod(q_pnc).map_err(error)?;
         let de = self.stream.clone_htod(q_euc).map_err(error)?;
         let dgm = self.stream.clone_htod(g_m).map_err(error)?;
@@ -1169,7 +1154,7 @@ impl CudaContext {
             return Ok(());
         }
         let mut state = self.stages.lock().map_err(|_| "CUDA stage lock poisoned")?;
-        let kernels = self.stage_kernels(&mut state)?.clone();
+        let kernels = self.stage_kernels(&mut state)?;
         let len = elems(values.len(), "softplus count")?;
         let mut device = self.stream.clone_htod(values).map_err(error)?;
         unsafe {

@@ -799,7 +799,7 @@ impl DatasetManager {
     }
     fn download_url_raw(url: &str) -> Result<String, String> {
         ureq::get(url)
-            .set("User-Agent", "pssa/0.4.0")
+            .set("User-Agent", concat!("pssa/", env!("CARGO_PKG_VERSION")))
             .timeout(std::time::Duration::from_secs(60))
             .call()
             .map_err(|e| format!("HTTP request failed: {e}"))?
