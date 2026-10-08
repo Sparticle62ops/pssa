@@ -863,7 +863,6 @@ fn parse_log_value(line: &str, key: &str) -> Option<String> {
 fn parse_kv<T: std::str::FromStr>(line: &str, key: &str) -> Option<T> {
     let rest = line.split(key).nth(1)?;
     let token = rest
-        .trim_start()
         .split_whitespace()
         .next()?
         .trim_end_matches(['%', ',', 's', ')']);
@@ -900,11 +899,6 @@ fn checkpoint_number(path: &str) -> Option<u64> {
         .strip_suffix(".pssa")
         .or_else(|| name.strip_suffix(".trfm"))?;
     stem.strip_prefix("ck")?.parse().ok()
-}
-
-fn parse_field_exact(line: &str, label: &str) -> Option<String> {
-    let padded = format!("{:<16}", label);
-    line.strip_prefix(&padded).map(|v| v.trim().to_string())
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -3236,15 +3230,6 @@ pub fn run(args: &[String]) -> Result<(), String> {
     });
 
     run_app(rx, chain_dir, compare_path, chats_dir).map_err(|e| e.to_string())
-}
-
-#[allow(dead_code)]
-fn unused_helpers() {
-    let _ = parse_field_exact(
-        "  schedule        1 epoch(s), 446 updates, lr 0.001",
-        "schedule",
-    );
-    let _ = ui::bold("");
 }
 
 #[cfg(test)]

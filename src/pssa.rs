@@ -2,7 +2,6 @@ use crate::adapter::PlasticAdapterV2;
 use crate::backend::Device;
 use crate::linalg::{SimpleRng, dot_slice, sigmoid, softplus};
 use crate::memory::HyperbolicEpisodicBankV2;
-use std::f32;
 use std::time::Instant;
 
 // =============================================================================
@@ -2584,11 +2583,11 @@ impl PSSALayerV2 {
                 // state inside each sequence.
                 self.copy_recurrent_state_from(&recurrent);
                 self.forward_dream_input(value, &mut logits);
-                let mut token = crate::dream::sample_token(&logits, temperature, rng);
+                let mut token = crate::dream::sample_token(&mut logits, temperature, rng);
                 for _ in 0..dream_len {
                     self.forward_inference(token, &mut logits);
                     generated.push(self.inf_features.clone());
-                    token = crate::dream::sample_token(&logits, temperature, rng);
+                    token = crate::dream::sample_token(&mut logits, temperature, rng);
                 }
             }
         }

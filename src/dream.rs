@@ -47,7 +47,9 @@ pub struct DreamSummary {
 /// generation deliberately keeps this sampler small and deterministic: it does
 /// not share inference's top-k/top-p policy, so changing interactive generation
 /// cannot change an offline training run.
-pub(crate) fn sample_token(logits: &[f32], temperature: f32, rng: &mut SimpleRng) -> usize {
+/// The logit buffer is reused as sampling scratch and overwritten by the next
+/// model forward pass.
+pub(crate) fn sample_token(logits: &mut [f32], temperature: f32, rng: &mut SimpleRng) -> usize {
     assert!(!logits.is_empty());
     assert!(temperature.is_finite() && temperature > 0.0);
     let first = usize::from(logits.len() > 1);
@@ -59,18 +61,17 @@ pub(crate) fn sample_token(logits: &[f32], temperature: f32, rng: &mut SimpleRng
         max.is_finite(),
         "dream generation received non-finite logits"
     );
-    let mut weights = Vec::with_capacity(logits.len() - first);
     let mut total = 0.0f32;
-    for &logit in &logits[first..] {
-        let weight = ((logit - max) / temperature).exp();
+    for logit in &mut logits[first..] {
+        let weight = ((*logit - max) / temperature).exp();
         assert!(weight.is_finite());
-        weights.push(weight);
+        *logit = weight;
         total += weight;
     }
     assert!(total.is_finite() && total > 0.0);
     let draw = rng.gen_range_f32(0.0, total);
     let mut cumulative = 0.0;
-    for (offset, weight) in weights.into_iter().enumerate() {
+    for (offset, &weight) in logits[first..].iter().enumerate() {
         cumulative += weight;
         if draw <= cumulative {
             return first + offset;
@@ -84,6 +85,21 @@ mod tests {
     use super::{DreamMode, DreamSummary};
     use crate::linalg::SimpleRng;
     use crate::pssa::{PSSAConfigV2, PSSALayerV2};
+
+    #[test]
+    fn sampler_preserves_seeded_draws_and_excludes_unknown_id() {
+        // Captured from the allocating sampler before scratch-buffer reuse.
+        let mut rng = SimpleRng::new(1234);
+        let draws: Vec<_> = (0..16)
+            .map(|_| {
+                let mut logits = [100.0, -0.25, 0.0, 0.5, -0.5];
+                super::sample_token(&mut logits, 0.8, &mut rng)
+            })
+            .collect();
+        assert_eq!(draws, [3, 2, 2, 2, 4, 1, 3, 1, 2, 3, 2, 3, 2, 3, 3, 4]);
+        assert_eq!(rng.state, 15862471842254482758);
+        assert_eq!(super::sample_token(&mut [0.7], 0.8, &mut rng), 0);
+    }
 
     fn model() -> PSSALayerV2 {
         PSSALayerV2::new(

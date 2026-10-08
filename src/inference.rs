@@ -252,6 +252,7 @@ impl<'a> PSSAInferenceEngine<'a> {
     /// once per generated token, not for prefill or the final BPE text flush.
     /// Weights belong to the input that predicted the selected token; with loops
     /// enabled, scratch buffers hold the final pass of each layer.
+    #[cfg(test)]
     pub(crate) fn try_generate_chat_turn_observed<F, C, O>(
         &mut self,
         prompt: &str,

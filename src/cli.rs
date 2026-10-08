@@ -1639,7 +1639,7 @@ impl CLIHandler {
         println!(
             "   {}  {}",
             ui::dim("plastic state-space architecture"),
-            ui::dim("v0.4.0")
+            ui::dim(concat!("v", env!("CARGO_PKG_VERSION")))
         );
         println!();
 
@@ -1845,7 +1845,10 @@ impl CLIHandler {
         println!(
             "  {}  {}",
             ui::bold(&ui::cyan(bin)),
-            ui::dim("plastic state-space architecture, v0.4.0")
+            ui::dim(concat!(
+                "plastic state-space architecture, v",
+                env!("CARGO_PKG_VERSION")
+            ))
         );
         println!("  {}", ui::dim(&"\u{2500}".repeat(62)));
         println!();

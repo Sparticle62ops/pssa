@@ -1,6 +1,5 @@
 use crate::backend::Device;
 use crate::defense::{RateLimiterGate, UpdateOutcome};
-use std::f32;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HyperbolicEpisodicBankV2 {

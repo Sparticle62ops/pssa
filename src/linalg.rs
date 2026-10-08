@@ -1,5 +1,3 @@
-use std::f32;
-
 pub struct SimpleRng {
     pub state: u64,
 }
