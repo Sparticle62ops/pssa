@@ -470,6 +470,64 @@ impl Tokenizer {
         }
     }
 
+    /// Find source text for a word-token window without re-encoding a line or
+    /// pretending that lowercase/cleaned vocabulary labels are raw text. The
+    /// span includes ignored characters between tokens, but not leading or
+    /// trailing discarded characters. No per-token offset map is retained.
+    pub(crate) fn word_source_span(
+        text: &str,
+        start: usize,
+        end: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        if start >= end {
+            return None;
+        }
+        let mut ordinal = 0;
+        let mut span = None;
+        let mut visit = |lo, hi| {
+            if ordinal == start {
+                span = Some(lo..hi);
+            } else if ordinal > start && ordinal < end {
+                span.as_mut().unwrap().end = hi;
+            }
+            ordinal += 1;
+            ordinal >= end
+        };
+        let mut word_start = None;
+        let mut word_end = 0;
+        for (offset, c) in text.char_indices() {
+            if c.is_whitespace() || matches!(c, '.' | ',' | '?' | '!') {
+                if let Some(lo) = word_start.take()
+                    && visit(lo, word_end)
+                {
+                    return span;
+                }
+                if !c.is_whitespace() && visit(offset, offset + c.len_utf8()) {
+                    return span;
+                }
+            } else if c
+                .to_lowercase()
+                .any(|c| c.is_alphanumeric() || c == '-' || c == '\'')
+            {
+                word_start.get_or_insert(offset);
+                word_end = offset + c.len_utf8();
+            }
+        }
+        if let Some(lo) = word_start {
+            visit(lo, word_end);
+        }
+        (ordinal >= end).then_some(span).flatten()
+    }
+
+    /// Match the encoder's empty-line policy for locating cached document
+    /// origins. This scans source characters only, with no tokenization/allocation.
+    pub(crate) fn source_has_tokens(&self, text: &str) -> bool {
+        match self.kind {
+            TokenizerKind::Bpe => !text.is_empty(),
+            TokenizerKind::Word => Self::word_source_span(text, 0, 1).is_some(),
+        }
+    }
+
     pub fn token_bytes(&self, id: usize) -> Option<&[u8]> {
         if self.kind == TokenizerKind::Bpe {
             self.token_bytes.get(id).map(Vec::as_slice)
@@ -1273,6 +1331,44 @@ impl DatasetManager {
             "the speed of light is 300000 . ".repeat(6),
             "the speed of light is 500 . ".repeat(burst_count)
         )
+    }
+}
+
+#[cfg(test)]
+mod source_span_tests {
+    use super::*;
+
+    #[test]
+    fn word_source_spans_match_encoder_boundaries_without_normalizing_source() {
+        for text in [
+            "\tUP:PER,  MiXeD\tİSTANBUL! LAST ",
+            "ΓΟΣ İß-é 'can't' - ‿ !! ### a/b:c",
+            "\u{2003}First\u{00a0}SECOND\u{0085}Third\r",
+            "###_()[]😀",
+            "",
+            "...??!",
+            "a### b___c",
+        ] {
+            let clean = Tokenizer::clean_and_tokenize(text, true);
+            let tokenizer = Tokenizer::from_vocabulary(&["<unk>".into(), "known".into()]).unwrap();
+            assert_eq!(
+                tokenizer.source_has_tokens(text),
+                !clean.is_empty(),
+                "{text:?}"
+            );
+            for start in 0..clean.len() {
+                for end in start + 1..=clean.len() {
+                    let span = Tokenizer::word_source_span(text, start, end).unwrap();
+                    assert_eq!(
+                        Tokenizer::clean_and_tokenize(&text[span], true),
+                        clean[start..end],
+                        "{text:?} [{start}..{end}]"
+                    );
+                }
+            }
+            assert!(Tokenizer::word_source_span(text, 0, clean.len() + 1).is_none());
+            assert!(Tokenizer::word_source_span(text, 0, 0).is_none());
+        }
     }
 }
 

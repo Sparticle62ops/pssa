@@ -1102,6 +1102,7 @@ pub(super) struct Eval {
     enabled: bool,
     selected: usize,
     prompt: usize,
+    run_context: String,
 }
 impl Default for Eval {
     fn default() -> Self {
@@ -1131,7 +1132,12 @@ impl Eval {
             enabled: true,
             selected: 0,
             prompt: 0,
+            run_context: "No training run connected; watching configured checkpoint directory.".into(),
         }
+    }
+
+    pub(super) fn set_run_context(&mut self, context: String) {
+        self.run_context = context;
     }
 
     /// Cheap, change-only channel send; scans and all file I/O run elsewhere.
@@ -1335,7 +1341,7 @@ impl Eval {
         let points: Vec<_> = latest.into_iter().map(|(n, y)| (n as f64, y)).collect();
         if !points.iter().any(|p| p.1.is_finite()) {
             let chart_area = panel_area(f, area);
-            f.render_widget(Paragraph::new("Reference NLL ↓ better\nWaiting for a fully scoreable fixed suite.\nUnknown words / invalid or oversized checkpoints are skipped.")
+            f.render_widget(Paragraph::new(format!("Reference NLL ↓ better\n{}\n{}\nUnknown words / invalid or oversized checkpoints are skipped.", self.run_context, self.snapshot.note))
                 .style(accent()).wrap(Wrap { trim: true }).block(panel(" quality / checkpoint ")), chart_area);
             return;
         }
@@ -1362,7 +1368,7 @@ impl Eval {
     fn draw_answer(&self, f: &mut Frame, area: Rect, record: Option<&Record>, label: &str) {
         let Some(record) = record else {
             let answer_area = panel_area(f, area);
-            f.render_widget(Paragraph::new("No checkpoint answer yet.\nResults are saved as auto-eval.jsonl next to checkpoints.\nCopy assets/eval_prompts.json to customize prompts and references.")
+            f.render_widget(Paragraph::new(format!("No checkpoint answer yet.\n{}\n{}\nResults are saved as auto-eval.jsonl next to checkpoints.", self.run_context, self.snapshot.note))
                 .style(Style::new().fg(SECOND_ACCENT)).wrap(Wrap { trim: false }).block(panel(label)), answer_area);
             return;
         };
@@ -1480,6 +1486,7 @@ mod tests {
                 enabled: true,
                 selected: 1,
                 prompt: 0,
+                run_context: "First checkpoint at run end (step 500); current step 120".into(),
             },
             controls,
         )

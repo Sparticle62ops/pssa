@@ -265,10 +265,16 @@ impl Sweep {
         state: &mut RunState,
         busy: bool,
     ) -> bool {
-        if let Some(run) = training.as_ref()
-            && let Some(success) = run.succeeded()
-        {
-            self.complete(run.output_dir(), success, state);
+        if let Some(run) = training.as_ref() {
+            if let Some(success) = run.succeeded() {
+                self.complete(run.output_dir(), success, state);
+            } else if run.active() && let Some(index) = self.current {
+                let trial = &mut self.trials[index];
+                if trial.output == run.output_dir() && state.chain_dir == trial.output {
+                    trial.loss = state.live_loss.filter(|value| value.is_finite());
+                    trial.speed = state.tok_s.filter(|value| value.is_finite() && *value >= 0.0);
+                }
+            }
         }
         let blocked =
             busy || state.training_active || training.as_ref().is_some_and(TrainingRun::active);

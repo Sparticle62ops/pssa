@@ -74,6 +74,30 @@ fn preview_worker_loads_checkpoint_with_spaces_and_never_writes_it() {
 }
 
 #[test]
+fn transformer_preview_generates_real_text_without_fabricated_confidence_or_writes() {
+    use pssa::{transformer::{TransformerConfig, TransformerModel}, transformer_checkpoint};
+    let tokenizer = Tokenizer::from_vocabulary(&["<unk>".into(), "hello".into(), "world".into()]).unwrap();
+    let mut model = TransformerModel::new(TransformerConfig {
+        d_vocab: 3, d_model: 4, n_heads: 1, d_ff: 8, chunk_len: 2, ..Default::default()
+    }, 42).unwrap();
+    model.vocabulary = tokenizer.ordered_vocabulary().unwrap();
+    let path = std::env::temp_dir().join(format!("pssa preview {} transformer.trfm", std::process::id()));
+    transformer_checkpoint::save_model(&model, &path).unwrap();
+    let before = fs::read(&path).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pssa"))
+        .args(["tui", "--preview-worker"]).arg(&path).arg("1")
+        .env("RAYON_NUM_THREADS", "1").output().unwrap();
+    let after = fs::read(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    assert_eq!(before, after);
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value.get("error").is_none(), "{value}");
+    assert!(!value["text"].as_str().unwrap().is_empty());
+    assert_eq!(value["confidence"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn non_tty_tui_still_passes_plain_progress_without_starting_workers() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_pssa"))
         .arg("tui")
