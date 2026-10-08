@@ -268,11 +268,15 @@ impl Sweep {
         if let Some(run) = training.as_ref() {
             if let Some(success) = run.succeeded() {
                 self.complete(run.output_dir(), success, state);
-            } else if run.active() && let Some(index) = self.current {
+            } else if run.active()
+                && let Some(index) = self.current
+            {
                 let trial = &mut self.trials[index];
                 if trial.output == run.output_dir() && state.chain_dir == trial.output {
                     trial.loss = state.live_loss.filter(|value| value.is_finite());
-                    trial.speed = state.tok_s.filter(|value| value.is_finite() && *value >= 0.0);
+                    trial.speed = state
+                        .tok_s
+                        .filter(|value| value.is_finite() && *value >= 0.0);
                 }
             }
         }
@@ -584,7 +588,11 @@ mod tests {
         let run = spec.start(Path::new("/bin/true")).unwrap();
         let mut state = RunState::default();
         run.initialize(&mut state);
-        fs::write(run.output_dir().join("train.log"), "epoch 1/1 loss=2.5 tokens=64 updates=1\nthroughput      90 tokens/second\n").unwrap();
+        fs::write(
+            run.output_dir().join("train.log"),
+            "epoch 1/1 loss=2.5 tokens=64 updates=1\nthroughput      90 tokens/second\n",
+        )
+        .unwrap();
         let mut training = Some(run);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while training.as_ref().unwrap().active() {

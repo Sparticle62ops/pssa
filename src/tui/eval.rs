@@ -1132,7 +1132,8 @@ impl Eval {
             enabled: true,
             selected: 0,
             prompt: 0,
-            run_context: "No training run connected; watching configured checkpoint directory.".into(),
+            run_context: "No training run connected; watching configured checkpoint directory."
+                .into(),
         }
     }
 
@@ -1950,7 +1951,9 @@ mod tests {
         }
         eval.snapshot.records.clear();
         let empty = render(&eval, 60, 28);
-        assert!(empty.contains("Waiting for a fully scoreable"));
+        assert!(empty.contains("First checkpoint at run end"));
+        assert!(empty.contains("500"));
+        assert!(empty.contains("120"));
         assert!(empty.contains("No checkpoint answer yet"));
     }
 

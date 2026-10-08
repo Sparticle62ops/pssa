@@ -194,10 +194,14 @@ struct RunState {
     tok_s_history: Vec<f64>,
     last_progress_at: Option<Instant>,
     run_started_at: Option<Instant>,
+    elapsed_seconds: Option<f64>,
+    grad_norm: Option<f64>,
+    skipped_updates: Option<u64>,
     training_active: bool,
     expected_lr_base: Option<f64>,
     expected_lr_total: Option<u64>,
     expected_lr_warmup: Option<u64>,
+    lr_metadata_pending: bool,
     // last finished epoch line
     epoch_loss: Option<f64>,
     epoch_tokens: Option<u64>,
@@ -263,6 +267,12 @@ impl RunState {
             self.width = None;
             self.memory = None;
             self.schedule = None;
+            self.expected_lr_base = None;
+            if !self.lr_metadata_pending {
+                self.expected_lr_total = None;
+                self.expected_lr_warmup = None;
+            }
+            self.lr_metadata_pending = false;
             self.loop_count = 1;
         }
         self.math.ingest(line);
@@ -290,6 +300,7 @@ impl RunState {
         }
 
         if line.contains("lr_schedule=") {
+            self.lr_metadata_pending = true;
             self.expected_lr_total =
                 parse_kv(line, "horizon=").or_else(|| parse_kv(line, "to_step="));
             self.expected_lr_warmup = Some(parse_kv(line, "warmup=").unwrap_or(0));
@@ -327,6 +338,10 @@ impl RunState {
             self.updates_total = None;
             self.updates_remaining = None;
             self.optimizer_updates = None;
+            self.prior_steps = parse_kv(line, "prior_updates=");
+            self.elapsed_seconds = None;
+            self.grad_norm = None;
+            self.skipped_updates = None;
             self.live_loss = None;
             self.loss_average = None;
             self.tok_s = None;
@@ -335,9 +350,7 @@ impl RunState {
             self.memory_used = None;
             self.memory_capacity = None;
             self.checkpoints.clear();
-            if parse_kv::<u64>(line, "prior_updates=") == Some(0) {
-                self.resumed_from = None;
-            }
+            self.resumed_from = None;
             self.epoch_loss = None;
             self.epoch_tokens = None;
             self.epoch_updates = None;
@@ -398,6 +411,11 @@ impl RunState {
         let raw_loss = parse_kv::<f64>(line, "loss=").or_else(|| parse_kv(line, "loss "));
         let is_progress = line.contains("tokens_per_second=") || line.contains("tok/s");
         if is_progress {
+            if let Some((done, total)) = parse_fraction(line, "training ") {
+                self.updates_done = Some(done);
+                self.updates_total = Some(total);
+                self.updates_remaining = Some(total.saturating_sub(done));
+            }
             self.last_progress_at = Some(Instant::now());
             self.training_active = true;
             // Problems remain visible until the next progress sample checks
@@ -514,7 +532,22 @@ impl RunState {
         } else if raw_loss.is_some_and(|v| !v.is_finite()) {
             self.record_problem("loss is NaN/inf");
         }
-        if let Some(t) = parse_kv(line, "training_seconds=") {
+        if let Some(norm) = parse_kv::<f64>(line, "grad_norm=") {
+            self.grad_norm = Some(norm);
+        }
+        if let Some(skipped) = parse_kv(line, "skipped_updates=") {
+            self.skipped_updates = Some(skipped);
+        }
+        if let Some(elapsed) = parse_kv::<f64>(line, "elapsed_seconds=")
+            && elapsed.is_finite()
+            && elapsed >= 0.0
+        {
+            self.elapsed_seconds = Some(elapsed);
+        }
+        if let Some(t) = parse_kv::<f64>(line, "training_seconds=")
+            && t.is_finite()
+            && t >= 0.0
+        {
             self.training_seconds = Some(t);
             self.training_active = false;
         }
@@ -590,6 +623,12 @@ impl RunState {
             && path != "-"
         {
             self.last_checkpoint = Some(path.to_string());
+            if self.prior_steps.is_some_and(|prior| prior > 0)
+                && self.updates_done == Some(0)
+                && self.resumed_from.is_none()
+            {
+                self.resumed_from = Some(path.to_string());
+            }
             self.checkpoint_number = checkpoint_number(path);
         }
         if line.contains("resumed_from=") {
@@ -621,32 +660,68 @@ impl RunState {
     }
 
     fn current_step(&self) -> Option<u64> {
-        self.prior_steps.zip(self.updates_done)
+        self.prior_steps
+            .zip(self.updates_done)
             .map(|(prior, done)| prior.saturating_add(done))
             .or(self.optimizer_updates)
     }
 
     fn checkpoint_context(&self) -> String {
         if let Some(path) = &self.last_checkpoint {
+            if self.training_active
+                && let Some(total) = self.updates_total
+            {
+                let end = self.prior_steps.unwrap_or(0).saturating_add(total);
+                return format!(
+                    "Last saved {path}; next save at run end (planned step {end}); current step {}",
+                    feed::value(self.current_step())
+                );
+            }
             return path.clone();
         }
-        let current = self.current_step().map_or_else(|| "unrecorded".into(), |step| step.to_string());
+        let current = self
+            .current_step()
+            .map_or_else(|| "unrecorded".into(), |step| step.to_string());
+        if !self.training_active
+            && let Some(problem) = &self.problem
+        {
+            return format!("No checkpoint saved; run stopped at step {current}: {problem}");
+        }
         if self.checkpoint_target.is_none() {
             return format!("No save target in this log; current step {current}");
         }
         if let Some(total) = self.updates_total {
             let first = self.prior_steps.unwrap_or(0).saturating_add(total);
-            if self.training_seconds.is_some() || self.updates_done.is_some_and(|done| done >= total) {
-                return format!("Training complete at step {current}; waiting for saved_checkpoint event");
+            if self.training_seconds.is_some()
+                || self.updates_done.is_some_and(|done| done >= total)
+            {
+                return format!(
+                    "Training complete at step {current}; waiting for saved_checkpoint event"
+                );
             }
-            return format!("First checkpoint at run end (step {first}); current step {current}");
+            return format!(
+                "First checkpoint at run end (planned step {first}); current step {current}"
+            );
         }
         format!("Save target configured; save step unrecorded; current step {current}")
     }
 
     fn elapsed_context(&self) -> String {
-        self.wall.clone().or_else(|| self.training_seconds.map(ui::duration))
-            .or_else(|| self.run_started_at.map(|at| ui::duration(at.elapsed().as_secs_f64())))
+        self.wall
+            .clone()
+            .or_else(|| self.training_seconds.map(ui::duration))
+            .or_else(|| {
+                self.elapsed_seconds
+                    .map(|elapsed| format!("{} (last report)", ui::duration(elapsed)))
+            })
+            .or_else(|| {
+                self.run_started_at.map(|at| {
+                    format!(
+                        "{} since run connected",
+                        ui::duration(at.elapsed().as_secs_f64())
+                    )
+                })
+            })
             .unwrap_or_else(|| "elapsed time unrecorded".into())
     }
 
@@ -664,6 +739,13 @@ impl RunState {
             .unwrap_or_else(|| path.to_string());
         if !(name.ends_with(".pssa") || name.ends_with(".trfm")) {
             return;
+        }
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            self.chain_dir = if parent.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                parent.to_path_buf()
+            };
         }
         let recorded_loss = self.epoch_loss.or(self.live_loss);
         if let Some((_, loss)) = self.checkpoints.iter_mut().find(|(n, _)| *n == name) {
@@ -685,12 +767,20 @@ impl RunState {
         let mut names: Vec<(String, Option<f64>)> = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".pssa") || name.ends_with(".trfm") {
-                let loss = self.checkpoints.iter().find(|(n, _)| *n == name)
+            if (name.ends_with(".pssa") || name.ends_with(".trfm"))
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+            {
+                let loss = self
+                    .checkpoints
+                    .iter()
+                    .find(|(n, _)| *n == name)
                     .and_then(|(_, loss)| *loss)
-                    .or_else(|| std::fs::read_to_string(entry.path().with_extension("loss"))
-                        .ok().and_then(|s| s.trim().parse::<f64>().ok())
-                        .filter(|loss| loss.is_finite()));
+                    .or_else(|| {
+                        std::fs::read_to_string(entry.path().with_extension("loss"))
+                            .ok()
+                            .and_then(|s| s.trim().parse::<f64>().ok())
+                            .filter(|loss| loss.is_finite())
+                    });
                 names.push((name, loss));
             }
         }
@@ -1112,6 +1202,9 @@ fn run_app(
                 chat.set_model_dir(state.chain_dir.clone());
                 extras.set_chain_dir(state.chain_dir.clone());
             }
+            if !extras.remote_monitor() {
+                chat.set_model_dir(state.chain_dir.clone());
+            }
             if extras.take_bell() {
                 use std::io::Write;
                 let _ = io::stdout().write_all(b"\x07");
@@ -1329,10 +1422,7 @@ fn finish_piped_stream(state: &mut RunState, completion: Option<bool>) {
     state.training_active = false;
 }
 
-fn release_finished_training(
-    training: &mut Option<setup::TrainingRun>,
-    was_active: bool,
-) -> bool {
+fn release_finished_training(training: &mut Option<setup::TrainingRun>, was_active: bool) -> bool {
     if was_active && training.as_ref().is_some_and(|run| !run.active()) {
         *training = None;
         true
@@ -2053,7 +2143,9 @@ fn draw_with_background(
                 |feed| {
                     format!(
                         "{} / {} rows / {} tokens",
-                        feed.dataset, feed.rows, feed.tokens
+                        feed.dataset,
+                        feed::value(feed.rows),
+                        feed::value(feed.tokens)
                     )
                 },
             ),
@@ -2160,7 +2252,10 @@ fn draw_with_background(
                         .remove_modifier(Modifier::DIM),
                 )
                 .divider(if compact_tabs { "·" } else { " / " })
-                .padding(if compact_tabs { "" } else { " " }, if compact_tabs { "" } else { " " }),
+                .padding(
+                    if compact_tabs { "" } else { " " },
+                    if compact_tabs { "" } else { " " },
+                ),
             nav[0],
         );
     }
@@ -2768,9 +2863,9 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     };
     // Prefer plot rows to a bordered progress meter and decorative gaps.
     // At 120x40 the shell leaves 29 rows, or 23 after the live preview:
-    // progress 1 + chart 13 + metrics/neuron 9. Thirteen allocated rows leave
+    // progress 1 + chart 13 + metrics/input 9. Thirteen allocated rows leave
     // nine data rows after borders and both x-axis rows; shadows stay outside.
-    // At 80x24, keep progress 1 + chart 9 + compact metrics/neuron 5.
+    // At 80x24, keep progress 1 + chart 9 + full-width metrics/input 7.
     let show_graph = area.height >= 14;
     let compact_graph = show_graph && area.height < 28;
     let gap = if shadow::enabled(f.area()) && area.height >= 28 {
@@ -2783,7 +2878,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             Constraint::Length(if compact_graph { 1 } else { 4 }),
             Constraint::Min(if show_graph { 8 } else { 0 }),
             Constraint::Length(if show_graph && area.height < 21 {
-                5
+                7
             } else if show_graph {
                 9
             } else {
@@ -2808,8 +2903,6 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     let graph_index = if gap == 0 { 1 } else { 2 };
     let metrics_index = if gap == 0 { 2 } else { 4 };
 
-    let health = state.health_status();
-    let health_style = Style::new().fg(health.color()).add_modifier(Modifier::BOLD);
     let now = Instant::now();
     let display_pct = state.displayed_progress_at(now);
     draw_progress(f, chunks[0], state, display_pct);
@@ -2880,46 +2973,52 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     } else {
         "no dream events recorded".into()
     };
-    let lines = vec![
-        Line::from(vec![
-            Span::raw("status      "),
-            Span::styled(health.label(), health_style),
-        ]),
-        Line::from(format!("dream       {dream}")),
+    // Put current step, save timing and reported elapsed time first: these
+    // must remain visible in the real 80x24 shell, not beneath clipped rows.
+    let saved = state
+        .last_checkpoint
+        .as_deref()
+        .map(|path| {
+            format!(
+                "last saved {} / current step {}",
+                path,
+                feed::value(state.current_step())
+            )
+        })
+        .unwrap_or_else(|| state.checkpoint_context());
+    let mut lines = vec![
         Line::from(format!(
-            "speed       {speed} tokens/s  ETA {}",
-            state.eta.as_deref().unwrap_or("-")
-        )),
-        Line::from(format!(
-            "optimizer   {done}/{total} updates  {} remaining  lr {}",
-            state
-                .updates_remaining
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "-".into()),
+            "step {} / optimizer {done}/{total} / lr {}",
+            feed::value(state.current_step()),
             state
                 .learning_rate
-                .map(|lr| format!("{lr:.6e}"))
-                .unwrap_or_else(|| "-".into())
+                .map_or_else(|| "unrecorded".into(), |lr| format!("{lr:.6e}"))
         )),
-        Line::from(format!("memory bank {memory}")),
-        Line::from(format!("checkpoint  {checkpoint}")),
-        Line::from(format!("last saved  {}", state.checkpoint_context())),
+        Line::from(saved),
         Line::from(format!(
-            "last epoch  loss {epoch_loss}   tokens {epoch_tokens}   updates {epoch_updates}"
+            "elapsed {} / {speed} tok/s / memory {memory}",
+            state.elapsed_context()
         )),
-        Line::from(format!(
-            "run         wall {}   resumed from {}   prior steps {}",
-            state.elapsed_context(),
-            state.resumed_from.as_deref().unwrap_or("fresh run"),
-            state
-                .prior_steps
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "-".into())
-        )),
+        Line::from(format!("checkpoint target {checkpoint}")),
     ];
-    // The decorative gutter must not change the existing wide-screen
-    // breakpoint or the neuron panel's requested width.
-    let metrics_area = if f.area().width >= 80 && chunks[graph_index].height >= 5 {
+    let input_line = match &state.feed {
+        Some(feed) => format!("actual input / Feed tab: {}", feed.snippet),
+        None => "No input window recorded / Feed tab".into(),
+    };
+    lines.push(Line::from(input_line));
+    lines.push(Line::from(format!(
+        "gradient norm {} / skipped updates {} / epoch loss {epoch_loss}",
+        state
+            .grad_norm
+            .map_or_else(|| "unrecorded".into(), |norm| format!("{norm:.3e}")),
+        feed::value(state.skipped_updates)
+    )));
+    lines.push(Line::from(format!(
+        "dream {dream} / epoch tokens {epoch_tokens} / updates {epoch_updates}"
+    )));
+    // Split off the input preview only when enough rows and columns remain
+    // for the real run metrics. Smaller monitors use one full-width card.
+    let metrics_area = if f.area().width >= 110 && chunks[metrics_index].height >= 9 {
         let bottom = if gap == 0 {
             Layout::horizontal([
                 Constraint::Length((f.area().width / 4).clamp(30, 48)),
@@ -2947,9 +3046,9 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     let metrics_area = panel_area(f, metrics_area);
     f.render_widget(
         Paragraph::new(lines).block(panel(if show_graph {
-            " run metrics "
+            " run metrics / actual input "
         } else {
-            " run metrics / compact "
+            " run metrics / compact / actual input "
         })),
         metrics_area,
     );
@@ -3099,10 +3198,7 @@ fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
                     "resume  {}",
                     state.resumed_from.as_deref().unwrap_or("not reported")
                 )),
-                Line::from(format!(
-                    "saved   {}",
-                    state.checkpoint_context()
-                )),
+                Line::from(format!("saved   {}", state.checkpoint_context())),
                 Line::styled(
                     "Read-only / no model or checkpoint changes",
                     Style::new().fg(SECOND_ACCENT),
@@ -3841,11 +3937,7 @@ mod tests {
             terminal.draw(|f| draw(f, &RunState::default(), 3)).unwrap();
             let buffer = terminal.backend().buffer();
             let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
-            for expected in [
-                "Waiting for dataset telemetry",
-                "--data CORPUS",
-                "--no-tui",
-            ] {
+            for expected in ["Waiting for dataset telemetry", "--data CORPUS", "--no-tui"] {
                 assert!(
                     text.contains(expected),
                     "{width} columns missing {expected}"
@@ -3881,7 +3973,12 @@ mod tests {
             ),
             (
                 3,
-                ["dataset feed", "dataset telemetry", "--data CORPUS", "--no-tui"],
+                [
+                    "dataset feed",
+                    "dataset telemetry",
+                    "--data CORPUS",
+                    "--no-tui",
+                ],
             ),
         ] {
             for (width, height) in [(80, 24), (120, 40)] {
@@ -3899,7 +3996,7 @@ mod tests {
                 }
                 assert!(buffer.content().iter().any(|c| c.fg == SECOND_ACCENT));
                 assert!(!buffer.content().iter().any(|c| c.fg == BRIGHT_RED));
-                if height >= 40 {
+                if height >= 40 && tab != 3 {
                     assert!(
                         buffer
                             .content()
@@ -4710,21 +4807,8 @@ mod tests {
                         if tab == 0 {
                             assert!(text.contains("actual input"));
                             assert!(text.contains("No input window recorded"));
-                            let row = terminal
-                                .backend()
-                                .buffer()
-                                .content()
-                                .chunks(width as usize)
-                                .find(|row| {
-                                    row.iter()
-                                        .map(|c| c.symbol())
-                                        .collect::<String>()
-                                        .contains("run metrics")
-                                })
-                                .unwrap();
-                            let left = row.iter().position(|c| c.symbol() == "┌").unwrap();
-                            let right = row.iter().position(|c| c.symbol() == "┐").unwrap();
-                            assert_eq!(right - left + 1, (width as usize / 4).clamp(30, 48));
+                            assert!(text.contains("run metrics"));
+                            assert!(!text.contains("not written yet"));
                         }
                         let expected = [
                             "run metrics",
@@ -4797,12 +4881,101 @@ mod tests {
         state.ingest("saved_checkpoint=/tmp/real run/model.pssa");
         assert_eq!(state.checkpoint_context(), "/tmp/real run/model.pssa");
         assert_eq!(state.checkpoints[0].1, Some(3.0));
-        state.ingest("progress_schema=2 updates_total=10 prior_updates=0 checkpoint_target=model.pssa");
+        state.ingest(
+            "progress_schema=2 updates_total=10 prior_updates=0 checkpoint_target=model.pssa",
+        );
         assert_eq!(state.chain_dir, PathBuf::from("."));
         assert!(state.last_checkpoint.is_none());
         assert!(state.live_loss.is_none());
         assert!(state.checkpoints.is_empty());
         assert!(state.checkpoint_context().contains("current step 0"));
+    }
+
+    #[test]
+    fn real_save_timing_elapsed_and_input_are_visible_in_the_monitor_shell() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut state = RunState::default();
+        state.ingest(
+            "progress_schema=2 updates_total=500 prior_updates=0 checkpoint_target=/tmp/model.pssa",
+        );
+        state.ingest("training 120/500 (24%) loss=3 tokens_per_second=90 optimizer_updates=120 global_update=120 elapsed_seconds=12.5 grad_norm=0.25 skipped_updates=2 feed_dataset=corpus.txt feed_snippet=actual%20dataset%20window feed_token_ids=1%2C2");
+        for (width, height) in [(80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| draw(f, &state, 0)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            for expected in [
+                "step 120",
+                "planned step 500",
+                "current step 120",
+                "elapsed 12.5s",
+                "actual dataset window",
+            ] {
+                assert!(
+                    text.contains(expected),
+                    "{width}x{height} missing {expected}: {text}"
+                );
+            }
+        }
+        assert_eq!(state.grad_norm, Some(0.25));
+        assert_eq!(state.skipped_updates, Some(2));
+    }
+
+    #[test]
+    fn reported_elapsed_resume_and_failed_save_context_do_not_invent_data() {
+        let mut state = RunState::default();
+        state.ingest(
+            "progress_schema=2 updates_total=500 prior_updates=100 checkpoint_target=/tmp/new.pssa",
+        );
+        state.ingest("last_checkpoint=/tmp/old.pssa");
+        state.ingest("training 120/500 (24%) loss=3 tokens_per_second=90 optimizer_updates=120 global_update=220 elapsed_seconds=12.5");
+        assert!(
+            state
+                .checkpoint_context()
+                .contains("Last saved /tmp/old.pssa")
+        );
+        assert!(state.checkpoint_context().contains("planned step 600"));
+        assert_eq!(state.resumed_from.as_deref(), Some("/tmp/old.pssa"));
+        state.run_started_at = Some(Instant::now() - Duration::from_secs(600));
+        state.training_active = false;
+        assert_eq!(state.elapsed_context(), "12.5s (last report)");
+        state.ingest(
+            "progress_schema=2 updates_total=10 prior_updates=0 checkpoint_target=/tmp/new.pssa",
+        );
+        state.training_active = false;
+        state.problem = Some("save failed: disk full".into());
+        assert!(
+            state
+                .checkpoint_context()
+                .contains("save failed: disk full")
+        );
+        assert!(state.elapsed_seconds.is_none());
+        assert!(state.resumed_from.is_none());
+        assert!(state.grad_norm.is_none());
+        state.ingest("progress_schema=1");
+        assert!(
+            state.current_step().is_none(),
+            "legacy unknown prior must not reuse another run's counter"
+        );
+    }
+
+    #[test]
+    fn new_reported_schedule_replaces_the_previous_warmup() {
+        let mut state = RunState::default();
+        state.ingest("lr_schedule=per-run horizon=100 from_step=0 to_step=100 warmup=10");
+        state.ingest("schedule 1 epoch(s), 100 updates, lr first=0.00010000 last=0.00001000 (base 0.00100000, horizon 100)");
+        state.ingest("progress_schema=2 prior_updates=0 updates_total=100");
+        assert_eq!(state.expected_lr_warmup, Some(10));
+        state.ingest("lr_schedule=per-run horizon=200 from_step=0 to_step=200 warmup=0");
+        state.ingest("schedule 1 epoch(s), 200 updates, lr first=0.00100000 last=0.00001000 (base 0.00100000, horizon 200)");
+        state.ingest("progress_schema=2 prior_updates=0 updates_total=200");
+        assert_eq!(state.expected_lr_warmup, Some(0));
+        assert_eq!(state.expected_lr_total, Some(200));
     }
 
     #[test]
@@ -4820,7 +4993,10 @@ mod tests {
         assert_eq!(feed.dataset, "owner/name");
         assert_eq!(feed.snippet, "héllo 世界 100% loss=NaN next");
         assert_eq!(feed.token_ids, [12, 34, 56]);
-        assert_eq!((feed.rows, feed.tokens, feed.row), (2, 17, 3));
+        assert_eq!(
+            (feed.rows, feed.tokens, feed.row),
+            (Some(2), Some(17), Some(3))
+        );
         assert_eq!(state.live_loss, Some(4.0));
         assert_eq!(state.progress_pct, Some(50.0));
         assert_eq!(state.eta.as_deref(), Some("2h 14m 09s"));
@@ -4862,7 +5038,10 @@ mod tests {
             assert!(!buffer.content().iter().any(|c| c.fg == BRIGHT_RED));
             frames.push(buffer.clone());
         }
-        assert_eq!(frames[0], frames[1], "recorded input does not invent motion");
+        assert_eq!(
+            frames[0], frames[1],
+            "recorded input does not invent motion"
+        );
         assert_eq!(frames[1], frames[2]);
         for (width, height) in [(120, 40), (80, 24), (60, 20), (30, 10), (10, 5), (1, 1)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();

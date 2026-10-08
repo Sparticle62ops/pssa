@@ -1,8 +1,9 @@
 //! Thin integration for the local-model/data screens, kept out of the app shell.
 use super::{
-    RunState, feature_area as content_area,
+    RunState,
     chat::Chat,
     eval::Eval,
+    feature_area as content_area,
     keybindings::{EVAL_TAB, LIBRARY_TAB, MIXER_TAB},
     library::{Library, Pick},
     mixer::Mixer,
@@ -40,9 +41,18 @@ impl Local {
         (tab == LIBRARY_TAB && self.library.editing()) || (tab == EVAL_TAB && self.eval.editing())
     }
     pub(super) fn poll(&mut self, setup: &mut Setup, state: &RunState, remote: bool) {
-        let run_dir = (!remote && (state.training_active || state.checkpoint_target.is_some()
-            || state.last_checkpoint.is_some())).then(|| state.chain_dir.clone());
+        let run_dir = (!remote
+            && (state.training_active
+                || state.checkpoint_target.is_some()
+                || state.last_checkpoint.is_some()))
+        .then(|| state.chain_dir.clone());
         self.library.watch_run(run_dir, state.checkpoint_revision);
+        let dataset = (!remote)
+            .then(|| state.feed.as_ref())
+            .flatten()
+            .filter(|feed| feed.split.is_empty() && !feed.dataset.contains("://"))
+            .map(|feed| PathBuf::from(&feed.dataset));
+        self.library.watch_dataset(dataset);
         self.library.poll();
         self.mixer.sync(
             &self.library.entries,
@@ -135,9 +145,20 @@ impl Local {
 
 // Kaggle log paths are remote, even when a same-named local file exists.
 // Only the explicitly configured local library remains eligible in that mode.
-fn eval_target<'a>(state: &'a RunState, models: &'a Path, remote: bool) -> (&'a Path, Option<&'a Path>) {
-    if !remote && (state.training_active || state.last_checkpoint.is_some() || state.checkpoint_target.is_some()) {
-        (&state.chain_dir, state.last_checkpoint.as_deref().map(Path::new))
+fn eval_target<'a>(
+    state: &'a RunState,
+    models: &'a Path,
+    remote: bool,
+) -> (&'a Path, Option<&'a Path>) {
+    if !remote
+        && (state.training_active
+            || state.last_checkpoint.is_some()
+            || state.checkpoint_target.is_some())
+    {
+        (
+            &state.chain_dir,
+            state.last_checkpoint.as_deref().map(Path::new),
+        )
     } else {
         (models, None)
     }
@@ -173,9 +194,17 @@ pub(super) fn resume_hints(path: &Path) -> Vec<(&'static str, String)> {
     let mut result: Vec<_> = fields
         .iter()
         .filter_map(|&(label, at)| {
-            word(at)
-                .filter(|n| *n > 0 && *n <= 65536)
-                .map(|n| (label, if label == "Vocab ceiling" { n.max(257) } else { n }.to_string()))
+            word(at).filter(|n| *n > 0 && *n <= 65536).map(|n| {
+                (
+                    label,
+                    if label == "Vocab ceiling" {
+                        n.max(257)
+                    } else {
+                        n
+                    }
+                    .to_string(),
+                )
+            })
         })
         .collect();
     if &bytes[..4] == b"PSSA" {

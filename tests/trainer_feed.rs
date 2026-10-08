@@ -150,6 +150,21 @@ fn transformer_bpe_actual_window_cache_and_epochs_do_not_change_checkpoint_bits(
                 (stream_offset + end.saturating_sub(16).max(start)).to_string()
             );
             assert_eq!(sample["feed_end"], (stream_offset + end).to_string());
+            assert_eq!(sample["feed_skip_tokens"], "3");
+            let source_tokens: Vec<usize> = raw
+                .lines()
+                .flat_map(|line| tokenizer.encode(line, true))
+                .collect();
+            let source_start: usize = sample["feed_source_start"].parse().unwrap();
+            let source_end: usize = sample["feed_source_end"].parse().unwrap();
+            assert_eq!(ids, source_tokens[source_start..source_end]);
+            let source_row: usize = sample["feed_source_row"].parse().unwrap();
+            assert!(
+                raw.lines()
+                    .nth(source_row - 1)
+                    .unwrap()
+                    .contains(&sample["feed_snippet"])
+            );
             let consumed: usize = plan[..batch].iter().map(|chunk| chunk.2).sum();
             assert_eq!(sample["feed_epoch_tokens"], consumed.to_string());
             let epoch: usize = sample["feed_epoch"].parse().unwrap();
