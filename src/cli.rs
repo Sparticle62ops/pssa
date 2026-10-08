@@ -2976,6 +2976,33 @@ mod training_safeguards_tests {
     }
 
     #[test]
+    fn dream_rehearsal_flags_parse_and_reject_invalid_values() {
+        let parsed = Parsed::parse(
+            &[
+                "--dream-lr".into(),
+                "0.002".into(),
+                "--dream-steps".into(),
+                "3".into(),
+            ],
+            &["--dream-lr", "--dream-steps"],
+        )
+        .unwrap();
+        let options = CLIHandler::common_options(&parsed).unwrap();
+        assert_eq!(options.dream_lr, 0.002);
+        assert_eq!(options.dream_steps, 3);
+        for (flag, bad) in [
+            ("--dream-lr", "0"),
+            ("--dream-lr", "NaN"),
+            ("--dream-steps", "0"),
+        ] {
+            let parsed =
+                Parsed::parse(&[flag.into(), bad.into()], &["--dream-lr", "--dream-steps"])
+                    .unwrap();
+            assert!(CLIHandler::common_options(&parsed).is_err(), "{flag}={bad}");
+        }
+    }
+
+    #[test]
     fn skip_limit_allows_twenty_and_resets_after_success() {
         let mut skipped = SkippedUpdates::default();
         for _ in 0..MAX_CONSECUTIVE_SKIPPED_UPDATES {
