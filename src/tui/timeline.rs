@@ -34,6 +34,8 @@ struct Metrics {
     loss: Option<f64>,
     speed: Option<f64>,
     update: Option<u64>,
+    prior_updates: Option<u64>,
+    global_update_seen: bool,
     observed: bool,
 }
 impl Metrics {
@@ -63,10 +65,25 @@ impl Metrics {
                 .and_then(|v| v.replace(',', "").parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v >= 0.0);
         }
-        if let Some(value) =
-            field(line, "global_update").or_else(|| field(line, "optimizer_updates"))
+        if let Some(prior) = field(line, "prior_updates")
+            .or_else(|| field(line, "prior_steps"))
+            .and_then(|value| value.parse().ok())
         {
-            self.update = value.split('/').next().and_then(|v| v.parse().ok());
+            self.prior_updates = Some(prior);
+        }
+        if let Some(global) = field(line, "global_update").and_then(|value| value.parse().ok()) {
+            self.update = Some(global);
+            self.global_update_seen = true;
+        } else if let Some(local) =
+            field(line, "optimizer_updates").and_then(|value| value.split('/').next()?.parse().ok())
+        {
+            if let Some(prior) = self.prior_updates {
+                self.update = Some(prior.saturating_add(local));
+            } else if !self.global_update_seen {
+                self.update = Some(local);
+            }
+            // A completion summary is run-local. Without resume context it
+            // must not replace an already recorded global update count.
         }
     }
 }
@@ -357,7 +374,10 @@ pub(super) struct Timeline {
     root: Option<PathBuf>,
     entries: Vec<Entry>,
     selected: usize,
-    worker: Option<(PathBuf, Receiver<Scan>)>,
+    worker: Option<(u64, Receiver<Scan>)>,
+    checkpoint_revision: u64,
+    run_started_at: Option<Instant>,
+    scan_revision: u64,
     last_scan: Option<Instant>,
     refresh: bool,
     note: String,
@@ -371,6 +391,9 @@ impl Default for Timeline {
             entries: Vec::new(),
             selected: 0,
             worker: None,
+            checkpoint_revision: 0,
+            run_started_at: None,
+            scan_revision: 0,
             last_scan: None,
             refresh: true,
             note: "Open a run to inspect its saved checkpoints. No weights are loaded.".into(),
@@ -382,7 +405,10 @@ impl Default for Timeline {
 impl Timeline {
     pub(super) fn poll(&mut self, state: &RunState, visible: bool) {
         self.waiting_context = state.checkpoint_context();
-        self.live = state.training_active.then_some((state.current_step(), state.live_loss, state.tok_s));
+        self.live =
+            state
+                .training_active
+                .then_some((state.current_step(), state.live_loss, state.tok_s));
         let root = if state.chain_dir.as_os_str().is_empty() {
             state
                 .last_checkpoint
@@ -393,23 +419,31 @@ impl Timeline {
         } else {
             Some(absolute(&state.chain_dir))
         };
-        if self.root != root {
+        if self.root != root
+            || self.checkpoint_revision != state.checkpoint_revision
+            || self.run_started_at != state.run_started_at
+        {
             self.root = root;
+            self.checkpoint_revision = state.checkpoint_revision;
+            self.run_started_at = state.run_started_at;
+            self.scan_revision = self.scan_revision.wrapping_add(1);
             self.entries.clear();
             self.selected = 0;
             self.refresh = true;
-            self.note = "Current run changed; waiting for its checkpoint scan.".into();
+            self.last_scan = None;
+            self.note =
+                "Current run or saved artifact changed; waiting for its checkpoint scan.".into();
             // Keep the old receiver until it completes: never multiply workers
             // when a user rapidly browses between runs.
         }
         let result = self
             .worker
             .as_ref()
-            .map(|(root, rx)| (root.clone(), rx.try_recv()));
+            .map(|(revision, rx)| (*revision, rx.try_recv()));
         match result {
-            Some((root, Ok(scan))) => {
+            Some((revision, Ok(scan))) => {
                 self.worker = None;
-                if self.root.as_ref() == Some(&root) {
+                if self.scan_revision == revision {
                     let selected = self.entries.get(self.selected).map(|e| e.path.clone());
                     self.entries = scan.entries;
                     self.selected = selected
@@ -418,9 +452,11 @@ impl Timeline {
                     self.note = scan.note;
                 }
             }
-            Some((_, Err(TryRecvError::Disconnected))) => {
+            Some((revision, Err(TryRecvError::Disconnected))) => {
                 self.worker = None;
-                self.note = "History worker stopped; r retries.".into();
+                if self.scan_revision == revision {
+                    self.note = "History worker stopped; r retries.".into();
+                }
             }
             _ => {}
         }
@@ -462,7 +498,7 @@ impl Timeline {
                     let _ = tx.send(scan(&root, recent));
                 }
             }) {
-            Ok(_) => self.worker = Some((root, rx)),
+            Ok(_) => self.worker = Some((self.scan_revision, rx)),
             Err(error) => {
                 self.note = format!("Cannot start history scan: {}", clean(&error.to_string()))
             }
@@ -471,7 +507,10 @@ impl Timeline {
 
     pub(super) fn recorded_losses(&self) -> impl Iterator<Item = (String, f64)> + '_ {
         self.entries.iter().filter_map(|entry| {
-            Some((entry.path.file_name()?.to_string_lossy().into_owned(), entry.metrics.loss?))
+            Some((
+                entry.path.file_name()?.to_string_lossy().into_owned(),
+                entry.metrics.loss?,
+            ))
         })
     }
 
@@ -598,6 +637,17 @@ impl Timeline {
             }
         }
         let mut rows = Vec::new();
+        if let Some((step, loss, speed)) = self.live {
+            rows.push(Line::from(format!(
+                "Unsaved live run: step {} / loss {} / {} tok/s",
+                step.map_or("unrecorded".into(), |value| value.to_string()),
+                loss.map_or("unrecorded".into(), super::charts::number),
+                speed.map_or("unrecorded".into(), |value| format!("{value:.0}"))
+            )));
+            rows.push(Line::from(
+                "Live metrics are not checkpoint history until a save event arrives.",
+            ));
+        }
         if let Some(entry) = self.entries.get(self.selected) {
             rows.push(Line::styled(
                 clean(&entry.path.display().to_string()),
@@ -635,13 +685,6 @@ impl Timeline {
             }
         } else {
             rows.push(Line::from(self.waiting_context.clone()));
-            if let Some((step, loss, speed)) = self.live {
-                rows.push(Line::from(format!("Unsaved live run: step {} / loss {} / {} tok/s",
-                    step.map_or("unrecorded".into(), |value| value.to_string()),
-                    loss.map_or("unrecorded".into(), super::charts::number),
-                    speed.map_or("unrecorded".into(), |value| format!("{value:.0}")))));
-                rows.push(Line::from("Live metrics are not checkpoint history until a save event arrives."));
-            }
             rows.push(Line::from("Keep train.log beside checkpoints; missing history cannot be recovered from weights."));
         }
         rows.push(Line::styled(
@@ -801,6 +844,45 @@ mod tests {
     }
 
     #[test]
+    fn resumed_completion_save_records_global_updates_not_local_summary() {
+        let fixture = Fixture::new();
+        let checkpoint = fixture.checkpoint("model.pssa");
+        for (context, progress) in [
+            (
+                "progress_schema=2 prior_updates=100",
+                "optimizer_updates=480/500 global_update=580",
+            ),
+            (
+                "resumed_from=ck01.pssa prior_steps=100",
+                "optimizer_updates=480/500",
+            ),
+            (
+                "progress_schema=2",
+                "optimizer_updates=500/500 global_update=600",
+            ),
+        ] {
+            fs::write(fixture.0.join("train.log"), format!(
+                "{context}\nloss=3 tokens_per_second=90 {progress}\noptimizer_updates=500\ntraining_seconds=2\nsaved_checkpoint={}\n",
+                checkpoint.display()
+            )).unwrap();
+            let result = scan(&fixture.0, vec![]);
+            assert_eq!(result.entries[0].metrics.update, Some(600), "{context}");
+            assert!(result.entries[0].explicit);
+        }
+        let mut fresh = Metrics::default();
+        fresh.ingest("optimizer_updates=480/500");
+        fresh.ingest("optimizer_updates=500");
+        assert_eq!(fresh.update, Some(500));
+        fresh.ingest("progress_schema=2 prior_updates=0");
+        fresh.ingest("optimizer_updates=10");
+        assert_eq!(
+            fresh.update,
+            Some(10),
+            "new runs discard prior global context"
+        );
+    }
+
+    #[test]
     fn bounded_reader_drops_partial_paths_and_oversized_lines() {
         let fixture = Fixture::new();
         let log = fixture.0.join("bounded.log");
@@ -881,6 +963,85 @@ mod tests {
     }
 
     #[test]
+    fn same_path_save_invalidates_cached_history_and_pending_artifact_scan() {
+        let fixture = Fixture::new();
+        let checkpoint = fixture.checkpoint("model.pssa");
+        let mut state = RunState {
+            chain_dir: fixture.0.clone(),
+            ..Default::default()
+        };
+        state.ingest("loss=4 tokens_per_second=40 global_update=100");
+        state.ingest(&format!("saved_checkpoint={}", checkpoint.display()));
+        let mut timeline = Timeline::default();
+        timeline.poll(&state, false);
+        timeline.entries = scan(&fixture.0, state.raw_lines.clone()).entries;
+        assert_eq!(timeline.recorded_losses().next().unwrap().1, 4.0);
+        let stale = scan(&fixture.0, state.raw_lines.clone());
+        let (tx, rx) = mpsc::channel();
+        let revision = timeline.scan_revision;
+        timeline.worker = Some((revision, rx));
+
+        fs::write(&checkpoint, "overwritten artifact; still never decoded").unwrap();
+        state.ingest("loss=2 tokens_per_second=80 global_update=600");
+        state.ingest(&format!("saved_checkpoint={}", checkpoint.display()));
+        timeline.poll(&state, false);
+        assert!(
+            timeline.entries.is_empty(),
+            "hidden history must invalidate too"
+        );
+        assert!(timeline.refresh);
+        assert_eq!(
+            timeline.worker.as_ref().unwrap().0,
+            revision,
+            "keep the sole pending worker"
+        );
+        tx.send(stale).unwrap();
+        timeline.poll(&state, false);
+        assert!(
+            timeline.entries.is_empty(),
+            "old artifact results must be discarded"
+        );
+        assert!(timeline.worker.is_none());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while timeline.entries.is_empty() && Instant::now() < deadline {
+            timeline.poll(&state, true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(timeline.recorded_losses().next().unwrap().1, 2.0);
+        assert_eq!(timeline.entries[0].metrics.update, Some(600));
+    }
+
+    #[test]
+    fn new_run_at_same_root_discards_pending_previous_run_scan() {
+        let fixture = Fixture::new();
+        let checkpoint = fixture.checkpoint("model.pssa");
+        let mut state = RunState::default();
+        let header = format!(
+            "progress_schema=2 checkpoint_target={}",
+            checkpoint.display()
+        );
+        state.ingest(&header);
+        let mut timeline = Timeline::default();
+        timeline.poll(&state, false);
+        let revision = timeline.scan_revision;
+        let (tx, rx) = mpsc::channel();
+        timeline.worker = Some((revision, rx));
+        // The run changes without any save or directory change. Make its
+        // timestamp deterministic rather than relying on clock resolution.
+        let previous_start = state.run_started_at.unwrap();
+        state.ingest(&header);
+        state.run_started_at = Some(previous_start + Duration::from_secs(1));
+        timeline.poll(&state, false);
+        assert_ne!(timeline.scan_revision, revision);
+        tx.send(scan(&fixture.0, vec![])).unwrap();
+        timeline.poll(&state, false);
+        assert!(timeline.entries.is_empty());
+        assert!(timeline.worker.is_none());
+        assert!(timeline.refresh);
+    }
+
+    #[test]
     fn unsaved_timeline_shows_current_run_without_inventing_checkpoint_history() {
         let mut state = RunState::default();
         state.ingest("progress_schema=2 updates_total=500 prior_updates=100 checkpoint_target=/tmp/live run/model.pssa");
@@ -889,12 +1050,76 @@ mod tests {
         timeline.poll(&state, false);
         assert!(timeline.entries.is_empty());
         assert!(timeline.worker.is_none());
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| timeline.draw(f, f.area())).unwrap();
-        let text: String = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
-        for expected in ["step 600", "current step 220", "Unsaved live run: step 220", "loss 3", "90 tok/s"] {
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for expected in [
+            "step 600",
+            "current step 220",
+            "Unsaved live run: step 220",
+            "loss 3",
+            "90 tok/s",
+        ] {
             assert!(text.contains(expected), "missing {expected}: {text}");
         }
+    }
+
+    #[test]
+    fn live_metrics_remain_distinct_and_visible_while_inspecting_saved_history() {
+        let fixture = Fixture::new();
+        let checkpoint = fixture.checkpoint("ck01.pssa");
+        let mut state = RunState::default();
+        state.ingest(&format!(
+            "progress_schema=2 updates_total=500 prior_updates=100 checkpoint_target={}",
+            fixture.0.join("model.pssa").display()
+        ));
+        state.ingest("training 120/500 (24%) loss=3 tokens_per_second=90 optimizer_updates=120 global_update=220");
+        let mut timeline = Timeline::default();
+        timeline.poll(&state, false);
+        timeline.entries = vec![Entry {
+            path: checkpoint,
+            metrics: Metrics {
+                loss: Some(4.0),
+                update: Some(100),
+                ..Default::default()
+            },
+            source: Some("saved checkpoint log".into()),
+            explicit: true,
+        }];
+        for (width, height) in [(120, 30), (80, 24), (45, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| timeline.draw(f, f.area())).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            for expected in [
+                "Unsaved live run: step 220",
+                "loss 3",
+                "90 tok/s",
+                "not checkpoint history",
+                "Recorded training loss: 4",
+            ] {
+                assert!(
+                    text.contains(expected),
+                    "missing {expected} at {width}x{height}: {text}"
+                );
+            }
+        }
+        assert_eq!(
+            timeline.recorded_losses().collect::<Vec<_>>(),
+            vec![("ck01.pssa".into(), 4.0)]
+        );
     }
 
     #[test]

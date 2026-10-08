@@ -288,8 +288,9 @@ pub struct FeedSample {
     pub field: Option<String>,
     pub snippet: String,
     pub token_ids: String,
-    /// JSON array of exact vocabulary labels, one per token ID. ByteLevel BPE
-    /// labels preserve split UTF-8 bytes that individual decoding would lose.
+    /// JSON array of vocabulary labels, one per exact token ID (32 characters
+    /// per piece, with explicit ellipsis on truncation). ByteLevel BPE labels
+    /// preserve split UTF-8 bytes that individual decoding would lose.
     pub token_pieces: String,
     pub tokens: usize,
     pub epoch_tokens: usize,
@@ -303,6 +304,10 @@ pub struct FeedSample {
     pub rows: usize,
     pub start: usize,
     pub end: usize,
+    pub source_row: Option<usize>,
+    pub source_start: usize,
+    pub source_end: usize,
+    pub skip_tokens: usize,
     pub bytes: Option<usize>,
     pub bytes_total: Option<usize>,
     pub text_kind: &'static str,
@@ -400,6 +405,12 @@ impl Progress {
     /// allocations out of ordinary optimizer updates.
     pub fn set_feed(&mut self, sample: FeedSample) {
         self.feed = Some(sample);
+    }
+
+    /// Emit the final consumed input even if safeguards skipped some Adam
+    /// updates, so the run can end before the planned optimizer total.
+    pub(crate) fn report_final_inputs(&mut self) {
+        self.emitted = false;
     }
 
     /// Let optional presentation work share the logger's existing throttle.
@@ -605,6 +616,13 @@ impl Progress {
             feed.end,
             feed.text_kind,
         );
+        fields.push_str(&format!(
+            " feed_source_start={} feed_source_end={} feed_skip_tokens={}",
+            feed.source_start, feed.source_end, feed.skip_tokens
+        ));
+        if let Some(row) = feed.source_row {
+            fields.push_str(&format!(" feed_source_row={row}"));
+        }
         for (key, value) in [
             ("feed_config", feed.config.as_deref()),
             ("feed_split", feed.split.as_deref()),
@@ -739,6 +757,10 @@ mod progress_tests {
             rows: 2,
             start: 3,
             end: 5,
+            source_row: Some(3),
+            source_start: 103,
+            source_end: 105,
+            skip_tokens: 100,
             bytes: None,
             bytes_total: None,
             text_kind: "raw",

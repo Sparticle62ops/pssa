@@ -14,9 +14,9 @@ pub(super) struct FeedState {
     pub config: String,
     pub split: String,
     pub field: String,
-    pub rows: u64,
-    pub tokens: u64,
-    pub row: u64,
+    pub rows: Option<u64>,
+    pub tokens: Option<u64>,
+    pub row: Option<u64>,
     pub snippet: String,
     pub token_ids: Vec<u64>,
     pub token_pieces: Vec<String>,
@@ -29,6 +29,10 @@ pub(super) struct FeedState {
     pub batches: Option<u64>,
     pub start: Option<u64>,
     pub end: Option<u64>,
+    pub source_row: Option<u64>,
+    pub source_start: Option<u64>,
+    pub source_end: Option<u64>,
+    pub skip_tokens: Option<u64>,
     pub bytes: Option<u64>,
     pub bytes_total: Option<u64>,
     pub text_kind: String,
@@ -46,7 +50,15 @@ fn number(line: &str, key: &str) -> Option<u64> {
 impl FeedState {
     pub(super) fn parse(line: &str) -> Option<Self> {
         let dataset = parse_log_value(line, "feed_dataset")?;
-        let ids = parse_log_value(line, "feed_token_ids").unwrap_or_default();
+        let schema = number(line, "feed_schema");
+        if schema.is_some_and(|schema| schema != 2) {
+            return None;
+        }
+        let ids = parse_log_value(line, "feed_token_ids");
+        if schema == Some(2) && ids.is_none() {
+            return None;
+        }
+        let ids = ids.unwrap_or_default();
         // Reject a damaged list instead of shifting the id/piece pairing.
         let token_ids = if ids.is_empty() {
             Vec::new()
@@ -72,6 +84,7 @@ impl FeedState {
                     .map(|piece| crate::ui::terminal_text(&piece).chars().take(256).collect())
                     .collect()
             }
+            None if schema == Some(2) => return None,
             None => Vec::new(),
         };
         let start = number(line, "feed_start");
@@ -79,33 +92,95 @@ impl FeedState {
         if start.zip(end).is_some_and(|(start, end)| start > end) {
             return None;
         }
+        let snippet = parse_log_value(line, "feed_snippet");
+        let tokens = number(line, "feed_tokens");
+        let row = number(line, "feed_row");
+        let rows = number(line, "feed_rows");
+        let epoch_tokens = number(line, "feed_epoch_tokens");
+        let epoch_total = number(line, "feed_epoch_total");
+        let epoch = number(line, "feed_epoch");
+        let epochs = number(line, "feed_epochs");
+        let step = number(line, "feed_step");
+        let batch = number(line, "feed_batch");
+        let batches = number(line, "feed_batches");
+        let text_kind = parse_log_value(line, "feed_text_kind").unwrap_or_default();
+        if schema == Some(2) {
+            let (tokens, row, rows, done, total, epoch, epochs, batch, batches, start, end) = (
+                tokens?,
+                row?,
+                rows?,
+                epoch_tokens?,
+                epoch_total?,
+                epoch?,
+                epochs?,
+                batch?,
+                batches?,
+                start?,
+                end?,
+            );
+            if snippet.is_none()
+                || step.is_none()
+                || token_ids.is_empty()
+                || row == 0
+                || row > rows
+                || total == 0
+                || done > total
+                || done > tokens
+                || epoch == 0
+                || epoch > epochs
+                || batch == 0
+                || batch > batches
+                || end - start != token_ids.len() as u64
+                || !matches!(text_kind.as_str(), "raw" | "decoded")
+            {
+                return None;
+            }
+        }
+        let source_start = number(line, "feed_source_start");
+        let source_end = number(line, "feed_source_end");
+        if source_start.is_some() != source_end.is_some()
+            || source_start
+                .zip(source_end)
+                .is_some_and(|(start, end)| end < start || end - start != token_ids.len() as u64)
+        {
+            return None;
+        }
+        let bytes = number(line, "feed_bytes");
+        let bytes_total = number(line, "feed_bytes_total");
+        if bytes.is_some() != bytes_total.is_some()
+            || bytes
+                .zip(bytes_total)
+                .is_some_and(|(done, total)| done > total)
+        {
+            return None;
+        }
         Some(Self {
             dataset,
             config: parse_log_value(line, "feed_config").unwrap_or_default(),
             split: parse_log_value(line, "feed_split").unwrap_or_default(),
             field: parse_log_value(line, "feed_field").unwrap_or_default(),
-            rows: number(line, "feed_rows").unwrap_or(0),
-            tokens: number(line, "feed_tokens").unwrap_or(0),
-            row: number(line, "feed_row").unwrap_or(0),
-            snippet: parse_log_value(line, "feed_snippet")
-                .unwrap_or_default()
-                .chars()
-                .take(256)
-                .collect(),
+            rows,
+            tokens,
+            row,
+            snippet: snippet.unwrap_or_default().chars().take(256).collect(),
             token_ids,
             token_pieces,
-            epoch_tokens: number(line, "feed_epoch_tokens"),
-            epoch_total: number(line, "feed_epoch_total"),
-            epoch: number(line, "feed_epoch"),
-            epochs: number(line, "feed_epochs"),
-            step: number(line, "feed_step"),
-            batch: number(line, "feed_batch"),
-            batches: number(line, "feed_batches"),
+            epoch_tokens,
+            epoch_total,
+            epoch,
+            epochs,
+            step,
+            batch,
+            batches,
             start,
             end,
-            bytes: number(line, "feed_bytes"),
-            bytes_total: number(line, "feed_bytes_total"),
-            text_kind: parse_log_value(line, "feed_text_kind").unwrap_or_default(),
+            source_row: number(line, "feed_source_row"),
+            source_start,
+            source_end,
+            skip_tokens: number(line, "feed_skip_tokens"),
+            bytes,
+            bytes_total,
+            text_kind,
             updated_at: Some(Instant::now()),
         })
     }
@@ -113,21 +188,23 @@ impl FeedState {
     fn position(&self) -> String {
         match (self.epoch_tokens, self.epoch_total) {
             (Some(done), Some(total)) if total > 0 => format!(
-                "epoch {}/{}: {done}/{total} input tokens ({:.2}%) / {} tokens consumed",
+                "epoch {}/{}: {done}/{total} inputs ({:.2}%) / consumed {}",
                 value(self.epoch),
                 value(self.epochs),
                 done as f64 * 100.0 / total as f64,
-                self.tokens
+                value(self.tokens)
             ),
             _ => format!(
                 "{} rows consumed / {} tokens / selected row {} (legacy log)",
-                self.rows, self.tokens, self.row
+                value(self.rows),
+                value(self.tokens),
+                value(self.row)
             ),
         }
     }
 }
 
-fn value(value: Option<u64>) -> String {
+pub(super) fn value(value: Option<u64>) -> String {
     value.map_or_else(|| "unrecorded".into(), |n| n.to_string())
 }
 
@@ -173,15 +250,24 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &RunState) {
             )));
         }
         lines.push(Line::from(format!(
-            "step {} / batch {}/{} / selected document {}/{} / tokens {}..{}",
+            "step {} / batch {}/{} / selected doc {}/{} / tokens {}..{}",
             value(feed.step),
             value(feed.batch),
             value(feed.batches),
-            feed.row,
-            feed.rows,
+            value(feed.row),
+            value(feed.rows),
             value(feed.start),
             value(feed.end)
         )));
+        if feed.source_start.is_some() {
+            lines.push(Line::from(format!(
+                "Dataset row {} / source tokens {}..{} / skip {} (EOF wrap)",
+                value(feed.source_row),
+                value(feed.source_start),
+                value(feed.source_end),
+                value(feed.skip_tokens)
+            )));
+        }
         lines.push(Line::from(match (feed.bytes, feed.bytes_total) {
             (Some(bytes), Some(total)) => format!("Source bytes consumed: {bytes}/{total} (UTF-8)"),
             _ => {
@@ -191,14 +277,14 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &RunState) {
         }));
     }
     let text_label = match feed.text_kind.as_str() {
-        "raw" => "Source text window (truncated)",
+        "raw" => "Source text window (truncated; UTF-8 boundary context)",
         "decoded" => "Input window decoded from actual IDs (normalized; not original source bytes)",
         _ => "Recorded snippet (legacy log; original source fidelity unrecorded)",
     };
     lines.push(Line::styled(text_label, accent()));
     lines.push(Line::from(feed.snippet.clone()));
     lines.push(Line::styled(
-        "Token pieces → IDs (bounded preview, in input order)",
+        "Token pieces → IDs (input order; … = truncated)",
         accent(),
     ));
     if feed.token_pieces.is_empty() {
@@ -248,7 +334,7 @@ pub(super) fn draw_compact(f: &mut Frame, area: Rect, state: &RunState) {
     let lines = match &state.feed {
         Some(feed) => vec![
             Line::styled(
-                format!("step {} / doc {}", value(feed.step), feed.row),
+                format!("step {} / doc {}", value(feed.step), value(feed.row)),
                 accent(),
             ),
             Line::from(feed.snippet.clone()),
@@ -260,7 +346,7 @@ pub(super) fn draw_compact(f: &mut Frame, area: Rect, state: &RunState) {
                     .collect::<Vec<_>>()
                     .join(",")
             )),
-            Line::from(format!("{} input tokens consumed", feed.tokens)),
+            Line::from(format!("{} input tokens consumed", value(feed.tokens))),
         ],
         None => vec![
             Line::from("No input window recorded"),
@@ -282,9 +368,30 @@ mod tests {
     use crate::ui::encode_log_value;
     use ratatui::{Terminal, backend::TestBackend};
 
+    fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        if buffer.area.width == 0 {
+            return String::new();
+        }
+        let mut text = String::new();
+        for row in buffer.content().chunks(buffer.area.width as usize) {
+            let mut continuation = 0;
+            for cell in row {
+                if continuation > 0 {
+                    continuation -= 1;
+                    continue;
+                }
+                text.push_str(cell.symbol());
+                continuation = Line::from(cell.symbol()).width().saturating_sub(1);
+            }
+            text.push('\n');
+        }
+        text
+    }
+
     fn event() -> String {
         format!(
-            "feed_schema=2 feed_dataset={} feed_tokens=64 feed_rows=3 feed_row=2 feed_epoch=2 feed_epochs=4 feed_epoch_tokens=16 feed_epoch_total=32 feed_step=8 feed_batch=2 feed_batches=4 feed_start=12 feed_end=14 feed_text_kind=raw feed_bytes=27 feed_bytes_total=54 feed_snippet={} feed_token_ids=7%2C9 feed_token_pieces={}",
+            "feed_schema=2 feed_dataset={} feed_tokens=64 feed_rows=3 feed_row=2 feed_epoch=2 feed_epochs=4 feed_epoch_tokens=16 feed_epoch_total=32 feed_step=8 feed_batch=2 feed_batches=4 feed_start=12 feed_end=14 feed_source_row=4 feed_source_start=112 feed_source_end=114 feed_skip_tokens=100 feed_text_kind=raw feed_bytes=27 feed_bytes_total=54 feed_snippet={} feed_token_ids=7%2C9 feed_token_pieces={}",
             encode_log_value("/tmp/corpus with spaces.txt"),
             encode_log_value("héllo 世界"),
             encode_log_value(r#"["héllo","世界"]"#)
@@ -296,8 +403,13 @@ mod tests {
         assert_eq!(feed.dataset, "/tmp/corpus with spaces.txt");
         assert_eq!(feed.token_ids, [7, 9]);
         assert_eq!(feed.token_pieces, ["héllo", "世界"]);
-        assert_eq!(feed.tokens, 64);
+        assert_eq!(feed.tokens, Some(64));
         assert_eq!(feed.epoch_tokens, Some(16));
+        assert_eq!(feed.source_row, Some(4));
+        assert_eq!(
+            (feed.source_start, feed.source_end, feed.skip_tokens),
+            (Some(112), Some(114), Some(100))
+        );
         assert_eq!(
             (feed.start, feed.end, feed.bytes),
             (Some(12), Some(14), Some(27))
@@ -321,6 +433,39 @@ mod tests {
         assert!(!feed.token_pieces[0].contains('\n'));
     }
     #[test]
+    fn damaged_new_schema_never_replaces_the_last_valid_window() {
+        let mut state = RunState::default();
+        state.ingest(&event());
+        for (field, damage) in [
+            ("feed_epoch_total=32", "feed_epoch_total=0"),
+            ("feed_epoch_tokens=16", "feed_epoch_tokens=33"),
+            ("feed_row=2", "feed_row=0"),
+            ("feed_batch=2", "feed_batch=5"),
+            ("feed_end=14", "feed_end=15"),
+            ("feed_source_end=114", "feed_source_end=111"),
+            ("feed_bytes=27", "feed_bytes=55"),
+            ("feed_token_ids=7%2C9", "feed_token_ids=%ZZ"),
+            ("feed_token_pieces=", "damaged_token_pieces="),
+            ("feed_snippet=", "damaged_snippet="),
+        ] {
+            let damaged = event().replace(field, damage);
+            assert!(FeedState::parse(&damaged).is_none(), "accepted {damaged}");
+            state.ingest(&damaged);
+            assert_eq!(state.feed.as_ref().unwrap().snippet, "héllo 世界");
+        }
+    }
+
+    #[test]
+    fn missing_legacy_counters_are_unrecorded_not_zero() {
+        let mut state = RunState::default();
+        state.ingest("feed_dataset=legacy feed_snippet=hello feed_token_ids=1");
+        let feed = state.feed.as_ref().unwrap();
+        assert_eq!((feed.tokens, feed.row, feed.rows), (None, None, None));
+        assert!(feed.position().contains("unrecorded tokens"));
+        assert!(!feed.position().contains("0 tokens"));
+    }
+
+    #[test]
     fn renders_real_window_progress_and_tokens_at_wide_and_narrow_sizes() {
         let mut state = RunState::default();
         state.ingest(&event());
@@ -335,13 +480,7 @@ mod tests {
         ] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             terminal.draw(|f| draw(f, f.area(), &state)).unwrap();
-            let text: String = terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(|c| c.symbol())
-                .collect();
+            let text = rendered_text(&terminal);
             if w >= 60 {
                 for expected in [
                     "corpus with spaces.txt",

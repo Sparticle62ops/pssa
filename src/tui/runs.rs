@@ -317,8 +317,9 @@ impl Runs {
         let (tx, rx) = mpsc::channel();
         self.open = Some(rx);
         std::thread::spawn(move || {
+            let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
             let mut state = RunState {
-                chain_dir: path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+                chain_dir: root.clone(),
                 ..Default::default()
             };
             let mut log = path.with_extension("log");
@@ -336,9 +337,34 @@ impl Runs {
             } else {
                 Ok(())
             };
+            // Replayed trainer targets may describe an obsolete remote folder.
+            // Browsing a copied run must stay rooted in the selected local run.
+            state.chain_dir = root;
+            let local_artifact = |recorded: Option<&str>| {
+                let name = Path::new(recorded?).file_name()?;
+                let candidate = state.chain_dir.join(name);
+                (candidate
+                    .extension()
+                    .is_some_and(|ext| ext == "pssa" || ext == "trfm")
+                    && candidate.is_file())
+                .then_some(candidate)
+            };
+            let last = local_artifact(state.last_checkpoint.as_deref());
+            let target = local_artifact(state.checkpoint_target.as_deref());
+            state.last_checkpoint = last.map(|p| p.display().to_string());
+            state.checkpoint_target = target.map(|p| p.display().to_string());
             if path.extension().is_some_and(|e| e != "log") {
                 state.note_checkpoint(&path.display().to_string());
+                state
+                    .checkpoint_target
+                    .get_or_insert_with(|| path.display().to_string());
             }
+            state.checkpoint_number = state
+                .last_checkpoint
+                .as_deref()
+                .or(state.checkpoint_target.as_deref())
+                .and_then(super::checkpoint_number);
+            state.refresh_chain();
             state.training_active = false;
             state.last_progress_at = None;
             if state.metric_series.is_empty() {
@@ -542,6 +568,77 @@ mod tests {
         assert!(state.warning.unwrap().contains("not recoverable"));
         fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn copied_remote_log_keeps_selected_local_root_and_artifact_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "pssa-runs-copied-{} path with spaces",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.pssa");
+        let previous = dir.join("ck01.pssa");
+        let log = dir.join("train.log");
+        fs::write(&path, "local model; not decoded or modified").unwrap();
+        fs::write(&previous, "local previous artifact").unwrap();
+        fs::write(&log, "progress_schema=2 updates_total=500 prior_updates=100 checkpoint_target=/kaggle/working/obsolete run/model.pssa\nloss=4 tokens_per_second=40 optimizer_updates=0 global_update=100\nsaved_checkpoint=/kaggle/working/obsolete run/ck01.pssa\nloss=2.5 tokens_per_second=50 optimizer_updates=500 global_update=600\ntraining_seconds=2\nsaved_checkpoint=/kaggle/working/obsolete run/model.pssa\n").unwrap();
+        for selected in [&path, &log] {
+            let mut runs = Runs::new(dir.clone());
+            runs.open_monitor(selected.clone());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while runs.action.is_none() && std::time::Instant::now() < deadline {
+                runs.poll(false);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let Some(Action::Monitor(state)) = runs.action.take() else {
+                panic!("copied run did not open: {}", selected.display())
+            };
+            assert_eq!(state.chain_dir, dir);
+            assert_eq!(state.last_checkpoint.as_deref(), path.to_str());
+            assert_eq!(state.checkpoint_target.as_deref(), path.to_str());
+            assert_eq!(state.checkpoint_context(), path.display().to_string());
+            assert_eq!(state.current_step(), Some(600));
+            assert_eq!(
+                state.checkpoints,
+                vec![
+                    ("ck01.pssa".into(), Some(4.0)),
+                    ("model.pssa".into(), Some(2.5))
+                ]
+            );
+            assert!(!state.training_active);
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                "local model; not decoded or modified"
+            );
+            assert_eq!(
+                fs::read_to_string(&previous).unwrap(),
+                "local previous artifact"
+            );
+        }
+        // A remote filename without a corresponding local artifact is not a
+        // usable local save target, even when a different checkpoint is present.
+        fs::write(&log, "progress_schema=2 checkpoint_target=/kaggle/working/missing/model.trfm\nsaved_checkpoint=/kaggle/working/missing/model.trfm\n").unwrap();
+        let mut runs = Runs::new(dir.clone());
+        runs.open_monitor(log);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runs.action.is_none() && std::time::Instant::now() < deadline {
+            runs.poll(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let Some(Action::Monitor(state)) = runs.action.take() else {
+            panic!("copied log did not open")
+        };
+        assert_eq!(state.chain_dir, dir);
+        assert!(state.last_checkpoint.is_none());
+        assert!(state.checkpoint_target.is_none());
+        assert!(
+            state
+                .checkpoints
+                .iter()
+                .all(|(name, _)| name != "model.trfm")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn scoring_different_checkpoint_formats_keeps_separate_sidecars() {
         let dir = std::env::temp_dir().join(format!("pssa-runs-scores-{}", std::process::id()));

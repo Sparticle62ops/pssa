@@ -418,6 +418,7 @@ pub(super) struct Library {
     selected: usize,
     rescan: bool,
     runtime_models: Option<PathBuf>,
+    runtime_dataset: Option<PathBuf>,
     runtime_revision: u64,
     edit: Option<(char, String)>,
     note: String,
@@ -434,6 +435,7 @@ impl Library {
             selected: 0,
             rescan: false,
             runtime_models: None,
+            runtime_dataset: None,
             runtime_revision: 0,
             edit: None,
             note: "m models folder / d datasets folder / r rescan".into(),
@@ -455,6 +457,13 @@ impl Library {
         }
     }
 
+    pub(super) fn watch_dataset(&mut self, dataset: Option<PathBuf>) {
+        if self.runtime_dataset != dataset {
+            self.runtime_dataset = dataset;
+            self.refresh();
+        }
+    }
+
     fn refresh(&mut self) {
         if self.scan_job.is_some() {
             self.rescan = true;
@@ -464,6 +473,7 @@ impl Library {
         let (tx, rx) = mpsc::channel();
         let (models, datasets) = (self.config.models.clone(), self.config.datasets.clone());
         let runtime = self.runtime_models.clone().filter(|path| *path != models);
+        let runtime_dataset = self.runtime_dataset.clone();
         std::thread::spawn(move || {
             let mut result = scan(&models, &datasets);
             if let Some(runtime) = runtime {
@@ -473,6 +483,24 @@ impl Library {
                         result.0.push(entry);
                     }
                 }
+                result.0.sort_by(|a, b| a.path.cmp(&b.path));
+            }
+            if let Some(path) = runtime_dataset
+                && !result.0.iter().any(|entry| entry.path == path)
+                && let Ok(meta) = fs::metadata(&path)
+                && meta.is_file()
+            {
+                result.0.push(Entry {
+                    path,
+                    kind: Kind::Dataset,
+                    bytes: meta.len(),
+                    modified: meta
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                        .map_or(0, |time| time.as_secs()),
+                    dims: String::new(),
+                });
                 result.0.sort_by(|a, b| a.path.cmp(&b.path));
             }
             let _ = tx.send(result);
@@ -864,21 +892,53 @@ pub(super) mod tests {
         fs::create_dir_all(&runtime).unwrap();
         let mut library = Library {
             config: Config::load_at(temp.0.join("cfg"), configured.clone()),
-            entries: Vec::new(), revision: 0, selected: 0, rescan: false,
-            runtime_models: None, runtime_revision: 0, edit: None, note: String::new(),
-            scan_job: None, stats_job: None, stats: None,
+            entries: Vec::new(),
+            revision: 0,
+            selected: 0,
+            rescan: false,
+            runtime_models: None,
+            runtime_dataset: None,
+            runtime_revision: 0,
+            edit: None,
+            note: String::new(),
+            scan_job: None,
+            stats_job: None,
+            stats: None,
         };
         library.watch_run(Some(runtime.clone()), 0);
         fs::write(runtime.join("new.pssa"), b"checkpoint header fixture").unwrap();
         library.watch_run(Some(runtime.clone()), 1);
+        let corpus = temp.0.join("external corpus.txt");
+        fs::write(&corpus, "actual dataset text").unwrap();
+        let configured_datasets = library.config.datasets.clone();
+        library.watch_dataset(Some(corpus.clone()));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while library.scan_job.is_some() && std::time::Instant::now() < deadline {
             library.poll();
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(library.config.models, configured);
-        assert!(library.entries.iter().any(|entry| entry.path == runtime.join("new.pssa")));
-        assert_eq!(library.entries.iter().filter(|entry| entry.path == runtime.join("new.pssa")).count(), 1);
+        assert_eq!(library.config.datasets, configured_datasets);
+        assert!(
+            library
+                .entries
+                .iter()
+                .any(|entry| entry.path == corpus && entry.kind == Kind::Dataset)
+        );
+        assert!(
+            library
+                .entries
+                .iter()
+                .any(|entry| entry.path == runtime.join("new.pssa"))
+        );
+        assert_eq!(
+            library
+                .entries
+                .iter()
+                .filter(|entry| entry.path == runtime.join("new.pssa"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -892,6 +952,7 @@ pub(super) mod tests {
             selected: 0,
             rescan: false,
             runtime_models: None,
+            runtime_dataset: None,
             runtime_revision: 0,
             edit: None,
             note: "Ready".into(),

@@ -129,11 +129,25 @@ impl Math {
         if v.model.as_deref() == Some("transformer") {
             lines = vec![
                 Line::styled("Transformer run / logged configuration", accent()),
-                Line::from(format!("Width: {}", state.width.as_deref().unwrap_or("unrecorded"))),
-                Line::from(format!("Vocabulary {} / trainable parameters {}", n(v.vocab), n(v.parameters))),
-                Line::from(format!("Learning rate {}", state.learning_rate.map_or("unrecorded".into(), |lr| format!("{lr:.6e}")))),
+                Line::from(format!(
+                    "Width: {}",
+                    state.width.as_deref().unwrap_or("unrecorded")
+                )),
+                Line::from(format!(
+                    "Vocabulary {} / trainable parameters {}",
+                    n(v.vocab),
+                    n(v.parameters)
+                )),
+                Line::from(format!(
+                    "Learning rate {}",
+                    state
+                        .learning_rate
+                        .map_or("unrecorded".into(), |lr| format!("{lr:.6e}"))
+                )),
                 Line::from("PSSA memory, recurrence and dense-MAC estimate: not applicable."),
-                Line::from("Equations below are PSSA reference documentation, NOT this model's telemetry."),
+                Line::from(
+                    "Equations below are PSSA reference documentation, NOT this model's telemetry.",
+                ),
             ];
         }
         for line in EQUATIONS.lines() {

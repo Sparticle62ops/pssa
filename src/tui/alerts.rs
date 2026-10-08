@@ -113,7 +113,13 @@ mod tests {
         a.ingest("progress_schema=1");
         a.ingest("training_seconds=1");
         assert!(a.message.as_ref().unwrap().0);
-        assert!(a.message.as_ref().unwrap().1.contains("waiting for checkpoint"));
+        assert!(
+            a.message
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("waiting for checkpoint")
+        );
         a.ingest("saved_checkpoint=model.pssa");
         assert!(a.message.as_ref().unwrap().1.contains("Checkpoint saved"));
         a.bell = false;

@@ -1269,6 +1269,9 @@ impl CLIHandler {
                     }
                     feed.finish_batch();
                 }
+                if feed.inputs_complete() {
+                    progress.report_final_inputs();
+                }
                 let learning_rate = schedule.lr(update + 1)?;
                 let optimizer_trace = crate::training_diagnostics::StageTrace::new(
                     &model.device,
@@ -1283,7 +1286,17 @@ impl CLIHandler {
                         }
                         GradientClipOutcome::Skipped { norm } => {
                             skipped.record(norm, model.step_counter)?;
-                            // Consume this group, but neither Adam nor the LR
+                            progress.set_gradient_metrics(norm, skipped.total);
+                            tokens_seen += total_tokens;
+                            progress.update_with_feed(
+                                update,
+                                total_tokens,
+                                (loss_sum - prior_loss) / total_tokens.max(1) as f64,
+                                None,
+                                Self::memory_occupancy(&model),
+                                || feed.sample(model.step_counter),
+                            );
+                            // Inputs were consumed, but neither Adam nor the LR
                             // schedule advances. The next group gets clean grads.
                             continue;
                         }

@@ -51,10 +51,20 @@ impl Extras {
         if line.contains("progress_schema=") {
             self.inspector = Inspector::default();
         }
-        if !self.remote_monitor && let Some(path) = line.trim().strip_prefix("saved_checkpoint=") {
-            if let Some(parent) = std::path::Path::new(path).parent() {
-                self.runs.add_root(if parent.as_os_str().is_empty() { ".".into() } else { parent.to_path_buf() });
-            }
+        if !self.remote_monitor
+            && let Some(path) = line.trim().strip_prefix("saved_checkpoint=").or_else(|| {
+                line.split_once("checkpoint_target=")
+                    .map(|(_, path)| path.trim())
+            })
+            && path != "-"
+            && !path.is_empty()
+            && let Some(parent) = std::path::Path::new(path).parent()
+        {
+            self.runs.add_root(if parent.as_os_str().is_empty() {
+                ".".into()
+            } else {
+                parent.to_path_buf()
+            });
         }
         self.inspector.ingest(line);
         self.alerts.ingest(line);
@@ -121,8 +131,10 @@ impl Extras {
         }
         // Remote paths are not local checkpoint files. Still collect streamed
         // occupancy/snippets, but never load a coincidentally matching path.
-        self.inspector
-            .poll(state, *tab == MEMORY_TAB && !self.remote_monitor && !self.memory_live);
+        self.inspector.poll(
+            state,
+            *tab == MEMORY_TAB && !self.remote_monitor && !self.memory_live,
+        );
         self.runs.poll(*tab == RUNS_TAB);
         if let Some(action) = self.runs.action.take() {
             match action {
@@ -191,7 +203,7 @@ impl Extras {
                 } else if !self.memory_live {
                     self.inspector.key(key);
                 }
-            },
+            }
             RUNS_TAB => self.runs.key(key),
             BENCHMARK_TAB
                 if (state.training_active || self.remote_busy())
@@ -217,7 +229,7 @@ impl Extras {
                 } else {
                     self.inspector.draw(f, area, state);
                 }
-            },
+            }
             RUNS_TAB => self.runs.draw(f, area),
             BENCHMARK_TAB => self.benchmark.draw(f, area),
             _ => {}

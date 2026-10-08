@@ -32,6 +32,7 @@ impl CacheStatus {
 pub(crate) struct DocumentSelection {
     pub(crate) source_doc: usize,
     pub(crate) token_start: usize,
+    pub(crate) source_token_start: usize,
     pub(crate) byte_start: Option<usize>,
 }
 
@@ -189,6 +190,7 @@ fn select_documents(
 
     let mut docs = Vec::new();
     let mut selections = Vec::new();
+    let mut source_token_start = skip % total;
     while remaining > 0 {
         let ids = nonempty[doc_index];
         let take = (ids.len() - offset).min(remaining);
@@ -204,10 +206,12 @@ fn select_documents(
             selections.push(DocumentSelection {
                 source_doc: doc_index,
                 token_start: offset,
+                source_token_start,
                 byte_start,
             });
         }
         remaining -= take;
+        source_token_start = (source_token_start + ids.len() - offset) % total;
         doc_index = (doc_index + 1) % nonempty.len();
         offset = 0;
         if limit.is_none() && doc_index == 0 {

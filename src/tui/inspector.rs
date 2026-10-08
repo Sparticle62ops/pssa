@@ -200,16 +200,16 @@ impl Inspector {
         }
     }
     pub fn draw(&self, f: &mut ratatui::Frame, area: Rect, state: &RunState) {
-        let occupancy = self
-            .last_occupancy
-            .or_else(|| {
-                self.snapshot
-                    .as_ref()
-                    .map(|s| (s.used as u64, s.capacity as u64))
-            });
+        let occupancy = self.last_occupancy.or_else(|| {
+            self.snapshot
+                .as_ref()
+                .map(|s| (s.used as u64, s.capacity as u64))
+        });
         let (used, capacity) = occupancy.unwrap_or((0, 0));
-        let title = occupancy.map_or_else(|| " plastic memory / occupancy unrecorded ".into(),
-            |(used, capacity)| format!(" plastic memory / {used}/{capacity} slots "));
+        let title = occupancy.map_or_else(
+            || " plastic memory / occupancy unrecorded ".into(),
+            |(used, capacity)| format!(" plastic memory / {used}/{capacity} slots "),
+        );
         // Budget for eight actual history rows on the full-height shell, but
         // retain room for occupancy details and refresh/scroll hints when short.
         let chunks = Layout::vertical([
@@ -258,8 +258,12 @@ impl Inspector {
         let mut lines = vec![
             Line::styled("MEMORY / store → protect → replace", accent()),
             Line::from(if capacity == 0 {
-                if state.checkpoint_target.as_deref().or(state.last_checkpoint.as_deref())
-                    .is_some_and(|path| path.ends_with(".trfm")) {
+                if state
+                    .checkpoint_target
+                    .as_deref()
+                    .or(state.last_checkpoint.as_deref())
+                    .is_some_and(|path| path.ends_with(".trfm"))
+                {
                     "Transformer runs have no PSSA plastic-memory bank.".into()
                 } else {
                     format!("Occupancy unrecorded. {}", state.checkpoint_context())
@@ -277,7 +281,11 @@ impl Inspector {
                 (Some(total), _) => format!("Reported evictions {total} / rate pending"),
                 _ => "Exact eviction rate: not recorded by this trainer.".into(),
             }),
-            Line::from(if self.note.is_empty() { state.checkpoint_context() } else { self.note.clone() }),
+            Line::from(if self.note.is_empty() {
+                state.checkpoint_context()
+            } else {
+                self.note.clone()
+            }),
             Line::from("r refresh • PgUp/PgDn scroll • Tab tabs"),
             Line::from(""),
             Line::styled(
@@ -390,7 +398,13 @@ mod tests {
             super::super::charts::assert_named_plot(
                 terminal.backend().buffer(),
                 "plastic memory",
-                &["used slots", "sample", "Used memory slots", "6/8 slots", "0"],
+                &[
+                    "used slots",
+                    "sample",
+                    "Used memory slots",
+                    "6/8 slots",
+                    "0",
+                ],
             );
             super::super::charts::assert_named_plot(
                 terminal.backend().buffer(),
