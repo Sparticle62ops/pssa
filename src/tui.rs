@@ -2356,7 +2356,7 @@ fn metric_points(
     latest: Option<MetricSample>,
 ) -> Vec<(f64, f64)> {
     (start..end.min(series.len()))
-        .map(|index| {
+        .filter_map(|index| {
             let sample = if index + 1 == series.len() {
                 latest.unwrap_or(series[index])
             } else {
@@ -2367,12 +2367,14 @@ fn metric_points(
             } else {
                 metric_value(sample, kind)
             };
-            (
-                index as f64,
-                value
-                    .filter(|v| v.is_finite())
-                    .map_or(f64::NAN, |v| v.max(0.0)),
-            )
+            let value = match value {
+                Some(value) if value.is_finite() => value.max(0.0),
+                Some(_) => f64::NAN,
+                // Progress-only steps are not invalid loss measurements.
+                None if matches!(kind, MetricKind::Loss) => return None,
+                None => f64::NAN,
+            };
+            Some((index as f64, value))
         })
         .collect()
 }
@@ -2384,14 +2386,15 @@ fn moving_loss_points(
     latest: Option<MetricSample>,
 ) -> Vec<(f64, f64)> {
     (start..end.min(series.len()))
-        .map(|index| {
-            // The average smooths measured losses, not missing observations.
-            let value = series[index]
-                .loss
-                .filter(|v| v.is_finite())
-                .and_then(|_| moving_loss_at(series, index, latest))
-                .unwrap_or(f64::NAN);
-            (index as f64, value)
+        .filter_map(|index| {
+            // The average smooths measured losses, skipping unmeasured steps.
+            let loss = series[index].loss?;
+            let value = if loss.is_finite() {
+                moving_loss_at(series, index, latest).unwrap_or(f64::NAN)
+            } else {
+                f64::NAN
+            };
+            Some((index as f64, value))
         })
         .collect()
 }
@@ -4151,28 +4154,29 @@ mod tests {
     }
 
     #[test]
-    fn missing_chart_observations_stay_gaps_when_smoothed_or_normalized() {
+    fn missing_loss_observations_are_skipped_when_smoothed_or_normalized() {
         let series = [
             MetricSample {
-                loss: Some(3.0),
+                loss: Some(5.0),
                 ..Default::default()
             },
             MetricSample::default(),
+            MetricSample::default(),
             MetricSample {
-                loss: Some(3.0),
+                loss: Some(4.0),
                 ..Default::default()
             },
         ];
-        for points in [
-            metric_points(&series, MetricKind::Loss, 0, series.len(), None),
-            moving_loss_points(&series, 0, series.len(), None),
-        ] {
-            assert_eq!(points.len(), 3);
-            assert!(points[1].1.is_nan());
+        let loss = metric_points(&series, MetricKind::Loss, 0, series.len(), None);
+        let moving = moving_loss_points(&series, 0, series.len(), None);
+        assert_eq!(loss, [(0.0, 5.0), (3.0, 4.0)]);
+        assert_eq!(moving, [(0.0, 5.0), (3.0, 4.5)]);
+        for points in [loss, moving] {
+            assert!(points.iter().all(|(_, y)| y.is_finite()));
             let normalized = normalize_points(&points);
-            assert_eq!(normalized[0].1, 0.5);
-            assert!(normalized[1].1.is_nan());
-            assert_eq!(normalized[2].1, 0.5);
+            assert_eq!(normalized.len(), 2);
+            assert_eq!(normalized[0].1, 1.0);
+            assert_eq!(normalized[1].1, 0.0);
         }
         let state = RunState {
             metric_series: vec![series[0], series[1]],
@@ -4187,6 +4191,38 @@ mod tests {
                 .loss
                 .is_none()
         );
+    }
+
+    #[test]
+    fn non_finite_loss_observations_remain_chart_gaps() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let series = [
+                MetricSample {
+                    loss: Some(5.0),
+                    ..Default::default()
+                },
+                MetricSample {
+                    loss: Some(invalid),
+                    ..Default::default()
+                },
+                MetricSample {
+                    loss: Some(4.0),
+                    ..Default::default()
+                },
+            ];
+            for points in [
+                metric_points(&series, MetricKind::Loss, 0, series.len(), None),
+                moving_loss_points(&series, 0, series.len(), None),
+            ] {
+                assert_eq!(points.len(), 3);
+                assert_eq!(points[0], (0.0, 5.0));
+                assert_eq!(points[1].0, 1.0);
+                assert!(points[1].1.is_nan());
+                assert_eq!(points[2].0, 2.0);
+                assert!(points[2].1.is_finite());
+                assert!(normalize_points(&points)[1].1.is_nan());
+            }
+        }
     }
 
     #[test]
