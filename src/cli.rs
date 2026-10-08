@@ -497,6 +497,9 @@ impl CLIHandler {
         if !(x.lr > 0.0) {
             return Err("--lr must be positive".into());
         }
+        if !x.dream_lr.is_finite() || x.dream_lr <= 0.0 {
+            return Err("--dream-lr must be finite and positive".into());
+        }
         if x.max_tokens == Some(0) {
             return Err("--max-tokens must be positive".into());
         }
@@ -2987,7 +2990,7 @@ mod training_safeguards_tests {
             &["--dream-lr", "--dream-steps"],
         )
         .unwrap();
-        let options = CLIHandler::common_options(&parsed).unwrap();
+        let options = CLIHandler::options(&parsed).unwrap();
         assert_eq!(options.dream_lr, 0.002);
         assert_eq!(options.dream_steps, 3);
         for (flag, bad) in [
@@ -2998,7 +3001,7 @@ mod training_safeguards_tests {
             let parsed =
                 Parsed::parse(&[flag.into(), bad.into()], &["--dream-lr", "--dream-steps"])
                     .unwrap();
-            assert!(CLIHandler::common_options(&parsed).is_err(), "{flag}={bad}");
+            assert!(CLIHandler::options(&parsed).is_err(), "{flag}={bad}");
         }
     }
 
