@@ -502,6 +502,7 @@ fn raw_confidence(logits: &[f32], out: &mut [f32]) {
     if out.is_empty() {
         return;
     }
+    assert_eq!(logits.len(), out.len(), "confidence output must match logits length");
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;
     for (p, &logit) in out.iter_mut().zip(logits) {
