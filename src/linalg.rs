@@ -142,13 +142,29 @@ impl Vector {
 
 /// Repository RMSNorm convention, with epsilon inside the root. Returns the
 /// inverse RMS for backward; affine gamma/beta are applied by the model.
+#[inline(always)]
 pub fn rms_norm_slice(input: &[f32], out: &mut [f32]) -> f32 {
     assert_eq!(input.len(), out.len());
     if input.is_empty() {
         return 0.0;
     }
-    let sum_sq: f32 = input.iter().map(|&x| x * x).sum();
+    let sum_sq = if input.len() >= 16 {
+        dot_slice(input, input)
+    } else {
+        input.iter().map(|&x| x * x).sum()
+    };
     let inv = 1.0 / (sum_sq / input.len() as f32 + 1e-5).sqrt();
+    #[cfg(target_arch = "x86_64")]
+    if input.len() >= 16 && avx2_fma_available() {
+        // SAFETY: the cached feature check enables AVX2 and the validated
+        // equal-length slices give the helper matching readable/writable spans.
+        unsafe { scale_slice_avx2(input, out, inv) };
+    } else {
+        for (y, x) in out.iter_mut().zip(input) {
+            *y = x * inv;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     for (y, x) in out.iter_mut().zip(input) {
         *y = x * inv;
     }
@@ -158,7 +174,9 @@ pub fn rms_norm_slice(input: &[f32], out: &mut [f32]) -> f32 {
 /// Returns the dot product of two equally sized slices.
 ///
 /// Generic x86_64 builds select AVX2/FMA using cached runtime feature detection;
-/// other CPUs retain the portable implementation. Tiny slices avoid SIMD setup.
+/// other CPUs retain the portable implementation. Eight-element slices use one
+/// full SIMD vector; nine through fifteen stay portable to avoid a partial-tail
+/// setup cost.
 /// Fused multiply-add has one rounding rather than the scalar multiply followed
 /// by add's two, so finite results require a mixed absolute/relative tolerance
 /// rather than bitwise equality.
@@ -171,7 +189,7 @@ pub fn dot_slice(a: &[f32], b: &[f32]) -> f32 {
     );
 
     #[cfg(target_arch = "x86_64")]
-    if a.len() >= 32 && avx2_fma_available() {
+    if (a.len() == 8 || a.len() >= 16) && avx2_fma_available() {
         // SAFETY: runtime detection establishes both target features and the
         // helper only reads within the equally sized input slices.
         return unsafe { dot_slice_avx2_fma(a, b) };
@@ -181,7 +199,7 @@ pub fn dot_slice(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline]
+#[inline(always)]
 fn avx2_fma_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
@@ -277,6 +295,28 @@ fn dot_slice_portable(a: &[f32], b: &[f32]) -> f32 {
         i += 1;
     }
     sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scale_slice_avx2(input: &[f32], out: &mut [f32], scale: f32) {
+    use std::arch::x86_64::*;
+
+    let mut i = 0;
+    let input_ptr = input.as_ptr();
+    let out_ptr = out.as_mut_ptr();
+    let scale_vec = _mm256_set1_ps(scale);
+    unsafe {
+        while i + 8 <= input.len() {
+            let values = _mm256_loadu_ps(input_ptr.add(i));
+            _mm256_storeu_ps(out_ptr.add(i), _mm256_mul_ps(values, scale_vec));
+            i += 8;
+        }
+        while i < input.len() {
+            *out_ptr.add(i) = *input_ptr.add(i) * scale;
+            i += 1;
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -579,6 +619,24 @@ mod tests {
         assert_eq!(dot_slice(&a, &b).to_bits(), selected.to_bits());
     }
 
+    #[test]
+    fn rms_norm_matches_f64_reference_across_simd_boundaries() {
+        for len in [1, 8, 12, 16, 32, 127, 128, 1024] {
+            let input: Vec<f32> = (0..len)
+                .map(|i| ((i as f32 * 0.19).sin() * 0.7) + 0.1)
+                .collect();
+            let mut output = vec![0.0; len];
+            let inv = rms_norm_slice(&input, &mut output);
+            let sum_sq: f64 = input.iter().map(|&x| (x as f64) * (x as f64)).sum();
+            let expected_inv = 1.0 / (sum_sq / len as f64 + 1e-5).sqrt();
+            assert!((inv as f64 - expected_inv).abs() <= 2e-6 * expected_inv);
+            for (&actual, &x) in output.iter().zip(&input) {
+                let expected = x as f64 * expected_inv;
+                assert!((actual as f64 - expected).abs() <= 3e-6 * expected.abs().max(1.0));
+            }
+        }
+    }
+
     /// Opt-in microbenchmark: run an optimized generic-target test binary with
     /// `--ignored --nocapture dot_kernel_microbenchmark`. Not a training timing.
     #[test]
@@ -611,7 +669,7 @@ mod tests {
         }
         #[cfg(target_arch = "x86_64")]
         println!("runtime_avx2_fma={}", avx2_fma_available());
-        for len in [16, 32, 64, 128, 256, 257, 512, 2048] {
+        for len in [8, 12, 16, 32, 64, 128, 256, 257, 512, 2048] {
             let a: Vec<f32> = (0..len).map(|i| (i as f32 * 0.19).sin()).collect();
             let b: Vec<f32> = (0..len).map(|i| (i as f32 * 0.31).cos()).collect();
             let iterations = (20_000_000 / len).max(50_000);
