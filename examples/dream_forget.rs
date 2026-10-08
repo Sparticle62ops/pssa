@@ -44,6 +44,8 @@ fn run(
     a_steps: usize,
     b_steps: usize,
     replay: usize,
+    rehearsal_lr: f32,
+    rehearsal_steps: usize,
 ) -> (f32, f32, f32) {
     let mut m = new_model(seed);
     for _ in 0..a_steps {
@@ -77,8 +79,8 @@ fn run(
                 replay,
                 8,
                 0.8,
-                1e-2,
-                2,
+                rehearsal_lr,
+                rehearsal_steps,
                 Some((&B_IN, &B_TG)),
                 &mut rng,
             );
@@ -88,6 +90,10 @@ fn run(
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let rehearsal_lr = args.get(1).map_or(6e-3, |s| s.parse().expect("rehearsal LR"));
+    let rehearsal_steps = args.get(2).map_or(1, |s| s.parse().expect("rehearsal steps"));
+    println!("rehearsal_lr={rehearsal_lr} rehearsal_steps={rehearsal_steps}");
     let seeds = [7u64, 11, 23, 42, 99];
     for (label, mode) in [
         ("off", None),
@@ -96,7 +102,7 @@ fn main() {
     ] {
         let (mut fa, mut fb, mut f0) = (0.0, 0.0, 0.0);
         for &s in &seeds {
-            let (a0, a1, b1) = run(s, mode, 40, 40, 8);
+            let (a0, a1, b1) = run(s, mode, 40, 40, 8, rehearsal_lr, rehearsal_steps);
             println!(
                 "seed={s} dream={label} a_after_a={a0:.4} a_after_b={a1:.4} b_after_b={b1:.4} forget={:.4}",
                 a1 - a0
