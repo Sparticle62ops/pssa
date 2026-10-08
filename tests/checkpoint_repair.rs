@@ -758,8 +758,8 @@ fn matrix_bytes(p: &ParamMatrix) -> usize {
 }
 
 fn actual_numeric_storage(m: &PSSALayerV2) -> usize {
-    // Exhaustive patterns deliberately fail to compile if new model/tape fields
-    // are added: each buffer must be classified here and in allocation_bytes.
+    // Classify every accessible model/tape buffer here and in allocation_bytes.
+    // The private dream cache is runtime-only and intentionally excluded.
     let PSSALayerV2 {
         cfg: _,
         step_counter: _,
@@ -785,6 +785,7 @@ fn actual_numeric_storage(m: &PSSALayerV2) -> usize {
         layer_activations,
         inf_features,
         inf_block_out,
+        ..
     } = m;
     matrix_bytes(embed_w)
         + matrix_bytes(unembed_w)
