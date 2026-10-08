@@ -104,7 +104,7 @@ impl DepthZoom {
             "stack"
         };
         let title = format!(
-            " depth {} / {} layers / {direction} ",
+            " depth {} / {} layers / {direction} / diagram ",
             self.depth, self.depth
         );
         let inner = panel(&title).inner(area);
@@ -114,8 +114,8 @@ impl DepthZoom {
             return;
         }
 
-        // Reuse the actual renderer, not an independently invented neuron or
-        // topology. Its temporary image stays inside this panel and is fully
+        // Reuse the illustrative configuration renderer; this is not measured
+        // model connectivity. Its temporary image stays inside this panel and is fully
         // replaced by the final canvas before the terminal frame is flushed.
         let source = Rect::new(
             area.x,

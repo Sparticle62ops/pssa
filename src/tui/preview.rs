@@ -137,6 +137,7 @@ pub(super) struct Preview {
     pub note: String,
     prompt: String,
     checkpoint: String,
+    waiting_context: String,
 }
 impl Default for Preview {
     fn default() -> Self {
@@ -152,7 +153,8 @@ impl Default for Preview {
             marks: Vec::new(),
             prompt: String::new(),
             checkpoint: String::new(),
-            note: "No checkpoint yet / waiting for a saved .pssa model".into(),
+            note: "No checkpoint yet / no training save target connected".into(),
+            waiting_context: "No checkpoint yet / no training save target connected".into(),
         }
     }
 }
@@ -165,7 +167,7 @@ impl Preview {
             .or(state.resumed_from.as_deref())
         {
             let path = PathBuf::from(path);
-            if path.extension().is_some_and(|x| x == "pssa") && path.is_file() {
+            if path.extension().is_some_and(|x| x == "pssa" || x == "trfm") && path.is_file() {
                 return Some(path);
             }
         }
@@ -173,9 +175,13 @@ impl Preview {
             .checkpoints
             .iter()
             .rev()
-            .filter(|(name, _)| name.ends_with(".pssa"))
+            .filter(|(name, _)| name.ends_with(".pssa") || name.ends_with(".trfm"))
             .map(|(name, _)| state.chain_dir.join(name))
             .find(|path| path.is_file())
+    }
+
+    pub(super) fn set_waiting_context(&mut self, context: String) {
+        self.waiting_context = context;
     }
 
     fn clear_missing_sample(&mut self) {
@@ -185,7 +191,7 @@ impl Preview {
         self.marks.clear();
         self.checkpoint.clear();
         self.note = if self.enabled {
-            "No checkpoint yet / waiting for a saved .pssa model".into()
+            self.waiting_context.clone()
         } else {
             "Preview paused / F7 resumes".into()
         };
@@ -236,9 +242,11 @@ impl Preview {
                 self.job = None;
                 match result.and_then(|bytes| self.accept(&bytes)) {
                     Ok(()) => {
-                        self.note =
-                            "Read-only CPU sample / refresh on changed checkpoint, at most 1/min"
-                                .into()
+                        self.note = if self.checkpoint.ends_with(".trfm") {
+                            "Read-only transformer CPU sample / confidence not exposed by this sampler / at most 1/min".into()
+                        } else {
+                            "Read-only CPU sample / refresh on changed checkpoint, at most 1/min".into()
+                        }
                     }
                     Err(e) => {
                         self.note = format!("Preview unavailable: {e}");
@@ -316,7 +324,13 @@ impl Preview {
                     .env("TOKENIZERS_PARALLELISM", "false");
                 Process::start(cmd, TIMEOUT)
             });
-        self.checkpoint = heatmap::clean(&path.to_string_lossy());
+        let checkpoint = heatmap::clean(&path.to_string_lossy());
+        if checkpoint != self.checkpoint {
+            self.text.clear();
+            self.marks.clear();
+            self.prompt.clear();
+        }
+        self.checkpoint = checkpoint;
         self.revision = Some(revision);
         match result {
             Ok(job) => {
@@ -351,17 +365,15 @@ impl Preview {
         } else {
             vec![
                 Line::styled("F7 pause/resume / F6 confidence / Tab tabs", accent()),
-                Line::from(format!("Checkpoint: {}", self.checkpoint)),
-                Line::from(format!("Prompt: {}", self.prompt)),
+                Line::from(format!("Checkpoint: {}", if self.checkpoint.is_empty() { "not saved locally" } else { &self.checkpoint })),
+                Line::from(format!("Prompt: {}", if self.prompt.is_empty() { "selected from saved tokenizer after load" } else { &self.prompt })),
                 Line::from("32 tokens / 20s timeout / one CPU thread / no GPU"),
                 Line::from("Linux prlimit when installed: 512 MiB worker address-space cap"),
             ]
         };
         lines.push(Line::from(heatmap::clean(&self.note)));
         lines.push(heatmap::legend(self.heatmap));
-        if self.text.is_empty() {
-            lines.push(Line::from("[ waiting for generated sample ]"));
-        } else {
+        if !self.text.is_empty() {
             lines.extend(heatmap::lines(&self.text, &self.marks, self.heatmap));
         }
         f.render_widget(
@@ -417,16 +429,26 @@ pub(super) fn worker(path: &str, loops: usize) -> Result<(), String> {
         {
             return Err("not enough free RAM for a safe preview".into());
         }
+        if Path::new(path).extension().is_some_and(|extension| extension == "trfm") {
+            let model = crate::transformer_checkpoint::load_checkpoint(path)
+                .map_err(|error| error.to_string())?;
+            let tok = model.tokenizer()?;
+            let prompt = prompt_for(&tok)?;
+            drop(model);
+            let text = crate::transformer_inference::generate_controlled(
+                path, &prompt, &InferenceConfig { max_new_tokens: 32, ..Default::default() },
+                &mut |_, _| {}, &|| {
+                    std::thread::sleep(Duration::from_millis(10));
+                    false
+                },
+            )?;
+            // The transformer sampler does not expose probabilities. Empty
+            // confidence means unmeasured, never synthesized confidence.
+            return Ok(serde_json::json!({"prompt":prompt,"text":text,"confidence":[]}));
+        }
         let (mut model, tok) = CLIHandler::load_for_inference(path, None)?;
         model.set_loops(loops)?;
-        let prompt = match tok.kind() {
-            crate::dataset::TokenizerKind::Bpe => "The".to_owned(),
-            crate::dataset::TokenizerKind::Word => (1..tok.vocab_size)
-                .filter_map(|id| tok.id_to_token.get(&id))
-                .find(|s| s.chars().any(char::is_alphanumeric))
-                .cloned()
-                .ok_or("no usable prompt token")?,
-        };
+        let prompt = prompt_for(&tok)?;
         let mut marks = Vec::new();
         let text = PSSAInferenceEngine::try_new(&mut model, &tok)?.try_generate_chat_turn_scored(
             &prompt,
@@ -449,6 +471,16 @@ pub(super) fn worker(path: &str, loops: usize) -> Result<(), String> {
     let value = result.unwrap_or_else(|e| serde_json::json!({"error":e}));
     println!("{value}");
     Ok(())
+}
+
+fn prompt_for(tok: &crate::dataset::Tokenizer) -> Result<String, String> {
+    match tok.kind() {
+        crate::dataset::TokenizerKind::Bpe => Ok("The".to_owned()),
+        crate::dataset::TokenizerKind::Word => (1..tok.vocab_size)
+            .filter_map(|id| tok.id_to_token.get(&id))
+            .find(|piece| piece.chars().any(char::is_alphanumeric))
+            .cloned().ok_or_else(|| "no usable prompt token".into()),
+    }
 }
 
 #[cfg(test)]
@@ -484,6 +516,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn waiting_sample_has_real_save_context_and_transformer_files_are_candidates() {
+        let mut state = RunState::default();
+        state.ingest("progress_schema=2 updates_total=500 prior_updates=0 checkpoint_target=/tmp/model.trfm");
+        state.ingest("training 120/500 (24%) loss=3 tokens_per_second=100 optimizer_updates=120 global_update=120");
+        let mut preview = Preview::default();
+        preview.set_waiting_context(state.checkpoint_context());
+        preview.poll(None, 1, false);
+        assert!(preview.note.contains("step 500"));
+        assert!(preview.note.contains("current step 120"));
+        assert!(preview.job.is_none());
+        let path = std::env::temp_dir().join(format!("pssa-preview-transformer-candidate-{}.trfm", std::process::id()));
+        std::fs::write(&path, b"candidate fixture").unwrap();
+        state.last_checkpoint = Some(path.to_string_lossy().into_owned());
+        assert_eq!(Preview::candidate(&state), Some(path.clone()));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

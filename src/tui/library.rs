@@ -417,6 +417,8 @@ pub(super) struct Library {
     pub revision: u64,
     selected: usize,
     rescan: bool,
+    runtime_models: Option<PathBuf>,
+    runtime_revision: u64,
     edit: Option<(char, String)>,
     note: String,
     scan_job: Option<mpsc::Receiver<(Vec<Entry>, String)>>,
@@ -431,6 +433,8 @@ impl Library {
             revision: 0,
             selected: 0,
             rescan: false,
+            runtime_models: None,
+            runtime_revision: 0,
             edit: None,
             note: "m models folder / d datasets folder / r rescan".into(),
             scan_job: None,
@@ -443,6 +447,14 @@ impl Library {
     pub(super) fn editing(&self) -> bool {
         self.edit.is_some()
     }
+    pub(super) fn watch_run(&mut self, models: Option<PathBuf>, revision: u64) {
+        if self.runtime_models != models || self.runtime_revision != revision {
+            self.runtime_models = models;
+            self.runtime_revision = revision;
+            self.refresh();
+        }
+    }
+
     fn refresh(&mut self) {
         if self.scan_job.is_some() {
             self.rescan = true;
@@ -451,8 +463,19 @@ impl Library {
         }
         let (tx, rx) = mpsc::channel();
         let (models, datasets) = (self.config.models.clone(), self.config.datasets.clone());
+        let runtime = self.runtime_models.clone().filter(|path| *path != models);
         std::thread::spawn(move || {
-            let _ = tx.send(scan(&models, &datasets));
+            let mut result = scan(&models, &datasets);
+            if let Some(runtime) = runtime {
+                let extra = scan(&runtime, &datasets);
+                for entry in extra.0 {
+                    if !result.0.iter().any(|existing| existing.path == entry.path) {
+                        result.0.push(entry);
+                    }
+                }
+                result.0.sort_by(|a, b| a.path.cmp(&b.path));
+            }
+            let _ = tx.send(result);
         });
         self.scan_job = Some(rx);
         self.note = "Scanning folder entries and headers in background…".into();
@@ -833,6 +856,32 @@ pub(super) mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), "invalid config");
     }
     #[test]
+    fn current_run_checkpoints_refresh_without_replacing_configured_folders() {
+        let temp = Temp::new();
+        let configured = temp.0.join("configured");
+        let runtime = temp.0.join("live run");
+        fs::create_dir_all(&configured).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        let mut library = Library {
+            config: Config::load_at(temp.0.join("cfg"), configured.clone()),
+            entries: Vec::new(), revision: 0, selected: 0, rescan: false,
+            runtime_models: None, runtime_revision: 0, edit: None, note: String::new(),
+            scan_job: None, stats_job: None, stats: None,
+        };
+        library.watch_run(Some(runtime.clone()), 0);
+        fs::write(runtime.join("new.pssa"), b"checkpoint header fixture").unwrap();
+        library.watch_run(Some(runtime.clone()), 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while library.scan_job.is_some() && std::time::Instant::now() < deadline {
+            library.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(library.config.models, configured);
+        assert!(library.entries.iter().any(|entry| entry.path == runtime.join("new.pssa")));
+        assert_eq!(library.entries.iter().filter(|entry| entry.path == runtime.join("new.pssa")).count(), 1);
+    }
+
+    #[test]
     fn library_renders_wide_narrow_and_tiny() {
         let temp = Temp::new();
         fs::write(temp.0.join("sample.txt"), "sample text").unwrap();
@@ -842,6 +891,8 @@ pub(super) mod tests {
             revision: 0,
             selected: 0,
             rescan: false,
+            runtime_models: None,
+            runtime_revision: 0,
             edit: None,
             note: "Ready".into(),
             scan_job: None,

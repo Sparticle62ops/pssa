@@ -40,6 +40,9 @@ impl Local {
         (tab == LIBRARY_TAB && self.library.editing()) || (tab == EVAL_TAB && self.eval.editing())
     }
     pub(super) fn poll(&mut self, setup: &mut Setup, state: &RunState, remote: bool) {
+        let run_dir = (!remote && (state.training_active || state.checkpoint_target.is_some()
+            || state.last_checkpoint.is_some())).then(|| state.chain_dir.clone());
+        self.library.watch_run(run_dir, state.checkpoint_revision);
         self.library.poll();
         self.mixer.sync(
             &self.library.entries,
@@ -50,6 +53,11 @@ impl Local {
             setup.set_dataset(path);
         }
         let (dir, latest) = eval_target(state, &self.library.config.models, remote);
+        self.eval.set_run_context(if remote {
+            "Remote checkpoints are not local files; sync a saved checkpoint to evaluate it.".into()
+        } else {
+            state.checkpoint_context()
+        });
         self.eval.watch(dir, latest);
         self.eval.poll();
     }
@@ -128,7 +136,7 @@ impl Local {
 // Kaggle log paths are remote, even when a same-named local file exists.
 // Only the explicitly configured local library remains eligible in that mode.
 fn eval_target<'a>(state: &'a RunState, models: &'a Path, remote: bool) -> (&'a Path, Option<&'a Path>) {
-    if !remote && (state.training_active || state.last_checkpoint.is_some()) {
+    if !remote && (state.training_active || state.last_checkpoint.is_some() || state.checkpoint_target.is_some()) {
         (&state.chain_dir, state.last_checkpoint.as_deref().map(Path::new))
     } else {
         (models, None)

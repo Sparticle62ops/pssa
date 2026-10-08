@@ -12,6 +12,7 @@ const EQUATIONS: &str = include_str!("../../assets/math.md");
 
 #[derive(Default)]
 pub(super) struct Values {
+    model: Option<String>,
     latent: Option<u64>,
     state: Option<u64>,
     vocab: Option<u64>,
@@ -23,6 +24,9 @@ pub(super) struct Values {
 }
 impl Values {
     pub(super) fn ingest(&mut self, line: &str) {
+        if line.starts_with("model=") {
+            self.model = parse_kv(line, "model=");
+        }
         for (label, field) in [
             ("parameters=", &mut self.parameters),
             ("vocab=", &mut self.vocab),
@@ -122,6 +126,16 @@ impl Math {
                 accent(),
             ),
         ];
+        if v.model.as_deref() == Some("transformer") {
+            lines = vec![
+                Line::styled("Transformer run / logged configuration", accent()),
+                Line::from(format!("Width: {}", state.width.as_deref().unwrap_or("unrecorded"))),
+                Line::from(format!("Vocabulary {} / trainable parameters {}", n(v.vocab), n(v.parameters))),
+                Line::from(format!("Learning rate {}", state.learning_rate.map_or("unrecorded".into(), |lr| format!("{lr:.6e}")))),
+                Line::from("PSSA memory, recurrence and dense-MAC estimate: not applicable."),
+                Line::from("Equations below are PSSA reference documentation, NOT this model's telemetry."),
+            ];
+        }
         for line in EQUATIONS.lines() {
             if let Some(title) = line.strip_prefix("# ") {
                 lines.push(Line::styled(format!("▌ {title}"), accent()));

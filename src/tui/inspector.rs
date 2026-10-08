@@ -87,6 +87,9 @@ pub(super) struct Inspector {
 }
 impl Inspector {
     pub fn ingest(&mut self, line: &str) {
+        if line.contains("progress_schema=") {
+            *self = Self::default();
+        }
         if let Some(total) = parse_kv::<u64>(line, "memory_evictions=") {
             let now = Instant::now();
             self.eviction_rate = self
@@ -142,6 +145,10 @@ impl Inspector {
                     } else {
                         "First checkpoint snapshot; no overwrite interval yet.".into()
                     };
+                    if self.last_occupancy.is_none() {
+                        self.history.push_back(new.used as u64);
+                        self.history.truncate(120);
+                    }
                     self.snapshot = Some(new);
                     self.snapshot_at = Some(Instant::now());
                 }
@@ -163,6 +170,7 @@ impl Inspector {
         let Some(path) = state
             .last_checkpoint
             .as_ref()
+            .or(state.resumed_from.as_ref())
             .filter(|s| s.ends_with(".pssa"))
             .map(PathBuf::from)
         else {
@@ -192,14 +200,16 @@ impl Inspector {
         }
     }
     pub fn draw(&self, f: &mut ratatui::Frame, area: Rect, state: &RunState) {
-        let (used, capacity) = self
+        let occupancy = self
             .last_occupancy
             .or_else(|| {
                 self.snapshot
                     .as_ref()
                     .map(|s| (s.used as u64, s.capacity as u64))
-            })
-            .unwrap_or((0, 0));
+            });
+        let (used, capacity) = occupancy.unwrap_or((0, 0));
+        let title = occupancy.map_or_else(|| " plastic memory / occupancy unrecorded ".into(),
+            |(used, capacity)| format!(" plastic memory / {used}/{capacity} slots "));
         // Budget for eight actual history rows on the full-height shell, but
         // retain room for occupancy details and refresh/scroll hints when short.
         let chunks = Layout::vertical([
@@ -217,7 +227,7 @@ impl Inspector {
             f,
             chunks[0],
             super::charts::Plot {
-                title: &format!(" plastic memory / {used}/{capacity} slots "),
+                title: &title,
                 caption: "Used memory slots over recent observations",
                 x: "sample",
                 integer_x: true,
@@ -236,8 +246,8 @@ impl Inspector {
                 Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
                     .split(chunks[1]);
             let occupancy = RunState {
-                memory_used: Some(used),
-                memory_capacity: Some(capacity),
+                memory_used: occupancy.map(|pair| pair.0),
+                memory_capacity: occupancy.map(|pair| pair.1),
                 ..Default::default()
             };
             super::draw_memory_graph(f, columns[0], &occupancy);
@@ -248,7 +258,12 @@ impl Inspector {
         let mut lines = vec![
             Line::styled("MEMORY / store → protect → replace", accent()),
             Line::from(if capacity == 0 {
-                "Waiting for memory_occupancy progress or a saved checkpoint.".into()
+                if state.checkpoint_target.as_deref().or(state.last_checkpoint.as_deref())
+                    .is_some_and(|path| path.ends_with(".trfm")) {
+                    "Transformer runs have no PSSA plastic-memory bank.".into()
+                } else {
+                    format!("Occupancy unrecorded. {}", state.checkpoint_context())
+                }
             } else {
                 format!(
                     "Occupancy {:.1}% (live progress when available)",
@@ -262,7 +277,7 @@ impl Inspector {
                 (Some(total), _) => format!("Reported evictions {total} / rate pending"),
                 _ => "Exact eviction rate: not recorded by this trainer.".into(),
             }),
-            Line::from(self.note.as_str()),
+            Line::from(if self.note.is_empty() { state.checkpoint_context() } else { self.note.clone() }),
             Line::from("r refresh • PgUp/PgDn scroll • Tab tabs"),
             Line::from(""),
             Line::styled(

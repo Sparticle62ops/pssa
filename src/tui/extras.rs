@@ -51,6 +51,11 @@ impl Extras {
         if line.contains("progress_schema=") {
             self.inspector = Inspector::default();
         }
+        if !self.remote_monitor && let Some(path) = line.trim().strip_prefix("saved_checkpoint=") {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                self.runs.add_root(if parent.as_os_str().is_empty() { ".".into() } else { parent.to_path_buf() });
+            }
+        }
         self.inspector.ingest(line);
         self.alerts.ingest(line);
     }

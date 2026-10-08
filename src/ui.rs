@@ -278,6 +278,36 @@ impl Step {
     }
 }
 
+/// Presentation-only sample of the actual latest input window. Counts refer
+/// to selected training inputs (not final target-only IDs or generated tokens).
+#[derive(Debug, PartialEq, Eq)]
+pub struct FeedSample {
+    pub dataset: String,
+    pub config: Option<String>,
+    pub split: Option<String>,
+    pub field: Option<String>,
+    pub snippet: String,
+    pub token_ids: String,
+    /// JSON array of exact vocabulary labels, one per token ID. ByteLevel BPE
+    /// labels preserve split UTF-8 bytes that individual decoding would lose.
+    pub token_pieces: String,
+    pub tokens: usize,
+    pub epoch_tokens: usize,
+    pub epoch_total: usize,
+    pub epoch: usize,
+    pub epochs: usize,
+    pub step: usize,
+    pub batch: usize,
+    pub batches: usize,
+    pub row: usize,
+    pub rows: usize,
+    pub start: usize,
+    pub end: usize,
+    pub bytes: Option<usize>,
+    pub bytes_total: Option<usize>,
+    pub text_kind: &'static str,
+}
+
 /// A bounded inline training dashboard. No raw mode, alternate screen or
 /// input interception: Ctrl+C keeps its usual meaning. Headless output emits
 /// a first, five-second and final sample, always as newline-delimited text.
@@ -295,18 +325,8 @@ pub struct Progress {
     last_checkpoint: Option<String>,
     prior_updates: usize,
     memory_occupancy: Option<(usize, usize)>,
-    // Optional Hugging Face feed metadata. These fields are presentation-only
-    // and are emitted as additional key=value fields, so older log consumers
-    // can ignore them unchanged.
-    feed_dataset: Option<String>,
-    feed_config: Option<String>,
-    feed_split: Option<String>,
-    feed_field: Option<String>,
-    feed_rows: Option<usize>,
-    feed_tokens: Option<usize>,
-    feed_row: Option<usize>,
-    feed_snippet: Option<String>,
-    feed_token_ids: Option<String>,
+    // Runtime-only dataset telemetry, never part of model/checkpoint state.
+    feed: Option<FeedSample>,
     interactive: bool,
     emitted: bool,
     drawn_rows: u16,
@@ -334,15 +354,7 @@ impl Progress {
             last_checkpoint: None,
             prior_updates: 0,
             memory_occupancy: None,
-            feed_dataset: None,
-            feed_config: None,
-            feed_split: None,
-            feed_field: None,
-            feed_rows: None,
-            feed_tokens: None,
-            feed_row: None,
-            feed_snippet: None,
-            feed_token_ids: None,
+            feed: None,
             interactive: tui && color_enabled(),
             emitted: false,
             drawn_rows: 0,
@@ -384,30 +396,10 @@ impl Progress {
         self.gradient_metrics = Some((norm, skipped));
     }
 
-    /// Set the optional source/sample metadata shown by the feed tab. The
-    /// sample is deliberately short and the IDs are already formatted by the
-    /// caller so the progress logger never needs to know tokenizer details.
-    pub fn set_feed(
-        &mut self,
-        dataset: &str,
-        config: Option<&str>,
-        split: &str,
-        field: &str,
-        rows: usize,
-        tokens: usize,
-        row: usize,
-        snippet: &str,
-        token_ids: &str,
-    ) {
-        self.feed_dataset = Some(dataset.to_string());
-        self.feed_config = config.map(str::to_string);
-        self.feed_split = Some(split.to_string());
-        self.feed_field = Some(field.to_string());
-        self.feed_rows = Some(rows);
-        self.feed_tokens = Some(tokens);
-        self.feed_row = Some(row);
-        self.feed_snippet = Some(snippet.to_string());
-        self.feed_token_ids = Some(token_ids.to_string());
+    /// Called only when `should_emit` is true, keeping sample formatting and
+    /// allocations out of ordinary optimizer updates.
+    pub fn set_feed(&mut self, sample: FeedSample) {
+        self.feed = Some(sample);
     }
 
     /// Let optional presentation work share the logger's existing throttle.
@@ -432,6 +424,35 @@ impl Progress {
         learning_rate: Option<f32>,
         memory: Option<(usize, usize)>,
     ) {
+        self.update_with_optional_feed(done, token_delta, loss, learning_rate, memory, || None);
+    }
+
+    /// Lazily construct the exact current sample inside the logger's emission
+    /// decision. A second timer check outside this method could otherwise emit
+    /// stale feed fields if the throttle interval elapsed between checks.
+    pub(crate) fn update_with_feed(
+        &mut self,
+        done: usize,
+        token_delta: usize,
+        loss: f64,
+        learning_rate: Option<f32>,
+        memory: Option<(usize, usize)>,
+        sample: impl FnOnce() -> FeedSample,
+    ) {
+        self.update_with_optional_feed(done, token_delta, loss, learning_rate, memory, || {
+            Some(sample())
+        });
+    }
+
+    fn update_with_optional_feed(
+        &mut self,
+        done: usize,
+        token_delta: usize,
+        loss: f64,
+        learning_rate: Option<f32>,
+        memory: Option<(usize, usize)>,
+        sample: impl FnOnce() -> Option<FeedSample>,
+    ) {
         self.tokens += token_delta;
         self.set_metrics(learning_rate, memory);
         if loss.is_finite() {
@@ -442,6 +463,9 @@ impl Progress {
         }
         if !self.should_emit(done) {
             return;
+        }
+        if let Some(sample) = sample() {
+            self.set_feed(sample);
         }
         self.last_draw = Instant::now();
         self.emitted = true;
@@ -504,13 +528,19 @@ impl Progress {
                 format!("checkpoint #{number} pending: {checkpoint}"),
                 format!("last checkpoint: {last_checkpoint}"),
             ];
-            if let Some(dataset) = self.feed_dataset.as_deref() {
+            if let Some(feed) = &self.feed {
                 rows.push(format!(
-                    "feed {dataset} selected row {} / {} rows consumed / {} tokens: {}",
-                    self.feed_row.unwrap_or(0),
-                    self.feed_rows.unwrap_or(0),
-                    self.feed_tokens.unwrap_or(0),
-                    terminal_text(self.feed_snippet.as_deref().unwrap_or("-"))
+                    "feed {} row {}/{} | epoch {}/{} inputs {}/{} | batch {}/{}: {}",
+                    feed.dataset,
+                    feed.row,
+                    feed.rows,
+                    feed.epoch,
+                    feed.epochs,
+                    feed.epoch_tokens,
+                    feed.epoch_total,
+                    feed.batch,
+                    feed.batches,
+                    terminal_text(&feed.snippet)
                 ));
             }
             let (columns, height) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -552,21 +582,42 @@ impl Progress {
     }
 
     fn feed_fields(&self) -> String {
-        let Some(dataset) = self.feed_dataset.as_deref() else {
+        let Some(feed) = &self.feed else {
             return String::new();
         };
-        format!(
-            " feed_dataset={} feed_config={} feed_split={} feed_field={} feed_rows={} feed_tokens={} feed_row={} feed_snippet={} feed_token_ids={}",
-            encode_log_value(dataset),
-            encode_log_value(self.feed_config.as_deref().unwrap_or("auto")),
-            encode_log_value(self.feed_split.as_deref().unwrap_or("train")),
-            encode_log_value(self.feed_field.as_deref().unwrap_or("text")),
-            self.feed_rows.unwrap_or(0),
-            self.feed_tokens.unwrap_or(0),
-            self.feed_row.unwrap_or(0),
-            encode_log_value(self.feed_snippet.as_deref().unwrap_or("")),
-            encode_log_value(self.feed_token_ids.as_deref().unwrap_or("")),
-        )
+        let mut fields = format!(
+            " feed_schema=2 feed_dataset={} feed_snippet={} feed_token_ids={} feed_token_pieces={} feed_tokens={} feed_epoch_tokens={} feed_epoch_total={} feed_epoch={} feed_epochs={} feed_step={} feed_batch={} feed_batches={} feed_row={} feed_rows={} feed_start={} feed_end={} feed_text_kind={}",
+            encode_log_value(&feed.dataset),
+            encode_log_value(&feed.snippet),
+            encode_log_value(&feed.token_ids),
+            encode_log_value(&feed.token_pieces),
+            feed.tokens,
+            feed.epoch_tokens,
+            feed.epoch_total,
+            feed.epoch,
+            feed.epochs,
+            feed.step,
+            feed.batch,
+            feed.batches,
+            feed.row,
+            feed.rows,
+            feed.start,
+            feed.end,
+            feed.text_kind,
+        );
+        for (key, value) in [
+            ("feed_config", feed.config.as_deref()),
+            ("feed_split", feed.split.as_deref()),
+            ("feed_field", feed.field.as_deref()),
+        ] {
+            if let Some(value) = value {
+                fields.push_str(&format!(" {key}={}", encode_log_value(value)));
+            }
+        }
+        if let (Some(bytes), Some(total)) = (feed.bytes, feed.bytes_total) {
+            fields.push_str(&format!(" feed_bytes={bytes} feed_bytes_total={total}"));
+        }
+        fields
     }
 
     fn loss_average(&self) -> Option<f64> {
@@ -668,26 +719,46 @@ mod progress_tests {
         let mut progress = Progress::new_with_tui("training", 10, false);
         assert!(progress.feed_fields().is_empty());
         assert!(progress.should_emit(1));
-        progress.set_feed(
-            "owner/name",
-            None,
-            "train",
-            "text",
-            2,
-            8,
-            3,
-            "a b\n%é",
-            "1,2",
-        );
+        progress.set_feed(FeedSample {
+            dataset: "owner/name".into(),
+            config: None,
+            split: Some("train".into()),
+            field: Some("text".into()),
+            snippet: "a b\n%é".into(),
+            token_ids: "1,2".into(),
+            token_pieces: "[\"a\",\"b\"]".into(),
+            tokens: 8,
+            epoch_tokens: 4,
+            epoch_total: 4,
+            epoch: 2,
+            epochs: 2,
+            step: 9,
+            batch: 2,
+            batches: 2,
+            row: 2,
+            rows: 2,
+            start: 3,
+            end: 5,
+            bytes: None,
+            bytes_total: None,
+            text_kind: "raw",
+        });
         let fields = progress.feed_fields();
-        assert!(fields.contains(" feed_dataset=owner/name"));
-        assert!(fields.contains(" feed_rows=2 feed_tokens=8 feed_row=3"));
+        assert!(fields.contains(" feed_schema=2 feed_dataset=owner/name"));
+        assert!(fields.contains(" feed_tokens=8 feed_epoch_tokens=4 feed_epoch_total=4"));
+        assert!(fields.contains(" feed_row=2 feed_rows=2 feed_start=3 feed_end=5"));
+        assert!(fields.contains(" feed_token_pieces=%5B%22a%22%2C%22b%22%5D"));
+        assert!(!fields.contains("feed_bytes="));
+        assert!(!fields.contains("feed_config="));
         assert!(fields.contains(" feed_snippet=a%20b%0A%25%C3%A9"));
         assert!(fields.contains(" feed_token_ids=1%2C2"));
         assert!(!fields.contains('\n'));
         progress.emitted = true;
         progress.last_draw = Instant::now();
         assert!(!progress.should_emit(2));
+        progress.update_with_feed(2, 1, 2.0, None, None, || {
+            panic!("throttled updates must not construct/allocate a preview")
+        });
         assert!(
             progress.should_emit(10),
             "final preview is never throttled away"

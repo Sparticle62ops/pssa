@@ -3,7 +3,7 @@
 use crate::checkpoint;
 use crate::cli::{CLIHandler, TrainingOptions};
 use crate::dataset::{DatasetManager, Tokenizer, TokenizerKind};
-use crate::training::{Schedule, chunk_plan, report_stream};
+use crate::training::{DatasetFeed, Schedule, chunk_plan, report_stream};
 use crate::transformer::{TransformerConfig, TransformerModel};
 use crate::transformer_checkpoint;
 use crate::ui;
@@ -74,8 +74,17 @@ pub fn train_corpus(
         (model, tok)
     };
     model.cfg.lr = opts.lr;
-    let docs = CLIHandler::documents(raw, &tokenizer, opts.max_tokens, opts.skip_tokens)?;
-    let plan = chunk_plan(&docs, model.cfg.chunk_len);
+    let window = CLIHandler::training_window(
+        raw,
+        &tokenizer,
+        opts.max_tokens,
+        opts.skip_tokens,
+        opts.token_cache.as_deref().map(std::path::Path::new),
+        opts.token_cache_source.as_deref().map(std::path::Path::new),
+    )?;
+    let docs = &window.docs;
+    let plan = chunk_plan(docs, model.cfg.chunk_len);
+    let mut feed = DatasetFeed::new(raw, &tokenizer, &window, opts, plan.len());
     let schedule = Schedule::new_with_warmup(
         plan.len(),
         model.step_counter,
@@ -91,7 +100,7 @@ pub fn train_corpus(
         model.parameter_count(),
         model.cfg.d_vocab
     );
-    report_stream(&docs, model.cfg.chunk_len, opts.accumulate);
+    report_stream(docs, model.cfg.chunk_len, opts.accumulate);
     ui::banner("train-transformer", "decoder-only transformer baseline");
     ui::field(
         "corpus",
@@ -149,6 +158,7 @@ pub fn train_corpus(
     );
     println!("last_checkpoint={}", opts.resume.as_deref().unwrap_or("-"));
     for epoch in 0..opts.epochs {
+        feed.begin_epoch(epoch + 1);
         let mut loss_sum = 0.0f64;
         let mut token_sum = 0usize;
         for group in plan.chunks(opts.accumulate) {
@@ -166,6 +176,8 @@ pub fn train_corpus(
                 model.backward_chunk(len, len as f32 / total_tokens as f32);
                 loss_sum += loss as f64 * len as f64;
                 token_sum += len;
+                feed.consume(doc, start, len);
+                feed.finish_batch();
             }
             update += 1;
             let learning_rate = schedule.lr(update)?;
@@ -178,12 +190,13 @@ pub fn train_corpus(
                 curve.record(total_tokens, model.step_counter, loss_sum - prior_loss)?;
             }
             let update_loss = (loss_sum - prior_loss) / total_tokens.max(1) as f64;
-            progress.update_with_metrics(
+            progress.update_with_feed(
                 update,
                 total_tokens,
                 update_loss,
                 Some(learning_rate),
                 None,
+                || feed.sample(model.step_counter),
             );
         }
         progress.finish();
@@ -233,6 +246,10 @@ pub fn run_training(
     let raw = DatasetManager::try_load_dataset(Some(data))?;
     let mut run_options = opts.clone();
     run_options.checkpoint_path = Some(out.to_string());
+    run_options.dataset_source = Some(data.to_string());
+    if run_options.token_cache.is_some() && run_options.token_cache_source.is_none() {
+        run_options.token_cache_source = Some(data.to_string());
+    }
     let (model, _) = train_corpus(&raw, &run_options, tokenizer_from)?;
     transformer_checkpoint::save_model(&model, out)
         .map_err(|e| format!("cannot save checkpoint '{out}': {e}"))?;

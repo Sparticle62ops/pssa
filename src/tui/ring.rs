@@ -65,8 +65,8 @@ pub(super) fn draw(f: &mut Frame, area: Rect, loops: usize, elapsed: Duration) {
     let frame = frame_at(loops, elapsed);
     // Put the selected count first so even narrow panels retain that value.
     let title = format!(
-        " loops {} / pass {}/{} ",
-        frame.loops, frame.pass, frame.loops
+        " loops {} / configuration diagram ",
+        frame.loops
     );
     if frame.loops == 1 {
         draw_neuron_frame(f, area, neuron_frame_at(elapsed), &title);
@@ -182,10 +182,10 @@ mod tests {
         for loops in 1..=MAX_LOOPS {
             let elapsed = LAP * (loops - 1) as u32;
             let buffer = render(loops, elapsed, 64, 16);
-            assert!(text(&buffer).contains(&format!("loops {loops} / pass {loops}/{loops}")));
+            assert!(text(&buffer).contains(&format!("loops {loops} / configuration diagram")));
             assert!(braille_count(&buffer) > 0);
             let restarted = render(loops, elapsed + LAP, 64, 16);
-            assert!(text(&restarted).contains(&format!("loops {loops} / pass 1/{loops}")));
+            assert!(text(&restarted).contains(&format!("loops {loops} / configuration diagram")));
         }
     }
 
@@ -263,7 +263,7 @@ mod tests {
                         f,
                         f.area(),
                         neuron_frame_at(elapsed),
-                        " loops 1 / pass 1/1 ",
+                        " loops 1 / configuration diagram ",
                     );
                 })
                 .unwrap();

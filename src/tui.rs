@@ -14,6 +14,7 @@ mod depth_zoom;
 mod device;
 mod eval;
 mod extras;
+mod feed;
 mod github;
 mod hardware;
 mod heatmap;
@@ -129,19 +130,7 @@ impl GraphView {
     }
 }
 
-#[derive(Default)]
-struct FeedState {
-    dataset: String,
-    config: String,
-    split: String,
-    field: String,
-    rows: u64,
-    tokens: u64,
-    row: u64,
-    snippet: String,
-    token_ids: Vec<u64>,
-    updated_at: Option<Instant>,
-}
+use feed::FeedState;
 
 #[derive(Default)]
 struct RunState {
@@ -186,6 +175,7 @@ struct RunState {
     checkpoint_number: Option<u64>,
     checkpoint_target: Option<String>,
     last_checkpoint: Option<String>,
+    checkpoint_revision: u64,
     // Parsed progress samples used by the real line charts. `loss_series` is
     // retained for health checks and existing log compatibility tests.
     loss_series: Vec<f64>,
@@ -203,6 +193,7 @@ struct RunState {
     warning: Option<String>,
     tok_s_history: Vec<f64>,
     last_progress_at: Option<Instant>,
+    run_started_at: Option<Instant>,
     training_active: bool,
     expected_lr_base: Option<f64>,
     expected_lr_total: Option<u64>,
@@ -265,6 +256,15 @@ impl RunState {
         if line.is_empty() {
             return;
         }
+        if line.starts_with("model=") && line.contains("parameters=") {
+            self.math = math::Values::default();
+            self.corpus = None;
+            self.vocab = None;
+            self.width = None;
+            self.memory = None;
+            self.schedule = None;
+            self.loop_count = 1;
+        }
         self.math.ingest(line);
         if let Some(loops) = parse_kv::<usize>(line, "loops=") {
             self.loop_count = loops.clamp(1, 32);
@@ -321,7 +321,32 @@ impl RunState {
         if line.contains("progress_schema=") {
             // Start the stall clock even before the first update arrives.
             self.last_progress_at = Some(Instant::now());
+            self.run_started_at = Some(Instant::now());
             self.training_active = true;
+            self.updates_done = Some(0);
+            self.updates_total = None;
+            self.updates_remaining = None;
+            self.optimizer_updates = None;
+            self.live_loss = None;
+            self.loss_average = None;
+            self.tok_s = None;
+            self.eta = None;
+            self.learning_rate = None;
+            self.memory_used = None;
+            self.memory_capacity = None;
+            self.checkpoints.clear();
+            if parse_kv::<u64>(line, "prior_updates=") == Some(0) {
+                self.resumed_from = None;
+            }
+            self.epoch_loss = None;
+            self.epoch_tokens = None;
+            self.epoch_updates = None;
+            self.wall = None;
+            self.throughput = None;
+            self.training_seconds = None;
+            self.last_checkpoint = None;
+            self.checkpoint_target = None;
+            self.checkpoint_number = None;
             self.problem = None;
             self.warning = None;
             self.loss_series.clear();
@@ -366,28 +391,8 @@ impl RunState {
                 .filter(|value| value.is_finite());
         }
 
-        if let Some(dataset) = parse_log_value(line, "feed_dataset") {
-            self.feed = Some(FeedState {
-                dataset,
-                config: parse_log_value(line, "feed_config").unwrap_or_default(),
-                split: parse_log_value(line, "feed_split").unwrap_or_else(|| "train".into()),
-                field: parse_log_value(line, "feed_field").unwrap_or_else(|| "text".into()),
-                rows: parse_kv(line, "feed_rows=").unwrap_or(0),
-                tokens: parse_kv(line, "feed_tokens=").unwrap_or(0),
-                row: parse_kv(line, "feed_row=").unwrap_or(0),
-                snippet: parse_log_value(line, "feed_snippet")
-                    .unwrap_or_default()
-                    .chars()
-                    .take(96)
-                    .collect(),
-                token_ids: parse_log_value(line, "feed_token_ids")
-                    .unwrap_or_default()
-                    .split(',')
-                    .take(16)
-                    .filter_map(|id| id.parse().ok())
-                    .collect(),
-                updated_at: Some(Instant::now()),
-            });
+        if let Some(feed) = FeedState::parse(line) {
+            self.feed = Some(feed);
         }
 
         let raw_loss = parse_kv::<f64>(line, "loss=").or_else(|| parse_kv(line, "loss "));
@@ -571,6 +576,14 @@ impl RunState {
         {
             self.checkpoint_target = Some(path.to_string());
             self.checkpoint_number = checkpoint_number(path);
+            // Follow the actual output directory rather than a default chain.
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                self.chain_dir = if parent.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    parent.to_path_buf()
+                };
+            }
         }
         if let Some(path) = line.split("last_checkpoint=").nth(1).map(str::trim)
             && !path.is_empty()
@@ -607,12 +620,43 @@ impl RunState {
         }
     }
 
+    fn current_step(&self) -> Option<u64> {
+        self.prior_steps.zip(self.updates_done)
+            .map(|(prior, done)| prior.saturating_add(done))
+            .or(self.optimizer_updates)
+    }
+
+    fn checkpoint_context(&self) -> String {
+        if let Some(path) = &self.last_checkpoint {
+            return path.clone();
+        }
+        let current = self.current_step().map_or_else(|| "unrecorded".into(), |step| step.to_string());
+        if self.checkpoint_target.is_none() {
+            return format!("No save target in this log; current step {current}");
+        }
+        if let Some(total) = self.updates_total {
+            let first = self.prior_steps.unwrap_or(0).saturating_add(total);
+            if self.training_seconds.is_some() || self.updates_done.is_some_and(|done| done >= total) {
+                return format!("Training complete at step {current}; waiting for saved_checkpoint event");
+            }
+            return format!("First checkpoint at run end (step {first}); current step {current}");
+        }
+        format!("Save target configured; save step unrecorded; current step {current}")
+    }
+
+    fn elapsed_context(&self) -> String {
+        self.wall.clone().or_else(|| self.training_seconds.map(ui::duration))
+            .or_else(|| self.run_started_at.map(|at| ui::duration(at.elapsed().as_secs_f64())))
+            .unwrap_or_else(|| "elapsed time unrecorded".into())
+    }
+
     fn note_checkpoint(&mut self, path: &str) {
         let path = path.trim();
         if path.is_empty() || path == "-" {
             return;
         }
         self.last_checkpoint = Some(path.to_string());
+        self.checkpoint_revision = self.checkpoint_revision.saturating_add(1);
         self.checkpoint_number = checkpoint_number(path);
         let name = PathBuf::from(path)
             .file_name()
@@ -621,15 +665,18 @@ impl RunState {
         if !(name.ends_with(".pssa") || name.ends_with(".trfm")) {
             return;
         }
-        if !self.checkpoints.iter().any(|(n, _)| *n == name) {
-            self.checkpoints.push((name, None));
+        let recorded_loss = self.epoch_loss.or(self.live_loss);
+        if let Some((_, loss)) = self.checkpoints.iter_mut().find(|(n, _)| *n == name) {
+            *loss = recorded_loss.or(*loss);
+        } else {
+            self.checkpoints.push((name, recorded_loss));
             self.checkpoints
                 .sort_by_key(|(name, _)| checkpoint_sort_key(name));
         }
     }
 
-    /// Scan the chain directory for checkpoint files; also carry any loss
-    /// recorded on disk in sibling `.loss` files (written by future runs).
+    /// Scan real checkpoint files, preserving metrics attached to save events.
+    /// Historical metrics from matching recorded logs are loaded by Timeline.
     fn refresh_chain(&mut self) {
         let Ok(entries) = std::fs::read_dir(&self.chain_dir) else {
             self.checkpoints.clear();
@@ -639,9 +686,11 @@ impl RunState {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.ends_with(".pssa") || name.ends_with(".trfm") {
-                let loss = std::fs::read_to_string(entry.path().with_extension("loss"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<f64>().ok());
+                let loss = self.checkpoints.iter().find(|(n, _)| *n == name)
+                    .and_then(|(_, loss)| *loss)
+                    .or_else(|| std::fs::read_to_string(entry.path().with_extension("loss"))
+                        .ok().and_then(|s| s.trim().parse::<f64>().ok())
+                        .filter(|loss| loss.is_finite()));
                 names.push((name, loss));
             }
         }
@@ -890,7 +939,10 @@ fn parse_log_value(line: &str, key: &str) -> Option<String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::new();
     let mut i = 0;
-    while i < bytes.len() && decoded.len() < 1024 {
+    while i < bytes.len() {
+        if decoded.len() >= 4096 {
+            return None;
+        }
         if bytes[i] == b'%' {
             let digits = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
             decoded.push(u8::from_str_radix(digits, 16).ok()?);
@@ -1066,6 +1118,8 @@ fn run_app(
                 let _ = io::stdout().flush();
             }
             let checkpoint = preview::Preview::candidate(&state);
+            let context = state.checkpoint_context();
+            state.preview.set_waiting_context(context);
             state
                 .preview
                 .poll(checkpoint, state.loop_count, extras.remote_monitor());
@@ -1675,12 +1729,7 @@ fn neuron_green(intensity: f64) -> Color {
     )
 }
 
-fn draw_neuron_animation(f: &mut ratatui::Frame, area: Rect, now: Instant) {
-    static ANIMATION_START: OnceLock<Instant> = OnceLock::new();
-    let started = *ANIMATION_START.get_or_init(Instant::now);
-    draw_neuron_animation_at(f, area, now.saturating_duration_since(started));
-}
-
+#[cfg(test)]
 fn draw_neuron_animation_at(f: &mut ratatui::Frame, area: Rect, elapsed: Duration) {
     let frame = neuron_frame_at(elapsed);
     draw_neuron_frame(f, area, frame, "");
@@ -1771,6 +1820,11 @@ fn draw_neuron_frame(f: &mut ratatui::Frame, area: Rect, frame: NeuronFrame, tit
 }
 
 fn progress_label(state: &RunState, pct: f64, width: u16) -> String {
+    if state.progress_pct.is_none() && state.updates_total.is_none() {
+        return "No training progress recorded".into();
+    }
+    // Numeric labels use reported progress, not the visual bar's tween.
+    let pct = state.progress_pct.unwrap_or(pct);
     let done = state
         .updates_done
         .or(state.optimizer_updates)
@@ -2158,156 +2212,12 @@ fn draw_with_background(
 }
 
 fn draw_feed(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
-    let elapsed = state
-        .feed
-        .as_ref()
-        .and_then(|feed| feed.updated_at)
-        .map(|at| at.elapsed())
-        .unwrap_or_default();
-    draw_feed_at(f, area, state, elapsed);
+    feed::draw(f, area, state);
 }
 
-fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: Duration) {
-    let Some(feed) = state.feed.as_ref() else {
-        // Preserve the wrapped connection hint rather than squeezing empty
-        // cards into border-only fragments on short terminals.
-        if area.height < 10 {
-            let idle_area = panel_area(f, area);
-            f.render_widget(
-                Paragraph::new(vec![
-                    Line::styled("Waiting for feed samples", accent()),
-                    Line::from("Train with --hf-dataset OWNER/NAME --no-tui | pssa tui"),
-                    Line::from("Older/local logs still work without previews."),
-                ])
-                .wrap(Wrap { trim: false })
-                .block(panel(" feed / idle ")),
-                idle_area,
-            );
-            return;
-        }
-        let sections = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).split(area);
-        let summary_area = panel_area(f, sections[0]);
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::styled("Waiting for feed samples", accent()),
-                Line::from("dataset -   rows -   tokens -"),
-                Line::styled(
-                    "No sample metadata in this log yet.",
-                    Style::new().fg(SECOND_ACCENT),
-                ),
-            ])
-            .block(panel(" feed / idle ")),
-            summary_area,
-        );
-        let cards = card_pair(f, sections[1]);
-        draw_info_card(
-            f,
-            cards[0],
-            " 01 / source text ",
-            vec![
-                Line::styled("[ awaiting sample ]", accent()),
-                Line::from("Stream HF training into this dashboard:"),
-                Line::from(
-                    "pssa train --hf-dataset OWNER/NAME --no-tui | pssa tui",
-                ),
-            ],
-        );
-        draw_info_card(
-            f,
-            cards[1],
-            " 02 / token strips ",
-            vec![
-                Line::styled("text → shredder → token ids", accent()),
-                Line::from("Rows, tokens and the latest snippet appear when reported."),
-                Line::from("Older/local logs still work without previews."),
-            ],
-        );
-        return;
-    };
-    if area.height < 9 {
-        let feed_area = panel_area(f, area);
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::styled(&feed.dataset, accent()),
-                Line::from(format!(
-                    "{} rows / {} tokens consumed",
-                    feed.rows, feed.tokens
-                )),
-                Line::from(feed.snippet.as_str()),
-            ])
-            .block(panel(" feed ")),
-            feed_area,
-        );
-        return;
-    }
-    let sections = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).split(area);
-    let summary_area = panel_area(f, sections[0]);
-    f.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                format!(
-                    "{} / {} / {} / field {}",
-                    feed.dataset, feed.config, feed.split, feed.field
-                ),
-                accent(),
-            ),
-            Line::from(format!(
-                "{} rows consumed / {} tokens / selected row {}",
-                feed.rows, feed.tokens, feed.row
-            )),
-            Line::styled(
-                "Selected-window rows (including repeats); latest chunk preview, not every sample.",
-                Style::new().fg(Color::DarkGray),
-            ),
-        ])
-        .block(panel(" dataset feed ")),
-        summary_area,
-    );
-    let panel_area = panel_area(f, sections[1]);
-    let block = panel(" shredder / text → token ids ");
-    let inner = block.inner(panel_area);
-    f.render_widget(block, panel_area);
-    if inner.width == 0 || inner.height < 2 {
-        return;
-    }
-
-    // Cosmetic motion runs only in the reader at the shared ~30fps cap. The
-    // numbers and preview never invent data between producer samples.
-    let tick = (elapsed.as_millis() / 140) as u64;
-    let blade = (inner.height / 2).min(4);
-    let incoming_y = (tick % (blade as u64 + 2)) as u16;
-    if incoming_y < blade {
-        let indent = (inner.width / 12).min(5);
-        f.render_widget(
-            Paragraph::new(feed.snippet.as_str()).style(accent()),
-            Rect::new(
-                inner.x + indent,
-                inner.y + incoming_y,
-                inner.width - indent,
-                1,
-            ),
-        );
-    }
-    let teeth = if tick % 2 == 0 { "▾▿" } else { "▿▾" };
-    f.render_widget(
-        Paragraph::new(teeth.repeat(inner.width as usize / 2 + 1)).style(accent()),
-        Rect::new(inner.x, inner.y + blade, inner.width, 1),
-    );
-    let output_height = inner.height.saturating_sub(blade + 1);
-    if output_height == 0 {
-        return;
-    }
-    let columns = (inner.width / 10).max(1) as usize;
-    for (index, id) in feed.token_ids.iter().enumerate() {
-        let x = inner.x + (index % columns) as u16 * (inner.width / columns as u16);
-        let y =
-            inner.y + blade + 1 + ((tick + (index / columns) as u64) % output_height as u64) as u16;
-        f.render_widget(
-            Paragraph::new(format!("│{id}│"))
-                .style(Style::new().fg(progress_gradient(index as u16, 16))),
-            Rect::new(x, y, inner.width / columns as u16, 1),
-        );
-    }
+#[cfg(test)]
+fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, _elapsed: Duration) {
+    feed::draw(f, area, state);
 }
 
 #[derive(Clone, Copy)]
@@ -2968,7 +2878,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             state.dream_count
         )
     } else {
-        "off".into()
+        "no dream events recorded".into()
     };
     let lines = vec![
         Line::from(vec![
@@ -2993,20 +2903,14 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         )),
         Line::from(format!("memory bank {memory}")),
         Line::from(format!("checkpoint  {checkpoint}")),
-        Line::from(format!(
-            "last saved  {}",
-            state
-                .last_checkpoint
-                .as_deref()
-                .unwrap_or("not written yet")
-        )),
+        Line::from(format!("last saved  {}", state.checkpoint_context())),
         Line::from(format!(
             "last epoch  loss {epoch_loss}   tokens {epoch_tokens}   updates {epoch_updates}"
         )),
         Line::from(format!(
             "run         wall {}   resumed from {}   prior steps {}",
-            state.wall.as_deref().unwrap_or("-"),
-            state.resumed_from.as_deref().unwrap_or("-"),
+            state.elapsed_context(),
+            state.resumed_from.as_deref().unwrap_or("fresh run"),
             state
                 .prior_steps
                 .map(|s| s.to_string())
@@ -3030,19 +2934,9 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             ])
             .split(chunks[metrics_index])
         };
-        // The same panel animates while waiting for the first progress line:
-        // the idle dashboard doubles as the splash, without a blocking delay.
-        if state.loop_count > 1 {
-            static RING_START: OnceLock<Instant> = OnceLock::new();
-            ring::draw(
-                f,
-                bottom[0],
-                state.loop_count,
-                RING_START.get_or_init(Instant::now).elapsed(),
-            );
-        } else {
-            draw_neuron_animation(f, bottom[0], now);
-        }
+        // The old neuron/ring animation was not model telemetry. Show the
+        // trainer's latest real input instead, with no invented motion.
+        feed::draw_compact(f, bottom[0], state);
         let metrics_index = if gap == 0 { 1 } else { 2 };
         bottom[metrics_index]
     } else {
@@ -3074,7 +2968,7 @@ fn draw_chain(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             Constraint::Min(0),
         ])
         .split(area);
-        rows.push(Line::styled("No checkpoint files found yet.", accent()));
+        rows.push(Line::styled(state.checkpoint_context(), accent()));
         let summary_area = panel_area(f, sections[0]);
         f.render_widget(
             Paragraph::new(rows).block(panel(" chain / checkpoints ")),
@@ -3087,8 +2981,8 @@ fn draw_chain(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             " checkpoint index / 0 files ",
             vec![
                 Line::styled("FILE                 LOSS", Style::new().fg(SECOND_ACCENT)),
-                Line::from("-                    -"),
-                Line::from("Saved checkpoints will appear here automatically."),
+                Line::from(state.checkpoint_context()),
+                Line::from("Only saved files and recorded losses appear; no synthetic history."),
             ],
         );
         draw_info_card(
@@ -3096,7 +2990,7 @@ fn draw_chain(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             cards[1],
             " connect a chain ",
             vec![
-                Line::styled("[ waiting for checkpoint files ]", accent()),
+                Line::styled(state.checkpoint_context(), accent()),
                 Line::from("pssa tui --chain \"path/to/chain\""),
                 Line::from("Use the directory where your run saves checkpoints."),
                 Line::from("Read-only view / existing files stay untouched."),
@@ -3104,7 +2998,7 @@ fn draw_chain(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         );
         return;
     } else if state.checkpoints.is_empty() {
-        rows.push(Line::from("No checkpoint files found yet."));
+        rows.push(Line::from(state.checkpoint_context()));
     } else {
         let last = state.checkpoints.len().saturating_sub(1);
         rows.extend(
@@ -3207,7 +3101,7 @@ fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
                 )),
                 Line::from(format!(
                     "saved   {}",
-                    state.last_checkpoint.as_deref().unwrap_or("not reported")
+                    state.checkpoint_context()
                 )),
                 Line::styled(
                     "Read-only / no model or checkpoint changes",
@@ -3948,8 +3842,8 @@ mod tests {
             let buffer = terminal.backend().buffer();
             let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
             for expected in [
-                "Waiting for feed samples",
-                "--hf-dataset OWNER/NAME",
+                "Waiting for dataset telemetry",
+                "--data CORPUS",
                 "--no-tui",
             ] {
                 assert!(
@@ -3987,7 +3881,7 @@ mod tests {
             ),
             (
                 3,
-                ["feed / idle", "source text", "token strips", "--hf-dataset"],
+                ["dataset feed", "dataset telemetry", "--data CORPUS", "--no-tui"],
             ),
         ] {
             for (width, height) in [(80, 24), (120, 40)] {
@@ -4782,7 +4676,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_keeps_neuron_on_idle_and_training_monitor_and_preserves_other_tabs() {
+    fn test_backend_monitor_shows_actual_input_instead_of_synthetic_neurons() {
         use ratatui::{Terminal, backend::TestBackend};
 
         let mut state = RunState::default();
@@ -4814,7 +4708,8 @@ mod tests {
                     if width >= 80 {
                         assert!(!text.contains("neuron /"));
                         if tab == 0 {
-                            assert!(braille_pixels(terminal.backend().buffer()) >= 5);
+                            assert!(text.contains("actual input"));
+                            assert!(text.contains("No input window recorded"));
                             let row = terminal
                                 .backend()
                                 .buffer()
@@ -4835,7 +4730,7 @@ mod tests {
                             "run metrics",
                             "chain / checkpoints",
                             "model / configuration",
-                            "feed / idle",
+                            "dataset feed",
                             "conversation",
                             "parameters",
                             "HF login",
@@ -4890,6 +4785,33 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_waiting_context_tracks_real_run_end_step_and_output_directory() {
+        let mut state = RunState::default();
+        state.ingest("progress_schema=2 updates_total=500 prior_updates=100 checkpoint_target=/tmp/real run/model.pssa");
+        state.ingest("training 120/500 (24%) loss=3 tokens_per_second=90 optimizer_updates=120 global_update=220");
+        assert_eq!(state.chain_dir, PathBuf::from("/tmp/real run"));
+        assert!(state.checkpoint_context().contains("step 600"));
+        assert!(state.checkpoint_context().contains("current step 220"));
+        state.ingest("training_seconds=3 optimizer_updates=500");
+        assert!(state.checkpoint_context().contains("complete at step 600"));
+        state.ingest("saved_checkpoint=/tmp/real run/model.pssa");
+        assert_eq!(state.checkpoint_context(), "/tmp/real run/model.pssa");
+        assert_eq!(state.checkpoints[0].1, Some(3.0));
+        state.ingest("progress_schema=2 updates_total=10 prior_updates=0 checkpoint_target=model.pssa");
+        assert_eq!(state.chain_dir, PathBuf::from("."));
+        assert!(state.last_checkpoint.is_none());
+        assert!(state.live_loss.is_none());
+        assert!(state.checkpoints.is_empty());
+        assert!(state.checkpoint_context().contains("current step 0"));
+    }
+
+    #[test]
+    fn rejects_oversized_encoded_strings_instead_of_accepting_a_partial_window() {
+        let line = format!("feed_snippet={}%ZZ", "x".repeat(4096));
+        assert!(parse_log_value(&line, "feed_snippet").is_none());
+    }
+
+    #[test]
     fn feed_log_roundtrip_preserves_unicode_metrics_and_paths() {
         let mut state = RunState::default();
         let snippet = "héllo 世界 100% loss=NaN\nnext";
@@ -4933,18 +4855,15 @@ mod tests {
             let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
             assert!(text.contains("owner/name"));
             assert!(text.contains("7 rows consumed / 128 tokens / selected row 2"));
-            assert!(text.contains("shredder"));
-            assert!(text.contains("│12│"));
-            assert_eq!(buffer.cell((0, 5)).unwrap().symbol(), "┌");
+            assert!(text.contains("Token pieces → IDs"));
+            assert!(text.contains("IDs: 12, 34, 56"));
+            assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "┌");
             assert_eq!(buffer.cell((79, 18)).unwrap().symbol(), "┘");
             assert!(!buffer.content().iter().any(|c| c.fg == BRIGHT_RED));
             frames.push(buffer.clone());
         }
-        assert_ne!(
-            frames[0], frames[1],
-            "text and strips animate between samples"
-        );
-        assert_ne!(frames[1], frames[2]);
+        assert_eq!(frames[0], frames[1], "recorded input does not invent motion");
+        assert_eq!(frames[1], frames[2]);
         for (width, height) in [(120, 40), (80, 24), (60, 20), (30, 10), (10, 5), (1, 1)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|f| draw(f, &state, 3)).unwrap();
