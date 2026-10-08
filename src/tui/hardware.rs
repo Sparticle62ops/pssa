@@ -252,7 +252,7 @@ impl Hardware {
             let low = values.iter().copied().reduce(f64::min).unwrap_or(0.0);
             let high = values.iter().copied().reduce(f64::max).unwrap_or(0.0);
             lines.push(Line::styled(
-                format!("CPU history / observed {low:.0}..{high:.0}% / time: oldest -> latest"),
+                format!("CPU history / observed {low:.0}..{high:.0}% / time: oldest → latest"),
                 Style::new().fg(SECOND_ACCENT),
             ));
             lines.push(Line::styled(
@@ -376,7 +376,7 @@ mod tests {
                         assert!(text.contains("CPU meters 0..100%"));
                         if populated {
                             assert!(text.contains("CPU history / observed 0..100%"));
-                            assert!(text.contains("oldest -> latest"));
+                            assert!(text.contains("oldest → latest"));
                             assert!(text.contains(&sparkline(
                                 &[0.0, 25.0, 50.0, 75.0, 100.0, 50.0],
                                 usize::from(w.saturating_sub(2)),

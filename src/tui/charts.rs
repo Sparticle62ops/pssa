@@ -224,6 +224,68 @@ pub(super) fn draw(f: &mut Frame, area: Rect, plot: Plot<'_>, series: &[Series<'
     draw_labeled(f, area, plot, series, None);
 }
 
+/// Return the drawable plot rectangle after the panel border, y-axis gutter,
+/// and two rows reserved for x labels. Keeping this calculation shared makes
+/// overlay layers land on exactly the same cells as the primary plot.
+pub(super) fn graph_rect(area: Rect, plot: &Plot<'_>) -> Option<Rect> {
+    let inner = panel("").inner(area);
+    let label_width = y_ticks(plot.y_bounds, inner.height.saturating_sub(2))
+        .iter()
+        .map(|(_, s)| s.len())
+        .max()
+        .unwrap_or(0) as u16;
+    graph_rect_for_label_width(area, label_width)
+}
+
+fn graph_rect_for_label_width(area: Rect, label_width: u16) -> Option<Rect> {
+    let inner = panel("").inner(area);
+    if inner.width < 16 || inner.height < 5 {
+        return None;
+    }
+    let gutter = label_width.min(inner.width / 3) + 1;
+    Some(Rect::new(
+        inner.x + gutter,
+        inner.y,
+        inner.width.saturating_sub(gutter),
+        inner.height - 2,
+    ))
+}
+
+/// Paint a continuous HalfBlock layer over a normal plot without clearing its
+/// existing glyphs. This is used for geometry that must read as a solid wall
+/// while the measurements below it remain small, separate braille dots.
+pub(super) fn draw_solid_overlay(
+    f: &mut Frame,
+    area: Rect,
+    plot: Plot<'_>,
+    points: &[(f64, f64)],
+    color: Color,
+) {
+    let area = panel_area(f, area);
+    let Some(graph) = graph_rect(area, &plot) else {
+        return;
+    };
+    f.render_widget(
+        Canvas::default()
+            .background_color(PANEL_BG)
+            .marker(Marker::HalfBlock)
+            .x_bounds(plot.x_bounds)
+            .y_bounds(plot.y_bounds)
+            .paint(|ctx| {
+                ctx.draw(&Points { coords: points, color });
+                for pair in points.windows(2) {
+                    ctx.draw(&ThinLine {
+                        from: pair[0],
+                        to: pair[1],
+                        color,
+                    });
+                }
+                ctx.layer();
+            }),
+        graph,
+    );
+}
+
 /// Optional category labels for comparisons (never connect unrelated models).
 pub(super) fn draw_labeled(
     f: &mut Frame,
@@ -242,7 +304,7 @@ pub(super) fn draw_labeled(
     };
     let mut title = Line::styled(heading, accent().add_modifier(Modifier::BOLD));
     for s in series {
-        let legend = format!(" | {} ", s.name);
+        let legend = format!(" │ {} ", s.name);
         if !title.to_string().contains(s.name)
             && title.width() + legend.len() <= area.width.saturating_sub(2) as usize
         {
@@ -280,15 +342,12 @@ pub(super) fn draw_labeled(
                 .collect()
         },
     );
-    let label_width = y_labels.iter().map(|(_, s)| s.len()).max().unwrap_or(0) as u16;
-    let gutter = label_width.min(inner.width / 3) + 1;
     // Reserve separate rows for the axis stroke and its labels, never data.
-    let graph = Rect::new(
-        inner.x + gutter,
-        inner.y,
-        inner.width - gutter,
-        inner.height - 2,
-    );
+    let label_width = y_labels.iter().map(|(_, s)| s.len()).max().unwrap_or(0) as u16;
+    let Some(graph) = graph_rect_for_label_width(area, label_width) else {
+        return;
+    };
+    let gutter = graph.x - inner.x;
     let axis_x = graph.x - 1;
     let axis_y = graph.bottom();
     let buffer = f.buffer_mut();
@@ -580,6 +639,29 @@ pub(super) fn assert_plot(buffer: &Buffer, area: Rect, labels: &[&str]) {
     assert!(
         !text.chars().any(|c| ('\u{2580}'..='\u{259f}').contains(&c)),
         "block glyph in plot:\n{text}"
+    );
+}
+
+#[cfg(test)]
+pub(super) fn assert_plot_with_halfblocks(buffer: &Buffer, area: Rect, labels: &[&str]) {
+    let rows: Vec<String> = (area.y..area.bottom())
+        .map(|y| {
+            (area.x..area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        })
+        .collect();
+    let text = rows.join("\n");
+    for label in labels {
+        assert!(text.contains(label), "missing {label}:\n{text}");
+    }
+    assert!(
+        text.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
+        "no braille in plot:\n{text}"
+    );
+    assert!(
+        text.chars().any(|c| ('\u{2580}'..='\u{259f}').contains(&c)),
+        "no half-block boundary in plot:\n{text}"
     );
 }
 

@@ -25,6 +25,30 @@ const MAX_GENERATION_TOKENS: usize = 100_000;
 /// Opt-in clipping tolerates isolated bad gradients, not sustained divergence.
 const MAX_CONSECUTIVE_SKIPPED_UPDATES: usize = 20;
 
+fn dream_phase_start_line(update: usize, mode: DreamMode) -> String {
+    format!("dream phase=start update={update} mode={}", mode.as_str())
+}
+
+fn dream_phase_end_line(
+    update: usize,
+    mode: DreamMode,
+    summary: &crate::dream::DreamSummary,
+) -> String {
+    let dream_loss = summary
+        .last_rehearsal_loss
+        .filter(|loss| loss.is_finite())
+        .map_or_else(|| "unavailable".to_owned(), |loss| format!("{loss:.6e}"));
+    format!(
+        "dream phase=end update={update} mode={} entries_replayed={} generated_tokens={} rehearsal_sequences={} consolidation_delta_norm={:.6e} time={:.3}s dream_loss={dream_loss}",
+        mode.as_str(),
+        summary.entries_replayed,
+        summary.generated_tokens,
+        summary.rehearsal_sequences,
+        summary.consolidation_delta_norm,
+        summary.elapsed_seconds,
+    )
+}
+
 #[derive(Default)]
 struct SkippedUpdates {
     total: usize,
@@ -315,6 +339,55 @@ impl Parsed {
 }
 
 pub struct CLIHandler;
+
+#[cfg(test)]
+pub(crate) fn parse_train_options_for_test(args: &[String]) -> Result<TrainingOptions, String> {
+    let allowed = [
+        "--data",
+        "-d",
+        "--out",
+        "-o",
+        "--epochs",
+        "-e",
+        "--latent",
+        "--state",
+        "--key",
+        "--memory",
+        "--chunk",
+        "--lr",
+        "--accumulate",
+        "--warmup-steps",
+        "--total-updates",
+        "--seed",
+        "--max-tokens",
+        "--tokenizer",
+        "--vocab-size",
+        "--resume",
+        "--skip-tokens",
+        "--loss-csv",
+        "--loss-every",
+        "--tokens-seen",
+        "--no-tui",
+        "--threads",
+        "--ram-mib",
+        "--batch-size",
+        "--depth",
+        "--loops",
+        "--backend",
+        "--grad-clip",
+        "--memory-value-cap",
+        "--token-cache",
+        "--dream-every",
+        "--dream-replay",
+        "--dream-mode",
+        "--dream-len",
+        "--dream-lr",
+        "--dream-steps",
+    ];
+    let parsed = Parsed::parse(args, &allowed)?;
+    CLIHandler::common_options(&parsed)
+}
+
 impl CLIHandler {
     fn validate_loops(loops: usize) -> Result<(), String> {
         if !(1..=PSSALayerV2::MAX_LOOPS).contains(&loops) {
@@ -1205,6 +1278,7 @@ impl CLIHandler {
                     && update % options.dream_every == 0
                     && let Some(rng) = dream_rng.as_mut()
                 {
+                    println!("{}", dream_phase_start_line(update, options.dream_mode));
                     #[cfg(feature = "cuda")]
                     if let Some(ctx) = cuda_optimizer.as_ref() {
                         ctx.sync_safeguarded_weights(&mut model.adam_tensors())?;
@@ -1222,15 +1296,7 @@ impl CLIHandler {
                         fresh_task,
                         rng,
                     );
-                    println!(
-                        "dream mode={:?} entries_replayed={} generated_tokens={} rehearsal_sequences={} consolidation_delta_norm={:.6e} time={:.3}s",
-                        options.dream_mode,
-                        summary.entries_replayed,
-                        summary.generated_tokens,
-                        summary.rehearsal_sequences,
-                        summary.consolidation_delta_norm,
-                        summary.elapsed_seconds
-                    );
+                    println!("{}", dream_phase_end_line(update, options.dream_mode, &summary));
                 }
                 let finite = {
                     let _trace = crate::training_diagnostics::StageTrace::new(
@@ -3005,6 +3071,33 @@ mod training_safeguards_tests {
                 Parsed::parse(&[flag.into(), bad.into()], &["--dream-lr", "--dream-steps"])
                     .unwrap();
             assert!(CLIHandler::options(&parsed).is_err(), "{flag}={bad}");
+        }
+    }
+
+    #[test]
+    fn dream_phase_events_report_finite_loss_or_explicit_unavailable() {
+        assert_eq!(
+            dream_phase_start_line(7, DreamMode::Both),
+            "dream phase=start update=7 mode=both"
+        );
+
+        let finite = crate::dream::DreamSummary {
+            last_rehearsal_loss: Some(0.125),
+            ..Default::default()
+        };
+        let line = dream_phase_end_line(7, DreamMode::Both, &finite);
+        assert!(line.contains("dream phase=end update=7 mode=both"));
+        assert!(line.contains("dream_loss=1.250000e-1"));
+        assert!(!line.contains("loss=nan"));
+
+        for loss in [None, Some(f32::NAN), Some(f32::INFINITY)] {
+            let summary = crate::dream::DreamSummary {
+                last_rehearsal_loss: loss,
+                ..Default::default()
+            };
+            let line = dream_phase_end_line(8, DreamMode::Memory, &summary);
+            assert!(line.contains("dream_loss=unavailable"), "{line}");
+            assert!(!line.contains("loss=nan"), "{line}");
         }
     }
 

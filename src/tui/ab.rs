@@ -341,7 +341,7 @@ impl Comparison {
         if area.width < 44 || area.height < 16 {
             f.render_widget(
                 Paragraph::new(format!(
-                    "A/B • A then B (one model in RAM)\nA {} tok • {:.1} tok/s\nB {} tok • {:.1} tok/s\n{}\n> {}\nEnlarge for side-by-side replies • Esc stop",
+                    "A/B • A then B (one model in RAM)\nA {} tok • {:.1} tok/s\nB {} tok • {:.1} tok/s\n{}\n▶ {}\nEnlarge for side-by-side replies • Esc stop",
                     self.sides[0].tokens, self.sides[0].rate(),
                     self.sides[1].tokens, self.sides[1].rate(),
                     clean(note), clean(input)
@@ -452,7 +452,7 @@ impl Comparison {
         let input = clean(input);
         let tail = super::setup::visible_tail(&input, prompt_area.width.saturating_sub(4) as usize);
         f.render_widget(
-            Paragraph::new(format!("> {tail}")).block(panel(" shared prompt / command ")),
+            Paragraph::new(format!("▶ {tail}")).block(panel(" shared prompt / command ")),
             prompt_area,
         );
         f.render_widget(

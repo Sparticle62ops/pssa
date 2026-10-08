@@ -332,7 +332,7 @@ impl Sweep {
             fields.push(Line::styled(
                 format!(
                     "{} {label}: {}{}",
-                    if index == self.selected { ">" } else { " " },
+                    if index == self.selected { "▶" } else { " " },
                     clean(value),
                     if index == self.selected && self.editing() {
                         "▏"
@@ -357,9 +357,9 @@ impl Sweep {
         );
         let mut rows = vec![Line::styled(
             if compact {
-                "# state lr/latent/batch | loss | tok/s"
+                "№ state lr/latent/batch │ loss │ tok/s"
             } else {
-                "#    state       learning rate  latent  batch    training loss     tok/s"
+                "№    state       learning rate  latent  batch    training loss     tok/s"
             },
             accent(),
         )];
@@ -382,7 +382,7 @@ impl Sweep {
             let [lr, latent, batch] = &trial.grid;
             let row = if compact {
                 format!(
-                    "{} {:7} {lr}/{latent}/{batch} | {loss} | {speed}",
+                    "{} {:7} {lr}/{latent}/{batch} │ {loss} │ {speed}",
                     i + 1,
                     trial.status.label()
                 )

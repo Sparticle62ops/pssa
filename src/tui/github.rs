@@ -394,7 +394,7 @@ impl Github {
             lines.extend([
                 Line::from(format!(
                     "Token: {}",
-                    "*".repeat(
+                    "•".repeat(
                         self.input
                             .chars()
                             .count()
@@ -585,7 +585,7 @@ mod tests {
                 if w >= 79 {
                     assert!(text.contains("READ ONLY"));
                     if editing {
-                        assert!(text.contains("*****"));
+                        assert!(text.contains("•••••"));
                     }
                 }
             }

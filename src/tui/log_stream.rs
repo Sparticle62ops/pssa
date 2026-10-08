@@ -245,8 +245,8 @@ impl LogStream {
         let lines = vec![
             Line::styled("CLOUD LOG / separate live view", accent()),
             Line::from(format!(
-                "> Source: {shown}{}",
-                if self.editing() { "_" } else { "" }
+                "▶ Source: {shown}{}",
+                if self.editing() { "▏" } else { "" }
             )),
             Line::from(self.status.as_str()),
             Line::from(
@@ -822,6 +822,7 @@ mod tests {
             let live = render(&view);
             assert!(live.contains("NEWEST_ENTRY"), "live at {width}x{height}");
             assert!(live.contains("CLOUD LOG / separate live view"));
+            assert!(live.contains("▶ Source:"));
             view.key(key(KeyCode::PageUp));
             assert!(!render(&view).contains("NEWEST_ENTRY"));
             view.key(key(KeyCode::End));

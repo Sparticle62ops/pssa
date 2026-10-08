@@ -2714,13 +2714,15 @@ impl PSSALayerV2 {
         guard: &DreamSequence,
         lr: f32,
         steps: usize,
-    ) {
+    ) -> f32 {
         const LOSS_TOLERANCE: f32 = 1e-6;
         let mut recurrent = vec![0.0; self.recurrent_state_len()];
         self.copy_recurrent_state_to(&mut recurrent);
+        let mut last_loss = f32::NAN;
         for _ in 0..steps {
             let (baseline, fresh_gradients) = self.dream_gradient(guard, &recurrent);
-            let (_, old_gradients) = self.dream_gradient(sequence, &recurrent);
+            let (old_loss, old_gradients) = self.dream_gradient(sequence, &recurrent);
+            last_loss = old_loss;
             let snapshot = self.dream_parameter_snapshot();
             let mut step_lr = lr;
             let mut accepted = false;
@@ -2747,6 +2749,7 @@ impl PSSALayerV2 {
             self.zero_gradients();
         }
         self.copy_recurrent_state_from(&recurrent);
+        last_loss
     }
 
     fn rehearse_dream_sequence(
@@ -2755,22 +2758,23 @@ impl PSSALayerV2 {
         guard: Option<&DreamSequence>,
         lr: f32,
         steps: usize,
-    ) {
+    ) -> f32 {
         if let Some(guard) = guard {
-            self.rehearse_dream_sequence_guarded(sequence, guard, lr, steps);
-            return;
+            return self.rehearse_dream_sequence_guarded(sequence, guard, lr, steps);
         }
         let mut recurrent = vec![0.0; self.recurrent_state_len()];
         self.copy_recurrent_state_to(&mut recurrent);
+        let mut last_loss = f32::NAN;
         for _ in 0..steps {
             self.copy_recurrent_state_from(&recurrent);
-            self.forward_train_chunk(&sequence.input_ids, &sequence.target_ids);
+            last_loss = self.forward_train_chunk(&sequence.input_ids, &sequence.target_ids);
             self.zero_gradients();
             self.backward_chunk(sequence.input_ids.len(), 1.0);
             self.apply_dream_sgd(lr, &sequence.target_ids);
             self.zero_gradients();
         }
         self.copy_recurrent_state_from(&recurrent);
+        last_loss
     }
 
     /// Stage 1 API retained for callers that only want memory replay.
@@ -2952,9 +2956,15 @@ impl PSSALayerV2 {
         // method; restore the backend and invalidate its cache afterward.
         let device = std::mem::replace(&mut self.device, Device::Cpu);
         let mut rehearsal_sequences = 0;
+        let mut last_rehearsal_loss = None;
         let stored_sequences: Vec<DreamSequence> = self.dream_sequences[..sequence_take].to_vec();
         for sequence in stored_sequences {
-            self.rehearse_dream_sequence(&sequence, guard.as_ref(), rehearsal_lr, rehearsal_steps);
+            last_rehearsal_loss = Some(self.rehearse_dream_sequence(
+                &sequence,
+                guard.as_ref(),
+                rehearsal_lr,
+                rehearsal_steps,
+            ));
             rehearsal_sequences += 1;
         }
         if mode.includes_generation() {
@@ -2969,12 +2979,12 @@ impl PSSALayerV2 {
                     input_ids: inputs.to_vec(),
                     target_ids: targets.to_vec(),
                 };
-                self.rehearse_dream_sequence(
+                last_rehearsal_loss = Some(self.rehearse_dream_sequence(
                     &sequence,
                     guard.as_ref(),
                     rehearsal_lr,
                     rehearsal_steps,
-                );
+                ));
                 rehearsal_sequences += 1;
             }
         }
@@ -2993,6 +3003,7 @@ impl PSSALayerV2 {
             entries_replayed: take,
             generated_tokens: generated.len(),
             rehearsal_sequences,
+            last_rehearsal_loss: last_rehearsal_loss.filter(|loss| loss.is_finite()),
             consolidation_delta_norm,
             elapsed_seconds: started.elapsed().as_secs_f64(),
         }

@@ -837,7 +837,7 @@ impl Chat {
         if area.width < 26 || area.height < 9 {
             f.render_widget(
                 Paragraph::new(format!(
-                    "inference / Tab tabs\n{} tok • {:.1} tok/s\n{}\n> {}\nEnlarge to chat",
+                    "inference / Tab tabs\n{} tok • {:.1} tok/s\n{}\n▶ {}\nEnlarge to chat",
                     self.tokens,
                     self.rate(),
                     clean(&self.note),
@@ -935,7 +935,7 @@ impl Chat {
         let tail = super::setup::visible_tail(&input, input_area.width.saturating_sub(4) as usize);
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("> ", accent()),
+                Span::styled("▶ ", accent()),
                 Span::raw(tail),
             ]))
             .block(panel(&title)),

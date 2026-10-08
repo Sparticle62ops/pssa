@@ -1256,7 +1256,7 @@ impl Eval {
         let source = self
             .edit
             .as_deref()
-            .map(|s| format!("Prompt file > {s}  [Enter apply / Esc cancel]"))
+            .map(|s| format!("Prompt file ▶ {s}  [Enter apply / Esc cancel]"))
             .unwrap_or_else(|| {
                 format!(
                     "Prompts: {}",
@@ -1893,7 +1893,7 @@ mod tests {
                 .map(|c| c.symbol())
                 .collect();
             assert!(text.contains("AUTO EVAL / WATCHING"));
-            assert!(text.contains("Prompt file > custom-prompts.json"));
+            assert!(text.contains("Prompt file ▶ custom-prompts.json"));
         }
     }
 
