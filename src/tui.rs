@@ -352,6 +352,11 @@ impl RunState {
         }
         if line.contains("dream phase=end") {
             self.dream_active = false;
+            // Restart the stall clock after the dream so its length is not
+            // charged to the next training update.
+            if self.training_active {
+                self.last_progress_at = Some(Instant::now());
+            }
             self.dream_count = self.dream_count.saturating_add(1);
             self.dream_mode = parse_kv::<String>(line, "mode=").or(self.dream_mode.take());
             self.dream_update = parse_kv(line, "update=").or(self.dream_update);
@@ -740,7 +745,12 @@ impl RunState {
             };
         }
         if let Some(at) = self.last_progress_at {
-            if self.training_active && now.saturating_duration_since(at) > STALL_TIMEOUT {
+            // A dream phase emits no progress lines until it ends, so it must
+            // not count as a stall.
+            if self.training_active
+                && !self.dream_active
+                && now.saturating_duration_since(at) > STALL_TIMEOUT
+            {
                 return HealthStatus {
                     level: HealthLevel::Problem,
                     reason: Some(format!(
@@ -2198,7 +2208,7 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
                 Line::styled("[ awaiting sample ]", accent()),
                 Line::from("Stream HF training into this dashboard:"),
                 Line::from(
-                    "pssa train --hf-dataset OWNER/NAME --no-tui │ pssa tui",
+                    "pssa train --hf-dataset OWNER/NAME --no-tui | pssa tui",
                 ),
             ],
         );
@@ -3643,6 +3653,21 @@ mod tests {
         let health = state.health_status();
         assert_eq!(health.level, HealthLevel::Problem);
         assert!(health.label().contains("no progress line"));
+    }
+
+    #[test]
+    fn dream_phase_does_not_trip_the_stall_check() {
+        let mut state = RunState::default();
+        state.ingest("progress_schema=1");
+        state.ingest("dream phase=start mode=memory update=10");
+        state.last_progress_at = Some(Instant::now() - STALL_TIMEOUT - Duration::from_secs(5));
+        let health = state.health_status();
+        assert_ne!(health.level, HealthLevel::Problem);
+        assert_eq!(health.normal_label, "DREAMING");
+
+        state.ingest("dream phase=end mode=memory update=10 dream_loss=2.5");
+        let health = state.health_status();
+        assert_ne!(health.level, HealthLevel::Problem);
     }
 
     #[test]
