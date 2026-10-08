@@ -18,13 +18,22 @@ fn dataset_telemetry_is_default_and_its_switches_are_value_less_and_exclusive() 
     assert!(pssa::cli::TrainingOptions::default().feed_telemetry);
     for flag in ["--feed-telemetry", "--no-feed-telemetry"] {
         let error = CLIHandler::parse_and_execute(vec![
-            "pssa".into(), "train".into(), flag.into(), "--epochs".into(), "--bogus".into(),
-        ]).unwrap_err();
+            "pssa".into(),
+            "train".into(),
+            flag.into(),
+            "--epochs".into(),
+            "--bogus".into(),
+        ])
+        .unwrap_err();
         assert_eq!(error, "option '--epochs' requires a value", "{flag}");
     }
     let error = CLIHandler::parse_and_execute(vec![
-        "pssa".into(), "train".into(), "--feed-telemetry".into(), "--no-feed-telemetry".into(),
-    ]).unwrap_err();
+        "pssa".into(),
+        "train".into(),
+        "--feed-telemetry".into(),
+        "--no-feed-telemetry".into(),
+    ])
+    .unwrap_err();
     assert!(error.contains("mutually exclusive"));
 }
 
@@ -241,10 +250,16 @@ fn cached_hf_training_emits_real_feed_and_matches_local_checkpoint() {
             .collect::<Vec<_>>()
     );
     assert_eq!(field(local_feed, "feed_snippet"), snippet);
-    assert!(
-        !last.contains("feed_bytes="),
-        "word byte consumption is not exact"
-    );
+    assert_eq!(field(last, "feed_bytes"), field(last, "feed_bytes_total"));
+    assert_eq!(field(local_feed, "feed_bytes"), field(last, "feed_bytes"));
+    // Two epochs of the actual selected input spans, excluding each doc's
+    // final target-only word (including the partial cyclic wrap at EOF).
+    let epoch_bytes = "Four FIVE Six SEVEN Eight NINE".len()
+        + "SHORT".len()
+        + "A Different SIZED Final SAMPLE With EXTRA".len()
+        + "ONE  Two THREE Four FIVE Six SEVEN Eight NINE".len()
+        + "SHORT".len();
+    assert_eq!(field(last, "feed_bytes"), (2 * epoch_bytes).to_string());
     fs::remove_dir_all(root).unwrap();
 }
 

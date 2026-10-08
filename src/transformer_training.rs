@@ -196,7 +196,7 @@ pub fn train_corpus(
                 curve.record(total_tokens, model.step_counter, loss_sum - prior_loss)?;
             }
             let update_loss = (loss_sum - prior_loss) / total_tokens.max(1) as f64;
-            if let Some(feed) = &feed {
+            if let Some(feed) = &mut feed {
                 progress.update_with_feed(
                     update,
                     total_tokens,
