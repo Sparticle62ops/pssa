@@ -122,6 +122,9 @@ pub struct TrainingOptions {
     pub hf_config: Option<String>,
     pub hf_split: String,
     pub hf_field: String,
+    /// Presentation-only source name; run_training sets this from its caller.
+    /// None on the in-memory API is explicitly labeled in-memory corpus.
+    pub dataset_source: Option<String>,
     pub tokenizer: TokenizerKind,
     pub vocab_size: usize,
     /// Continue training from an existing checkpoint instead of fresh initialization.
@@ -174,6 +177,7 @@ impl Default for TrainingOptions {
             hf_config: None,
             hf_split: "train".into(),
             hf_field: "text".into(),
+            dataset_source: None,
             skip_tokens: 0,
             token_cache: None,
             token_cache_source: None,
@@ -524,6 +528,7 @@ impl CLIHandler {
                 .string("--hf-field", "")
                 .unwrap_or("text")
                 .to_string(),
+            dataset_source: None,
             tokenizer,
             vocab_size: parsed.usize_nonzero("--vocab-size", "", 2048)?,
             resume: parsed.string("--resume", "").map(str::to_string),
@@ -671,6 +676,17 @@ impl CLIHandler {
         cache_path: Option<&Path>,
         source_path: Option<&Path>,
     ) -> Result<Vec<Vec<usize>>, String> {
+        Ok(Self::training_window(raw, tokenizer, limit, skip, cache_path, source_path)?.docs)
+    }
+
+    pub(crate) fn training_window(
+        raw: &str,
+        tokenizer: &Tokenizer,
+        limit: Option<usize>,
+        skip: usize,
+        cache_path: Option<&Path>,
+        source_path: Option<&Path>,
+    ) -> Result<token_cache::WindowResult, String> {
         let result = token_cache::documents(raw, tokenizer, limit, skip, cache_path, source_path)?;
         if cache_path.is_some() {
             println!(
@@ -679,7 +695,7 @@ impl CLIHandler {
                 result.elapsed.as_secs_f64()
             );
         }
-        Ok(result.docs)
+        Ok(result)
     }
     fn memory_occupancy(model: &PSSALayerV2) -> Option<(usize, usize)> {
         let banks = std::iter::once(&model.block).chain(model.extra_blocks.iter());
@@ -976,7 +992,7 @@ impl CLIHandler {
         }
         let cache_path = options.token_cache.as_deref().map(Path::new);
         let source_path = options.token_cache_source.as_deref().map(Path::new);
-        let docs = Self::documents_with_cache(
+        let window = Self::training_window(
             raw,
             &tokenizer,
             options.max_tokens,
@@ -984,9 +1000,7 @@ impl CLIHandler {
             cache_path,
             source_path,
         )?;
-        // Feed metadata is derived from the actual selected training window,
-        // never estimated from row lengths. Local training keeps its old path.
-        let mut feed_rows_consumed = 0usize;
+        let docs = &window.docs;
         let chunk_len = if options.resume.is_some() {
             // A checkpoint owns its tape capacity.  Using a fresh CLI default
             // here could make the plan longer than that tape and panic in the
@@ -995,7 +1009,9 @@ impl CLIHandler {
         } else {
             options.chunk
         };
-        let plan = crate::training::sequence_plan(&docs, chunk_len, options.batch_size)?;
+        let plan = crate::training::sequence_plan(docs, chunk_len, options.batch_size)?;
+        let mut feed =
+            crate::training::DatasetFeed::new(raw, &tokenizer, &window, options, plan.len());
         let mut sequence_batch = if options.batch_size > 1 {
             Some(crate::sequence_batch::SequenceBatch::new(
                 &mut model,
@@ -1024,7 +1040,7 @@ impl CLIHandler {
             model.depth(),
             model.loops()
         );
-        crate::training::report_stream(&docs, chunk_len, options.accumulate);
+        crate::training::report_stream(docs, chunk_len, options.accumulate);
         if options.batch_size > 1 {
             crate::training::report_sequence_plan(&plan, options.batch_size);
         }
@@ -1121,6 +1137,7 @@ impl CLIHandler {
             options.resume.as_deref().unwrap_or("-")
         );
         for epoch in 0..options.epochs {
+            feed.begin_epoch(epoch + 1);
             model.reset_recurrent_state();
             if let Some(batch) = &mut sequence_batch {
                 batch.reset_states();
@@ -1248,7 +1265,9 @@ impl CLIHandler {
                         loss_sum += loss as f64 * c.len as f64;
                         token_sum += c.len;
                         offset += c.len;
+                        feed.consume(c.doc, c.start, c.len);
                     }
+                    feed.finish_batch();
                 }
                 let learning_rate = schedule.lr(update + 1)?;
                 let optimizer_trace = crate::training_diagnostics::StageTrace::new(
@@ -1296,7 +1315,10 @@ impl CLIHandler {
                         fresh_task,
                         rng,
                     );
-                    println!("{}", dream_phase_end_line(update, options.dream_mode, &summary));
+                    println!(
+                        "{}",
+                        dream_phase_end_line(update, options.dream_mode, &summary)
+                    );
                 }
                 let finite = {
                     let _trace = crate::training_diagnostics::StageTrace::new(
@@ -1316,45 +1338,14 @@ impl CLIHandler {
                 if let Some(curve) = &mut curve {
                     curve.record(total_tokens, model.step_counter, loss_sum - prior_loss)?;
                 }
-                if let Some(dataset) = options.hf_dataset.as_deref() {
-                    feed_rows_consumed += group
-                        .iter()
-                        .flatten()
-                        .filter(|c| c.start + c.len + 1 == docs[c.doc].len())
-                        .count();
-                    // Decode only a bounded slice, only when the existing logger
-                    // is due (5s piped / 200ms interactive). No extra tokenization
-                    // or work in the forward/backward path.
-                    if progress.should_emit(update) {
-                        let c = group.iter().flatten().last().expect("nonempty update");
-                        let end = c.start + c.len;
-                        let ids = &docs[c.doc][end.saturating_sub(16).max(c.start)..end];
-                        let snippet: String = tokenizer.decode(ids).chars().take(96).collect();
-                        let token_ids = ids
-                            .iter()
-                            .map(usize::to_string)
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        progress.set_feed(
-                            dataset,
-                            options.hf_config.as_deref(),
-                            &options.hf_split,
-                            &options.hf_field,
-                            feed_rows_consumed,
-                            tokens_seen,
-                            c.doc + 1,
-                            &snippet,
-                            &token_ids,
-                        );
-                    }
-                }
                 let update_loss = (loss_sum - prior_loss) / total_tokens.max(1) as f64;
-                progress.update_with_metrics(
+                progress.update_with_feed(
                     update,
                     total_tokens,
                     update_loss,
                     Some(learning_rate),
                     Self::memory_occupancy(&model),
+                    || feed.sample(model.step_counter),
                 );
             }
             progress.finish();
@@ -1421,6 +1412,9 @@ impl CLIHandler {
         };
         let mut run_options = options.clone();
         run_options.checkpoint_path = Some(out.to_string());
+        if run_options.hf_dataset.is_none() {
+            run_options.dataset_source = Some(data.to_string());
+        }
         // Token caching is explicitly opt-in. In particular, do not infer a
         // cache path for local files: omitting --token-cache must retain the
         // historical lazy serial tokenization path.

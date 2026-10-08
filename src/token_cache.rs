@@ -27,8 +27,17 @@ impl CacheStatus {
     }
 }
 
+/// Origins only for the selected documents, not a full-corpus offset map.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DocumentSelection {
+    pub(crate) source_doc: usize,
+    pub(crate) token_start: usize,
+    pub(crate) byte_start: Option<usize>,
+}
+
 pub(crate) struct WindowResult {
     pub(crate) docs: Vec<Vec<usize>>,
+    pub(crate) selections: Vec<DocumentSelection>,
     pub(crate) status: CacheStatus,
     pub(crate) elapsed: Duration,
 }
@@ -60,9 +69,10 @@ pub(crate) fn documents(
         Some(path) => {
             let key = cache_key(raw, tokenizer, source_path);
             if let Some(encoded) = read_cache(path, key, tokenizer.vocab_size) {
-                let docs = select_documents(&encoded, limit, skip)?;
+                let (docs, selections) = select_documents(&encoded, tokenizer, limit, skip)?;
                 WindowResult {
                     docs,
+                    selections,
                     status: CacheStatus::Reused,
                     elapsed: started.elapsed(),
                 }
@@ -77,9 +87,10 @@ pub(crate) fn documents(
                 let encoded = read_cache(path, key, tokenizer.vocab_size).ok_or_else(|| {
                     "token cache could not be read after it was built".to_string()
                 })?;
-                let docs = select_documents(&encoded, limit, skip)?;
+                let (docs, selections) = select_documents(&encoded, tokenizer, limit, skip)?;
                 WindowResult {
                     docs,
+                    selections,
                     status: CacheStatus::Built,
                     elapsed: started.elapsed(),
                 }
@@ -87,9 +98,10 @@ pub(crate) fn documents(
         }
         None => {
             let collected = tokenize_until_window(raw, tokenizer, limit, skip)?;
-            let docs = select_documents(&collected, limit, skip)?;
+            let (docs, selections) = select_documents(&collected, tokenizer, limit, skip)?;
             WindowResult {
                 docs,
+                selections,
                 status: CacheStatus::Disabled,
                 elapsed: started.elapsed(),
             }
@@ -147,9 +159,10 @@ fn tokenize_all_serial(raw: &str, tokenizer: &Tokenizer) -> Result<Vec<Vec<usize
 /// same boundary and cyclic-wrap behavior as the historical implementation.
 fn select_documents(
     encoded: &[Vec<usize>],
+    tokenizer: &Tokenizer,
     limit: Option<usize>,
     skip: usize,
-) -> Result<Vec<Vec<usize>>, String> {
+) -> Result<(Vec<Vec<usize>>, Vec<DocumentSelection>), String> {
     let nonempty: Vec<&[usize]> = encoded
         .iter()
         .map(Vec::as_slice)
@@ -175,11 +188,24 @@ fn select_documents(
     }
 
     let mut docs = Vec::new();
+    let mut selections = Vec::new();
     while remaining > 0 {
         let ids = nonempty[doc_index];
         let take = (ids.len() - offset).min(remaining);
         if take >= 2 {
             docs.push(ids[offset..offset + take].to_vec());
+            let byte_start = if tokenizer.kind() == crate::dataset::TokenizerKind::Bpe {
+                ids[..offset].iter().try_fold(0usize, |sum, &id| {
+                    sum.checked_add(tokenizer.token_bytes(id)?.len())
+                })
+            } else {
+                None
+            };
+            selections.push(DocumentSelection {
+                source_doc: doc_index,
+                token_start: offset,
+                byte_start,
+            });
         }
         remaining -= take;
         doc_index = (doc_index + 1) % nonempty.len();
@@ -191,7 +217,7 @@ fn select_documents(
     if docs.is_empty() {
         Err("dataset has no token transitions in the selected window".into())
     } else {
-        Ok(docs)
+        Ok((docs, selections))
     }
 }
 

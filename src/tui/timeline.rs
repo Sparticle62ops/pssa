@@ -361,6 +361,8 @@ pub(super) struct Timeline {
     last_scan: Option<Instant>,
     refresh: bool,
     note: String,
+    waiting_context: String,
+    live: Option<(Option<u64>, Option<f64>, Option<f64>)>,
 }
 impl Default for Timeline {
     fn default() -> Self {
@@ -372,11 +374,15 @@ impl Default for Timeline {
             last_scan: None,
             refresh: true,
             note: "Open a run to inspect its saved checkpoints. No weights are loaded.".into(),
+            waiting_context: "No run connected; no checkpoint history to inspect.".into(),
+            live: None,
         }
     }
 }
 impl Timeline {
     pub(super) fn poll(&mut self, state: &RunState, visible: bool) {
+        self.waiting_context = state.checkpoint_context();
+        self.live = state.training_active.then_some((state.current_step(), state.live_loss, state.tok_s));
         let root = if state.chain_dir.as_os_str().is_empty() {
             state
                 .last_checkpoint
@@ -463,6 +469,12 @@ impl Timeline {
         }
     }
 
+    pub(super) fn recorded_losses(&self) -> impl Iterator<Item = (String, f64)> + '_ {
+        self.entries.iter().filter_map(|entry| {
+            Some((entry.path.file_name()?.to_string_lossy().into_owned(), entry.metrics.loss?))
+        })
+    }
+
     pub(super) fn key(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
             KeyCode::Left | KeyCode::Up => self.selected = self.selected.saturating_sub(1),
@@ -545,7 +557,7 @@ impl Timeline {
             f.render_widget(block, timeline_area);
             if self.entries.is_empty() {
                 f.render_widget(
-                    Paragraph::new("No saved checkpoints in this run. r refresh"),
+                    Paragraph::new(self.waiting_context.as_str()).wrap(Wrap { trim: false }),
                     inner,
                 );
             } else {
@@ -622,12 +634,15 @@ impl Timeline {
                 ));
             }
         } else {
-            rows.push(Line::from(
-                "History is not recoverable from checkpoint weights.",
-            ));
-            rows.push(Line::from(
-                "Keep train.log / checkpoint-specific .log files beside the checkpoints.",
-            ));
+            rows.push(Line::from(self.waiting_context.clone()));
+            if let Some((step, loss, speed)) = self.live {
+                rows.push(Line::from(format!("Unsaved live run: step {} / loss {} / {} tok/s",
+                    step.map_or("unrecorded".into(), |value| value.to_string()),
+                    loss.map_or("unrecorded".into(), super::charts::number),
+                    speed.map_or("unrecorded".into(), |value| format!("{value:.0}")))));
+                rows.push(Line::from("Live metrics are not checkpoint history until a save event arrives."));
+            }
+            rows.push(Line::from("Keep train.log beside checkpoints; missing history cannot be recovered from weights."));
         }
         rows.push(Line::styled(
             "Enter prepares setup ONLY; review configuration before START.",
@@ -863,6 +878,23 @@ mod tests {
         }
         assert_eq!(timeline.entries.len(), 1);
         assert_eq!(timeline.entries[0].path, wanted);
+    }
+
+    #[test]
+    fn unsaved_timeline_shows_current_run_without_inventing_checkpoint_history() {
+        let mut state = RunState::default();
+        state.ingest("progress_schema=2 updates_total=500 prior_updates=100 checkpoint_target=/tmp/live run/model.pssa");
+        state.ingest("training 120/500 (24%) loss=3 tokens_per_second=90 optimizer_updates=120 global_update=220");
+        let mut timeline = Timeline::default();
+        timeline.poll(&state, false);
+        assert!(timeline.entries.is_empty());
+        assert!(timeline.worker.is_none());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| timeline.draw(f, f.area())).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
+        for expected in ["step 600", "current step 220", "Unsaved live run: step 220", "loss 3", "90 tok/s"] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
     }
 
     #[test]

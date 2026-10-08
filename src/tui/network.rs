@@ -450,7 +450,12 @@ impl Network {
         self.github.poll(tab == GITHUB_TAB);
         self.remote_timeline = remote;
         if !remote {
-            self.timeline.poll(state, tab == TIMELINE_TAB);
+            self.timeline.poll(state, tab == TIMELINE_TAB || tab == 1);
+            for (name, loss) in self.timeline.recorded_losses() {
+                if let Some((_, recorded)) = state.checkpoints.iter_mut().find(|(file, _)| *file == name) {
+                    *recorded = Some(loss);
+                }
+            }
         }
         let started = self.sweep.poll(training, state, busy);
         if started {
