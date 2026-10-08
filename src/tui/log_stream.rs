@@ -279,9 +279,11 @@ impl LogStream {
         }
         lines.reverse();
         if self.history.is_empty() {
-            lines.push(Line::from(
-                "Waiting for complete lines. Partial lines survive append/reconnect.",
-            ));
+            lines.push(Line::from(if self.source.is_empty() {
+                "No cloud log source configured. Local training data is in Monitor and Feed."
+            } else {
+                "Waiting for complete lines. Partial lines survive append/reconnect."
+            }));
         }
         let scroll = wrapped_height.saturating_sub(available).min(u16::MAX as usize) as u16;
         f.render_widget(

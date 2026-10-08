@@ -142,6 +142,7 @@ struct RunState {
     resource_limits: std::cell::RefCell<limits::Limits>,
     loop_count: usize,
     feed: Option<FeedState>,
+    feed_scroll: std::cell::Cell<u16>,
     // header card
     corpus: Option<String>,
     vocab: Option<String>,
@@ -371,6 +372,7 @@ impl RunState {
             self.progress_from = None;
             self.progress_updated_at = None;
             self.feed = None;
+            self.feed_scroll.set(0);
             self.dream_active = false;
             self.dream_count = 0;
             self.dream_mode = None;
@@ -385,8 +387,8 @@ impl RunState {
         if line.contains("dream phase=start") {
             self.dream_active = true;
             self.dream_mode = parse_kv::<String>(line, "mode=");
-            self.dream_update = parse_kv(line, "update=")
-                .or_else(|| parse_kv(line, "global_update="));
+            self.dream_update =
+                parse_kv(line, "update=").or_else(|| parse_kv(line, "global_update="));
         }
         if line.contains("dream phase=end") {
             self.dream_active = false;
@@ -1048,7 +1050,10 @@ fn parse_log_value(line: &str, key: &str) -> Option<String> {
 
 /// Pull `key=value` (or `key value`) numeric pairs out of a line.
 fn parse_kv<T: std::str::FromStr>(line: &str, key: &str) -> Option<T> {
-    let rest = line.split(key).nth(1)?;
+    let (at, _) = line.match_indices(key).find(|(at, _)| {
+        *at == 0 || line[..*at].ends_with(|c: char| c.is_whitespace() || matches!(c, '(' | '│'))
+    })?;
+    let rest = &line[at + key.len()..];
     let token = rest
         .split_whitespace()
         .next()?
@@ -1361,6 +1366,11 @@ fn run_app(
                             }
                         }
                         Some(Action::Preview) => state.preview.toggle(),
+                        Some(Action::FeedScroll(lines)) => state
+                            .feed_scroll
+                            .set(state.feed_scroll.get().saturating_add_signed(lines)),
+                        Some(Action::FeedTop) => state.feed_scroll.set(0),
+                        Some(Action::FeedBottom) => state.feed_scroll.set(u16::MAX),
                         Some(Action::MathScroll(lines)) => state
                             .math_view
                             .scroll
@@ -2225,8 +2235,7 @@ fn draw_with_background(
     let tabs_width = if compact_tabs {
         visible_tabs.iter().map(|tab| tab.len()).sum::<usize>() + visible_tabs.len() - 1
     } else {
-        visible_tabs.iter().map(|tab| tab.len() + 2).sum::<usize>()
-            + (visible_tabs.len() - 1) * 3
+        visible_tabs.iter().map(|tab| tab.len() + 2).sum::<usize>() + (visible_tabs.len() - 1) * 3
     } as u16;
     let nav = Layout::default()
         .direction(Direction::Horizontal)
@@ -2439,9 +2448,12 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
     let (start, end) = state.visible_graph_range();
     if end == 0 {
         let waiting_area = panel_area(f, area);
-        if view == GraphView::Comparison && let Some(error) = &state.comparison_error {
+        if view == GraphView::Comparison
+            && let Some(error) = &state.comparison_error
+        {
             f.render_widget(
-                Paragraph::new(error.as_str()).wrap(Wrap { trim: false })
+                Paragraph::new(error.as_str())
+                    .wrap(Wrap { trim: false })
                     .block(panel(" graph / comparison unavailable ")),
                 waiting_area,
             );
@@ -3220,7 +3232,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .ok_or("invalid preview loops")?;
         return preview::worker(&args[1], loops);
     }
-    if let Some(result) = eval::run_worker(args) { return result; }
+    if let Some(result) = eval::run_worker(args) {
+        return result;
+    }
     // Keep the default useful on a local checkout; Kaggle callers can pass
     // their mounted chain explicitly (the training scripts already do).
     let mut chain_dir = PathBuf::from("chain");
@@ -4324,7 +4338,10 @@ mod tests {
                         pixels.insert((x, y + 1));
                     }
                 } else if cell.fg == NORMAL_GREEN
-                    && cell.symbol().chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+                    && cell
+                        .symbol()
+                        .chars()
+                        .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
                 {
                     dots += 1;
                 }
@@ -4353,7 +4370,11 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(seen.len(), pixels.len(), "boundary has a gap between adjacent pixels");
+            assert_eq!(
+                seen.len(),
+                pixels.len(),
+                "boundary has a gap between adjacent pixels"
+            );
 
             // Connectivity alone would still allow an open arc. Flood-fill the
             // interior in physical half-block pixels: a closed outline must
@@ -4976,6 +4997,35 @@ mod tests {
         state.ingest("progress_schema=2 prior_updates=0 updates_total=200");
         assert_eq!(state.expected_lr_warmup, Some(0));
         assert_eq!(state.expected_lr_total, Some(200));
+    }
+
+    #[test]
+    fn metric_keys_never_match_another_fields_suffix() {
+        assert_eq!(
+            parse_kv::<f64>("loss_average=9 dream_loss=8 loss=3", "loss="),
+            Some(3.0)
+        );
+        assert_eq!(
+            parse_kv::<u64>("feed_tokens=90 epoch_tokens=10 tokens=5", "tokens="),
+            Some(5)
+        );
+        assert_eq!(
+            parse_kv::<u64>("feed_step=20 skipped_updates=7 updates=4", "updates="),
+            Some(4)
+        );
+        assert_eq!(
+            parse_kv::<f64>("(base 0.00100000, horizon 100)", "base "),
+            Some(0.001)
+        );
+        let mut state = RunState::default();
+        state.ingest("training 1/10 (10%) loss_average=9 loss=3 tokens_per_second=90 optimizer_updates=1 global_update=1");
+        state.ingest("dream phase=end update=1 mode=memory dream_loss=NaN");
+        assert_eq!(state.live_loss, Some(3.0));
+        assert_eq!(state.loss_average, Some(9.0));
+        assert!(
+            state.problem.is_none(),
+            "unreported training loss must not become dream loss"
+        );
     }
 
     #[test]

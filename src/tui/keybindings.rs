@@ -90,6 +90,7 @@ pub(super) enum Context {
     Network,
     NetworkEdit,
     Timeline,
+    Feed,
 }
 impl Context {
     fn mask(self) -> u32 {
@@ -99,6 +100,7 @@ impl Context {
     pub(super) fn for_tab(tab: usize, editing: bool) -> Self {
         match tab {
             0 => Self::Monitor,
+            3 => Self::Feed,
             4 => Self::Chat,
             5 if editing => Self::SetupEdit,
             5 => Self::Setup,
@@ -148,10 +150,11 @@ const EXTRA_BROWSE: u32 = KAGGLE_BUSY | MEMORY | RUNS | BENCHMARK;
 const EXTRA: u32 = EXTRA_EDIT | EXTRA_BROWSE;
 const SAMPLE: u32 = 1 << Context::Sample as u32;
 const MATH: u32 = 1 << Context::Math as u32;
+const FEED: u32 = 1 << Context::Feed as u32;
 const DEVICE: u32 = 1 << Context::Device as u32;
 const LIMITS: u32 = 1 << Context::Limits as u32;
 const LIMIT_EDIT: u32 = 1 << Context::LimitsEdit as u32;
-const PAGES: u32 = DASHBOARD | SAMPLE | MATH | DEVICE | LIMITS;
+const PAGES: u32 = DASHBOARD | SAMPLE | MATH | DEVICE | LIMITS | FEED;
 const LIBRARY: u32 = 1 << Context::Library as u32;
 const LIBRARY_EDIT: u32 = 1 << Context::LibraryEdit as u32;
 const MIXER: u32 = 1 << Context::Mixer as u32;
@@ -162,8 +165,7 @@ const LOCAL_EDIT: u32 = LIBRARY_EDIT | EVAL_EDIT;
 const NETWORK: u32 = 1 << Context::Network as u32;
 const NETWORK_EDIT: u32 = 1 << Context::NetworkEdit as u32;
 const TIMELINE: u32 = 1 << Context::Timeline as u32;
-const BROWSE: u32 =
-    MONITOR | PAGES | SETUP | EXTRA_BROWSE | LOCAL_BROWSE | NETWORK | TIMELINE;
+const BROWSE: u32 = MONITOR | PAGES | SETUP | EXTRA_BROWSE | LOCAL_BROWSE | NETWORK | TIMELINE;
 const ALL: u32 = BROWSE
     | CHAT
     | EDIT
@@ -194,6 +196,9 @@ pub(super) enum Action {
     MathScroll(i16),
     MathTop,
     MathBottom,
+    FeedScroll(i16),
+    FeedTop,
+    FeedBottom,
     Device,
     Limits,
     Local,
@@ -267,8 +272,8 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('='), "=", "Monitor: zoom in; mixer: increase share", MONITOR => Zoom(true), MIXER => Local),
     bind!(Char('-'), "-", "Monitor: zoom out; setup: decrease depth/loops; mixer: decrease share", MONITOR => Zoom(false), SETUP => Setup, MIXER => Local),
     bind!(Char('0'), "0", "Monitor: reset graph navigation", MONITOR => ResetGraph),
-    bind!(Up, "Up", "Setup/runs/benchmark/palette/devices/limits/local/network: previous item; math/help: scroll up", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(-1), HELP => ScrollHelp(-1)),
-    bind!(Down, "Down", "Setup/runs/benchmark/palette/devices/limits/local/network: next item; math/help: scroll down", SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(1), HELP => ScrollHelp(1)),
+    bind!(Up, "Up", "Setup/runs/benchmark/palette/devices/limits/local/network: previous item; feed/math/help: scroll up", FEED => FeedScroll(-1), SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(-1), HELP => ScrollHelp(-1)),
+    bind!(Down, "Down", "Setup/runs/benchmark/palette/devices/limits/local/network: next item; feed/math/help: scroll down", FEED => FeedScroll(1), SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(1), HELP => ScrollHelp(1)),
     bind!(BackTab, "Shift+Tab", "Setup: previous wizard page", SETUP => Setup),
     bind!(F(5), "F5", "Setup: next wizard page", SETUP => Setup),
     bind!(Char('c'), "c", "Setup: command preview; runs/library: chat with checkpoint; network/timeline: open or copy", SETUP => Setup, RUNS => Extras, LIBRARY => Local, NETWORK | TIMELINE => Network),
@@ -289,10 +294,10 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('a'), "a", "Eval: pause/resume background checkpoint evaluation", EVAL => Local),
     bind!(Char('u'), "u", "Library: fill Setup Resume from selected checkpoint", LIBRARY => Local),
     bind!(Char('t'), "t", "Library: fill Setup Dataset (converts JSONL/Parquet off-thread)", LIBRARY => Local),
-    bind!(PageUp, "PgUp", "Chat/setup preview/memory/local/network/math/help: scroll up", CHAT => Chat, SETUP => Setup, MEMORY => Extras, EVAL => Local, NETWORK => Network, MATH => MathScroll(-8), HELP => ScrollHelp(-8)),
-    bind!(PageDown, "PgDn", "Chat/setup preview/memory/local/network/math/help: scroll down", CHAT => Chat, SETUP => Setup, MEMORY => Extras, EVAL => Local, NETWORK => Network, MATH => MathScroll(8), HELP => ScrollHelp(8)),
-    bind!(Home, "Home", "Math/help: first line; devices/limits/network: first field; timeline: first checkpoint", HELP => HelpTop, MATH => MathTop, DEVICE => Device, LIMITS => Limits, NETWORK | TIMELINE => Network),
-    bind!(End, "End", "Chat: follow; math/help: last line; devices/limits/network: last field", CHAT => Chat, HELP => HelpBottom, MATH => MathBottom, DEVICE => Device, LIMITS => Limits, NETWORK | TIMELINE => Network),
+    bind!(PageUp, "PgUp", "Chat/setup preview/memory/local/network/feed/math/help: scroll up", FEED => FeedScroll(-8), CHAT => Chat, SETUP => Setup, MEMORY => Extras, EVAL => Local, NETWORK => Network, MATH => MathScroll(-8), HELP => ScrollHelp(-8)),
+    bind!(PageDown, "PgDn", "Chat/setup preview/memory/local/network/feed/math/help: scroll down", FEED => FeedScroll(8), CHAT => Chat, SETUP => Setup, MEMORY => Extras, EVAL => Local, NETWORK => Network, MATH => MathScroll(8), HELP => ScrollHelp(8)),
+    bind!(Home, "Home", "Feed/math/help: first line; devices/limits/network: first field; timeline: first checkpoint", FEED => FeedTop, HELP => HelpTop, MATH => MathTop, DEVICE => Device, LIMITS => Limits, NETWORK | TIMELINE => Network),
+    bind!(End, "End", "Chat: follow; feed/math/help: last line; devices/limits/network: last field", FEED => FeedBottom, CHAT => Chat, HELP => HelpBottom, MATH => MathBottom, DEVICE => Device, LIMITS => Limits, NETWORK | TIMELINE => Network),
     bind!(Enter, "Enter", "Chat: send; setup: edit/save/start; HF: login; Kaggle: review; runs: monitor/score; benchmark/local/network: edit/save/open; palette: execute; devices/limits: select/edit/apply; timeline: prepare resume", CHAT => Chat, SETUP | EDIT => Setup, HF => Hf, KAGGLE_INPUT | RUNS | RUNS_EDIT | BENCHMARK | BENCHMARK_EDIT => Extras, PALETTE => Palette, DEVICE => Device, LIMITS | LIMIT_EDIT => Limits, LOCAL_BROWSE | LOCAL_EDIT => Local, NETWORK | NETWORK_EDIT | TIMELINE => Network),
     bind!(Char(' '), "Space", "Setup/devices/limits: activate selected field/button; text editors: type space", SETUP => Setup, DEVICE => Device, LIMITS => Limits),
     bind!(Backspace, "Backspace", "Text editors/palette", CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA_EDIT => Extras, PALETTE => Palette, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, NETWORK_EDIT => Network),
@@ -579,7 +584,7 @@ mod tests {
             (0, "monitor", Context::Monitor, Context::Monitor),
             (1, "chain", Context::Dashboard, Context::Dashboard),
             (2, "model", Context::Dashboard, Context::Dashboard),
-            (3, "feed", Context::Dashboard, Context::Dashboard),
+            (3, "feed", Context::Feed, Context::Feed),
             (4, "inference", Context::Chat, Context::Chat),
             (5, "setup", Context::Setup, Context::SetupEdit),
             (HF_TAB, "HF login", Context::HfInput, Context::HfInput),
@@ -607,7 +612,12 @@ mod tests {
             (MATH_TAB, "math", Context::Math, Context::Math),
             (DEVICE_TAB, "devices", Context::Device, Context::Device),
             (LIMITS_TAB, "limits", Context::Limits, Context::LimitsEdit),
-            (LIBRARY_TAB, "library", Context::Library, Context::LibraryEdit),
+            (
+                LIBRARY_TAB,
+                "library",
+                Context::Library,
+                Context::LibraryEdit,
+            ),
             (MIXER_TAB, "mixer", Context::Mixer, Context::Mixer),
             (EVAL_TAB, "eval", Context::Eval, Context::EvalEdit),
             (
@@ -667,7 +677,7 @@ mod tests {
                 .fold(0, |mask, context| mask | context.mask()),
             ALL
         );
-        assert_eq!(ALL.count_ones(), 28);
+        assert_eq!(ALL.count_ones(), 29);
         for context in contexts {
             for binding in BINDINGS {
                 let matching: Vec<_> = BINDINGS
@@ -720,7 +730,11 @@ mod tests {
                 vec![Char('y'), Char('Y'), Char('n'), Char('N'), Esc],
                 Extras,
             ),
-            (Context::Memory, vec![Char('r'), Char('v'), PageUp, PageDown], Extras),
+            (
+                Context::Memory,
+                vec![Char('r'), Char('v'), PageUp, PageDown],
+                Extras,
+            ),
             (
                 Context::Runs,
                 vec![Up, Down, Enter, Char('c'), Char('s'), Char('r'), Esc],
