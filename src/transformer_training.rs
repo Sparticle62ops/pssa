@@ -84,7 +84,9 @@ pub fn train_corpus(
     )?;
     let docs = &window.docs;
     let plan = chunk_plan(docs, model.cfg.chunk_len);
-    let mut feed = DatasetFeed::new(raw, &tokenizer, &window, opts, plan.len());
+    let mut feed = opts
+        .feed_telemetry
+        .then(|| DatasetFeed::new(raw, &tokenizer, &window, opts, plan.len()));
     let schedule = Schedule::new_with_warmup(
         plan.len(),
         model.step_counter,
@@ -158,7 +160,9 @@ pub fn train_corpus(
     );
     println!("last_checkpoint={}", opts.resume.as_deref().unwrap_or("-"));
     for epoch in 0..opts.epochs {
-        feed.begin_epoch(epoch + 1);
+        if let Some(feed) = &mut feed {
+            feed.begin_epoch(epoch + 1);
+        }
         let mut loss_sum = 0.0f64;
         let mut token_sum = 0usize;
         for group in plan.chunks(opts.accumulate) {
@@ -176,8 +180,10 @@ pub fn train_corpus(
                 model.backward_chunk(len, len as f32 / total_tokens as f32);
                 loss_sum += loss as f64 * len as f64;
                 token_sum += len;
-                feed.consume(doc, start, len);
-                feed.finish_batch();
+                if let Some(feed) = &mut feed {
+                    feed.consume(doc, start, len);
+                    feed.finish_batch();
+                }
             }
             update += 1;
             let learning_rate = schedule.lr(update)?;
@@ -190,14 +196,24 @@ pub fn train_corpus(
                 curve.record(total_tokens, model.step_counter, loss_sum - prior_loss)?;
             }
             let update_loss = (loss_sum - prior_loss) / total_tokens.max(1) as f64;
-            progress.update_with_feed(
-                update,
-                total_tokens,
-                update_loss,
-                Some(learning_rate),
-                None,
-                || feed.sample(model.step_counter),
-            );
+            if let Some(feed) = &feed {
+                progress.update_with_feed(
+                    update,
+                    total_tokens,
+                    update_loss,
+                    Some(learning_rate),
+                    None,
+                    || feed.sample(model.step_counter),
+                );
+            } else {
+                progress.update_with_metrics(
+                    update,
+                    total_tokens,
+                    update_loss,
+                    Some(learning_rate),
+                    None,
+                );
+            }
         }
         progress.finish();
         println!(

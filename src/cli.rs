@@ -125,6 +125,9 @@ pub struct TrainingOptions {
     /// Presentation-only source name; run_training sets this from its caller.
     /// None on the in-memory API is explicitly labeled in-memory corpus.
     pub dataset_source: Option<String>,
+    /// Bounded input telemetry, enabled by default for live and piped TUI runs.
+    /// Disabling it is presentation-only; no model/checkpoint state changes.
+    pub feed_telemetry: bool,
     pub tokenizer: TokenizerKind,
     pub vocab_size: usize,
     /// Continue training from an existing checkpoint instead of fresh initialization.
@@ -178,6 +181,7 @@ impl Default for TrainingOptions {
             hf_split: "train".into(),
             hf_field: "text".into(),
             dataset_source: None,
+            feed_telemetry: true,
             skip_tokens: 0,
             token_cache: None,
             token_cache_source: None,
@@ -238,7 +242,10 @@ impl Parsed {
                 // Boolean switches are deliberately explicit rather than
                 // accepting arbitrary valueless options.  Keep the existing
                 // value-taking parser for every other flag.
-                if arg == "--no-tui" {
+                if matches!(
+                    arg.as_str(),
+                    "--no-tui" | "--feed-telemetry" | "--no-feed-telemetry"
+                ) {
                     if flags.insert(arg.clone(), "true".into()).is_some() {
                         return Err(format!("option '{arg}' was specified more than once"));
                     }
@@ -372,6 +379,8 @@ pub(crate) fn parse_train_options_for_test(args: &[String]) -> Result<TrainingOp
         "--loss-every",
         "--tokens-seen",
         "--no-tui",
+        "--feed-telemetry",
+        "--no-feed-telemetry",
         "--threads",
         "--ram-mib",
         "--batch-size",
@@ -529,6 +538,7 @@ impl CLIHandler {
                 .unwrap_or("text")
                 .to_string(),
             dataset_source: None,
+            feed_telemetry: !parsed.flags.contains_key("--no-feed-telemetry"),
             tokenizer,
             vocab_size: parsed.usize_nonzero("--vocab-size", "", 2048)?,
             resume: parsed.string("--resume", "").map(str::to_string),
@@ -547,6 +557,11 @@ impl CLIHandler {
             no_tui: parsed.flags.contains_key("--no-tui"),
             checkpoint_path: None,
         };
+        if parsed.flags.contains_key("--feed-telemetry")
+            && parsed.flags.contains_key("--no-feed-telemetry")
+        {
+            return Err("--feed-telemetry and --no-feed-telemetry are mutually exclusive".into());
+        }
         if x.loss_csv.is_none()
             && (parsed.flags.contains_key("--loss-every") || x.tokens_seen.is_some())
         {
@@ -1010,8 +1025,9 @@ impl CLIHandler {
             options.chunk
         };
         let plan = crate::training::sequence_plan(docs, chunk_len, options.batch_size)?;
-        let mut feed =
-            crate::training::DatasetFeed::new(raw, &tokenizer, &window, options, plan.len());
+        let mut feed = options.feed_telemetry.then(|| {
+            crate::training::DatasetFeed::new(raw, &tokenizer, &window, options, plan.len())
+        });
         let mut sequence_batch = if options.batch_size > 1 {
             Some(crate::sequence_batch::SequenceBatch::new(
                 &mut model,
@@ -1137,7 +1153,9 @@ impl CLIHandler {
             options.resume.as_deref().unwrap_or("-")
         );
         for epoch in 0..options.epochs {
-            feed.begin_epoch(epoch + 1);
+            if let Some(feed) = &mut feed {
+                feed.begin_epoch(epoch + 1);
+            }
             model.reset_recurrent_state();
             if let Some(batch) = &mut sequence_batch {
                 batch.reset_states();
@@ -1265,11 +1283,15 @@ impl CLIHandler {
                         loss_sum += loss as f64 * c.len as f64;
                         token_sum += c.len;
                         offset += c.len;
-                        feed.consume(c.doc, c.start, c.len);
+                        if let Some(feed) = &mut feed {
+                            feed.consume(c.doc, c.start, c.len);
+                        }
                     }
-                    feed.finish_batch();
+                    if let Some(feed) = &mut feed {
+                        feed.finish_batch();
+                    }
                 }
-                if feed.inputs_complete() {
+                if feed.as_ref().is_some_and(|feed| feed.inputs_complete()) {
                     progress.report_final_inputs();
                 }
                 let learning_rate = schedule.lr(update + 1)?;
@@ -1288,14 +1310,26 @@ impl CLIHandler {
                             skipped.record(norm, model.step_counter)?;
                             progress.set_gradient_metrics(norm, skipped.total);
                             tokens_seen += total_tokens;
-                            progress.update_with_feed(
-                                update,
-                                total_tokens,
-                                (loss_sum - prior_loss) / total_tokens.max(1) as f64,
-                                None,
-                                Self::memory_occupancy(&model),
-                                || feed.sample(model.step_counter),
-                            );
+                            let update_loss = (loss_sum - prior_loss) / total_tokens.max(1) as f64;
+                            let memory = Self::memory_occupancy(&model);
+                            if let Some(feed) = &feed {
+                                progress.update_with_feed(
+                                    update,
+                                    total_tokens,
+                                    update_loss,
+                                    None,
+                                    memory,
+                                    || feed.sample(model.step_counter),
+                                );
+                            } else {
+                                progress.update_with_metrics(
+                                    update,
+                                    total_tokens,
+                                    update_loss,
+                                    None,
+                                    memory,
+                                );
+                            }
                             // Inputs were consumed, but neither Adam nor the LR
                             // schedule advances. The next group gets clean grads.
                             continue;
@@ -1352,14 +1386,25 @@ impl CLIHandler {
                     curve.record(total_tokens, model.step_counter, loss_sum - prior_loss)?;
                 }
                 let update_loss = (loss_sum - prior_loss) / total_tokens.max(1) as f64;
-                progress.update_with_feed(
-                    update,
-                    total_tokens,
-                    update_loss,
-                    Some(learning_rate),
-                    Self::memory_occupancy(&model),
-                    || feed.sample(model.step_counter),
-                );
+                let memory = Self::memory_occupancy(&model);
+                if let Some(feed) = &feed {
+                    progress.update_with_feed(
+                        update,
+                        total_tokens,
+                        update_loss,
+                        Some(learning_rate),
+                        memory,
+                        || feed.sample(model.step_counter),
+                    );
+                } else {
+                    progress.update_with_metrics(
+                        update,
+                        total_tokens,
+                        update_loss,
+                        Some(learning_rate),
+                        memory,
+                    );
+                }
             }
             progress.finish();
             model.ema_consolidate_plasticity();
@@ -2127,6 +2172,7 @@ impl CLIHandler {
         );
         println!("    --tokens-seen N  offset for a new CSV on resume (existing CSV restores it)");
         println!("    --no-tui         disable cursor updates; keep plain progress logs");
+        println!("    --no-feed-telemetry  omit bounded dataset windows (enabled by default)");
         println!();
         println!("  {}", ui::bold("GENERATE"));
         println!(
@@ -2322,6 +2368,9 @@ impl CLIHandler {
                 );
                 println!(
                     "      --no-tui                   disable cursor updates; keep plain progress logs"
+                );
+                println!(
+                    "      --no-feed-telemetry        omit dataset windows (enabled by default)"
                 );
                 println!();
                 println!("Example:");

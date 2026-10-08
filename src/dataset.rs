@@ -470,6 +470,63 @@ impl Tokenizer {
         }
     }
 
+    /// Decode only a display-sized prefix. In particular, do not first join
+    /// arbitrarily long word labels or BPE pieces and truncate afterwards.
+    pub(crate) fn decode_prefix(&self, ids: &[usize], max_chars: usize) -> String {
+        match &self.backend {
+            TokenizerBackend::Word => {
+                let mut out = String::new();
+                let mut remaining = max_chars;
+                for &id in ids {
+                    let Some(token) = self.id_to_token.get(&id) else {
+                        continue;
+                    };
+                    if !out.is_empty() && !matches!(token.as_str(), "." | "," | "?" | "!") {
+                        if remaining == 0 {
+                            break;
+                        }
+                        out.push(' ');
+                        remaining -= 1;
+                    }
+                    for c in token.chars().take(remaining) {
+                        out.push(c);
+                        remaining -= 1;
+                    }
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+                out
+            }
+            TokenizerBackend::Bpe(backend) => {
+                // Four bytes suffice for any Unicode scalar. ByteLevel's
+                // fallback decoder is UTF-8-lossy, including split characters.
+                let byte_limit = max_chars.saturating_mul(4);
+                let mut bytes = Vec::new();
+                for &id in ids {
+                    if self
+                        .id_to_token
+                        .get(&id)
+                        .is_some_and(|token| backend.get_added_vocabulary().is_special_token(token))
+                    {
+                        continue;
+                    }
+                    if let Some(piece) = self.token_bytes(id) {
+                        let take = piece.len().min(byte_limit - bytes.len());
+                        bytes.extend_from_slice(&piece[..take]);
+                    }
+                    if bytes.len() == byte_limit {
+                        break;
+                    }
+                }
+                String::from_utf8_lossy(&bytes)
+                    .chars()
+                    .take(max_chars)
+                    .collect()
+            }
+        }
+    }
+
     /// Find source text for a word-token window without re-encoding a line or
     /// pretending that lowercase/cleaned vocabulary labels are raw text. The
     /// span includes ignored characters between tokens, but not leading or
@@ -1337,6 +1394,32 @@ impl DatasetManager {
 #[cfg(test)]
 mod source_span_tests {
     use super::*;
+
+    #[test]
+    fn bounded_decode_matches_full_decode_prefix_for_words_and_byte_pieces() {
+        let raw = format!("{}, é😀 tail!", "界".repeat(10_000));
+        for tokenizer in [
+            Tokenizer::from_corpus(&raw, true).unwrap(),
+            Tokenizer::from_corpus_bpe(&raw, 280).unwrap(),
+        ] {
+            let ids = tokenizer.encode(&raw, true);
+            for start in 0..ids.len().min(8) {
+                let window = &ids[start..];
+                for limit in [0, 1, 2, 7, 256] {
+                    assert_eq!(
+                        tokenizer.decode_prefix(window, limit),
+                        tokenizer
+                            .decode(window)
+                            .chars()
+                            .take(limit)
+                            .collect::<String>(),
+                        "kind={:?} start={start} limit={limit}",
+                        tokenizer.kind()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn word_source_spans_match_encoder_boundaries_without_normalizing_source() {

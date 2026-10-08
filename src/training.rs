@@ -104,6 +104,15 @@ pub fn report_stream(docs: &[Vec<usize>], chunk: usize, accumulate: usize) {
     println!("token_stream_fnv1a64={hash:016x} chunk={chunk} accumulate={accumulate}");
 }
 
+fn bounded_feed_label(text: &str, limit: usize) -> String {
+    let mut chars = text.chars();
+    let mut label: String = chars.by_ref().take(limit).collect();
+    if chars.next().is_some() {
+        label.push('…');
+    }
+    label
+}
+
 /// Source views and counters are selected-document-sized. No corpus is
 /// re-tokenized for telemetry, and only `sample` (behind Progress::should_emit)
 /// allocates per-event strings. This never owns or mutates the training plan.
@@ -296,10 +305,7 @@ impl<'a> DatasetFeed<'a> {
         });
         let (snippet, text_kind) = match raw {
             Some(text) => (text.chars().take(256).collect(), "raw"),
-            None => (
-                self.tokenizer.decode(ids).chars().take(256).collect(),
-                "decoded",
-            ),
+            None => (self.tokenizer.decode_prefix(ids, 256), "decoded"),
         };
         let token_ids = ids
             .iter()
@@ -311,27 +317,28 @@ impl<'a> DatasetFeed<'a> {
         // exceed the reader's field limit. IDs remain exact; ellipsis is explicit.
         let pieces: Vec<_> = ids
             .iter()
-            .map(|id| {
-                let mut chars = self.tokenizer.id_to_token[id].chars();
-                let mut piece: String = chars.by_ref().take(32).collect();
-                if chars.next().is_some() {
-                    piece.push('…');
-                }
-                piece
-            })
+            .map(|id| bounded_feed_label(&self.tokenizer.id_to_token[id], 32))
             .collect();
         let hf = self.opts.hf_dataset.is_some();
         crate::ui::FeedSample {
-            dataset: self
-                .opts
-                .hf_dataset
-                .as_deref()
-                .or(self.opts.dataset_source.as_deref())
-                .unwrap_or("in-memory corpus")
-                .to_string(),
-            config: hf.then(|| self.opts.hf_config.clone()).flatten(),
-            split: hf.then(|| self.opts.hf_split.clone()),
-            field: hf.then(|| self.opts.hf_field.clone()),
+            dataset: bounded_feed_label(
+                self.opts
+                    .hf_dataset
+                    .as_deref()
+                    .or(self.opts.dataset_source.as_deref())
+                    .unwrap_or("in-memory corpus"),
+                256,
+            ),
+            config: hf
+                .then(|| {
+                    self.opts
+                        .hf_config
+                        .as_deref()
+                        .map(|text| bounded_feed_label(text, 256))
+                })
+                .flatten(),
+            split: hf.then(|| bounded_feed_label(&self.opts.hf_split, 256)),
+            field: hf.then(|| bounded_feed_label(&self.opts.hf_field, 256)),
             snippet,
             token_ids,
             token_pieces: serde_json::to_string(&pieces).expect("string array is serializable"),
@@ -636,6 +643,47 @@ mod feed_tests {
             tokenizer.encode(&raw, true),
             "telemetry cannot mutate inputs"
         );
+    }
+
+    #[test]
+    fn source_metadata_is_bounded_before_json_and_percent_encoding() {
+        let raw = "Alpha BETA gamma";
+        let tokenizer = Tokenizer::from_corpus(raw, true).unwrap();
+        let window = token_cache::documents(raw, &tokenizer, None, 0, None, None).unwrap();
+        let oversized = "😀".repeat(10_000);
+        for hf in [false, true] {
+            let opts = TrainingOptions {
+                dataset_source: Some(oversized.clone()),
+                hf_dataset: hf.then(|| oversized.clone()),
+                hf_config: hf.then(|| oversized.clone()),
+                hf_split: oversized.clone(),
+                hf_field: oversized.clone(),
+                ..Default::default()
+            };
+            let mut feed = DatasetFeed::new(raw, &tokenizer, &window, &opts, 1);
+            feed.begin_epoch(1);
+            feed.consume(0, 0, 2);
+            feed.finish_batch();
+            let sample = feed.sample(1);
+            for label in [
+                Some(&sample.dataset),
+                sample.config.as_ref(),
+                sample.split.as_ref(),
+                sample.field.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert_eq!(label.chars().count(), 257);
+                assert!(label.ends_with('…'));
+                assert!(crate::ui::encode_log_value(label).len() < 4096);
+            }
+            if !hf {
+                assert_eq!(sample.config, None);
+                assert_eq!(sample.split, None);
+                assert_eq!(sample.field, None);
+            }
+        }
     }
 
     #[test]

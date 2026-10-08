@@ -162,13 +162,18 @@ fn associate(
     let mut target_seen = false;
     let mut finished = false;
     let mut explicit = false;
+    let mut save_confirmation_required = false;
     for raw in lines {
         if raw.len() > MAX_LINE {
             continue;
         }
         let line = clean(&raw);
         let line = line.trim();
-        if field(line, "progress_schema").is_some() {
+        if let Some(schema) = field(line, "progress_schema") {
+            // Modern trainers always confirm saves explicitly. A completion
+            // summary precedes the save and cannot prove an existing file was
+            // replaced (the save may fail or the log may end here).
+            save_confirmation_required = schema != "1";
             target = None;
             target_seen = false;
             finished = false;
@@ -197,7 +202,7 @@ fn associate(
         // `last_checkpoint=` on progress refers to the PREVIOUS save; never
         // attach that progress sample to it or interpolate missing history.
     }
-    if !finished || explicit {
+    if !finished || explicit || save_confirmation_required {
         return;
     }
     // A finished, checkpoint-specific legacy log is an honest fallback, not
@@ -817,6 +822,26 @@ mod tests {
         );
         assert_eq!(result.entries[0].metrics.loss, Some(3.0));
         assert_eq!(result.entries[0].metrics.speed, Some(30.0));
+    }
+
+    #[test]
+    fn modern_completion_without_save_confirmation_never_labels_an_old_checkpoint() {
+        let fixture = Fixture::new();
+        let model = fixture.checkpoint("model.pssa");
+        for ending in ["", "save failed: disk full\n"] {
+            fs::write(fixture.0.join("train.log"), format!(
+                "progress_schema=2 prior_updates=0 checkpoint_target={}\nloss=2 tokens_per_second=50 global_update=10\ntraining_seconds=1\n{ending}", model.display()
+            )).unwrap();
+            let result = scan(&fixture.0, vec![]);
+            let entry = &result.entries[0];
+            assert!(entry.metrics.loss.is_none());
+            assert!(entry.metrics.update.is_none());
+            assert!(entry.source.is_none());
+        }
+        fs::write(fixture.0.join("train.log"), format!(
+            "progress_schema=2 checkpoint_target={}\nloss=2 tokens_per_second=50 global_update=10\ntraining_seconds=1\nsaved_checkpoint={}\n", model.display(), model.display()
+        )).unwrap();
+        assert_eq!(scan(&fixture.0, vec![]).entries[0].metrics.loss, Some(2.0));
     }
 
     #[test]

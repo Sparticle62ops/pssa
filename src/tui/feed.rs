@@ -50,7 +50,12 @@ fn number(line: &str, key: &str) -> Option<u64> {
 impl FeedState {
     pub(super) fn parse(line: &str) -> Option<Self> {
         let dataset = parse_log_value(line, "feed_dataset")?;
-        let schema = number(line, "feed_schema");
+        let schema = line
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("feed_schema="))
+            .map(str::parse::<u64>)
+            .transpose()
+            .ok()?;
         if schema.is_some_and(|schema| schema != 2) {
             return None;
         }
@@ -213,7 +218,9 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &RunState) {
     let Some(feed) = &state.feed else {
         let mut lines = vec![
             Line::styled("Waiting for dataset telemetry", accent()),
-            Line::from(if state.training_active {
+            Line::from(if !state.metric_series.is_empty() {
+                "Progress received without a valid window; producer/log may predate dataset telemetry."
+            } else if state.training_active {
                 "Training connected; first sampled window arrives with the first progress event."
             } else {
                 "Start training in Setup, or pipe a real training log:"
@@ -261,7 +268,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &RunState) {
         )));
         if feed.source_start.is_some() {
             lines.push(Line::from(format!(
-                "Dataset row {} / source tokens {}..{} / skip {} (EOF wrap)",
+                "Dataset row {} / source tokens {}..{} / skip {} (offset wraps at EOF)",
                 value(feed.source_row),
                 value(feed.source_start),
                 value(feed.source_end),
@@ -321,10 +328,18 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &RunState) {
             at.elapsed().as_secs_f64()
         ))
     )));
+    let block = panel(" dataset feed / real text → tokens / PgUp/Dn scroll ");
+    let inner = block.inner(area);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let max_scroll = paragraph
+        .line_count(inner.width)
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    state
+        .feed_scroll
+        .set(state.feed_scroll.get().min(max_scroll));
     f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(panel(" dataset feed / real text → tokens ")),
+        paragraph.scroll((state.feed_scroll.get(), 0)).block(block),
         area,
     );
 }
@@ -437,6 +452,10 @@ mod tests {
         let mut state = RunState::default();
         state.ingest(&event());
         for (field, damage) in [
+            ("feed_schema=2", "feed_schema=bad"),
+            ("feed_schema=2", "feed_schema=3"),
+            ("feed_schema=2", "feed_schema=%ZZ"),
+            ("feed_schema=2", "feed_schema="),
             ("feed_epoch_total=32", "feed_epoch_total=0"),
             ("feed_epoch_tokens=16", "feed_epoch_tokens=33"),
             ("feed_row=2", "feed_row=0"),
@@ -500,6 +519,59 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn full_feed_shell_scrolls_to_every_pair_without_inventing_positions() {
+        use super::super::keybindings::{self, Action, Context};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let ids = (1..=16)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let pieces: Vec<_> = (1..=16)
+            .map(|n| format!("a_long_real_vocabulary_piece_{n}"))
+            .collect();
+        let line = event()
+            .replace("feed_start=12 feed_end=14", "feed_start=0 feed_end=16")
+            .replace("feed_source_end=114", "feed_source_end=128")
+            .replace("7%2C9", &encode_log_value(&ids))
+            .replace(
+                &encode_log_value(r#"["héllo","世界"]"#),
+                &encode_log_value(&serde_json::to_string(&pieces).unwrap()),
+            );
+        let mut state = RunState::default();
+        state.ingest(&line);
+        assert_eq!(Context::for_tab(3, false), Context::Feed);
+        for (key, expected) in [
+            (KeyCode::Down, Action::FeedScroll(1)),
+            (KeyCode::PageDown, Action::FeedScroll(8)),
+            (KeyCode::Home, Action::FeedTop),
+            (KeyCode::End, Action::FeedBottom),
+        ] {
+            assert_eq!(
+                keybindings::action(KeyEvent::new(key, KeyModifiers::NONE), Context::Feed),
+                Some(expected)
+            );
+        }
+        for (w, h) in [(80, 24), (60, 20), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            state.feed_scroll.set(0);
+            terminal.draw(|f| super::super::draw(f, &state, 3)).unwrap();
+            let top = rendered_text(&terminal);
+            assert!(top.contains("50.00%"), "{w}x{h}: {top}");
+            state.feed_scroll.set(u16::MAX);
+            terminal.draw(|f| super::super::draw(f, &state, 3)).unwrap();
+            let bottom = rendered_text(&terminal);
+            assert!(bottom.contains("→ 16"), "{w}x{h}: {bottom}");
+            assert!(bottom.contains("do not advance between events"));
+            assert_eq!(
+                state.feed.as_ref().unwrap().token_ids,
+                (1..=16).collect::<Vec<_>>()
+            );
+        }
+        state.ingest("progress_schema=2 prior_updates=0 updates_total=10");
+        assert_eq!(state.feed_scroll.get(), 0);
+    }
+
     #[test]
     fn absent_bytes_and_legacy_pieces_are_not_invented() {
         let mut state = RunState::default();

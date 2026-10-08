@@ -1,12 +1,26 @@
-use pssa::{cli::CLIHandler, dataset::Tokenizer, training::chunk_plan};
-use std::{collections::HashMap, fs, path::PathBuf, process::Command};
+use pssa::{
+    cli::CLIHandler,
+    dataset::Tokenizer,
+    training::{chunk_plan, sequence_plan},
+};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
+};
 
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let root =
-            std::env::temp_dir().join(format!("pssa-transformer-feed-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "pssa-trainer-feed-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(&root).unwrap();
         Self(root)
     }
@@ -55,7 +69,7 @@ fn transformer_bpe_actual_window_cache_and_epochs_do_not_change_checkpoint_bits(
         .map(|&id| tokenizer.token_bytes(id).unwrap().len())
         .sum();
     let updates = plan.len().div_ceil(2) * 2;
-    let run = |label: &str, cached: bool| {
+    let run = |label: &str, cached: bool, telemetry: bool| {
         let out = fixture.0.join(format!("{label}.trfm"));
         let mut command = Command::new(env!("CARGO_BIN_EXE_pssa"));
         command
@@ -84,6 +98,9 @@ fn transformer_bpe_actual_window_cache_and_epochs_do_not_change_checkpoint_bits(
         if cached {
             command.arg("--token-cache").arg(&cache);
         }
+        if telemetry {
+            command.arg("--feed-telemetry");
+        }
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
@@ -95,11 +112,17 @@ fn transformer_bpe_actual_window_cache_and_epochs_do_not_change_checkpoint_bits(
         assert!(!log.contains('\x1b'));
         (log, fs::read(out).unwrap())
     };
-    let (uncached, reference) = run("uncached", false);
+    let (disabled, reference) = run("disabled", false, false);
+    assert!(!disabled.contains("feed_schema="), "telemetry stays opt-in");
+    let (uncached, uncached_bits) = run("uncached", false, true);
+    assert_eq!(
+        uncached_bits, reference,
+        "telemetry must not change model bits"
+    );
     assert!(!cache.exists(), "cache stays opt-in");
-    let (built, built_bits) = run("built", true);
+    let (built, built_bits) = run("built", true, true);
     let cache_bits = fs::read(&cache).unwrap();
-    let (reused, reused_bits) = run("reused", true);
+    let (reused, reused_bits) = run("reused", true, true);
     assert_eq!(built_bits, reference);
     assert_eq!(reused_bits, reference);
     assert_eq!(fs::read(&cache).unwrap(), cache_bits);
@@ -189,4 +212,330 @@ fn transformer_bpe_actual_window_cache_and_epochs_do_not_change_checkpoint_bits(
             assert_eq!(last[key], expected.to_string(), "{key}");
         }
     }
+}
+
+fn run_pssa(
+    fixture: &Fixture,
+    source: &std::path::Path,
+    label: &str,
+    telemetry: bool,
+    extra: &[&str],
+) -> (String, Vec<u8>, Vec<u8>, Duration) {
+    run_pssa_window(fixture, source, label, telemetry, extra, 31)
+}
+
+fn run_pssa_window(
+    fixture: &Fixture,
+    source: &std::path::Path,
+    label: &str,
+    telemetry: bool,
+    extra: &[&str],
+    max_tokens: usize,
+) -> (String, Vec<u8>, Vec<u8>, Duration) {
+    let max_tokens = max_tokens.to_string();
+    let out = fixture.0.join(format!("{label}.pssa"));
+    let curve = fixture.0.join(format!("{label}.csv"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pssa"));
+    command
+        .arg("train")
+        .arg(source)
+        .args([
+            "--backend",
+            "cpu",
+            "--latent",
+            "7",
+            "--state",
+            "3",
+            "--key",
+            "4",
+            "--memory",
+            "4",
+            "--chunk",
+            "3",
+            "--accumulate",
+            "2",
+            "--epochs",
+            "2",
+            "--skip-tokens",
+            "3",
+            "--max-tokens",
+            &max_tokens,
+            "--dream-every",
+            "0",
+            "--no-tui",
+            "--loss-every",
+            "1",
+            "--tokens-seen",
+            "0",
+            "--loss-csv",
+        ])
+        .arg(&curve)
+        .arg("--out")
+        .arg(&out)
+        .args(extra)
+        .env("RAYON_NUM_THREADS", "1");
+    if telemetry {
+        command.arg("--feed-telemetry");
+    }
+    let started = Instant::now();
+    let result = command.output().unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    // Throughput is wall-clock telemetry, not deterministic training state.
+    let curve = fs::read_to_string(curve).unwrap();
+    let loss_rows = curve
+        .lines()
+        .map(|row| row.rsplit_once(',').unwrap().0)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes();
+    (
+        String::from_utf8(result.stdout).unwrap(),
+        fs::read(out).unwrap(),
+        loss_rows,
+        elapsed,
+    )
+}
+
+#[test]
+fn pssa_dream_off_telemetry_preserves_checkpoint_and_loss_bits_for_lanes_depth_loops_and_resume() {
+    let fixture = Fixture::new();
+    let raw =
+        "Discard FIRST\nAlpha BETA gamma delta epsilon\nSolo\nδELTA EPSILON! tail final ROW\n";
+    let source = fixture.0.join("corpus.txt");
+    fs::write(&source, raw).unwrap();
+    for (kind, batch, depth, loops) in [
+        ("word", "1", "1", "1"),
+        ("word", "2", "2", "2"),
+        ("bpe", "2", "1", "1"),
+    ] {
+        let args = [
+            "--tokenizer",
+            kind,
+            "--vocab-size",
+            "257",
+            "--batch-size",
+            batch,
+            "--depth",
+            depth,
+            "--loops",
+            loops,
+        ];
+        let label = format!("{kind}-{batch}-{depth}-{loops}");
+        let disabled_label = format!("{label}-disabled");
+        let (disabled, reference, curve, _) =
+            run_pssa(&fixture, &source, &disabled_label, false, &args);
+        assert!(
+            !disabled.contains("feed_schema="),
+            "telemetry must be disabled by default"
+        );
+        assert!(!disabled.contains("dream phase="));
+        let (enabled, actual, enabled_curve, elapsed) =
+            run_pssa(&fixture, &source, &format!("{label}-enabled"), true, &args);
+        assert_eq!(
+            actual, reference,
+            "weights, memory, RNG and Adam bits: {label}"
+        );
+        assert_eq!(
+            enabled_curve, curve,
+            "exact losses and consumed target counts: {label}"
+        );
+        assert!(!enabled.contains("dream phase="));
+        let tokenizer = if kind == "word" {
+            Tokenizer::from_corpus(raw, true).unwrap()
+        } else {
+            Tokenizer::from_corpus_bpe(raw, 257).unwrap()
+        };
+        let docs = CLIHandler::documents(raw, &tokenizer, Some(31), 3).unwrap();
+        let plan = sequence_plan(&docs, 3, batch.parse().unwrap()).unwrap();
+        let epoch_tokens: usize = plan.iter().flatten().map(|c| c.len).sum();
+        let updates = plan.len().div_ceil(2) * 2;
+        let samples: Vec<_> = enabled
+            .lines()
+            .filter(|line| line.contains("feed_schema=2"))
+            .map(fields)
+            .collect();
+        assert!(!samples.is_empty());
+        assert!(samples.len() <= updates);
+        assert!(
+            samples.len() <= 2 + elapsed.as_secs() as usize / 5,
+            "headless telemetry is first/final plus at most one sample per five seconds"
+        );
+        let source_ids: Vec<_> = raw
+            .lines()
+            .flat_map(|line| tokenizer.encode(line, true))
+            .collect();
+        for sample in &samples {
+            let epoch: usize = sample["feed_epoch"].parse().unwrap();
+            let completed: usize = sample["feed_batch"].parse().unwrap();
+            let consumed: usize = plan[..completed].iter().flatten().map(|c| c.len).sum();
+            let last = plan[completed - 1].last().unwrap();
+            let start = (last.start + last.len).saturating_sub(16).max(last.start);
+            let end = last.start + last.len;
+            let ids: Vec<usize> = sample["feed_token_ids"]
+                .split(',')
+                .map(|id| id.parse().unwrap())
+                .collect();
+            assert_eq!(
+                ids,
+                docs[last.doc][start..end],
+                "last consumed lane, excluding target"
+            );
+            let source_start: usize = sample["feed_source_start"].parse().unwrap();
+            let source_end: usize = sample["feed_source_end"].parse().unwrap();
+            assert_eq!(
+                ids,
+                source_ids[source_start..source_end],
+                "cyclic source coordinates"
+            );
+            let pieces: Vec<String> = serde_json::from_str(&sample["feed_token_pieces"]).unwrap();
+            assert_eq!(
+                pieces,
+                ids.iter()
+                    .map(|id| tokenizer.id_to_token[id].clone())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(sample["feed_row"], (last.doc + 1).to_string());
+            assert_eq!(sample["feed_rows"], docs.len().to_string());
+            assert_eq!(sample["feed_epoch_tokens"], consumed.to_string());
+            assert_eq!(
+                sample["feed_tokens"],
+                ((epoch - 1) * epoch_tokens + consumed).to_string()
+            );
+            assert_eq!(sample["feed_dataset"], source.to_str().unwrap());
+            assert_eq!(sample["feed_text_kind"], "raw");
+            assert!(sample["feed_snippet"].chars().count() <= 256);
+            let source_row: usize = sample["feed_source_row"].parse().unwrap();
+            assert!(
+                raw.lines()
+                    .nth(source_row - 1)
+                    .unwrap()
+                    .contains(&sample["feed_snippet"])
+            );
+            if kind == "word" {
+                assert!(
+                    !sample.contains_key("feed_bytes"),
+                    "word normalization does not give exact byte counts"
+                );
+            } else {
+                let previous_bytes: usize = docs
+                    .iter()
+                    .flat_map(|doc| &doc[..doc.len() - 1])
+                    .map(|&id| tokenizer.token_bytes(id).unwrap().len())
+                    .sum();
+                let current_bytes: usize = plan[..completed]
+                    .iter()
+                    .flatten()
+                    .flat_map(|c| &docs[c.doc][c.start..c.start + c.len])
+                    .map(|&id| tokenizer.token_bytes(id).unwrap().len())
+                    .sum();
+                assert_eq!(
+                    sample["feed_bytes"],
+                    ((epoch - 1) * previous_bytes + current_bytes).to_string()
+                );
+                assert_eq!(sample["feed_bytes_total"], (2 * previous_bytes).to_string());
+            }
+        }
+        let last = samples.last().unwrap();
+        assert_eq!(last["feed_epoch"], "2");
+        assert_eq!(last["feed_batch"], plan.len().to_string());
+        assert_eq!(last["feed_batches"], plan.len().to_string());
+        assert_eq!(last["feed_tokens"], (2 * epoch_tokens).to_string());
+        assert_eq!(last["feed_epoch_total"], epoch_tokens.to_string());
+        assert_eq!(last["feed_epoch_tokens"], epoch_tokens.to_string());
+        assert_eq!(last["feed_step"], updates.to_string());
+        let resume = fixture.0.join(format!("{disabled_label}.pssa"));
+        let mut resume_args = args.to_vec();
+        resume_args.extend(["--resume", resume.to_str().unwrap()]);
+        let (_, resumed_reference, resumed_curve, _) = run_pssa(
+            &fixture,
+            &source,
+            &format!("{label}-resume-disabled"),
+            false,
+            &resume_args,
+        );
+        let (resumed_log, resumed_actual, resumed_enabled_curve, _) = run_pssa(
+            &fixture,
+            &source,
+            &format!("{label}-resume-enabled"),
+            true,
+            &resume_args,
+        );
+        assert_eq!(
+            resumed_actual, resumed_reference,
+            "resumed model bits: {label}"
+        );
+        assert_eq!(
+            resumed_enabled_curve, resumed_curve,
+            "resumed loss bits: {label}"
+        );
+        let last = resumed_log
+            .lines()
+            .filter(|line| line.contains("feed_schema=2"))
+            .map(fields)
+            .last()
+            .unwrap();
+        assert_eq!(
+            last["feed_step"],
+            (2 * updates).to_string(),
+            "global step survives resume"
+        );
+    }
+}
+
+#[test]
+#[ignore = "paired local telemetry overhead measurement; run explicitly with --ignored --nocapture"]
+fn telemetry_overhead_paired_cpu_measurement() {
+    let fixture = Fixture::new();
+    let raw = (0..256)
+        .map(|row| {
+            (0..96)
+                .map(|word| format!("token{}", (word + row) % 96))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source = fixture.0.join("corpus.txt");
+    fs::write(&source, raw).unwrap();
+    let args = ["--tokenizer", "word", "--batch-size", "2"];
+    // Keep model and selected input identical, warm both paths, then reverse
+    // order on alternate pairs to reduce startup and scheduling bias.
+    let _ = run_pssa_window(&fixture, &source, "warm-disabled", false, &args, 6144);
+    let _ = run_pssa_window(&fixture, &source, "warm-enabled", true, &args, 6144);
+    let mut disabled = Vec::new();
+    let mut enabled = Vec::new();
+    for pair in 0..7 {
+        let off = format!("pair{pair}-disabled");
+        let on = format!("pair{pair}-enabled");
+        let (a, b) = if pair % 2 == 0 {
+            (
+                run_pssa_window(&fixture, &source, &off, false, &args, 6144),
+                run_pssa_window(&fixture, &source, &on, true, &args, 6144),
+            )
+        } else {
+            let b = run_pssa_window(&fixture, &source, &on, true, &args, 6144);
+            (
+                run_pssa_window(&fixture, &source, &off, false, &args, 6144),
+                b,
+            )
+        };
+        assert_eq!(a.1, b.1);
+        assert_eq!(a.2, b.2);
+        disabled.push(a.3.as_secs_f64());
+        enabled.push(b.3.as_secs_f64());
+    }
+    disabled.sort_by(f64::total_cmp);
+    enabled.sort_by(f64::total_cmp);
+    println!(
+        "telemetry_overhead pairs=7 warmed=true rayon_threads=1 disabled_median_seconds={:.6} enabled_median_seconds={:.6} ratio={:.4} (subprocess wall; includes startup/tokenizer/checkpoint/CSV)",
+        disabled[3],
+        enabled[3],
+        enabled[3] / disabled[3]
+    );
 }
