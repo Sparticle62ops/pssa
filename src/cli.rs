@@ -1312,7 +1312,7 @@ impl CLIHandler {
                             tokens_seen += total_tokens;
                             let update_loss = (loss_sum - prior_loss) / total_tokens.max(1) as f64;
                             let memory = Self::memory_occupancy(&model);
-                            if let Some(feed) = &feed {
+                            if let Some(feed) = &mut feed {
                                 progress.update_with_feed(
                                     update,
                                     total_tokens,
@@ -1387,7 +1387,7 @@ impl CLIHandler {
                 }
                 let update_loss = (loss_sum - prior_loss) / total_tokens.max(1) as f64;
                 let memory = Self::memory_occupancy(&model);
-                if let Some(feed) = &feed {
+                if let Some(feed) = &mut feed {
                     progress.update_with_feed(
                         update,
                         total_tokens,

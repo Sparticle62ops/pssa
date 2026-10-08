@@ -123,6 +123,8 @@ struct FeedDocument<'a> {
     source_row: Option<usize>,
     byte_start: Option<usize>,
     next_byte: Option<usize>,
+    consumed_end: usize,
+    reported_end: usize,
     stream_start: usize,
 }
 
@@ -163,6 +165,8 @@ impl<'a> DatasetFeed<'a> {
                     source_row: None,
                     byte_start: selection.byte_start,
                     next_byte: selection.byte_start,
+                    consumed_end: 0,
+                    reported_end: 0,
                     stream_start,
                 };
                 stream_start += doc.len();
@@ -195,25 +199,44 @@ impl<'a> DatasetFeed<'a> {
         }
         let mut epoch_bytes = Some(0usize);
         for (source, doc) in sources.iter_mut().zip(&window.docs) {
-            // Claim BPE raw offsets/bytes only after verifying the cached IDs
-            // against the supplied source, without a second tokenization pass.
-            let cursor = source.byte_start.and_then(|start| {
-                doc.iter().try_fold(start, |start, &id| {
-                    let bytes = tokenizer.token_bytes(id)?;
-                    let end = start.checked_add(bytes.len())?;
-                    (source.text?.as_bytes().get(start..end)? == bytes).then_some(end)
-                })
-            });
-            if cursor.is_none() {
-                source.byte_start = None;
-                source.next_byte = None;
-                epoch_bytes = None;
-            } else {
-                let input_bytes = doc[..doc.len() - 1].iter().try_fold(0usize, |sum, &id| {
-                    sum.checked_add(tokenizer.token_bytes(id)?.len())
-                });
-                epoch_bytes = epoch_bytes.and_then(|sum| sum.checked_add(input_bytes?));
-            }
+            let input_bytes = match tokenizer.kind() {
+                crate::dataset::TokenizerKind::Word => {
+                    // Count source spans, not normalized vocabulary labels.
+                    // Gaps between input tokens count; row separators and the
+                    // final target-only token do not. Keep one cursor per doc,
+                    // never a corpus-sized array of per-token offsets.
+                    let span = source.text.and_then(|text| {
+                        crate::dataset::Tokenizer::word_source_span(
+                            text,
+                            source.token_start,
+                            source.token_start + doc.len() - 1,
+                        )
+                    });
+                    source.byte_start = span.as_ref().map(|span| span.start);
+                    span.map(|span| span.end - span.start)
+                }
+                crate::dataset::TokenizerKind::Bpe => {
+                    // Claim raw offsets only after verifying cached IDs
+                    // against the source, without another tokenization pass.
+                    let cursor = source.byte_start.and_then(|start| {
+                        doc.iter().try_fold(start, |start, &id| {
+                            let bytes = tokenizer.token_bytes(id)?;
+                            let end = start.checked_add(bytes.len())?;
+                            (source.text?.as_bytes().get(start..end)? == bytes).then_some(end)
+                        })
+                    });
+                    if cursor.is_none() {
+                        source.byte_start = None;
+                        None
+                    } else {
+                        doc[..doc.len() - 1].iter().try_fold(0usize, |sum, &id| {
+                            sum.checked_add(tokenizer.token_bytes(id)?.len())
+                        })
+                    }
+                }
+            };
+            source.next_byte = source.byte_start;
+            epoch_bytes = epoch_bytes.and_then(|sum| sum.checked_add(input_bytes?));
         }
         let bytes_total = epoch_bytes.and_then(|bytes| bytes.checked_mul(opts.epochs));
         Self {
@@ -234,12 +257,17 @@ impl<'a> DatasetFeed<'a> {
     }
 
     pub(crate) fn begin_epoch(&mut self, epoch: usize) {
+        // Flush unreported spans before resetting cursors. Short epochs may
+        // finish entirely between the logger's rate-limited samples.
+        self.refresh_word_bytes();
         self.epoch = epoch;
         self.epoch_tokens = 0;
         self.batch = 0;
         self.latest = None;
         for source in &mut self.sources {
             source.next_byte = source.byte_start;
+            source.consumed_end = 0;
+            source.reported_end = 0;
         }
     }
 
@@ -250,7 +278,9 @@ impl<'a> DatasetFeed<'a> {
         self.epoch_tokens += len;
         self.latest = Some((doc, start, start + len));
         let source = &mut self.sources[doc];
-        if source.next_byte.is_some() {
+        source.consumed_end = start + len;
+        if self.tokenizer.kind() == crate::dataset::TokenizerKind::Bpe && source.next_byte.is_some()
+        {
             let byte_count: usize = self.docs[doc][start..start + len]
                 .iter()
                 .map(|&id| self.tokenizer.token_bytes(id).unwrap().len())
@@ -270,7 +300,35 @@ impl<'a> DatasetFeed<'a> {
         self.epoch == self.opts.epochs && self.epoch_tokens == self.epoch_total
     }
 
-    pub(crate) fn sample(&self, step: usize) -> crate::ui::FeedSample {
+    fn refresh_word_bytes(&mut self) {
+        if self.tokenizer.kind() != crate::dataset::TokenizerKind::Word || self.bytes.is_none() {
+            return;
+        }
+        // Only scan newly consumed source characters when emitting a sample
+        // (or crossing an epoch). The hot training path only updates counters.
+        for source in &mut self.sources {
+            if source.consumed_end == source.reported_end {
+                continue;
+            }
+            let end = source.next_byte.and_then(|cursor| {
+                let text = source.text?.get(cursor..)?;
+                let span = crate::dataset::Tokenizer::word_source_span(
+                    text,
+                    0,
+                    source.consumed_end - source.reported_end,
+                )?;
+                cursor.checked_add(span.end)
+            });
+            self.bytes = self
+                .bytes
+                .and_then(|bytes| bytes.checked_add(end?.checked_sub(source.next_byte?)?));
+            source.next_byte = end;
+            source.reported_end = source.consumed_end;
+        }
+    }
+
+    pub(crate) fn sample(&mut self, step: usize) -> crate::ui::FeedSample {
+        self.refresh_word_bytes();
         let (doc, chunk_start, end) = self.latest.expect("a completed input chunk");
         let start = end.saturating_sub(16).max(chunk_start);
         let ids = &self.docs[doc][start..end];
@@ -411,11 +469,8 @@ mod feed_tests {
                 (sample.source_start, sample.source_end, sample.skip_tokens),
                 (1, 5, 1)
             );
-            assert_eq!(
-                sample.bytes, None,
-                "normalized word IDs cannot establish exact source byte consumption"
-            );
-            assert_eq!(sample.bytes_total, None);
+            assert_eq!(sample.bytes, Some(epoch * ",  MiXeD\tİSTANBUL!".len()));
+            assert_eq!(sample.bytes_total, Some(2 * ",  MiXeD\tİSTANBUL!".len()));
             let pieces: Vec<String> = serde_json::from_str(&sample.token_pieces).unwrap();
             let ids: Vec<usize> = sample
                 .token_ids
@@ -431,6 +486,81 @@ mod feed_tests {
             );
             assert!(!pieces.iter().any(|piece| piece == "last"));
         }
+    }
+
+    #[test]
+    fn word_byte_cursors_count_raw_spans_across_lanes_wraps_and_unsampled_epochs() {
+        let raw = "###\nUP:PER,  MiXeD\tİSTANBUL! LAST\nSolo\nSecond\tROW ends\n";
+        let tokenizer = Tokenizer::from_corpus(raw, true).unwrap();
+        let opts = TrainingOptions {
+            epochs: 3,
+            ..Default::default()
+        };
+        let window = token_cache::documents(raw, &tokenizer, Some(24), 1, None, None).unwrap();
+        let plan = sequence_plan(&window.docs, 1, 2).unwrap();
+        let mut feed = DatasetFeed::new(raw, &tokenizer, &window, &opts, plan.len());
+        let span_bytes = |doc: usize, end: usize| {
+            if end == 0 {
+                return 0;
+            }
+            let source = &feed.sources[doc];
+            let span = Tokenizer::word_source_span(
+                source.text.unwrap(),
+                source.token_start,
+                source.token_start + end,
+            )
+            .unwrap();
+            span.end - span.start
+        };
+        let totals: Vec<_> = window
+            .docs
+            .iter()
+            .enumerate()
+            .map(|(doc, ids)| span_bytes(doc, ids.len() - 1))
+            .collect();
+        let epoch_bytes: usize = totals.iter().sum();
+        for epoch in 1..=3 {
+            feed.begin_epoch(epoch);
+            let mut ends = vec![0; window.docs.len()];
+            for chunks in &plan {
+                for chunk in chunks {
+                    feed.consume(chunk.doc, chunk.start, chunk.len);
+                    ends[chunk.doc] = chunk.start + chunk.len;
+                }
+                feed.finish_batch();
+                // Omit ALL previews in the middle epoch: begin_epoch must
+                // flush its real bytes, not lose them to the logger throttle.
+                if epoch == 2 {
+                    continue;
+                }
+                let expected: usize = ends
+                    .iter()
+                    .enumerate()
+                    .map(|(doc, &end)| {
+                        if end == 0 {
+                            return 0;
+                        }
+                        let source = &feed.sources[doc];
+                        let span = Tokenizer::word_source_span(
+                            source.text.unwrap(),
+                            source.token_start,
+                            source.token_start + end,
+                        )
+                        .unwrap();
+                        span.end - span.start
+                    })
+                    .sum();
+                let sample = feed.sample(1);
+                assert_eq!(sample.bytes, Some((epoch - 1) * epoch_bytes + expected));
+                assert_eq!(sample.bytes_total, Some(3 * epoch_bytes));
+                assert_eq!(
+                    feed.sample(1).bytes,
+                    sample.bytes,
+                    "sampling cannot double-count"
+                );
+            }
+        }
+        assert_eq!(feed.sample(1).bytes, Some(3 * epoch_bytes));
     }
 
     #[test]
@@ -527,8 +657,10 @@ mod feed_tests {
                             }
                             feed.finish_batch();
                         }
-                        let samples: Vec<_> =
-                            feeds.iter().map(|feed| feed.sample(batch + 1)).collect();
+                        let samples: Vec<_> = feeds
+                            .iter_mut()
+                            .map(|feed| feed.sample(batch + 1))
+                            .collect();
                         assert_eq!(samples[0], samples[1], "skip={skip} limit={limit:?}");
                         assert_eq!(samples[0], samples[2]);
                         let sample = &samples[0];

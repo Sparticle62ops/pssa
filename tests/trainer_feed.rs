@@ -421,9 +421,11 @@ fn pssa_dream_off_telemetry_preserves_checkpoint_and_loss_bits_for_lanes_depth_l
                     .contains(&sample["feed_snippet"])
             );
             if kind == "word" {
+                let bytes: usize = sample["feed_bytes"].parse().unwrap();
+                let total: usize = sample["feed_bytes_total"].parse().unwrap();
                 assert!(
-                    !sample.contains_key("feed_bytes"),
-                    "word normalization does not give exact byte counts"
+                    bytes > 0 && bytes <= total,
+                    "counts must come from raw input spans"
                 );
             } else {
                 let previous_bytes: usize = docs
@@ -452,6 +454,7 @@ fn pssa_dream_off_telemetry_preserves_checkpoint_and_loss_bits_for_lanes_depth_l
         assert_eq!(last["feed_epoch_total"], epoch_tokens.to_string());
         assert_eq!(last["feed_epoch_tokens"], epoch_tokens.to_string());
         assert_eq!(last["feed_step"], updates.to_string());
+        assert_eq!(last["feed_bytes"], last["feed_bytes_total"]);
         let resume = fixture.0.join(format!("{disabled_label}.pssa"));
         let mut resume_args = args.to_vec();
         resume_args.extend(["--resume", resume.to_str().unwrap()]);
@@ -506,39 +509,53 @@ fn telemetry_overhead_paired_cpu_measurement() {
         .join("\n");
     let source = fixture.0.join("corpus.txt");
     fs::write(&source, raw).unwrap();
-    let args = ["--tokenizer", "word", "--batch-size", "2"];
-    // Keep model and selected input identical, warm both paths, then reverse
-    // order on alternate pairs to reduce startup and scheduling bias.
-    let _ = run_pssa_window(&fixture, &source, "warm-disabled", false, &args, 6144);
-    let _ = run_pssa_window(&fixture, &source, "warm-enabled", true, &args, 6144);
-    let mut disabled = Vec::new();
-    let mut enabled = Vec::new();
-    for pair in 0..7 {
-        let off = format!("pair{pair}-disabled");
-        let on = format!("pair{pair}-enabled");
-        let (a, b) = if pair % 2 == 0 {
-            (
-                run_pssa_window(&fixture, &source, &off, false, &args, 6144),
-                run_pssa_window(&fixture, &source, &on, true, &args, 6144),
-            )
-        } else {
-            let b = run_pssa_window(&fixture, &source, &on, true, &args, 6144);
-            (
-                run_pssa_window(&fixture, &source, &off, false, &args, 6144),
-                b,
-            )
-        };
-        assert_eq!(a.1, b.1);
-        assert_eq!(a.2, b.2);
-        disabled.push(a.3.as_secs_f64());
-        enabled.push(b.3.as_secs_f64());
+    for kind in ["word", "bpe"] {
+        let args = [
+            "--tokenizer",
+            kind,
+            "--vocab-size",
+            "257",
+            "--batch-size",
+            "2",
+        ];
+        // Keep model and selected input identical, warm both paths, then reverse
+        // order on alternate pairs to reduce startup and scheduling bias.
+        let _ = run_pssa_window(&fixture, &source, "warm-disabled", false, &args, 6144);
+        let _ = run_pssa_window(&fixture, &source, "warm-enabled", true, &args, 6144);
+        let mut disabled = Vec::new();
+        let mut enabled = Vec::new();
+        for pair in 0..7 {
+            let off = format!("pair{pair}-disabled");
+            let on = format!("pair{pair}-enabled");
+            let (a, b) = if pair % 2 == 0 {
+                (
+                    run_pssa_window(&fixture, &source, &off, false, &args, 6144),
+                    run_pssa_window(&fixture, &source, &on, true, &args, 6144),
+                )
+            } else {
+                let b = run_pssa_window(&fixture, &source, &on, true, &args, 6144);
+                (
+                    run_pssa_window(&fixture, &source, &off, false, &args, 6144),
+                    b,
+                )
+            };
+            assert_eq!(a.1, b.1);
+            assert_eq!(a.2, b.2);
+            println!(
+                "telemetry_pair tokenizer={kind} pair={pair} disabled_seconds={:.6} enabled_seconds={:.6}",
+                a.3.as_secs_f64(),
+                b.3.as_secs_f64()
+            );
+            disabled.push(a.3.as_secs_f64());
+            enabled.push(b.3.as_secs_f64());
+        }
+        disabled.sort_by(f64::total_cmp);
+        enabled.sort_by(f64::total_cmp);
+        println!(
+            "telemetry_overhead tokenizer={kind} pairs=7 warmed=true rayon_threads=1 disabled_median_seconds={:.6} enabled_median_seconds={:.6} ratio={:.4} (subprocess wall; includes startup/tokenizer/checkpoint/CSV)",
+            disabled[3],
+            enabled[3],
+            enabled[3] / disabled[3]
+        );
     }
-    disabled.sort_by(f64::total_cmp);
-    enabled.sort_by(f64::total_cmp);
-    println!(
-        "telemetry_overhead pairs=7 warmed=true rayon_threads=1 disabled_median_seconds={:.6} enabled_median_seconds={:.6} ratio={:.4} (subprocess wall; includes startup/tokenizer/checkpoint/CSV)",
-        disabled[3],
-        enabled[3],
-        enabled[3] / disabled[3]
-    );
 }

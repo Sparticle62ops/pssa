@@ -59,6 +59,40 @@ impl FeedState {
         if schema.is_some_and(|schema| schema != 2) {
             return None;
         }
+        if schema == Some(2) {
+            // Optional counters may be absent, but a present damaged value
+            // must not masquerade as an honest unavailable measurement.
+            for key in [
+                "feed_tokens",
+                "feed_rows",
+                "feed_row",
+                "feed_epoch_tokens",
+                "feed_epoch_total",
+                "feed_epoch",
+                "feed_epochs",
+                "feed_step",
+                "feed_batch",
+                "feed_batches",
+                "feed_start",
+                "feed_end",
+                "feed_source_row",
+                "feed_source_start",
+                "feed_source_end",
+                "feed_skip_tokens",
+                "feed_bytes",
+                "feed_bytes_total",
+            ] {
+                let mut fields = line.split_whitespace().filter_map(|part| {
+                    let (name, value) = part.split_once('=')?;
+                    (name == key).then_some(value)
+                });
+                if let Some(value) = fields.next()
+                    && (value.parse::<u64>().is_err() || fields.next().is_some())
+                {
+                    return None;
+                }
+            }
+        }
         let ids = parse_log_value(line, "feed_token_ids");
         if schema == Some(2) && ids.is_none() {
             return None;
@@ -276,7 +310,9 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &RunState) {
             )));
         }
         lines.push(Line::from(match (feed.bytes, feed.bytes_total) {
-            (Some(bytes), Some(total)) => format!("Source bytes consumed: {bytes}/{total} (UTF-8)"),
+            (Some(bytes), Some(total)) => format!(
+                "Source bytes consumed: {bytes}/{total} (UTF-8 input spans; excludes row separators/target-only tokens)"
+            ),
             _ => {
                 "Source bytes consumed: unavailable (no exact source offsets in this token stream)"
                     .into()
@@ -463,6 +499,13 @@ mod tests {
             ("feed_end=14", "feed_end=15"),
             ("feed_source_end=114", "feed_source_end=111"),
             ("feed_bytes=27", "feed_bytes=55"),
+            (
+                "feed_bytes=27 feed_bytes_total=54",
+                "feed_bytes=bad feed_bytes_total=bad",
+            ),
+            ("feed_source_row=4", "feed_source_row=bad"),
+            ("feed_skip_tokens=100", "feed_skip_tokens=bad"),
+            ("feed_bytes=27", "feed_bytes=27 feed_bytes=28"),
             ("feed_token_ids=7%2C9", "feed_token_ids=%ZZ"),
             ("feed_token_pieces=", "damaged_token_pieces="),
             ("feed_snippet=", "damaged_snippet="),
