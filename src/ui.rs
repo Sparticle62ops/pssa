@@ -58,14 +58,8 @@ pub fn cyan(t: &str) -> String {
 pub fn green(t: &str) -> String {
     paint("32", t)
 }
-pub fn yellow(t: &str) -> String {
-    paint("33", t)
-}
 pub fn red(t: &str) -> String {
     paint("31", t)
-}
-pub fn magenta(t: &str) -> String {
-    paint("35", t)
 }
 
 /// Visible width of a string, ignoring ANSI escape sequences.
@@ -132,10 +126,6 @@ pub fn panel_row(text: &str) {
     println!("  {} {} {}", dim("│"), pad(text, inner), dim("│"));
 }
 
-pub fn panel_blank() {
-    panel_row("");
-}
-
 /// `label  value` aligned inside a panel.
 pub fn panel_field(label: &str, value: &str) {
     panel_row(&format!("{}{}", pad(&dim(label), 16), value));
@@ -161,10 +151,6 @@ pub fn logo() {
     }
 }
 
-pub fn rule() {
-    println!("  {}", dim(&"─".repeat(width() - 2)));
-}
-
 /// The title block printed once at the start of a long command.
 pub fn banner(command: &str, subtitle: &str) {
     let name = format!("pssa {command}");
@@ -185,10 +171,6 @@ pub fn section(title: &str) {
 
 pub fn success(text: &str) {
     println!("  {} {}", green("✓"), text);
-}
-
-pub fn warn(text: &str) {
-    eprintln!("  {} {}", yellow("!"), text);
 }
 
 pub fn failure(text: &str) {
