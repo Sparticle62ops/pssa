@@ -77,8 +77,8 @@ fn run(
                 replay,
                 8,
                 0.8,
-                6e-3,
-                1,
+                1e-2,
+                2,
                 Some((&B_IN, &B_TG)),
                 &mut rng,
             );
