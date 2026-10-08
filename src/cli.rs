@@ -1163,7 +1163,7 @@ impl CLIHandler {
                             .sum::<f32>()
                             / c.len as f32;
                         model.insert_training_memory_at(loss, offset + c.len - 1);
-                        if loss > 3.5 {
+                        if options.dream_every > 0 && loss > 3.5 {
                             let inputs = model.block.tape.x_ids[offset..offset + c.len].to_vec();
                             let targets =
                                 model.block.tape.target_ids[offset..offset + c.len].to_vec();
