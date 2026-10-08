@@ -360,7 +360,12 @@ impl WgpuContext {
         // Library initialization may run after Rayon or other application
         // threads start. Configure XDG_RUNTIME_DIR externally when needed;
         // mutating process-wide environment here is not thread-safe on Unix.
-        let instance = wgpu::Instance::default();
+        // These compute stages use Vulkan/Metal/DX12/WebGPU. Probing the unused
+        // GLES backend can tear down an EGL display shared by live contexts.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -389,7 +394,11 @@ impl WgpuContext {
             &wgpu::DeviceDescriptor {
                 label: Some("PSSA V2 GPU Device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: wgpu::Limits {
+                    // The recurrent backward stage binds eighteen storage buffers.
+                    max_storage_buffers_per_shader_stage: 18,
+                    ..wgpu::Limits::default()
+                },
             },
             None,
         ))
@@ -1457,6 +1466,22 @@ impl Device {
 #[cfg(test)]
 mod backend_tests {
     use super::*;
+
+    #[test]
+    fn embedded_webgpu_shaders_parse_and_validate_without_an_adapter() {
+        let source = format!(
+            "{}\n{}",
+            WGSL_COMPUTE_KERNELS,
+            wgpu_stages::WGSL_STAGE_KERNELS
+        );
+        let module = wgpu::naga::front::wgsl::parse_str(&source).expect("embedded WGSL parses");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("embedded WGSL validates");
+    }
 
     #[test]
     fn shared_weight_layout_folds_sequences_and_tokens_without_overflow() {

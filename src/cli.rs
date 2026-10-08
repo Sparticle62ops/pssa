@@ -822,8 +822,25 @@ impl CLIHandler {
                     .gpu()
                     .map(|g| g.backend_label())
                     .unwrap_or_else(|| "cpu".to_string());
+                let explicit_cpu = gpu_device.gpu().is_none();
                 model.device = gpu_device;
-                println!("backend={label}");
+                if explicit_cpu && (model.depth() > 1 || model.loops() > 1) {
+                    println!(
+                        "backend=cpu ({}; explicitly selected)",
+                        if model.depth() > 1 {
+                            format!("stacked depth {}", model.depth())
+                        } else {
+                            format!("Ouro loops {}", model.loops())
+                        }
+                    );
+                    if options.batch_size > 1 {
+                        println!(
+                            "batch_backend=cpu-replay (independent lanes; no packed GEMM acceleration)"
+                        );
+                    }
+                } else {
+                    println!("backend={label}");
+                }
             }
             Err(e) => {
                 if model.depth() > 1 || model.loops() > 1 {

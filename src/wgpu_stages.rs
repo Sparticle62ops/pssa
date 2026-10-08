@@ -300,8 +300,7 @@ fn memory_forward_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     let scaled_radius = sqrt(scaled_sq);
-    var radius = max_abs * scaled_radius;
-    if (isInf(radius)) { radius = 3.402823e+38; }
+    let radius = min(max_abs * scaled_radius, 3.402823e+38);
     let max_radius = 1.0 - 8.0 * 1.1920929e-7;
     var project_scale = 1.0;
     if (max_abs != 0.0) {
@@ -829,20 +828,8 @@ impl WgpuContext {
                     resource: material_cfg.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: delta_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: b_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
                     binding: 3,
                     resource: x_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: rates_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
@@ -851,10 +838,6 @@ impl WgpuContext {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: local_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: scan_input_b.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
@@ -1334,46 +1317,6 @@ impl WgpuContext {
                     resource: cfg.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: delta_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: b_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: x_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: rates_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: barb_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: rev_a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: rev_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: scan_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: gz_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: gy_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
                     binding: 20,
                     resource: raw_b.as_entire_binding(),
                 },
@@ -1383,62 +1326,66 @@ impl WgpuContext {
                 },
                 wgpu::BindGroupEntry {
                     binding: 22,
-                    resource: c_b.as_entire_binding(),
+                    resource: b_b.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 23,
-                    resource: rates_b.as_entire_binding(),
+                    resource: c_b.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 24,
-                    resource: deriv_b.as_entire_binding(),
+                    resource: rates_b.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 25,
-                    resource: x_b.as_entire_binding(),
+                    resource: deriv_b.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 26,
-                    resource: states_b.as_entire_binding(),
+                    resource: x_b.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 27,
-                    resource: bara_b.as_entire_binding(),
+                    resource: states_b.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 28,
-                    resource: barb_b.as_entire_binding(),
+                    resource: bara_b.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 29,
-                    resource: scan_b.as_entire_binding(),
+                    resource: barb_b.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 30,
-                    resource: gz_b.as_entire_binding(),
+                    resource: scan_b.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 31,
-                    resource: gy_b.as_entire_binding(),
+                    resource: gz_b.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 32,
-                    resource: out_gd.as_entire_binding(),
+                    resource: gy_b.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 33,
-                    resource: out_gb.as_entire_binding(),
+                    resource: out_gd.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 34,
-                    resource: out_gc.as_entire_binding(),
+                    resource: out_gb.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 35,
-                    resource: out_ga.as_entire_binding(),
+                    resource: out_gc.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 36,
+                    resource: out_ga.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 37,
                     resource: out_gx.as_entire_binding(),
                 },
             ],
