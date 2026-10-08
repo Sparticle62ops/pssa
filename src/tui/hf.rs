@@ -341,7 +341,7 @@ impl Login {
     }
     pub fn draw(&self, f: &mut ratatui::Frame, area: Rect) {
         let area = panel_area(f, area);
-        let mask = "*".repeat(
+        let mask = "•".repeat(
             self.input
                 .chars()
                 .count()
@@ -589,7 +589,7 @@ mod tests {
                 .collect();
             assert!(!text.contains("hf_NEVER"));
             if width >= 79 {
-                assert!(text.contains("********"));
+                assert!(text.contains("••••••••"));
                 assert!(text.contains("fixture-user"));
             }
         }

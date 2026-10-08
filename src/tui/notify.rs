@@ -322,7 +322,7 @@ impl Notify {
         let mask = if target.is_empty() {
             "(not configured)".into()
         } else {
-            "*".repeat(target.chars().count().min(24))
+            "•".repeat(target.chars().count().min(24))
         };
         let mut lines = vec![
             Line::styled("NOTIFICATIONS / explicit opt-in", accent()),
@@ -332,19 +332,19 @@ impl Notify {
             )),
             Line::from(format!(
                 "{} Mode: {}",
-                if self.selected == 0 { ">" } else { " " },
+                if self.selected == 0 { "▶" } else { " " },
                 network::clean(mode)
             )),
             Line::from(format!(
                 "{} {}: {mask}{}",
-                if self.selected == 1 { ">" } else { " " },
+                if self.selected == 1 { "▶" } else { " " },
                 if self.webhook {
                     "Webhook URL"
                 } else {
                     "ntfy.sh topic"
                 },
                 if self.selected == 1 && self.editing() {
-                    "_"
+                    "▏"
                 } else {
                     ""
                 }
@@ -672,7 +672,7 @@ mod tests {
             assert!(!text.contains("NEVER_SHOW_SECRET"));
             if w >= 79 {
                 assert!(text.contains("OFF"));
-                assert!(text.contains("********"));
+                assert!(text.contains("••••••••"));
             }
         }
     }

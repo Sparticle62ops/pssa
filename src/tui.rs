@@ -170,6 +170,13 @@ struct RunState {
     loss_average: Option<f64>,
     tok_s: Option<f64>,
     eta: Option<String>,
+    // Dream telemetry is runtime-only and comes from explicit training log
+    // events. It never participates in progress or health calculations.
+    dream_active: bool,
+    dream_count: u64,
+    dream_mode: Option<String>,
+    dream_last_loss: Option<f64>,
+    dream_update: Option<u64>,
     updates_done: Option<u64>,
     updates_total: Option<u64>,
     updates_remaining: Option<u64>,
@@ -326,6 +333,32 @@ impl RunState {
             self.progress_from = None;
             self.progress_updated_at = None;
             self.feed = None;
+            self.dream_active = false;
+            self.dream_count = 0;
+            self.dream_mode = None;
+            self.dream_last_loss = None;
+            self.dream_update = None;
+        }
+
+        // Dream events are intentionally separate from ordinary loss samples:
+        // a rehearsal loss must not become the live training loss or chart
+        // series. Accept the structured schema emitted by the trainer and the
+        // shorter legacy aliases so recorded logs remain useful.
+        if line.contains("dream phase=start") {
+            self.dream_active = true;
+            self.dream_mode = parse_kv::<String>(line, "mode=");
+            self.dream_update = parse_kv(line, "update=")
+                .or_else(|| parse_kv(line, "global_update="));
+        }
+        if line.contains("dream phase=end") {
+            self.dream_active = false;
+            self.dream_count = self.dream_count.saturating_add(1);
+            self.dream_mode = parse_kv::<String>(line, "mode=").or(self.dream_mode.take());
+            self.dream_update = parse_kv(line, "update=").or(self.dream_update);
+            self.dream_last_loss = parse_kv::<f64>(line, "dream_loss=")
+                .or_else(|| parse_kv(line, "rehearsal_loss="))
+                .or_else(|| parse_kv(line, "loss="))
+                .filter(|value| value.is_finite());
         }
 
         if let Some(dataset) = parse_log_value(line, "feed_dataset") {
@@ -688,7 +721,9 @@ impl RunState {
     }
 
     fn health_status_at(&self, now: Instant) -> HealthStatus {
-        let normal_label = if self.training_active {
+        let normal_label = if self.dream_active {
+            "DREAMING"
+        } else if self.training_active {
             "TRAINING"
         } else if self.last_progress_at.is_some() || self.training_seconds.is_some() {
             // Recorded history deliberately has no live stall-clock timestamp.
@@ -1285,6 +1320,7 @@ fn status_badge(health: &HealthStatus) -> Line<'static> {
         HealthLevel::Warning | HealthLevel::Normal => match health.normal_label {
             "DONE" => "DONE",
             "WAITING" => "WAITING",
+            "DREAMING" => "DREAMING",
             _ => "TRAINING",
         },
     };
@@ -2162,7 +2198,7 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
                 Line::styled("[ awaiting sample ]", accent()),
                 Line::from("Stream HF training into this dashboard:"),
                 Line::from(
-                    "pssa train --hf-dataset OWNER/NAME --no-tui | pssa tui",
+                    "pssa train --hf-dataset OWNER/NAME --no-tui │ pssa tui",
                 ),
             ],
         );
@@ -2171,7 +2207,7 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
             cards[1],
             " 02 / token strips ",
             vec![
-                Line::styled("text -> shredder -> token ids", accent()),
+                Line::styled("text → shredder → token ids", accent()),
                 Line::from("Rows, tokens and the latest snippet appear when reported."),
                 Line::from("Older/local logs still work without previews."),
             ],
@@ -2218,7 +2254,7 @@ fn draw_feed_at(f: &mut ratatui::Frame, area: Rect, state: &RunState, elapsed: D
         summary_area,
     );
     let panel_area = panel_area(f, sections[1]);
-    let block = panel(" shredder / text -> token ids ");
+    let block = panel(" shredder / text → token ids ");
     let inner = block.inner(panel_area);
     f.render_widget(block, panel_area);
     if inner.width == 0 || inner.height < 2 {
@@ -2719,15 +2755,36 @@ fn draw_memory_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         let angle = index as f64 * 2.399963229728653;
         entries.push((radius * angle.cos(), radius * angle.sin()));
     }
-    let disk_points = [
-        charts::Series::line("unit circle", &boundary, Color::Rgb(0x32, 0x8f, 0x60)),
-        charts::Series {
-            name: "occupied entries",
-            points: &entries,
-            color: NORMAL_GREEN,
-            scatter: true,
-        },
-    ];
+    // HalfBlock has two vertical pixels per terminal row. Use the actual
+    // drawable plot rectangle, not the outer panel size, so the unit circle
+    // remains round after labels, borders, and the x-axis rows are removed.
+    // Terminal cells are about twice as tall as wide, hence the factor of two.
+    let geometry = charts::Plot {
+        title: " memory / Poincare disk ",
+        caption: "",
+        x: "disk x",
+        integer_x: false,
+        y: "disk y",
+        x_bounds: [-1.0, 1.0],
+        y_bounds: [-1.0, 1.0],
+    };
+    let x_extent = charts::graph_rect(area, &geometry)
+        .map(|graph| {
+            // HalfBlock has `width × (2 * height)` physical pixels. Use the
+            // last drawable pixel in each direction, rather than the cell
+            // count, so the unit circle stays round at every panel size.
+            let x_pixels = f64::from(graph.width.saturating_sub(1));
+            let y_pixels = f64::from(graph.height.saturating_mul(2).saturating_sub(1));
+            (x_pixels / y_pixels).max(1.0)
+        })
+        .unwrap_or(1.0);
+    let x_bounds = [-x_extent, x_extent];
+    let disk_points = [charts::Series {
+        name: "occupied entries",
+        points: &entries,
+        color: NORMAL_GREEN,
+        scatter: true,
+    }];
     let occupancy_label = if capacity > 0 {
         format!("{occupancy}/{capacity}")
     } else {
@@ -2743,10 +2800,23 @@ fn draw_memory_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             x: "disk x",
             integer_x: false,
             y: "disk y",
-            x_bounds: [-1.0, 1.0],
+            x_bounds,
             y_bounds: [-1.0, 1.0],
         },
         &disk_points,
+    );
+    // Render the boundary separately with HalfBlock pixels. It is deliberately
+    // not part of the occupied-entry series: a continuous wall should not make
+    // the small occupancy dots look like a connected trace.
+    charts::draw_solid_overlay(
+        f,
+        area,
+        charts::Plot {
+            x_bounds,
+            ..geometry
+        },
+        &boundary,
+        Color::Rgb(0x32, 0x8f, 0x60),
     );
 }
 
@@ -2865,11 +2935,34 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         .epoch_updates
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".into());
+    let dream_mode = state.dream_mode.as_deref().unwrap_or("-");
+    let dream_loss = state
+        .dream_last_loss
+        .map(charts::number)
+        .unwrap_or_else(|| "-".into());
+    let dream = if state.dream_active {
+        format!(
+            "DREAMING / #{} / mode {dream_mode} / update {}",
+            state.dream_count.saturating_add(1),
+            state
+                .dream_update
+                .map(|update| update.to_string())
+                .unwrap_or_else(|| "-".into())
+        )
+    } else if state.dream_count > 0 {
+        format!(
+            "{} completed / mode {dream_mode} / last loss {dream_loss}",
+            state.dream_count
+        )
+    } else {
+        "off".into()
+    };
     let lines = vec![
         Line::from(vec![
             Span::raw("status      "),
             Span::styled(health.label(), health_style),
         ]),
+        Line::from(format!("dream       {dream}")),
         Line::from(format!(
             "speed       {speed} tokens/s  ETA {}",
             state.eta.as_deref().unwrap_or("-")
@@ -3287,6 +3380,25 @@ mod tests {
         assert_eq!(state.loss_series, [4.0778]);
         state.ingest("  training 20/100 (20%) loss=4.0 tokens_per_second=150 eta=2h 14m 09s");
         assert_eq!(state.eta.as_deref(), Some("2h 14m 09s"));
+    }
+
+    #[test]
+    fn parses_dream_start_and_completion_without_polluting_training_loss() {
+        let mut state = RunState::default();
+        state.ingest("progress_schema=2 updates_total=12");
+        state.ingest("dream phase=start update=4 mode=both");
+        assert!(state.dream_active);
+        assert_eq!(state.dream_count, 0);
+        assert_eq!(state.dream_mode.as_deref(), Some("both"));
+        assert_eq!(state.dream_update, Some(4));
+        state.ingest("dream phase=end update=4 mode=both dream_loss=0.125 entries_replayed=2");
+        assert!(!state.dream_active);
+        assert_eq!(state.dream_count, 1);
+        assert_eq!(state.dream_last_loss, Some(0.125));
+        assert!(state.loss_series.is_empty());
+        assert_eq!(state.health_status().normal_label, "TRAINING");
+        state.ingest("dream phase=start update=8 mode=memory");
+        assert_eq!(state.health_status().normal_label, "DREAMING");
     }
 
     #[test]
@@ -4128,6 +4240,91 @@ mod tests {
     }
 
     #[test]
+    fn poincare_boundary_is_aspect_correct_and_one_connected_solid_outline() {
+        use ratatui::{Terminal, backend::TestBackend, style::Color};
+        use std::collections::{HashSet, VecDeque};
+
+        let state = RunState {
+            graph_view: GraphView::Memory,
+            memory_used: Some(12),
+            memory_capacity: Some(64),
+            ..RunState::default()
+        };
+        for (width, height) in [(120, 40), (80, 24), (240, 80), (80, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let outline_color = Color::Rgb(0x32, 0x8f, 0x60);
+            let mut pixels = HashSet::new();
+            let mut dots = 0;
+            for (index, cell) in buffer.content().iter().enumerate() {
+                let x = (index % usize::from(width)) as i32;
+                let y = (index / usize::from(width)) as i32 * 2;
+                if cell.fg == outline_color {
+                    assert!(
+                        matches!(cell.symbol(), "▀" | "▄" | "█"),
+                        "non-solid boundary glyph at {x},{y}"
+                    );
+                    if matches!(cell.symbol(), "▀" | "█") {
+                        pixels.insert((x, y));
+                    }
+                    if matches!(cell.symbol(), "▄" | "█") {
+                        pixels.insert((x, y + 1));
+                    }
+                } else if cell.fg == NORMAL_GREEN
+                    && cell.symbol().chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+                {
+                    dots += 1;
+                }
+            }
+            assert!(pixels.len() >= 12, "solid disk outline was not rendered");
+            assert!(dots > 0, "occupied slots must remain separate small dots");
+            let min_x = pixels.iter().map(|(x, _)| *x).min().unwrap();
+            let max_x = pixels.iter().map(|(x, _)| *x).max().unwrap();
+            let min_y = pixels.iter().map(|(_, y)| *y).min().unwrap();
+            let max_y = pixels.iter().map(|(_, y)| *y).max().unwrap();
+            assert!(
+                ((max_x - min_x) - (max_y - min_y)).abs() <= 2,
+                "disk is an oval at {width}x{height}: {}x{} physical pixels",
+                max_x - min_x,
+                max_y - min_y
+            );
+            let start = *pixels.iter().next().unwrap();
+            let mut seen = HashSet::from([start]);
+            let mut queue = VecDeque::from([start]);
+            while let Some((x, y)) = queue.pop_front() {
+                for nx in x - 1..=x + 1 {
+                    for ny in y - 1..=y + 1 {
+                        if pixels.contains(&(nx, ny)) && seen.insert((nx, ny)) {
+                            queue.push_back((nx, ny));
+                        }
+                    }
+                }
+            }
+            assert_eq!(seen.len(), pixels.len(), "boundary has a gap between adjacent pixels");
+
+            // Connectivity alone would still allow an open arc. Flood-fill the
+            // interior in physical half-block pixels: a closed outline must
+            // prevent escape through any missing adjacent boundary cell.
+            let center = ((min_x + max_x) / 2, (min_y + max_y) / 2);
+            assert!(!pixels.contains(&center));
+            let mut seen = HashSet::from([center]);
+            let mut queue = VecDeque::from([center]);
+            while let Some((x, y)) = queue.pop_front() {
+                assert!(
+                    x >= min_x && x <= max_x && y >= min_y && y <= max_y,
+                    "boundary has a gap: interior escaped at {width}x{height}"
+                );
+                for next in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+                    if !pixels.contains(&next) && seen.insert(next) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn monitor_loss_axes_keep_ticks_and_titles_out_of_the_curve() {
         use ratatui::{Terminal, backend::TestBackend};
         let mut state = RunState::default();
@@ -4260,19 +4457,20 @@ mod tests {
                     if h == 40 { 8 } else { 3 },
                 );
                 let rect = Rect::new(content.x, top, content.width - 1, bottom - top + 1);
-                charts::assert_plot(
-                    buffer,
-                    rect,
-                    &[
-                        y,
-                        caption,
-                        if view == GraphView::Memory {
-                            "disk x"
-                        } else {
-                            "training step"
-                        },
-                    ],
-                );
+                let plot_labels = [
+                    y,
+                    caption,
+                    if view == GraphView::Memory {
+                        "disk x"
+                    } else {
+                        "training step"
+                    },
+                ];
+                if view == GraphView::Memory {
+                    charts::assert_plot_with_halfblocks(buffer, rect, &plot_labels);
+                } else {
+                    charts::assert_plot(buffer, rect, &plot_labels);
+                }
                 if view != GraphView::Memory {
                     charts::assert_plot(buffer, rect, &["100", "250", "400"]);
                 }

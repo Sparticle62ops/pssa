@@ -32,6 +32,15 @@ a background worker at most once per five seconds (64 MiB checkpoint size cap
 for automatic background loading). `r` refreshes manually;
 `PgUp`/`PgDn` scroll slot metadata. It never modifies the checkpoint or model.
 
+The setup wizard also exposes the six optional dreaming fields: cadence
+(`--dream-every`, `0` means off), replay entries (`--dream-replay`), mode
+(`--dream-mode memory|generate|both`), generated length (`--dream-len`),
+rehearsal rate (`--dream-lr`), and rehearsal passes (`--dream-steps`). Their
+names, defaults, and validation match the CLI. The monitor parses the trainer's
+`dream phase=start` and `dream phase=end` events and shows the active phase,
+completed count, mode, and latest rehearsal loss without mixing it into the
+training-loss graph.
+
 **Telemetry limits are explicit:** existing checkpoints store vectors and
 last-seen steps/confidence, not the source token text. A feed snippet is only feed
 context, never claimed as a confirmed write. Exact eviction rates and write

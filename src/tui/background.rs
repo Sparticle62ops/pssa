@@ -123,9 +123,9 @@ impl HexBackground {
                 let (cx, cy) = center(hex);
                 let (dx, dy) = (i32::from(x) - cx, i32::from(y) - cy);
                 let symbol = match (dx, dy) {
-                    (-2..=1, -2 | 2) => "_",
-                    (-3, -1) | (-4, 0) | (3, 1) | (2, 2) => "/",
-                    (2, -1) | (3, 0) | (-4, 1) | (-3, 2) => "\\",
+                    (-2..=1, -2 | 2) => "─",
+                    (-3, -1) | (-4, 0) | (3, 1) | (2, 2) => "╱",
+                    (2, -1) | (3, 0) | (-4, 1) | (-3, 2) => "╲",
                     _ => continue,
                 };
                 let pressure = self
@@ -159,9 +159,9 @@ mod tests {
     fn test_backend_static_without_mouse_and_narrow_fallback() {
         let mut background = HexBackground::default();
         let before = render(&background, 100, 30);
-        assert!(before.content().iter().any(|c| c.symbol() == "_"));
+        assert!(before.content().iter().any(|c| c.symbol() == "─"));
         let top: String = (3..9).map(|x| before[(x, 0)].symbol()).collect();
-        assert_eq!(top, "\\____/", "shared hex edges must join without gaps");
+        assert_eq!(top, "╲────╱", "shared hex edges must join without gaps");
         for _ in 0..300 {
             background.advance(Duration::from_millis(34));
         }

@@ -317,7 +317,7 @@ impl DevicePicker {
                 Line::styled(
                     format!(
                         "{} {} / {}",
-                        if index == self.selected { ">" } else { " " },
+                        if index == self.selected { "▶" } else { " " },
                         entry.label,
                         entry.detail
                     ),

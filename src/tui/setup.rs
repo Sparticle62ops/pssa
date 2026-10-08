@@ -7,6 +7,7 @@ use super::{
 use crate::{
     cli::{TrainingBackend, resource_limits::ResourceLimits},
     dataset::DatasetManager,
+    dream::DreamMode as DreamModeValue,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -49,9 +50,15 @@ enum Field {
     Batch,
     Threads,
     Ram,
+    DreamEvery,
+    DreamReplay,
+    DreamMode,
+    DreamLen,
+    DreamLr,
+    DreamSteps,
 }
 use Field::*;
-const LABELS: [&str; 22] = [
+const LABELS: [&str; 28] = [
     "Source",
     "Dataset",
     "HF config (optional)",
@@ -74,17 +81,37 @@ const LABELS: [&str; 22] = [
     "Max batch lanes",
     "Threads (optional)",
     "RAM MiB (optional)",
+    "Dream every updates (0 = off)",
+    "Dream replay entries",
+    "Dream mode",
+    "Dream length",
+    "Dream learning rate",
+    "Dream steps",
 ];
 const PAGES: [&str; 4] = ["1 dataset", "2 model", "3 training", "4 review / launch"];
 const FIELDS: [&[Field]; 4] = [
     &[Source, Dataset, HfConfig, HfSplit, HfField],
     &[Latent, State, Vocab, Depth, Loops],
-    &[Lr, Epochs, MaxTokens, Seed, Chunk, Accumulate, Batch],
+    &[
+        Lr,
+        Epochs,
+        MaxTokens,
+        Seed,
+        Chunk,
+        Accumulate,
+        Batch,
+        DreamEvery,
+        DreamReplay,
+        DreamMode,
+        DreamLen,
+        DreamLr,
+        DreamSteps,
+    ],
     &[Output, Resume, Backend, Threads, Ram],
 ];
 
 pub(super) struct Setup {
-    values: [String; 22],
+    values: [String; 28],
     devices: DevicePicker,
     page: usize,
     selected: usize,
@@ -123,6 +150,12 @@ impl Default for Setup {
                 "",
                 "",
                 "",
+                "0",
+                "32",
+                "memory",
+                "64",
+                "0.006",
+                "1",
             ]
             .map(str::to_owned),
             devices: DevicePicker::default(),
@@ -160,7 +193,7 @@ impl Setup {
                 self.values[index] = value;
             }
         }
-        self.message = "Resume selected; verify shape, chunk and schedule. TRFM uses CPU baseline; PSSA-only fields are ignored for TRFM.".into();
+        self.message = "Resume selected; verify shape, chunk and schedule. TRFM uses CPU baseline; PSSA-only fields, including dream controls, are ignored for TRFM.".into();
         self.error = false;
     }
 
@@ -502,6 +535,21 @@ impl Setup {
         self.value(Seed)
             .parse::<u64>()
             .map_err(|_| "Seed must be an unsigned 64-bit integer")?;
+        for (field, min, max) in [
+            (DreamEvery, 0, 1_000_000),
+            (DreamReplay, 1, 1_000_000),
+            (DreamLen, 1, 100_000),
+            (DreamSteps, 1, 1_000_000),
+        ] {
+            self.number(field, min, max)?;
+        }
+        DreamModeValue::parse(self.value(DreamMode))?;
+        let dream_lr = self.value(DreamLr).parse::<f32>().map_err(|_| {
+            "Dream learning rate must be a finite positive number"
+        })?;
+        if !dream_lr.is_finite() || dream_lr <= 0.0 {
+            return Err("Dream learning rate must be a finite positive number".into());
+        }
         let lr = self
             .value(Lr)
             .parse::<f32>()
@@ -592,6 +640,55 @@ impl Setup {
             // accept --batch-size, even when the shared draft explicitly says 1.
             if !(transformer && field == Batch) && !self.value(field).is_empty() {
                 push(flag, self.value(field).into());
+            }
+        }
+        if !transformer {
+            for (field, flag, differs) in [
+                (
+                    DreamEvery,
+                    "--dream-every",
+                    self.value(DreamEvery)
+                        .parse::<usize>()
+                        .map_or(true, |value| value != 0),
+                ),
+                (
+                    DreamReplay,
+                    "--dream-replay",
+                    self.value(DreamReplay)
+                        .parse::<usize>()
+                        .map_or(true, |value| value != 32),
+                ),
+                (
+                    DreamMode,
+                    "--dream-mode",
+                    DreamModeValue::parse(self.value(DreamMode))
+                        .map_or(true, |value| value != DreamModeValue::Memory),
+                ),
+                (
+                    DreamLen,
+                    "--dream-len",
+                    self.value(DreamLen)
+                        .parse::<usize>()
+                        .map_or(true, |value| value != 64),
+                ),
+                (
+                    DreamLr,
+                    "--dream-lr",
+                    self.value(DreamLr)
+                        .parse::<f32>()
+                        .map_or(true, |value| value != crate::dream::DEFAULT_REHEARSAL_LR),
+                ),
+                (
+                    DreamSteps,
+                    "--dream-steps",
+                    self.value(DreamSteps)
+                        .parse::<usize>()
+                        .map_or(true, |value| value != 1),
+                ),
+            ] {
+                if differs {
+                    push(flag, self.value(field).into());
+                }
             }
         }
         if !self.value(Resume).is_empty() {
@@ -723,7 +820,7 @@ impl Setup {
                 format!("{label:<21} ")
             };
             let label: String = label.chars().take(inner_width.saturating_sub(6)).collect();
-            let prefix = format!("{} {label}", if focused { ">" } else { " " });
+            let prefix = format!("{} {label}", if focused { "▶" } else { " " });
             let cursor = if focused && self.edit.is_some() {
                 "▏"
             } else {
@@ -744,7 +841,7 @@ impl Setup {
             if self.page == 3 {
                 "[ START TRAINING ]"
             } else {
-                "[ NEXT > ]"
+                "[ NEXT ▶ ]"
             },
             if self.selected == fields.len() {
                 accent().add_modifier(Modifier::REVERSED)
@@ -1215,6 +1312,124 @@ mod tests {
         let index = setup.args().iter().position(|arg| arg == "--resume").unwrap();
         assert_eq!(setup.args()[index + 1], path.to_str().unwrap());
         assert!(setup.prepare_resume(fixture.0.join("missing.pssa")).is_err());
+    }
+
+    #[test]
+    fn dream_defaults_and_changed_values_round_trip_through_the_real_cli_parser() {
+        let fixture = Fixture::new();
+        let setup = fixture.setup();
+        let spec = setup.validate().unwrap();
+        let dream_flags = [
+            "--dream-every",
+            "--dream-replay",
+            "--dream-mode",
+            "--dream-len",
+            "--dream-lr",
+            "--dream-steps",
+        ];
+        for flag in dream_flags {
+            assert_eq!(spec.args.iter().filter(|arg| *arg == flag).count(), 0);
+        }
+        let parsed = crate::cli::parse_train_options_for_test(&spec.args[1..]).unwrap();
+        assert_eq!(parsed.dream_every, 0);
+        assert_eq!(parsed.dream_replay, 32);
+        assert_eq!(parsed.dream_mode, DreamModeValue::Memory);
+        assert_eq!(parsed.dream_len, 64);
+        assert_eq!(parsed.dream_lr, crate::dream::DEFAULT_REHEARSAL_LR);
+        assert_eq!(parsed.dream_steps, crate::dream::DEFAULT_REHEARSAL_STEPS);
+
+        for (mode, expected_flags) in [
+            ("memory", [true, true, false, true, true, true]),
+            ("generate", [true, true, true, true, true, true]),
+            ("both", [true, true, true, true, true, true]),
+        ] {
+            let mut setup = fixture.setup();
+            for (field, value) in [
+                (DreamEvery, "1"),
+                (DreamReplay, "1"),
+                (DreamMode, mode),
+                (DreamLen, "1"),
+                (DreamLr, "0.001"),
+                (DreamSteps, "2"),
+            ] {
+                setup.values[field as usize] = value.into();
+            }
+            let spec = setup.validate().unwrap();
+            for (flag, should_emit) in dream_flags.into_iter().zip(expected_flags) {
+                let positions: Vec<_> = spec
+                    .args
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, arg)| (arg == flag).then_some(index))
+                    .collect();
+                assert_eq!(positions.len(), usize::from(should_emit), "{mode} {flag}");
+                if let Some(&index) = positions.first() {
+                    assert_eq!(spec.args[index + 1], setup.value(match flag {
+                        "--dream-every" => DreamEvery,
+                        "--dream-replay" => DreamReplay,
+                        "--dream-mode" => DreamMode,
+                        "--dream-len" => DreamLen,
+                        "--dream-lr" => DreamLr,
+                        "--dream-steps" => DreamSteps,
+                        _ => unreachable!(),
+                    }));
+                }
+            }
+            let parsed = crate::cli::parse_train_options_for_test(&spec.args[1..]).unwrap();
+            assert_eq!(parsed.dream_every, 1);
+            assert_eq!(parsed.dream_replay, 1);
+            assert_eq!(parsed.dream_mode, DreamModeValue::parse(mode).unwrap());
+            assert_eq!(parsed.dream_len, 1);
+            assert_eq!(parsed.dream_lr, 0.001);
+            assert_eq!(parsed.dream_steps, 2);
+            assert!(setup.command().contains("--dream-every 1"));
+        }
+    }
+
+    #[test]
+    fn dream_boundaries_and_invalid_values_match_cli_validation() {
+        let fixture = Fixture::new();
+        for (field, value) in [
+            (DreamEvery, "0"),
+            (DreamEvery, "1000000"),
+            (DreamReplay, "1"),
+            (DreamReplay, "1000000"),
+            (DreamLen, "1"),
+            (DreamLen, "100000"),
+            (DreamSteps, "1"),
+            (DreamSteps, "1000000"),
+            (DreamLr, "1e-45"),
+            (DreamLr, "3.4028235e38"),
+        ] {
+            let mut setup = fixture.setup();
+            setup.values[field as usize] = value.into();
+            let spec = setup.validate().unwrap();
+            assert!(crate::cli::parse_train_options_for_test(&spec.args[1..]).is_ok());
+        }
+        for (field, value) in [
+            (DreamEvery, "-1"),
+            (DreamEvery, "1000001"),
+            (DreamReplay, "0"),
+            (DreamReplay, "1000001"),
+            (DreamMode, "tokens"),
+            (DreamLen, "0"),
+            (DreamLen, "100001"),
+            (DreamLr, "0"),
+            (DreamLr, "-1"),
+            (DreamLr, "NaN"),
+            (DreamLr, "inf"),
+            (DreamSteps, "0"),
+            (DreamSteps, "1000001"),
+        ] {
+            let mut setup = fixture.setup();
+            setup.values[field as usize] = value.into();
+            assert!(setup.validate().is_err(), "wizard accepted {field:?}={value}");
+            let args = setup.args();
+            assert!(
+                crate::cli::parse_train_options_for_test(&args[1..]).is_err(),
+                "CLI accepted {field:?}={value}"
+            );
+        }
     }
 
     #[test]

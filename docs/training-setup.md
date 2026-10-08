@@ -13,9 +13,17 @@ The existing command-line training and piped-log monitor remain available.
    stacked neuron nets and an oval with electricity making one lap per pass.
    They illustrate the selected configuration, not measured model activity.
 3. **Training**: learning rate, epochs, optional max tokens, seed, chunk,
-   and accumulation. Blank max tokens means no cap.
+   accumulation, and the dream controls: dream cadence (`--dream-every`,
+   default `0`/off), replay count (`--dream-replay`, default `32`), mode
+   (`--dream-mode`, default `memory`), generated length (`--dream-len`, default
+   `64`), rehearsal rate (`--dream-lr`, default `0.006`), and rehearsal passes
+   (`--dream-steps`, default `1`). Blank max tokens means no cap. Dream values
+   use the same validation as the CLI and are ignored for transformer runs.
 4. **Review / launch**: output directory, optional resume checkpoint, backend,
-   and the equivalent shell command. Select **START TRAINING** and press Enter.
+   and the equivalent shell command. Dream flags appear in that command only
+   when they differ from their defaults. Select **START TRAINING** and press Enter.
+   The monitor then reports active dreams, completed count, mode, and last dream
+   loss separately from the ordinary training loss.
    On success the app switches to the monitor.
 
 **Up/Down** selects a field or button. **Enter** edits a field (or cycles source

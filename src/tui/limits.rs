@@ -149,14 +149,14 @@ impl Limits {
                     LABELS[index],
                     if value.is_empty() { "default" } else { value },
                     if self.selected == index && self.edit.is_some() {
-                        "_"
+                        "▏"
                     } else {
                         ""
                     }
                 )
             };
             rows.push(Line::styled(
-                format!("{} {text}", if self.selected == index { ">" } else { " " }),
+                format!("{} {text}", if self.selected == index { "▶" } else { " " }),
                 if self.selected == index {
                     accent().add_modifier(Modifier::REVERSED)
                 } else {
@@ -255,6 +255,7 @@ mod tests {
                 .map(|c| c.symbol())
                 .collect();
             if width >= 60 {
+                assert!(text.contains("▶ Rayon threads"));
                 for expected in [
                     "resource limits",
                     "Rayon threads",

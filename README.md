@@ -300,6 +300,45 @@ bottom, so you can copy it into a script.
 
 ![Setup tab: new-run wizard with the equivalent CLI command](docs/img/tui-setup.png)
 
+### Dreaming
+
+Dreaming is an optional sleep phase between training updates. The model replays
+some stored memories, and it can also generate short rehearsal sequences, so
+useful patterns are revisited instead of being left behind by the newest batch.
+It is off by default and does not alter the normal training path when disabled.
+
+The CLI controls are:
+
+- `--dream-every N` — run a dream every `N` optimizer updates; `0` disables it.
+- `--dream-replay K` — replay up to `K` occupied memory entries per dream
+  (default `32`).
+- `--dream-mode memory|generate|both` — choose memory replay, generated
+  rehearsal, or both (default `memory`).
+- `--dream-len N` — generated rehearsal length (default `64`).
+- `--dream-lr F` — rehearsal learning rate (default `0.006`).
+- `--dream-steps N` — rehearsal passes per sequence (default `1`).
+
+For example:
+
+```bash
+pssa train data/corpus.txt -o runs/dream.pssa --dream-every 100 \
+  --dream-replay 32 --dream-mode both --dream-len 64 \
+  --dream-lr 0.006 --dream-steps 1
+```
+
+In the TUI, open **Setup**, page through the training fields, and change
+**Dream every updates (0 = off)** from `0`; the remaining dream fields use the
+same names, defaults, and validation as the CLI. The equivalent command shown
+by the wizard includes only dream flags that differ from their defaults. The
+monitor reports when a dream is active, its count and mode, and the last dream
+loss separately from the ordinary training loss.
+
+On the measured five-seed probe (7, 11, 23, 42, 99), mean forgetting fell from
+`13.0549` with dreaming off to `9.5961` with dreaming on in `both` mode, a
+`26.5%` reduction. Task B's final loss fell from `0.0040` to `0.0030`.
+
+![Mean forgetting with dreaming](docs/img/dream-forgetting.svg)
+
 **Model, chain and feed.** The model tab shows the configuration the run
 reported. The chain tab lists saved checkpoints with their loss, and the feed tab
 shows the text and token ids being trained on when streaming from Hugging Face.
@@ -348,10 +387,9 @@ pssa status
   each link trains on the next 500,000 tokens of a mixed corpus and saves a
   checkpoint, so the run survives restarts. A sample from every checkpoint is
   being collected to show how the model improves over time.
-- **Sleep and dreaming.** An opt-in sleep phase (`--dream-every`) replays stored
-  memories between updates. In the first version, replay only updated the small
-  fast adapter, and on a sequential-task probe it did not reduce forgetting.
-  It is being reworked so replay also reaches the main weights.
+- **Sleep and dreaming.** The opt-in sleep phase replays stored memories and
+  optional generated rehearsal sequences between updates. It is described in
+  [Dreaming](#dreaming) and remains off by default.
 - **Depth and loops.** Stacked PSSA blocks (`--depth`) and shared repeated passes
   (`--loops`), with notes in [docs/STACKED-DEPTH.md](docs/STACKED-DEPTH.md).
 - **WebGPU training.** The recurrent scan and memory stage are being ported to

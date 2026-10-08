@@ -112,7 +112,7 @@ impl Overlay {
         {
             lines.push(Line::from(format!(
                 "{} {label}",
-                if i == self.selected { ">" } else { " " }
+                if i == self.selected { "▶" } else { " " }
             )));
         }
         f.render_widget(
