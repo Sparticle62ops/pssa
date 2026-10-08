@@ -98,8 +98,8 @@ fn transformer_bpe_actual_window_cache_and_epochs_do_not_change_checkpoint_bits(
         if cached {
             command.arg("--token-cache").arg(&cache);
         }
-        if telemetry {
-            command.arg("--feed-telemetry");
+        if !telemetry {
+            command.arg("--no-feed-telemetry");
         }
         let output = command.output().unwrap();
         assert!(
@@ -113,7 +113,10 @@ fn transformer_bpe_actual_window_cache_and_epochs_do_not_change_checkpoint_bits(
         (log, fs::read(out).unwrap())
     };
     let (disabled, reference) = run("disabled", false, false);
-    assert!(!disabled.contains("feed_schema="), "telemetry stays opt-in");
+    assert!(
+        !disabled.contains("feed_schema="),
+        "explicit opt-out must omit dataset windows"
+    );
     let (uncached, uncached_bits) = run("uncached", false, true);
     assert_eq!(
         uncached_bits, reference,
@@ -274,8 +277,8 @@ fn run_pssa_window(
         .arg(&out)
         .args(extra)
         .env("RAYON_NUM_THREADS", "1");
-    if telemetry {
-        command.arg("--feed-telemetry");
+    if !telemetry {
+        command.arg("--no-feed-telemetry");
     }
     let started = Instant::now();
     let result = command.output().unwrap();
@@ -332,7 +335,7 @@ fn pssa_dream_off_telemetry_preserves_checkpoint_and_loss_bits_for_lanes_depth_l
             run_pssa(&fixture, &source, &disabled_label, false, &args);
         assert!(
             !disabled.contains("feed_schema="),
-            "telemetry must be disabled by default"
+            "explicit opt-out must omit dataset windows"
         );
         assert!(!disabled.contains("dream phase="));
         let (enabled, actual, enabled_curve, elapsed) =
