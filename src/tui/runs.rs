@@ -445,7 +445,7 @@ impl Runs {
         for (i, e) in self.entries.iter().enumerate().skip(start).take(height) {
             rows.push(Line::from(format!(
                 "{} {}  ppl {}  {}",
-                if i == self.selected { ">" } else { " " },
+                if i == self.selected { "▶" } else { " " },
                 date(e.modified),
                 e.ppl.map_or("unscored".into(), |n| format!("{n:.3}")),
                 clean(&e.path.display().to_string())

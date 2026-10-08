@@ -278,7 +278,7 @@ impl Benchmark {
             .map(|(i, label)| {
                 format!(
                     "{} {label}: {}{}",
-                    if i == self.selected { ">" } else { " " },
+                    if i == self.selected { "▶" } else { " " },
                     clean(&self.fields[i]),
                     if i == self.selected && self.editing {
                         " ▌"
@@ -432,7 +432,7 @@ mod tests {
                 .map(|c| c.symbol())
                 .collect();
             assert!(
-                text.contains("> accumulate"),
+                text.contains("▶ accumulate"),
                 "selected field hidden at {w}x{h}"
             );
         }
@@ -520,7 +520,7 @@ mod tests {
                     .map(|c| c.symbol())
                     .collect();
                 assert!(
-                    text.contains(&format!("> {label}")),
+                    text.contains(&format!("▶ {label}")),
                     "hidden input at {w}x{h}: {label}"
                 );
             }

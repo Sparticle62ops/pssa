@@ -26,6 +26,14 @@ impl DreamMode {
         }
     }
 
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Generate => "generate",
+            Self::Both => "both",
+        }
+    }
+
     pub const fn includes_memory(self) -> bool {
         matches!(self, Self::Memory | Self::Both)
     }
@@ -47,6 +55,9 @@ pub struct DreamSummary {
     pub generated_tokens: usize,
     /// Number of supervised token sequences replayed through the main model.
     pub rehearsal_sequences: usize,
+    /// Loss of the last supervised sequence considered by the rehearsal pass.
+    /// This is runtime telemetry only and is absent when no sequence was ready.
+    pub last_rehearsal_loss: Option<f32>,
     pub consolidation_delta_norm: f32,
     pub elapsed_seconds: f64,
 }
@@ -232,6 +243,7 @@ mod tests {
         let slow = model.block.adapters[0].consolidated_up.clone();
         let summary = model.dream_replay_memory(0, &mut SimpleRng::new(9));
         assert_eq!(summary.entries_replayed, 0);
+        assert_eq!(summary.last_rehearsal_loss, None);
         assert_eq!(main_weight_bits(&model), before);
         assert_eq!(model.block.adapters[0].up_proj.data, fast);
         assert_eq!(model.block.adapters[0].consolidated_up, slow);
@@ -336,6 +348,7 @@ mod tests {
         assert_eq!(summary.entries_replayed, 1);
         assert_eq!(summary.generated_tokens, 4);
         assert_eq!(summary.rehearsal_sequences, 1);
+        assert!(summary.last_rehearsal_loss.is_some_and(f32::is_finite));
         assert!(summary.consolidation_delta_norm > 0.0);
         assert_ne!(main_weight_bits(&model), before);
         assert_eq!(optimizer_bits(&mut model), optimizer);
@@ -357,6 +370,36 @@ mod tests {
         assert_eq!(summary.generated_tokens, 0);
         assert_eq!(summary.rehearsal_sequences, 0);
         assert_eq!(main_weight_bits(&model), before);
+    }
+
+    #[test]
+    fn rehearsal_loss_telemetry_reports_the_existing_forward_loss() {
+        let mut replayed = model();
+        let observed = model();
+        let inputs = [1, 2, 1, 2];
+        let targets = [2, 1, 2, 1];
+        replayed.remember_dream_sequence(&inputs, &targets);
+        let expected = {
+            let mut observed = observed;
+            let loss = observed.forward_train_chunk(&inputs, &targets);
+            observed.zero_gradients();
+            loss
+        };
+        let summary = replayed.dream_replay_with_options(
+            DreamMode::Memory,
+            1,
+            0,
+            0.8,
+            6e-3,
+            1,
+            &mut SimpleRng::new(80),
+        );
+        assert_eq!(summary.rehearsal_sequences, 1);
+        let reported = summary
+            .last_rehearsal_loss
+            .expect("one rehearsal sequence has a loss");
+        assert!(reported.is_finite());
+        assert_eq!(reported.to_bits(), expected.to_bits());
     }
 
     #[test]
@@ -385,6 +428,7 @@ mod tests {
             &mut SimpleRng::new(79),
         );
         assert_eq!(summary.rehearsal_sequences, 1);
+        assert!(summary.last_rehearsal_loss.is_some_and(f32::is_finite));
         assert_ne!(main_weight_bits(&model), before);
         assert_eq!(optimizer_bits(&mut model), optimizer);
         assert_eq!(model.embed_row_marks, marks);
@@ -442,6 +486,7 @@ mod tests {
         assert_eq!(summary.entries_replayed, 0);
         assert_eq!(summary.generated_tokens, 0);
         assert_eq!(summary.rehearsal_sequences, 1);
+        assert!(summary.last_rehearsal_loss.is_some_and(f32::is_finite));
         assert_ne!(replayed.unembed_w.data, before_weights);
         assert_training_state_identical(&mut replayed, &mut reference);
         let after_loss = replayed.forward_train_chunk(&inputs, &targets);
@@ -627,5 +672,6 @@ mod tests {
     #[test]
     fn summary_defaults_to_empty() {
         assert_eq!(DreamSummary::default().entries_replayed, 0);
+        assert_eq!(DreamSummary::default().last_rehearsal_loss, None);
     }
 }

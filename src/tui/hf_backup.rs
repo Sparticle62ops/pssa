@@ -290,10 +290,10 @@ impl Backup {
             };
             lines.push(Line::from(format!(
                 "{} {name}: {}{}",
-                if i == self.selected { ">" } else { " " },
+                if i == self.selected { "▶" } else { " " },
                 network::clean(value),
                 if i == self.selected && self.editing() {
-                    "_"
+                    "▏"
                 } else {
                     ""
                 }
