@@ -225,6 +225,8 @@ mod tests {
         let before_loss = model.forward_train_chunk(&inputs, &targets);
         model.zero_gradients();
         let before = main_weight_bits(&model);
+        let before_m = model.unembed_w.m.clone();
+        let before_v = model.unembed_w.v.clone();
         let step = model.step_counter;
         let summary = model.dream_replay_with_options_and_guard(
             DreamMode::Memory,
@@ -238,6 +240,8 @@ mod tests {
         );
         assert_eq!(summary.rehearsal_sequences, 1);
         assert_eq!(model.step_counter, step);
+        assert_eq!(model.unembed_w.m, before_m);
+        assert_eq!(model.unembed_w.v, before_v);
         assert_ne!(main_weight_bits(&model), before);
         model.reset_recurrent_state();
         let after_loss = model.forward_train_chunk(&inputs, &targets);

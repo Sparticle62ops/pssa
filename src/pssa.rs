@@ -1582,7 +1582,6 @@ pub struct PSSALayerV2 {
     /// checkpoints: dream controls and their ephemeral rehearsal cache must be
     /// supplied again when resuming a run.
     dream_sequences: Vec<DreamSequence>,
-
 }
 
 impl std::ops::Deref for PSSALayerV2 {
@@ -1687,7 +1686,6 @@ impl PSSALayerV2 {
             inf_features: vec![0.0; d],
             inf_block_out: vec![0.0; d],
             dream_sequences: Vec::new(),
-
         }
     }
     pub fn depth(&self) -> usize {
@@ -2654,9 +2652,9 @@ impl PSSALayerV2 {
         for (tensor_index, (old, fresh)) in old_gradients.iter().zip(fresh_gradients).enumerate() {
             assert_eq!(old.len(), fresh.len());
             for (index, (&old, &fresh)) in old.iter().zip(fresh).enumerate() {
-                let selected = selected_rows.as_ref().is_none_or(|rows| {
-                    tensor_index == 1 && rows[index / self.cfg.d_latent]
-                });
+                let selected = selected_rows
+                    .as_ref()
+                    .is_none_or(|rows| tensor_index == 1 && rows[index / self.cfg.d_latent]);
                 if selected {
                     dot += old as f64 * fresh as f64;
                     fresh_norm_sq += fresh as f64 * fresh as f64;
@@ -2681,9 +2679,9 @@ impl PSSALayerV2 {
             for (index, ((weight, &old), &fresh)) in
                 tensor.data.iter_mut().zip(old).zip(fresh).enumerate()
             {
-                let selected = selected_rows.as_ref().is_none_or(|rows| {
-                    tensor_index == 1 && rows[index / d_latent]
-                });
+                let selected = selected_rows
+                    .as_ref()
+                    .is_none_or(|rows| tensor_index == 1 && rows[index / d_latent]);
                 if selected {
                     let projected = old as f64 - projection * fresh as f64;
                     *weight -= lr * projected as f32;
@@ -2798,10 +2796,11 @@ impl PSSALayerV2 {
     /// Run replay and consolidate it into the main model. Memory values are
     /// sampled first; generate/both modes also produce supervised next-token
     /// sequences from each seed. Stored sequences and generated sequences take
-    /// a separate small-LR SGD step on all main weights. The normal Adam state
-    /// and step counter are intentionally untouched, so dream updates cannot
-    /// change the fresh-task LR schedule. Recurrent carry is restored around
-    /// generation and rehearsal.
+    /// a separate small-LR SGD step on the main output rows associated with
+    /// the replay targets. The normal Adam state and step counter are
+    /// intentionally untouched, so dream updates cannot change the fresh-task
+    /// LR schedule. Recurrent carry is restored around generation and
+    /// rehearsal.
     pub fn dream_replay_with_options(
         &mut self,
         mode: crate::dream::DreamMode,
@@ -2938,12 +2937,7 @@ impl PSSALayerV2 {
         let mut rehearsal_sequences = 0;
         let stored_sequences: Vec<DreamSequence> = self.dream_sequences[..sequence_take].to_vec();
         for sequence in stored_sequences {
-            self.rehearse_dream_sequence(
-                &sequence,
-                guard.as_ref(),
-                rehearsal_lr,
-                rehearsal_steps,
-            );
+            self.rehearse_dream_sequence(&sequence, guard.as_ref(), rehearsal_lr, rehearsal_steps);
             rehearsal_sequences += 1;
         }
         if mode.includes_generation() {
@@ -2968,6 +2962,11 @@ impl PSSALayerV2 {
             }
         }
         self.device = device;
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(ctx) = self.device.clone() {
+            ctx.refresh_safeguarded_weights(&mut self.adam_tensors())
+                .expect("CUDA dream weight synchronization failed");
+        }
         if let Some(ctx) = self.device.gpu() {
             ctx.invalidate_weights();
         }
