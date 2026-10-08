@@ -35,10 +35,10 @@ impl DreamMode {
     }
 }
 
-/// Default learning rate for the separate SGD rehearsal optimizer.  It is
-/// deliberately much smaller than the normal training rate because replay is
-/// interleaved with fresh-task updates.
-pub const DEFAULT_REHEARSAL_LR: f32 = 1e-5;
+/// Default learning rate for the separate, output-row SGD rehearsal optimizer.
+/// Selected by the five-seed forgetting probe with projected fresh-task guards;
+/// it does not advance Adam's moments or learning-rate schedule.
+pub const DEFAULT_REHEARSAL_LR: f32 = 6e-3;
 pub const DEFAULT_REHEARSAL_STEPS: usize = 1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -154,6 +154,41 @@ mod tests {
         bits
     }
 
+    fn optimizer_bits(model: &PSSALayerV2) -> Vec<u32> {
+        let mut bits = Vec::new();
+        let mut matrix = |p: &crate::pssa::ParamMatrix| {
+            bits.extend(p.grad.iter().map(|x| x.to_bits()));
+            bits.extend(p.m.iter().map(|x| x.to_bits()));
+            bits.extend(p.v.iter().map(|x| x.to_bits()));
+        };
+        matrix(&model.embed_w);
+        matrix(&model.unembed_w);
+        let b = &model.block;
+        for p in [
+            &b.a_mat,
+            &b.w_delta,
+            &b.w_b,
+            &b.w_c,
+            &b.w_qx,
+            &b.w_qh,
+            &b.w_gate,
+            &b.w_proj,
+            &b.mlp_w1,
+            &b.mlp_w2,
+            &b.adapters[0].down_proj,
+            &b.adapters[0].up_proj,
+        ] {
+            matrix(p);
+        }
+        bits.extend(b.norm_gamma.grad.iter().map(|x| x.to_bits()));
+        bits.extend(b.norm_gamma.m.iter().map(|x| x.to_bits()));
+        bits.extend(b.norm_gamma.v.iter().map(|x| x.to_bits()));
+        bits.extend(b.norm_beta.grad.iter().map(|x| x.to_bits()));
+        bits.extend(b.norm_beta.m.iter().map(|x| x.to_bits()));
+        bits.extend(b.norm_beta.v.iter().map(|x| x.to_bits()));
+        bits
+    }
+
     #[test]
     fn dream_off_is_an_exact_no_op() {
         let mut model = seeded_model();
@@ -250,9 +285,11 @@ mod tests {
     }
 
     #[test]
-    fn generated_dream_replays_sampled_tokens_without_main_weight_updates() {
+    fn generated_dream_replays_sampled_tokens_into_main_weights() {
         let mut model = seeded_model();
         let before = main_weight_bits(&model);
+        let optimizer = optimizer_bits(&model);
+        let step = model.step_counter;
         let carry = {
             let mut state = vec![0.0; model.recurrent_state_len()];
             model.copy_recurrent_state_to(&mut state);
@@ -263,13 +300,63 @@ mod tests {
         let summary = model.dream_replay(DreamMode::Generate, 1, 4, 0.8, &mut SimpleRng::new(77));
         assert_eq!(summary.entries_replayed, 1);
         assert_eq!(summary.generated_tokens, 4);
+        assert_eq!(summary.rehearsal_sequences, 1);
         assert!(summary.consolidation_delta_norm > 0.0);
-        assert_eq!(main_weight_bits(&model), before);
+        assert_ne!(main_weight_bits(&model), before);
+        assert_eq!(optimizer_bits(&model), optimizer);
+        assert_eq!(model.step_counter, step);
         let mut restored = vec![0.0; model.recurrent_state_len()];
         model.copy_recurrent_state_to(&mut restored);
         assert_eq!(restored, carry);
         assert_ne!(model.block.adapters[0].up_proj.data, fast);
         assert_ne!(model.block.adapters[0].consolidated_up, slow);
+    }
+
+    #[test]
+    fn generated_mode_does_not_rehearse_stored_sequences_without_memory_seeds() {
+        let mut model = model();
+        model.remember_dream_sequence(&[1, 2, 1, 2], &[2, 1, 2, 1]);
+        let before = main_weight_bits(&model);
+        let summary = model.dream_replay(DreamMode::Generate, 1, 4, 0.8, &mut SimpleRng::new(78));
+        assert_eq!(summary.entries_replayed, 0);
+        assert_eq!(summary.generated_tokens, 0);
+        assert_eq!(summary.rehearsal_sequences, 0);
+        assert_eq!(main_weight_bits(&model), before);
+    }
+
+    #[test]
+    fn stored_sgd_preserves_carry_adam_and_gradients() {
+        let mut model = seeded_model();
+        model.remember_dream_sequence(&[1, 2, 1, 2], &[2, 1, 2, 1]);
+        model.step_counter = 3;
+        model.unembed_w.grad[0] = 0.125;
+        model.unembed_w.m[0] = -0.25;
+        model.unembed_w.v[1] = 0.5;
+        let before = main_weight_bits(&model);
+        let optimizer = optimizer_bits(&model);
+        let marks = model.embed_row_marks.clone();
+        let carry = {
+            let mut state = vec![0.0; model.recurrent_state_len()];
+            model.copy_recurrent_state_to(&mut state);
+            state
+        };
+        let summary = model.dream_replay_with_options(
+            DreamMode::Memory,
+            1,
+            0,
+            0.8,
+            6e-3,
+            1,
+            &mut SimpleRng::new(79),
+        );
+        assert_eq!(summary.rehearsal_sequences, 1);
+        assert_ne!(main_weight_bits(&model), before);
+        assert_eq!(optimizer_bits(&model), optimizer);
+        assert_eq!(model.embed_row_marks, marks);
+        assert_eq!(model.step_counter, 3);
+        let mut restored = vec![0.0; model.recurrent_state_len()];
+        model.copy_recurrent_state_to(&mut restored);
+        assert_eq!(restored, carry);
     }
 
     #[test]

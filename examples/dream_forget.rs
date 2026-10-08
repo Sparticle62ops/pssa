@@ -91,8 +91,12 @@ fn run(
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let rehearsal_lr = args.get(1).map_or(6e-3, |s| s.parse().expect("rehearsal LR"));
-    let rehearsal_steps = args.get(2).map_or(1, |s| s.parse().expect("rehearsal steps"));
+    let rehearsal_lr = args
+        .get(1)
+        .map_or(6e-3, |s| s.parse().expect("rehearsal LR"));
+    let rehearsal_steps = args
+        .get(2)
+        .map_or(1, |s| s.parse().expect("rehearsal steps"));
     println!("rehearsal_lr={rehearsal_lr} rehearsal_steps={rehearsal_steps}");
     let seeds = [7u64, 11, 23, 42, 99];
     for (label, mode) in [

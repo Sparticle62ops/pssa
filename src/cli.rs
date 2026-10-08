@@ -2205,7 +2205,7 @@ impl CLIHandler {
                     "      --dream-len <N>           generated tokens per seed (default: 64; temp 0.8)"
                 );
                 println!(
-                    "      --dream-lr <F>            main-weight rehearsal SGD rate (default: 0.00001)"
+                    "      --dream-lr <F>            main-weight rehearsal SGD rate (default: 0.006)"
                 );
                 println!(
                     "      --dream-steps <N>         rehearsal passes per sequence (default: 1)"
