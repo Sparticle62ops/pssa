@@ -2652,9 +2652,9 @@ impl PSSALayerV2 {
         for (tensor_index, (old, fresh)) in old_gradients.iter().zip(fresh_gradients).enumerate() {
             assert_eq!(old.len(), fresh.len());
             for (index, (&old, &fresh)) in old.iter().zip(fresh).enumerate() {
-                let selected = selected_rows
+                let selected = tensor_index == 1 && selected_rows
                     .as_ref()
-                    .is_none_or(|rows| tensor_index == 1 && rows[index / self.cfg.d_latent]);
+                    .is_none_or(|rows| rows[index / self.cfg.d_latent]);
                 if selected {
                     dot += old as f64 * fresh as f64;
                     fresh_norm_sq += fresh as f64 * fresh as f64;
@@ -2679,9 +2679,9 @@ impl PSSALayerV2 {
             for (index, ((weight, &old), &fresh)) in
                 tensor.data.iter_mut().zip(old).zip(fresh).enumerate()
             {
-                let selected = selected_rows
+                let selected = tensor_index == 1 && selected_rows
                     .as_ref()
-                    .is_none_or(|rows| tensor_index == 1 && rows[index / d_latent]);
+                    .is_none_or(|rows| rows[index / d_latent]);
                 if selected {
                     let projected = old as f64 - projection * fresh as f64;
                     *weight -= lr * projected as f32;
