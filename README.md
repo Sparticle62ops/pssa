@@ -298,7 +298,7 @@ colors each token by the model's confidence.
 loops, schedule, backend). It shows the exact equivalent CLI command at the
 bottom, so you can copy it into a script.
 
-![Setup tab: new-run wizard with the equivalent CLI command](docs/img/tui-setup.png)
+![Setup tab: training page with the dreaming controls and the equivalent CLI command](docs/img/tui-setup.png)
 
 ### Dreaming
 
