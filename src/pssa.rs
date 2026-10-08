@@ -2733,7 +2733,7 @@ impl PSSALayerV2 {
                     step_lr,
                     &old_gradients,
                     &fresh_gradients,
-                    None,
+                    Some(&sequence.target_ids),
                 );
                 let candidate = self.dream_loss(guard, &recurrent);
                 if candidate.is_finite() && candidate <= baseline + LOSS_TOLERANCE {
