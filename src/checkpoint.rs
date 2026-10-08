@@ -31,7 +31,7 @@ use crate::pssa::{PSSAConfigV2, PSSAContinuousBlockV2, PSSALayerV2, ParamMatrix,
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -726,6 +726,11 @@ pub(crate) fn read_vocab(r: &mut Reader<'_>, d_vocab: usize) -> Result<Vec<Strin
     if n != 0 && n != d_vocab {
         return Err(invalid("vocabulary count must be zero or d_vocab"));
     }
+    if n > r.bytes.len().saturating_sub(r.off) / 8 {
+        return Err(invalid(
+            "vocabulary count exceeds remaining checkpoint bytes",
+        ));
+    }
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         let len = r.usize("vocabulary token length")?;
@@ -1180,15 +1185,18 @@ pub fn save_model_v6(model: &PSSALayerV2, path: impl AsRef<Path>) -> Result<()> 
 }
 
 pub(crate) fn read_file_capped(path: &Path) -> Result<Vec<u8>> {
-    let len = usize::try_from(fs::metadata(path)?.len()).map_err(|_| invalid("file too large"))?;
-    if len
-        > MAX_LOAD_ALLOCATION_BYTES
-            .checked_add(HEADER_LEN)
-            .ok_or_else(|| invalid("load cap overflow"))?
-    {
+    let cap = MAX_LOAD_ALLOCATION_BYTES
+        .checked_add(HEADER_LEN)
+        .ok_or_else(|| invalid("load cap overflow"))?;
+    let mut file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take((cap + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > cap {
         return Err(invalid("checkpoint file exceeds load cap"));
     }
-    Ok(fs::read(path)?)
+    Ok(bytes)
 }
 
 fn validate_memory(model: &PSSAContinuousBlockV2, cfg: &PSSAConfigV2, step: usize) -> Result<()> {
