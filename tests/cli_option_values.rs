@@ -14,6 +14,21 @@ fn option_like_missing_value_is_rejected_before_typed_parsing() {
 }
 
 #[test]
+fn dataset_telemetry_is_default_and_its_switches_are_value_less_and_exclusive() {
+    assert!(pssa::cli::TrainingOptions::default().feed_telemetry);
+    for flag in ["--feed-telemetry", "--no-feed-telemetry"] {
+        let error = CLIHandler::parse_and_execute(vec![
+            "pssa".into(), "train".into(), flag.into(), "--epochs".into(), "--bogus".into(),
+        ]).unwrap_err();
+        assert_eq!(error, "option '--epochs' requires a value", "{flag}");
+    }
+    let error = CLIHandler::parse_and_execute(vec![
+        "pssa".into(), "train".into(), "--feed-telemetry".into(), "--no-feed-telemetry".into(),
+    ]).unwrap_err();
+    assert!(error.contains("mutually exclusive"));
+}
+
+#[test]
 fn hf_flags_reject_invalid_or_ambiguous_sources_before_network_access() {
     for (args, expected) in [
         (vec!["--hf-dataset", "bad-name"], "expected an owner/name"),

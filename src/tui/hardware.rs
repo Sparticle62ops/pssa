@@ -230,7 +230,11 @@ impl Hardware {
             Line::from(format!(
                 "CPU usage {} / {} logical CPUs",
                 usage(self.usage.first().copied().flatten()),
-                self.latest.cpu.len().saturating_sub(1)
+                if self.latest.cpu.is_empty() {
+                    "unavailable (OS counters not sampled)".into()
+                } else {
+                    self.latest.cpu.len().saturating_sub(1).to_string()
+                }
             )),
             Line::from(match self.latest.ram {
                 Some((used, total)) => format!(
@@ -391,6 +395,8 @@ mod tests {
                                         .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
                             }));
                         } else {
+                            assert!(text.contains("unavailable (OS counters not sampled)"));
+                            assert!(!text.contains("0 logical CPUs"));
                             assert!(!text.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)));
                         }
                     }

@@ -324,7 +324,9 @@ impl Runs {
             };
             let mut log = path.with_extension("log");
             if !log.exists()
-                && path.file_name().is_some_and(|name| name == "model.pssa" || name == "model.trfm")
+                && path
+                    .file_name()
+                    .is_some_and(|name| name == "model.pssa" || name == "model.trfm")
             {
                 log = path.with_file_name("train.log");
             }
@@ -354,7 +356,23 @@ impl Runs {
             state.last_checkpoint = last.map(|p| p.display().to_string());
             state.checkpoint_target = target.map(|p| p.display().to_string());
             if path.extension().is_some_and(|e| e != "log") {
+                // Selecting a file proves its existence, not that the latest
+                // log metrics were saved into it. Preserve only a loss already
+                // associated by an actual save event (or a .loss sidecar below).
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let recorded = state
+                    .checkpoints
+                    .iter()
+                    .find(|(file, _)| file == name.as_ref())
+                    .and_then(|(_, loss)| *loss);
                 state.note_checkpoint(&path.display().to_string());
+                if let Some((_, loss)) = state
+                    .checkpoints
+                    .iter_mut()
+                    .find(|(file, _)| file == name.as_ref())
+                {
+                    *loss = recorded;
+                }
                 state
                     .checkpoint_target
                     .get_or_insert_with(|| path.display().to_string());
@@ -640,6 +658,38 @@ mod tests {
     }
 
     #[test]
+    fn opening_an_existing_artifact_does_not_claim_unsaved_metrics_belong_to_it() {
+        let dir = std::env::temp_dir().join(format!("pssa-runs-unsaved-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.pssa");
+        fs::write(&path, "existing checkpoint must remain untouched").unwrap();
+        fs::write(dir.join("train.log"), format!(
+            "progress_schema=2 updates_total=10 prior_updates=0 checkpoint_target={}\ntraining 10/10 (100%) loss=2 tokens_per_second=50 global_update=10\ntraining_seconds=1 optimizer_updates=10\nsave failed: disk full\n", path.display()
+        )).unwrap();
+        let mut runs = Runs::new(dir.clone());
+        runs.open_monitor(path.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while runs.action.is_none() && std::time::Instant::now() < deadline {
+            runs.poll(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let Some(Action::Monitor(state)) = runs.action.take() else {
+            panic!("history did not open")
+        };
+        assert_eq!(
+            state.live_loss,
+            Some(2.0),
+            "the log's training measurement is still real"
+        );
+        assert_eq!(state.checkpoints, [("model.pssa".into(), None)]);
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "existing checkpoint must remain untouched"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn scoring_different_checkpoint_formats_keeps_separate_sidecars() {
         let dir = std::env::temp_dir().join(format!("pssa-runs-scores-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -679,7 +729,8 @@ mod tests {
             runs.add_root(dir.clone());
             runs.open_monitor(path.clone());
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while (runs.action.is_none() || runs.scan.is_some()) && std::time::Instant::now() < deadline
+            while (runs.action.is_none() || runs.scan.is_some())
+                && std::time::Instant::now() < deadline
             {
                 runs.poll(false);
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -693,11 +744,21 @@ mod tests {
             assert_eq!(state.metric_series.len(), 1);
             assert!(state.warning.is_none());
             assert!(!state.training_active);
-            assert!(state.last_progress_at.is_none(), "recorded history has no stall clock");
+            assert!(
+                state.last_progress_at.is_none(),
+                "recorded history has no stall clock"
+            );
             assert_eq!(state.health_status().normal_label, "DONE");
-            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
             terminal.draw(|f| super::super::draw(f, &state, 0)).unwrap();
-            let screen: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
             assert!(screen.contains("[ DONE ]"));
             fs::remove_file(path).unwrap();
         }
