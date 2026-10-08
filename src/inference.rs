@@ -239,7 +239,9 @@ impl<'a> PSSAInferenceEngine<'a> {
         C: Fn() -> bool,
     {
         self.try_generate_chat_turn_impl(
-            prompt, cfg, true,
+            prompt,
+            cfg,
+            true,
             |out, _, count, probability| callback(out, count, probability),
             cancelled,
             |_, _, _, _| {},
@@ -476,7 +478,12 @@ impl<'a> PSSAInferenceEngine<'a> {
                 if emitted < raw.len() {
                     let tail = String::from_utf8_lossy(&raw[emitted..]);
                     out.push_str(&tail);
-                    callback(&out, Some(&tail), generated_ids.len() - prompt_ids.len(), last_probability);
+                    callback(
+                        &out,
+                        Some(&tail),
+                        generated_ids.len() - prompt_ids.len(),
+                        last_probability,
+                    );
                 }
                 Ok(out)
             }
@@ -501,6 +508,11 @@ fn raw_confidence(logits: &[f32], out: &mut [f32]) {
     if out.is_empty() {
         return;
     }
+    assert_eq!(
+        logits.len(),
+        out.len(),
+        "confidence output must match logits length"
+    );
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;
     for (p, &logit) in out.iter_mut().zip(logits) {
@@ -571,23 +583,46 @@ mod tests {
             let tokenizer = word_tokenizer("word");
             let mut plain_model = tiny_model(&tokenizer);
             let mut scored_model = tiny_model(&tokenizer);
-            let cfg = InferenceConfig { temperature, top_k: 1, max_new_tokens: 3, ..Default::default() };
+            let cfg = InferenceConfig {
+                temperature,
+                top_k: 1,
+                max_new_tokens: 3,
+                ..Default::default()
+            };
             let plain = PSSAInferenceEngine::new(&mut plain_model, &tokenizer)
-                .try_generate_chat_turn_controlled("prompt", &cfg, |_, _| {}, || false).unwrap();
+                .try_generate_chat_turn_controlled("prompt", &cfg, |_, _| {}, || false)
+                .unwrap();
             let mut scores = Vec::new();
             let scored = PSSAInferenceEngine::new(&mut scored_model, &tokenizer)
-                .try_generate_chat_turn_scored("prompt", &cfg, |text, count, p| scores.push((text.to_owned(), count, p)), || false).unwrap();
+                .try_generate_chat_turn_scored(
+                    "prompt",
+                    &cfg,
+                    |text, count, p| scores.push((text.to_owned(), count, p)),
+                    || false,
+                )
+                .unwrap();
             assert_eq!(plain, scored);
             assert_eq!(scores.len(), 3);
-            for (_, _, p) in scores { assert_eq!(p, 1.0 / 3.0); } // includes unk, before top-k=1
+            for (_, _, p) in scores {
+                assert_eq!(p, 1.0 / 3.0);
+            } // includes unk, before top-k=1
             assert_eq!(plain_model.inf_features, scored_model.inf_features);
         }
         let tokenizer = bpe_tokenizer(0xc3);
         let mut model = tiny_model(&tokenizer);
         let mut scores = Vec::new();
-        PSSAInferenceEngine::new(&mut model, &tokenizer).try_generate_chat_turn_scored(
-            "a", &greedy(2), |text, count, p| scores.push((text.to_owned(), count, p)), || false).unwrap();
-        assert_eq!(scores.iter().map(|(_, n, _)| *n).collect::<Vec<_>>(), [1, 2, 2]);
+        PSSAInferenceEngine::new(&mut model, &tokenizer)
+            .try_generate_chat_turn_scored(
+                "a",
+                &greedy(2),
+                |text, count, p| scores.push((text.to_owned(), count, p)),
+                || false,
+            )
+            .unwrap();
+        assert_eq!(
+            scores.iter().map(|(_, n, _)| *n).collect::<Vec<_>>(),
+            [1, 2, 2]
+        );
         assert_eq!(scores[1].2, scores[2].2);
         assert_eq!(scores[2].0, "��");
     }
