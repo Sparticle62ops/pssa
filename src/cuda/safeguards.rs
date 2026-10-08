@@ -64,10 +64,16 @@ fn validate_packed_gradients(
     }
     for (index, (host, buffer)) in gradients.iter().zip(private).enumerate() {
         let key = host.as_ptr() as usize;
-        if gradients[..index].iter().any(|prior| prior.as_ptr() as usize == key) {
+        if gradients[..index]
+            .iter()
+            .any(|prior| prior.as_ptr() as usize == key)
+        {
             return Err("CUDA packed gradients alias; refusing publication".into());
         }
-        let device = state.tensors.get(&key).ok_or("unregistered packed CUDA gradient")?;
+        let device = state
+            .tensors
+            .get(&key)
+            .ok_or("unregistered packed CUDA gradient")?;
         if device.grad.len() != host.len() || buffer.len() != host.len() {
             return Err("packed CUDA gradient length changed".into());
         }
@@ -153,6 +159,29 @@ impl CudaContext {
                 .ok_or("CUDA optimizer tensor registration changed")?;
             self.stream
                 .memcpy_dtoh(&device.data, t.data)
+                .map_err(error)?;
+        }
+        self.stream.synchronize().map_err(error)
+    }
+
+    /// Publish host-only dream changes back into the resident optimizer before
+    /// the next GPU forward. The ordinary training path keeps device weights
+    /// authoritative; replay temporarily moves ownership to the host.
+    pub(crate) fn refresh_safeguarded_weights(
+        &self,
+        tensors: &mut [AdamTensor<'_>],
+    ) -> Result<(), String> {
+        let mut state = self.safeguards.lock().map_err(error)?;
+        if !state.resident {
+            return Ok(());
+        }
+        for t in tensors {
+            let device = state
+                .tensors
+                .get_mut(&(t.grad.as_ptr() as usize))
+                .ok_or("CUDA optimizer tensor registration changed")?;
+            self.stream
+                .memcpy_htod(t.data, &mut device.data)
                 .map_err(error)?;
         }
         self.stream.synchronize().map_err(error)
@@ -280,7 +309,9 @@ impl CudaContext {
         for (host, buffer) in gradients.iter().zip(private) {
             let device = &state.tensors[&(host.as_ptr() as usize)];
             if device.dense {
-                self.stream.memcpy_dtod(&device.grad, buffer).map_err(error)?;
+                self.stream
+                    .memcpy_dtod(&device.grad, buffer)
+                    .map_err(error)?;
             } else {
                 self.stream.memcpy_htod(*host, buffer).map_err(error)?;
             }
@@ -339,7 +370,9 @@ impl CudaContext {
         // A packed CPU replay may have accumulated into the host mirror after
         // handing ownership back. Do not resurrect a stale device contribution.
         if !device.dense {
-            self.stream.memcpy_htod(out, &mut device.grad).map_err(error)?;
+            self.stream
+                .memcpy_htod(out, &mut device.grad)
+                .map_err(error)?;
         }
         // SAFETY: caller performed exact cuBLAS shape validation; device grad
         // stays alive under the optimizer guard and all operations use one stream.
@@ -607,7 +640,9 @@ impl CudaContext {
                 .map_err(error)?;
         }
         let mut bad = [0u32];
-        self.stream.memcpy_dtoh(&*invalid, &mut bad).map_err(error)?;
+        self.stream
+            .memcpy_dtoh(&*invalid, &mut bad)
+            .map_err(error)?;
         self.stream.synchronize().map_err(error)?;
         if bad[0] != 0 {
             return Err("capped memory value must be finite".into());

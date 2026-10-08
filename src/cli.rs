@@ -79,6 +79,10 @@ pub struct TrainingOptions {
     pub dream_mode: DreamMode,
     /// Generated tokens per memory seed in generate/both modes.
     pub dream_len: usize,
+    /// Learning rate for the separate main-weight SGD rehearsal pass.
+    pub dream_lr: f32,
+    /// Number of SGD rehearsal passes per stored/generated sequence.
+    pub dream_steps: usize,
     /// Independent document lanes per PSSA microbatch (runtime-only).
     pub batch_size: usize,
     pub warmup_steps: usize,
@@ -135,6 +139,8 @@ impl Default for TrainingOptions {
             dream_replay: 32,
             dream_mode: DreamMode::Memory,
             dream_len: 64,
+            dream_lr: crate::dream::DEFAULT_REHEARSAL_LR,
+            dream_steps: crate::dream::DEFAULT_REHEARSAL_STEPS,
             batch_size: 1,
             warmup_steps: 0,
             schedule_total_updates: None,
@@ -409,6 +415,12 @@ impl CLIHandler {
             dream_replay: parsed.usize_nonzero("--dream-replay", "", 32)?,
             dream_mode: DreamMode::parse(parsed.string("--dream-mode", "").unwrap_or("memory"))?,
             dream_len: parsed.usize_nonzero("--dream-len", "", 64)?,
+            dream_lr: parsed.f32("--dream-lr", "", crate::dream::DEFAULT_REHEARSAL_LR)?,
+            dream_steps: parsed.usize_nonzero(
+                "--dream-steps",
+                "",
+                crate::dream::DEFAULT_REHEARSAL_STEPS,
+            )?,
             batch_size: parsed.usize_nonzero("--batch-size", "", 1)?,
             warmup_steps: parsed.required_usize("--warmup-steps", "", 0)?,
             schedule_total_updates: parsed
@@ -485,6 +497,9 @@ impl CLIHandler {
         if !(x.lr > 0.0) {
             return Err("--lr must be positive".into());
         }
+        if !x.dream_lr.is_finite() || x.dream_lr <= 0.0 {
+            return Err("--dream-lr must be finite and positive".into());
+        }
         if x.max_tokens == Some(0) {
             return Err("--max-tokens must be positive".into());
         }
@@ -506,6 +521,7 @@ impl CLIHandler {
             ("--dream-every", x.dream_every, 1_000_000),
             ("--dream-replay", x.dream_replay, 1_000_000),
             ("--dream-len", x.dream_len, 100_000),
+            ("--dream-steps", x.dream_steps, 1_000_000),
             ("--batch-size", x.batch_size, 65_536),
         ] {
             if value > maximum {
@@ -709,6 +725,12 @@ impl CLIHandler {
         }
         if options.dream_len == 0 {
             return Err("--dream-len must be positive".into());
+        }
+        if !options.dream_lr.is_finite() || options.dream_lr <= 0.0 {
+            return Err("--dream-lr must be finite and positive".into());
+        }
+        if options.dream_steps == 0 {
+            return Err("--dream-steps must be positive".into());
         }
         if !options.lr.is_finite() || options.lr <= 0.0 {
             return Err("learning rate must be finite and positive".into());
@@ -1002,6 +1024,10 @@ impl CLIHandler {
         let mut skipped = SkippedUpdates::default();
         let mut dream_rng =
             (options.dream_every > 0).then(|| SimpleRng::new(options.seed ^ 0xd0e5_5eed_5eed_0001));
+        // The last fresh chunk is an ephemeral guard for projected replay. It
+        // is populated only when dreaming is enabled, so the default path does
+        // not allocate or copy any additional training data.
+        let mut dream_fresh_task: Option<(Vec<usize>, Vec<usize>)> = None;
         let mut tokens_seen = 0usize;
         let mut progress = ui::Progress::new_with_tui("training", total_updates, !options.no_tui);
         if let Some(path) = options.checkpoint_path.as_deref() {
@@ -1044,6 +1070,14 @@ impl CLIHandler {
                 }
                 for microbatch in group {
                     let batch_tokens: usize = microbatch.iter().map(|c| c.len).sum();
+                    if options.dream_every > 0
+                        && let Some(c) = microbatch.last()
+                    {
+                        dream_fresh_task = Some((
+                            docs[c.doc][c.start..c.start + c.len].to_vec(),
+                            docs[c.doc][c.start + 1..c.start + 1 + c.len].to_vec(),
+                        ));
+                    }
                     let loss = if let Some(batch) = &mut sequence_batch {
                         sequence_views.clear();
                         for c in microbatch {
@@ -1132,6 +1166,12 @@ impl CLIHandler {
                             .sum::<f32>()
                             / c.len as f32;
                         model.insert_training_memory_at(loss, offset + c.len - 1);
+                        if options.dream_every > 0 && loss > 3.5 {
+                            let inputs = model.block.tape.x_ids[offset..offset + c.len].to_vec();
+                            let targets =
+                                model.block.tape.target_ids[offset..offset + c.len].to_vec();
+                            model.remember_dream_sequence(&inputs, &targets);
+                        }
                         loss_sum += loss as f64 * c.len as f64;
                         token_sum += c.len;
                         offset += c.len;
@@ -1169,18 +1209,25 @@ impl CLIHandler {
                     if let Some(ctx) = cuda_optimizer.as_ref() {
                         ctx.sync_safeguarded_weights(&mut model.adam_tensors())?;
                     }
-                    let summary = model.dream_replay(
+                    let fresh_task = dream_fresh_task
+                        .as_ref()
+                        .map(|(inputs, targets)| (inputs.as_slice(), targets.as_slice()));
+                    let summary = model.dream_replay_with_options_and_guard(
                         options.dream_mode,
                         options.dream_replay,
                         options.dream_len,
                         0.8,
+                        options.dream_lr,
+                        options.dream_steps,
+                        fresh_task,
                         rng,
                     );
                     println!(
-                        "dream mode={:?} entries_replayed={} generated_tokens={} consolidation_delta_norm={:.6e} time={:.3}s",
+                        "dream mode={:?} entries_replayed={} generated_tokens={} rehearsal_sequences={} consolidation_delta_norm={:.6e} time={:.3}s",
                         options.dream_mode,
                         summary.entries_replayed,
                         summary.generated_tokens,
+                        summary.rehearsal_sequences,
                         summary.consolidation_delta_norm,
                         summary.elapsed_seconds
                     );
@@ -2161,6 +2208,12 @@ impl CLIHandler {
                     "      --dream-len <N>           generated tokens per seed (default: 64; temp 0.8)"
                 );
                 println!(
+                    "      --dream-lr <F>            main-weight rehearsal SGD rate (default: 0.006)"
+                );
+                println!(
+                    "      --dream-steps <N>         rehearsal passes per sequence (default: 1)"
+                );
+                println!(
                     "                                dream controls are runtime-only; repeat flags on resume"
                 );
                 println!("      --lr <F>                  base learning rate (default: 0.001)");
@@ -2470,6 +2523,8 @@ impl CLIHandler {
                         "--dream-replay",
                         "--dream-mode",
                         "--dream-len",
+                        "--dream-lr",
+                        "--dream-steps",
                     ]);
                 }
                 let p = Parsed::parse(&args[2..], &allowed)?;
@@ -2923,6 +2978,33 @@ mod training_safeguards_tests {
                 },
                 Some(1.0)
             );
+        }
+    }
+
+    #[test]
+    fn dream_rehearsal_flags_parse_and_reject_invalid_values() {
+        let parsed = Parsed::parse(
+            &[
+                "--dream-lr".into(),
+                "0.002".into(),
+                "--dream-steps".into(),
+                "3".into(),
+            ],
+            &["--dream-lr", "--dream-steps"],
+        )
+        .unwrap();
+        let options = CLIHandler::options(&parsed).unwrap();
+        assert_eq!(options.dream_lr, 0.002);
+        assert_eq!(options.dream_steps, 3);
+        for (flag, bad) in [
+            ("--dream-lr", "0"),
+            ("--dream-lr", "NaN"),
+            ("--dream-steps", "0"),
+        ] {
+            let parsed =
+                Parsed::parse(&[flag.into(), bad.into()], &["--dream-lr", "--dream-steps"])
+                    .unwrap();
+            assert!(CLIHandler::options(&parsed).is_err(), "{flag}={bad}");
         }
     }
 
