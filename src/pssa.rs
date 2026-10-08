@@ -2627,6 +2627,20 @@ impl PSSALayerV2 {
         }
     }
 
+    fn dream_gradient_snapshot(&mut self) -> Vec<Vec<f32>> {
+        self.adam_tensors()
+            .into_iter()
+            .map(|tensor| tensor.grad.to_vec())
+            .collect()
+    }
+
+    fn dream_restore_gradients(&mut self, snapshot: &[Vec<f32>]) {
+        for (tensor, saved) in self.adam_tensors().into_iter().zip(snapshot) {
+            assert_eq!(tensor.grad.len(), saved.len());
+            tensor.grad.copy_from_slice(saved);
+        }
+    }
+
     /// Apply an old-task step after removing the component that would increase
     /// the current-task loss to first order. The exact current-task loss is
     /// checked by the caller as well: nonlinear effects are backtracked rather
@@ -2652,9 +2666,10 @@ impl PSSALayerV2 {
         for (tensor_index, (old, fresh)) in old_gradients.iter().zip(fresh_gradients).enumerate() {
             assert_eq!(old.len(), fresh.len());
             for (index, (&old, &fresh)) in old.iter().zip(fresh).enumerate() {
-                let selected = tensor_index == 1 && selected_rows
-                    .as_ref()
-                    .is_none_or(|rows| rows[index / self.cfg.d_latent]);
+                let selected = match selected_rows.as_ref() {
+                    None => true,
+                    Some(rows) => tensor_index == 1 && rows[index / self.cfg.d_latent],
+                };
                 if selected {
                     dot += old as f64 * fresh as f64;
                     fresh_norm_sq += fresh as f64 * fresh as f64;
@@ -2679,9 +2694,10 @@ impl PSSALayerV2 {
             for (index, ((weight, &old), &fresh)) in
                 tensor.data.iter_mut().zip(old).zip(fresh).enumerate()
             {
-                let selected = tensor_index == 1 && selected_rows
-                    .as_ref()
-                    .is_none_or(|rows| rows[index / d_latent]);
+                let selected = match selected_rows.as_ref() {
+                    None => true,
+                    Some(rows) => tensor_index == 1 && rows[index / d_latent],
+                };
                 if selected {
                     let projected = old as f64 - projection * fresh as f64;
                     *weight -= lr * projected as f32;
@@ -2745,20 +2761,14 @@ impl PSSALayerV2 {
             self.rehearse_dream_sequence_guarded(sequence, guard, lr, steps);
             return;
         }
-        // Stop each sleep burst once the old sequence is back below this loss.
-        // It prevents a strong replay rate from overshooting and erasing the
-        // fresh task's high-margin predictions.
-        const MAX_REHEARSAL_LOSS: f32 = 9.0;
         let mut recurrent = vec![0.0; self.recurrent_state_len()];
         self.copy_recurrent_state_to(&mut recurrent);
         for _ in 0..steps {
             self.copy_recurrent_state_from(&recurrent);
-            let loss = self.forward_train_chunk(&sequence.input_ids, &sequence.target_ids);
+            self.forward_train_chunk(&sequence.input_ids, &sequence.target_ids);
             self.zero_gradients();
-            if loss > MAX_REHEARSAL_LOSS {
-                self.backward_chunk(sequence.input_ids.len(), 1.0);
-                self.apply_dream_sgd(lr, &sequence.target_ids);
-            }
+            self.backward_chunk(sequence.input_ids.len(), 1.0);
+            self.apply_dream_sgd(lr, &sequence.target_ids);
             self.zero_gradients();
         }
         self.copy_recurrent_state_from(&recurrent);
@@ -2863,14 +2873,22 @@ impl PSSALayerV2 {
                 ..Default::default()
             };
         }
+        let saved_gradients = self.dream_gradient_snapshot();
+        let saved_embed_row_marks = self.embed_row_marks.clone();
         if mode.includes_generation() {
             assert!(dream_len > 0);
             assert!(temperature.is_finite() && temperature > 0.0);
         }
         let mut entries = self.dream_memory_entries();
         let take = replay.min(entries.len());
-        let sequence_take = replay.min(self.dream_sequences.len());
+        let sequence_take = if mode.includes_memory() {
+            replay.min(self.dream_sequences.len())
+        } else {
+            0
+        };
         if take == 0 && sequence_take == 0 {
+            self.dream_restore_gradients(&saved_gradients);
+            self.embed_row_marks.copy_from_slice(&saved_embed_row_marks);
             return crate::dream::DreamSummary {
                 elapsed_seconds: started.elapsed().as_secs_f64(),
                 ..Default::default()
@@ -2970,6 +2988,8 @@ impl PSSALayerV2 {
         if let Some(ctx) = self.device.gpu() {
             ctx.invalidate_weights();
         }
+        self.dream_restore_gradients(&saved_gradients);
+        self.embed_row_marks.copy_from_slice(&saved_embed_row_marks);
         crate::dream::DreamSummary {
             entries_replayed: take,
             generated_tokens: generated.len(),
