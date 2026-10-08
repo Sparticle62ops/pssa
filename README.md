@@ -404,7 +404,7 @@ Everything below is for running, training, and working on the project.
 
 ## Requirements
 
-- Rust toolchain with Edition 2024 support, including Cargo.
+- Rust 1.88 or newer (Edition 2024 and let-chain support), including Cargo.
 - Network access only when using an HTTP/HTTPS dataset or a Hugging Face dataset.
 - Enough memory and disk for larger corpora and serialized models.
 - Optional: a CUDA device for the GPU training path. The CPU path is the
@@ -1048,6 +1048,23 @@ The suite exercises synthetic streams for contradictory facts, MQAR-style distra
 | `data/model.pssa` | Checked-in serialized model artifact. |
 
 ## Development
+
+For repeated local edits, use the optimized incremental `fast` profile:
+
+```bash
+cargo check --profile fast --tests
+cargo build --profile fast
+cargo test --profile fast
+cargo run --profile fast -- help
+# Optional NVIDIA CUDA backend:
+cargo build --profile fast --features cuda
+```
+
+This profile enables incremental compilation, disables LTO, and uses 16 codegen
+units while retaining optimization level 3. Its binaries and compiler cache live
+under `target/fast/`. The first build populates the cache; subsequent edits can
+reuse it. Debug builds (`cargo build`) already enable incremental compilation.
+Keep using the normal release profile for reproducible performance measurements.
 
 ```bash
 cargo fmt --all -- --check

@@ -7,9 +7,7 @@
 //! the forward SSM buffers remain resident until the memory dispatch consumes
 //! them.
 
-use super::{
-    WgpuContext, WgpuWorkspace, begin_error_scopes, checked_f32_bytes, finish_error_scopes,
-};
+use super::{WgpuContext, begin_error_scopes, checked_f32_bytes, finish_error_scopes};
 
 pub(crate) const WGSL_STAGE_KERNELS: &str = r#"
 struct ScanUniforms { len: u32, stride: u32, _capacity: u32, _pad: u32 };
@@ -1606,8 +1604,3 @@ impl WgpuContext {
         read(self, &input, values)
     }
 }
-
-// Keep this import in the module so rustfmt/clippy can point at the actual
-// serialized stage workspace if its lock is ever extended for reuse.
-#[allow(dead_code)]
-fn _workspace_type(_: &WgpuWorkspace) {}
