@@ -29,6 +29,7 @@ pub mod transformer_training;
 mod token_cache;
 pub mod tui;
 pub mod ui;
+pub mod world_model;
 
 /// Fall back to a legacy environment variable only when the current one is
 /// unset. An empty or non-Unicode current value still takes precedence.
