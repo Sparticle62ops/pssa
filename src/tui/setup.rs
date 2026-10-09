@@ -62,9 +62,23 @@ enum Field {
     Memory,
     GrowMemory,
     MemoryTopK,
+    WorldSide,
+    WorldHidden,
+    WorldState,
+    WorldCategories,
+    WorldTrain,
+    WorldHeldout,
+    WorldHorizon,
+    WorldRollout,
+    WorldEpochs,
+    WorldLr,
+    WorldSeed,
+    WorldKl,
+    WorldAuxiliary,
+    WorldClip,
 }
 use Field::*;
-const LABELS: [&str; 34] = [
+const LABELS: [&str; 48] = [
     "Source",
     "Dataset",
     "HF config (optional)",
@@ -99,6 +113,35 @@ const LABELS: [&str; 34] = [
     "Memory slots (optional)",
     "Grow memory on resume (optional)",
     "Memory top-k (CPU, optional)",
+    "Grid side",
+    "World hidden width",
+    "World state width",
+    "Latent categories",
+    "Train episodes",
+    "Held-out episodes",
+    "Episode horizon",
+    "Open-loop horizon",
+    "World epochs",
+    "World learning rate",
+    "World seed",
+    "KL weight",
+    "Reward/continue weight",
+    "World gradient clip",
+];
+const WORLD_FLAGS: [(Field, &str); 14] = [
+    (WorldSide, "--side"), (WorldHidden, "--hidden"),
+    (WorldState, "--state"), (WorldCategories, "--categories"),
+    (WorldTrain, "--train-episodes"), (WorldHeldout, "--heldout-episodes"),
+    (WorldHorizon, "--horizon"), (WorldRollout, "--rollout-horizon"),
+    (WorldEpochs, "--epochs"), (WorldLr, "--lr"), (WorldSeed, "--seed"),
+    (WorldKl, "--kl-weight"), (WorldAuxiliary, "--auxiliary-weight"),
+    (WorldClip, "--grad-clip"),
+];
+const WORLD_FIELDS: [&[Field]; 4] = [
+    &[Source, WorldSide, WorldTrain, WorldHeldout],
+    &[WorldHidden, WorldState, WorldCategories],
+    &[WorldEpochs, WorldLr, WorldSeed, WorldHorizon, WorldRollout, WorldKl, WorldAuxiliary, WorldClip],
+    &[Output],
 ];
 const PAGES: [&str; 4] = ["1 dataset", "2 model", "3 training", "4 review / launch"];
 const FIELDS: [&[Field]; 4] = [
@@ -126,7 +169,7 @@ const FIELDS: [&[Field]; 4] = [
 ];
 
 pub(super) struct Setup {
-    values: [String; 34],
+    values: [String; 48],
     devices: DevicePicker,
     page: usize,
     selected: usize,
@@ -177,6 +220,8 @@ impl Default for Setup {
                 "",
                 "",
                 "",
+                "4", "16", "2", "16", "32", "12", "12", "8", "3",
+                "0.003", "73", "0.1", "0.25", "5",
             ]
             .map(str::to_owned),
             devices: DevicePicker::default(),
@@ -205,6 +250,7 @@ impl Setup {
     }
 
     pub(super) fn set_resume(&mut self, path: PathBuf) {
+        if self.is_world_model() { self.values[Source as usize] = "local".into(); }
         self.values[Resume as usize] = path.to_string_lossy().into_owned();
         self.page = 3;
         self.selected = 1;
@@ -229,8 +275,13 @@ impl Setup {
     fn value(&self, field: Field) -> &str {
         &self.values[field as usize]
     }
+    fn is_world_model(&self) -> bool {
+        self.value(Source) == "boxes-world"
+    }
     fn fields(&self) -> &[Field] {
-        if self.page == 0 && self.value(Source) == "local" {
+        if self.is_world_model() {
+            WORLD_FIELDS[self.page]
+        } else if self.page == 0 && self.value(Source) == "local" {
             &[Source, Dataset]
         } else {
             FIELDS[self.page]
@@ -312,6 +363,9 @@ impl Setup {
         batch: &str,
         output: &Path,
     ) -> Result<RunSpec, String> {
+        if self.is_world_model() {
+            return Err("Boxes-world has its own bounded comparison; text-training sweeps are unavailable.".into());
+        }
         if !self.value(Resume).is_empty() {
             return Err(
                 "Clear Resume in setup before sweeping: checkpoint dimensions override the grid."
@@ -348,6 +402,7 @@ impl Setup {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
+        if self.is_world_model() { self.values[Source as usize] = "local".into(); }
         self.values[Resume as usize] = value.into();
         self.values[Output as usize] = path
             .parent()
@@ -374,7 +429,7 @@ impl Setup {
             return;
         }
         let choices: &[&str] = match field {
-            Source => &["local", "hf"],
+            Source => &["local", "hf", "boxes-world"],
             _ => return,
         };
         let index = choices
@@ -382,6 +437,10 @@ impl Setup {
             .position(|v| *v == self.value(field))
             .unwrap_or(0);
         self.values[field as usize] = choices[(index + 1) % choices.len()].into();
+        if self.is_world_model() {
+            self.message = "Boxes-world: bounded CPU comparison, no corpus/resume/checkpoint. Output saves train.log only.".into();
+            self.error = false;
+        }
         self.selected = self.selected.min(self.fields().len());
     }
 
@@ -478,7 +537,7 @@ impl Setup {
             },
             _ => {}
         }
-        if self.page == 3 {
+        if self.page == 3 && !self.is_world_model() {
             self.devices.ensure_probe();
         }
         false
@@ -502,6 +561,21 @@ impl Setup {
             if value.chars().any(char::is_control) {
                 return Err("Inputs must not contain control characters".into());
             }
+        }
+        if self.is_world_model() {
+            let args = self.args();
+            crate::cli::world_model::parse(&args[1..])?;
+            if self.value(Output).trim().is_empty() {
+                return Err("Choose an output directory for train.log".into());
+            }
+            let output = PathBuf::from(safe_path(self.value(Output)));
+            if output.exists() && !output.is_dir() {
+                return Err("Output must be a directory, not a file".into());
+            }
+            if output.join("train.log").symlink_metadata().is_ok() {
+                return Err("train.log already exists; choose a new output directory".into());
+            }
+            return Ok(RunSpec { args, output, loops: 1 });
         }
         match self.value(Source) {
             "local" => {
@@ -644,6 +718,13 @@ impl Setup {
     }
 
     fn args(&self) -> Vec<String> {
+        if self.is_world_model() {
+            let mut args = vec!["world-model".into()];
+            for (field, flag) in WORLD_FLAGS {
+                args.extend([flag.into(), self.value(field).into()]);
+            }
+            return args;
+        }
         let transformer = self.transformer_resume();
         let mut args = vec![if transformer { "train-transformer" } else { "train" }.into()];
         let mut push = |flag: &str, value: String| {
@@ -770,6 +851,12 @@ impl Setup {
     fn command(&self) -> String {
         let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pssa"));
         let output = safe_path(self.value(Output));
+        if self.is_world_model() {
+            return format!("mkdir -p -- {} && (set -C; {} {} > {} 2>&1 < /dev/null)",
+                quote(&output), quote(&executable.to_string_lossy()),
+                self.args().iter().map(|v| quote(v)).collect::<Vec<_>>().join(" "),
+                quote(&Path::new(&output).join("train.log").to_string_lossy()));
+        }
         let checkpoint = Path::new(&output).join(self.checkpoint_name());
         format!(
             "mkdir -p -- {} && test ! -e {} && test ! -L {} && (set -C; {} {} > {} 2>&1 < /dev/null)",
@@ -846,7 +933,7 @@ impl Setup {
             Paragraph::new(format!("setup / {}", PAGES[self.page])).style(accent()),
             parts[0],
         );
-        let show_animation = self.page == 1 && f.area().width >= 80 && parts[1].height >= 7;
+        let show_animation = !self.is_world_model() && self.page == 1 && f.area().width >= 80 && parts[1].height >= 7;
         let body = if show_animation {
             Layout::default()
                 .direction(Direction::Horizontal)
@@ -900,7 +987,9 @@ impl Setup {
             ));
         }
         rows.push(Line::styled(
-            if self.page == 3 {
+            if self.page == 3 && self.is_world_model() {
+                "[ START WORLD MODEL ]"
+            } else if self.page == 3 {
                 "[ START TRAINING ]"
             } else {
                 "[ NEXT ▶ ]"
@@ -914,15 +1003,17 @@ impl Setup {
         if !compact {
             rows.push(Line::from(""));
             rows.push(Line::styled(
-                match self.page {
+                if self.is_world_model() {
+                    "CPU boxes-world / no checkpoint / same episodes, not parameter-matched."
+                } else { match self.page {
                     0 => "HF is cached by the CLI. Local files must be UTF-8.",
                     1 => "Depth = stacked nets. Loops = repeated passes. +/- changes either.",
                     2 => "Blank tokens = no cap; blank batch = 1. Batch is not a VRAM cap.",
                     _ => "Blank limits = unchanged. RAM = Linux address space, NOT RSS/VRAM.",
-                },
+                } },
                 Style::new().fg(AMBER),
             ));
-            if self.page == 3 {
+            if self.page == 3 && !self.is_world_model() {
                 rows.push(Line::from(
                     "Resume: shape/chunk must match; the child validates the checkpoint.",
                 ));
@@ -1077,7 +1168,11 @@ impl RunSpec {
         })();
         match spawn {
             Ok((child, log)) => Ok(TrainingRun {
-                checkpoint_name: if self.args.first().is_some_and(|s| s == "train-transformer") { "model.trfm" } else { "model.pssa" },
+                checkpoint_name: match self.args.first().map(String::as_str) {
+                    Some("world-model") => None,
+                    Some("train-transformer") => Some("model.trfm"),
+                    _ => Some("model.pssa"),
+                },
                 child,
                 log,
                 pending: Vec::new(),
@@ -1095,7 +1190,7 @@ impl RunSpec {
 }
 
 pub(super) struct TrainingRun {
-    checkpoint_name: &'static str,
+    checkpoint_name: Option<&'static str>,
     child: Child,
     log: File,
     pending: Vec<u8>,
@@ -1126,12 +1221,9 @@ impl TrainingRun {
             training_active: true,
             loop_count: self.loops,
             last_progress_at: Some(Instant::now()),
-            checkpoint_target: Some(
-                self.output
-                    .join(self.checkpoint_name)
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            checkpoint_target: self.checkpoint_name.map(|name| {
+                self.output.join(name).to_string_lossy().into_owned()
+            }),
             comparison_series,
             comparison_label,
             comparison_error,
@@ -1282,6 +1374,96 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    #[test]
+    fn world_model_wizard_uses_real_parser_and_separate_defaults() {
+        let fixture = Fixture::new();
+        let mut setup = fixture.setup();
+        let text_args = setup.args();
+        assert!(!press(&mut setup, KeyCode::Enter)); // local -> hf
+        assert!(!press(&mut setup, KeyCode::Enter)); // hf -> boxes-world
+        assert!(setup.is_world_model());
+        let spec = setup.validate().unwrap();
+        let parsed = crate::cli::world_model::parse(&spec.args[1..]).unwrap();
+        assert_eq!(format!("{parsed:?}"), format!("{:?}", crate::world_model::WorldModelConfig::default()));
+        assert_eq!(spec.args[0], "world-model");
+        assert_eq!(spec.loops, 1);
+        for flag in ["--data", "--resume", "--out", "--memory", "--dream-every", "--backend", "--no-tui"] {
+            assert!(!spec.args.iter().any(|s| s == flag));
+        }
+        assert!(!setup.command().contains("model.pssa"));
+        assert!(setup.command().contains("train.log"));
+        assert!(!spec.output.exists());
+        assert!(setup.sweep_spec(".001", "16", "1", &spec.output).is_err());
+        for (field, value) in [(WorldSide, "5"), (WorldHidden, "8"), (WorldState, "3"),
+            (WorldCategories, "7"), (WorldTrain, "5"), (WorldHeldout, "3"),
+            (WorldHorizon, "5"), (WorldRollout, "2"), (WorldEpochs, "2"),
+            (WorldLr, "0.006"), (WorldSeed, "149"), (WorldKl, "0.2"),
+            (WorldAuxiliary, "0.5"), (WorldClip, "3")] {
+            setup.values[field as usize] = value.into();
+        }
+        let changed = setup.validate().unwrap();
+        let parsed = crate::cli::world_model::parse(&changed.args[1..]).unwrap();
+        let expected = crate::world_model::WorldModelConfig {
+            side: 5, hidden: 8, state: 3, categories: 7, train_episodes: 5,
+            heldout_episodes: 3, horizon: 5, rollout_horizon: 2, epochs: 2,
+            learning_rate: 0.006, seed: 149, kl_weight: 0.2, auxiliary_weight: 0.5,
+            gradient_clip: 3.0,
+        };
+        assert_eq!(format!("{parsed:?}"), format!("{expected:?}"));
+        assert!(!press(&mut setup, KeyCode::Enter)); // returns to unchanged local draft
+        assert_eq!(setup.args(), text_args);
+    }
+
+    #[test]
+    fn world_model_wizard_validates_bounds_and_protects_logs() {
+        let fixture = Fixture::new();
+        let mut setup = fixture.setup();
+        setup.values[Source as usize] = "boxes-world".into();
+        // Irrelevant text-training fields are not used by the world-model mode.
+        setup.values[Resume as usize] = "missing.pssa".into();
+        setup.values[Dataset as usize] = "missing.txt".into();
+        setup.values[Latent as usize] = "bad".into();
+        assert!(setup.validate().is_ok());
+        for (field, bad) in [(WorldSide, "2"), (WorldHidden, "49"), (WorldState, "0"),
+            (WorldCategories, "33"), (WorldTrain, "129"), (WorldHeldout, "0"),
+            (WorldHorizon, "25"), (WorldRollout, "13"), (WorldEpochs, "0"),
+            (WorldLr, "NaN"), (WorldSeed, "-1"), (WorldKl, "0"),
+            (WorldAuxiliary, "-1"), (WorldClip, "inf")] {
+            let old = std::mem::replace(&mut setup.values[field as usize], bad.into());
+            assert!(setup.validate().is_err(), "{}", LABELS[field as usize]);
+            setup.values[field as usize] = old;
+        }
+        let output = PathBuf::from(setup.value(Output));
+        assert!(!output.exists());
+        fs::create_dir_all(&output).unwrap();
+        fs::write(output.join("train.log"), "keep").unwrap();
+        assert!(setup.validate().is_err());
+        assert_eq!(fs::read_to_string(output.join("train.log")).unwrap(), "keep");
+    }
+
+    #[test]
+    fn world_model_review_and_command_render_without_text_training_controls() {
+        let fixture = Fixture::new();
+        let mut setup = fixture.setup();
+        setup.values[Source as usize] = "boxes-world".into();
+        for (width, height) in [(80, 24), (120, 32), (44, 18)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for page in 0..4 {
+                setup.page = page;
+                setup.selected = 0;
+                terminal.draw(|f| setup.draw(f, f.area())).unwrap();
+                let rendered = text(&terminal);
+                assert!(!rendered.contains("Grow memory") && !rendered.contains("Dream every"));
+                if page == 3 { assert!(rendered.contains("START WORLD MODEL")); }
+            }
+        }
+        setup.page = 3;
+        setup.selected = setup.fields().len();
+        assert!(press(&mut setup, KeyCode::Enter));
+        assert!(setup.launch(true).is_none());
+        assert!(!Path::new(setup.value(Output)).exists());
     }
 
     #[test]

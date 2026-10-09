@@ -91,6 +91,61 @@ For a reproducible short capacity/CE/RSS sweep, see `experiments/memory_sweep.py
 
 </details>
 
+<h2 align="center">Boxes-world recurrent model experiment</h2>
+
+<details>
+<summary>Opt-in RSSM-style PSSA versus plain autoregressive PSSA (CPU only)</summary>
+
+```sh
+pssa world-model
+pssa world-model --seed 73 --train-episodes 32 --heldout-episodes 12 --epochs 3
+pssa world-model --help
+pssa world-model | pssa tui
+```
+
+This bounded **non-bio research mode** trains a continuous PSSA recurrent backbone
+on a tiny fully observed box-pushing grid. A categorical posterior observes real
+frames; a learned prior predicts latents from history and actions. Training uses
+reconstruction, KL, reward and continuation objectives with straight-through
+categorical gradients. Imagination sees only the initial frame and subsequent
+actions. Learned recurrence is backpropagated across each episode, not frozen.
+
+The command compares against a plain autoregressive PSSA control using the same
+episodes, update count and recurrent widths. It reports before/after held-out
+next-frame NLL, open-loop NLL, field/exact accuracy, reward/continuation Brier,
+parameter counts and training time. **NLL is nats per grid field, not text CE.**
+Targets are scored before assimilation, held-out seeds are disjoint, and evaluation
+carries reset. This comparison is **not parameter- or time-matched**. The short
+three-seed example (`cargo run --profile fast --example boxes_world`) found lower
+next-frame NLL with the plain control in all three seeds; stochastic training was
+about 4.5× slower. Neither model solved the task at this budget.
+
+All settings are listed in `--help`: grid size, recurrent widths, categorical
+size, training/held-out episodes, episode/open-loop horizons, epochs, seed,
+learning rate, KL/auxiliary weights and gradient clipping. Individual ranges and
+a combined work cap reject oversized requests before allocation. Defaults finish
+quickly; quadratic episode backpropagation is a correctness reference, not a
+scalable training engine. No external corpus, GPU selection or checkpoint I/O is
+supported; `train`, `score`, checkpoint formats and GPU kernels are unchanged.
+The experiment makes no memory writes or adapter consolidation.
+
+In **TUI → Setup → Source**, cycle to **boxes-world**. The four wizard pages show
+only its relevant settings; the review button launches `world-model` and saves
+`train.log` in a fresh output directory. No checkpoint is promised or written.
+The monitor keeps separate measured braille-dot objective traces and held-out
+results; it never inserts these values into language-loss charts. Text-training
+drafts are preserved when switching back. Existing loss-guard and memory settings
+remain available in the ordinary training wizard.
+
+This is RSSM-style, **not a full DreamerV3 agent**: one categorical variable, biased
+straight-through gradients, no actor/critic, replay-based policy learning or
+planning benchmark. The fully observed deterministic task does not establish a
+need for stochastic latents. Diffusion is not added: iterative denoising has no
+demonstrated benefit for these discrete symbolic frames. Existing `train
+--dream-*` replay options are a separate mechanism, not this mode.
+
+</details>
+
 ## The model
 
 ![The PSSA layer, one token](docs/img/pssa-block.png)
@@ -154,11 +209,12 @@ q  = W_qx x + W_qh y
 qh = proj(q)                     diffeomorphic map into the Poincare ball, |qh| < 1
 ```
 
-The read is bounded at four slots, weighted by a softmax over hyperbolic distance
-at temperature `tau_mem`:
+By default the read scans all occupied slots, weighted by a softmax over
+hyperbolic distance at temperature `tau_mem`. The opt-in CPU `--memory-top-k K`
+prototype instead normalizes over the K nearest slots after scanning all keys:
 
 ```
-w = softmax(-d_H(qh, k_s) / tau_mem)   over the 4 nearest slots
+w = softmax(-d_H(qh, k_s) / tau_mem)   over occupied slots (or selected top-k)
 m = sum_k w_k * v_k
 ```
 
@@ -166,8 +222,8 @@ m = sum_k w_k * v_k
 
 Hyperbolic distance grows toward the boundary of the ball, so slots holding
 general context and slots holding one specific episode stay separable without
-widening the read. Four slots is a fixed cost per token regardless of how much
-the bank holds.
+widening each key. Exact top-k reduces value mixing, not the linear key scan;
+it is not constant-cost retrieval as the occupied bank grows.
 
 ### Gate, adapter, MLP
 
