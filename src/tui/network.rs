@@ -269,7 +269,6 @@ struct RunEvents {
     active: bool,
     summary: bool,
     died: bool,
-    saved: bool,
     saved_after_summary: bool,
     closed: bool,
 }
@@ -286,7 +285,6 @@ impl RunEvents {
             return None;
         }
         if saved_checkpoint(line).is_some() {
-            self.saved = true;
             self.saved_after_summary |= self.summary;
         }
         if line.contains("tokens_per_second=") && !self.summary && !self.died {
@@ -403,15 +401,20 @@ impl Network {
         self.backup.pending() || self.notify.pending()
     }
     pub(super) fn stream_eof(&mut self) -> Option<bool> {
+        if self.local_closed {
+            return None;
+        }
         // Piped logs have no child exit status. Require the completion summary
-        // AND a successful save, not presentation-only loss/spike health flags.
+        // AND a subsequent successful final save, not an earlier periodic save
+        // or presentation-only loss/spike health flags.
         let active =
             self.local_events.active || self.local_events.summary || self.local_events.died;
         if !active {
             return None;
         }
-        let success =
-            self.local_events.summary && self.local_events.saved && !self.local_events.died;
+        let success = self.local_events.summary
+            && self.local_events.saved_after_summary
+            && !self.local_events.died;
         self.eof(success);
         Some(success)
     }
@@ -1001,6 +1004,22 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn piped_summary_cannot_promote_a_previous_save_to_final_save_confirmation() {
+        for final_save in [false, true] {
+            let mut ui = fixture();
+            ui.ingest("progress_schema=2");
+            ui.ingest("saved_checkpoint=periodic.pssa");
+            ui.ingest("training_seconds=2");
+            if final_save {
+                ui.ingest("saved_checkpoint=final.pssa");
+            }
+            assert_eq!(ui.stream_eof(), Some(final_save));
+            assert_eq!(ui.local_events.died, !final_save);
+            assert_eq!(ui.stream_eof(), None);
+        }
+    }
+
     #[test]
     fn local_completion_waits_for_exit_and_does_not_notify_again_on_repeated_eof() {
         let mut ui = fixture();
