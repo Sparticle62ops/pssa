@@ -59,9 +59,12 @@ enum Field {
     LossHigh,
     LossJump,
     LossPatience,
+    Memory,
+    GrowMemory,
+    MemoryTopK,
 }
 use Field::*;
-const LABELS: [&str; 31] = [
+const LABELS: [&str; 34] = [
     "Source",
     "Dataset",
     "HF config (optional)",
@@ -93,11 +96,14 @@ const LABELS: [&str; 31] = [
     "Loss high factor (>1)",
     "Loss jump factor (>1)",
     "Loss patience updates",
+    "Memory slots (optional)",
+    "Grow memory on resume (optional)",
+    "Memory top-k (CPU, optional)",
 ];
 const PAGES: [&str; 4] = ["1 dataset", "2 model", "3 training", "4 review / launch"];
 const FIELDS: [&[Field]; 4] = [
     &[Source, Dataset, HfConfig, HfSplit, HfField],
-    &[Latent, State, Vocab, Depth, Loops],
+    &[Latent, State, Vocab, Depth, Loops, Memory, GrowMemory, MemoryTopK],
     &[
         Lr,
         Epochs,
@@ -120,7 +126,7 @@ const FIELDS: [&[Field]; 4] = [
 ];
 
 pub(super) struct Setup {
-    values: [String; 31],
+    values: [String; 34],
     devices: DevicePicker,
     page: usize,
     selected: usize,
@@ -168,6 +174,9 @@ impl Default for Setup {
                 "4",
                 "8",
                 "3",
+                "",
+                "",
+                "",
             ]
             .map(str::to_owned),
             devices: DevicePicker::default(),
@@ -541,6 +550,19 @@ impl Setup {
         ] {
             self.number(field, min, max)?;
         }
+        if !self.transformer_resume() {
+            for field in [Memory, GrowMemory, MemoryTopK] {
+                if !self.value(field).is_empty() {
+                    self.number(field, 1, 1_000_000)?;
+                }
+            }
+            if !self.value(GrowMemory).is_empty() && self.value(Resume).is_empty() {
+                return Err("Grow memory requires a resume checkpoint".into());
+            }
+            if !self.value(MemoryTopK).is_empty() && self.value(Backend) != "cpu" {
+                return Err("Memory top-k requires Backend cpu".into());
+            }
+        }
         if !self.value(MaxTokens).is_empty() {
             self.number(MaxTokens, 1, usize::MAX)?;
         }
@@ -667,6 +689,15 @@ impl Setup {
             }
         }
         if !transformer {
+            for (field, flag) in [
+                (Memory, "--memory"),
+                (GrowMemory, "--grow-memory"),
+                (MemoryTopK, "--memory-top-k"),
+            ] {
+                if !self.value(field).is_empty() {
+                    push(flag, self.value(field).into());
+                }
+            }
             for (field, flag) in [
                 (LossHigh, "--loss-guard-high-factor"),
                 (LossJump, "--loss-guard-jump-factor"),
@@ -1343,6 +1374,33 @@ mod tests {
         let index = setup.args().iter().position(|arg| arg == "--resume").unwrap();
         assert_eq!(setup.args()[index + 1], path.to_str().unwrap());
         assert!(setup.prepare_resume(fixture.0.join("missing.pssa")).is_err());
+    }
+
+    #[test]
+    fn memory_settings_round_trip_and_validate_cpu_and_resume() {
+        let fixture = Fixture::new();
+        let mut setup = fixture.setup();
+        setup.values[Memory as usize] = "64".into();
+        setup.values[MemoryTopK as usize] = "4".into();
+        setup.values[Backend as usize] = "cpu".into();
+        let spec = setup.validate().unwrap();
+        let parsed = crate::cli::parse_train_options_for_test(&spec.args[1..]).unwrap();
+        assert_eq!(parsed.memory, 64);
+        assert_eq!(parsed.memory_top_k, Some(4));
+        assert_eq!(parsed.grow_memory, None);
+        setup.values[Backend as usize] = "auto".into();
+        assert!(setup.validate().is_err());
+        setup.values[Backend as usize] = "cpu".into();
+        setup.values[GrowMemory as usize] = "256".into();
+        assert!(setup.validate().is_err());
+        let checkpoint = fixture.0.join("resume.pssa");
+        fs::write(&checkpoint, "validation does not load checkpoints").unwrap();
+        setup.values[Resume as usize] = checkpoint.to_string_lossy().into_owned();
+        let spec = setup.validate().unwrap();
+        let parsed = crate::cli::parse_train_options_for_test(&spec.args[1..]).unwrap();
+        assert_eq!(parsed.grow_memory, Some(256));
+        setup.values[MemoryTopK as usize] = "0".into();
+        assert!(setup.validate().is_err());
     }
 
     #[test]

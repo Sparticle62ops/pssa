@@ -12,6 +12,8 @@ pub struct HyperbolicEpisodicBankV2 {
     pub values: Vec<f32>,
     /// Runtime-only Euclidean value norm limit; configure with `set_value_cap`.
     pub value_cap: Option<f32>,
+    /// Runtime-only exact nearest-slot selection; None retains the full soft read.
+    top_k: Option<usize>,
     pub norm_sq: Vec<f32>,
     pub confidence: Vec<f32>,
     pub last_seen_step: Vec<usize>,
@@ -32,10 +34,61 @@ impl HyperbolicEpisodicBankV2 {
             keys: vec![0.0; capacity * dim_key],
             values: vec![0.0; capacity * dim_val],
             value_cap: None,
+            top_k: None,
             norm_sq: vec![0.0; capacity],
             confidence: vec![1.0; capacity],
             last_seen_step: vec![0; capacity],
         }
+    }
+
+    /// Grow at a chunk/checkpoint boundary, retaining chronological eviction order.
+    /// Existing keys, values, confidence and timestamps are copied without modification.
+    pub fn grow(&mut self, capacity: usize) -> Result<(), String> {
+        if capacity < self.capacity {
+            return Err("memory growth cannot shrink the bank".into());
+        }
+        if capacity == self.capacity {
+            return Ok(());
+        }
+        for width in [self.dim_key, self.dim_val] {
+            capacity
+                .checked_mul(width)
+                .and_then(|n| n.checked_mul(4))
+                .filter(|&n| n <= isize::MAX as usize)
+                .ok_or("memory growth allocation overflow")?;
+        }
+        let mut grown = Self::new(capacity, self.dim_key, self.dim_val);
+        grown.count = self.count;
+        grown.value_cap = self.value_cap;
+        grown.top_k = self.top_k;
+        for dst in 0..self.count {
+            let src = if self.count == self.capacity {
+                (self.write_head + dst) % self.capacity
+            } else {
+                dst
+            };
+            grown.keys[dst * self.dim_key..(dst + 1) * self.dim_key]
+                .copy_from_slice(&self.keys[src * self.dim_key..(src + 1) * self.dim_key]);
+            grown.values[dst * self.dim_val..(dst + 1) * self.dim_val]
+                .copy_from_slice(&self.values[src * self.dim_val..(src + 1) * self.dim_val]);
+            grown.norm_sq[dst] = self.norm_sq[src];
+            grown.confidence[dst] = self.confidence[src];
+            grown.last_seen_step[dst] = self.last_seen_step[src];
+        }
+        *self = grown;
+        Ok(())
+    }
+
+    pub fn set_top_k(&mut self, top_k: Option<usize>) -> Result<(), String> {
+        if top_k == Some(0) {
+            return Err("memory top-k must be positive (omit for full scan)".into());
+        }
+        self.top_k = top_k;
+        Ok(())
+    }
+
+    pub fn top_k(&self) -> Option<usize> {
+        self.top_k
     }
 
     /// Set an opt-in Euclidean norm cap for each stored value vector.
@@ -301,6 +354,35 @@ impl HyperbolicEpisodicBankV2 {
             );
             min_dist = min_dist.min(dist);
             out_weights[idx] = dist;
+        }
+        if let Some(k) = self.top_k.filter(|&k| k < self.count) {
+            // Exact search, NOT an ANN index: all keys are scanned. Only k value
+            // vectors are mixed. Nonnegative distance bits sort numerically;
+            // slot index breaks ties deterministically, keeping the first k.
+            let mut nearest = std::collections::BinaryHeap::with_capacity(k + 1);
+            for (idx, &distance) in out_weights[..self.count].iter().enumerate() {
+                nearest.push((distance.to_bits(), idx));
+                if nearest.len() > k {
+                    nearest.pop();
+                }
+            }
+            let mut selected = nearest.into_vec();
+            selected.sort_unstable_by_key(|&(_, idx)| idx);
+            out_weights.fill(0.0);
+            let sum: f32 = selected
+                .iter()
+                .map(|&(bits, _)| ((min_dist - f32::from_bits(bits)) / tau).exp())
+                .sum();
+            out_val.fill(0.0);
+            for (bits, idx) in selected {
+                let weight = ((min_dist - f32::from_bits(bits)) / tau).exp() / sum;
+                out_weights[idx] = weight;
+                let off = idx * self.dim_val;
+                for j in 0..self.dim_val {
+                    out_val[j] += weight * self.values[off + j];
+                }
+            }
+            return min_dist;
         }
         let mut sum = 0.0;
         for w in &mut out_weights[..self.count] {

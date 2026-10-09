@@ -57,6 +57,40 @@ reason. Existing non-finite tensor checks remain in force.
 
 </details>
 
+<h2 align="center">Memory capacity experiments</h2>
+
+<details>
+<summary>Resume growth and opt-in CPU nearest-slot reads</summary>
+
+Full soft reads remain the default; the existing write/overwrite gate is unchanged.
+`--memory N` chooses fresh-run capacity. A resume still rejects a mismatched
+`--memory`; use the explicit `--grow-memory N` instead (equal or larger only).
+Growth preserves occupied slots, confidence, timestamps, eviction order, parameters,
+Adam moments and recurrent state. The next checkpoint uses the existing format
+with larger arrays; no migration or new checkpoint version is involved.
+
+```sh
+pssa train corpus.txt --resume old.pssa --grow-memory 4096 -o grown.pssa --backend cpu
+pssa train corpus.txt --memory 1024 --memory-top-k 4 --backend cpu -o sparse.pssa
+pssa score heldout.txt --model sparse.pssa --memory-top-k 4
+```
+
+`--memory-top-k K` is an **experimental exact nearest-slot read**, not an ANN
+index: it still scans every occupied key, selects K by hyperbolic distance,
+renormalizes soft weights on those slots, and mixes only their values. Selection
+is piecewise constant in backward; gradients flow through selected weights.
+Training requires explicit `--backend cpu`; GPU kernels are unchanged. K at least
+the occupied count takes the original full-read path. It may be slower, especially
+on small banks; do not assume a speed or accuracy improvement.
+
+Retrieval mode is runtime-only: repeat it on resume and `score`. Other checkpoint
+consumers (including automatic TUI evaluation/chat) use the default full read.
+The TUI **Setup → model** page exposes capacity, resume growth and CPU top-k;
+the monitor reports retrieval/growth events without treating them as losses.
+For a reproducible short capacity/CE/RSS sweep, see `experiments/memory_sweep.py`.
+
+</details>
+
 ## The model
 
 ![The PSSA layer, one token](docs/img/pssa-block.png)
@@ -247,7 +281,8 @@ context every step.
   information forward in a fixed-size state, instead of attention over the full
   context window.
 - **An episodic memory bank.** 512 slots with hyperbolic (Poincare-style)
-  retrieval and bounded top-4 search, written to and read from during the run.
+  retrieval (full soft reads by default; optional CPU nearest-slot prototype),
+  written to and read from during the run.
 - **Plastic weights.** Fast updates reinforce what works, novelty drives growth,
   and a refractory gate rate-limits overwrites so repeated contradictory input
   does less damage.
