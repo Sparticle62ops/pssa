@@ -220,6 +220,7 @@ impl Preview {
                 remote,
                 enabled: self.enabled,
                 heatmap: self.heatmap,
+                waiting_context: self.waiting_context.clone(),
                 ..Self::default()
             };
             if !self.enabled {
@@ -249,12 +250,26 @@ impl Preview {
             self.marks.clear();
             self.prompt.clear();
             self.checkpoint = requested.clone();
-            self.note = "Run changed; waiting for next throttled checkpoint sample".into();
+            self.note = if self.enabled {
+                "Run changed; waiting for next throttled checkpoint sample".into()
+            } else {
+                "Preview paused / F7 resumes".into()
+            };
         }
         let source_exists = path.as_ref().is_some_and(|path| path.is_file());
-        if !source_exists && self.job.is_some() {
+        if !source_exists {
             self.clear_missing_sample();
+            if self.enabled {
+                self.note = format!("Checkpoint file unavailable: {requested}");
+            }
             return;
+        }
+        if self.checkpoint.is_empty() {
+            self.checkpoint = requested.clone();
+            if self.enabled {
+                self.note =
+                    "Checkpoint file available; waiting for next throttled read-only sample".into();
+            }
         }
         if let Some(job) = &mut self.job {
             if let Some(result) = job.poll() {
@@ -545,6 +560,30 @@ mod tests {
         assert!(!preview.note.contains("No checkpoint"));
         assert_eq!(preview.checkpoint, path.display().to_string());
         assert!(preview.job.is_none());
+    }
+
+    #[test]
+    fn throttled_saved_checkpoint_and_remote_transitions_keep_honest_source_context() {
+        let temp = super::super::library::tests::Temp::new();
+        let path = temp.0.join("saved but throttled.pssa");
+        std::fs::write(&path, "checkpoint fixture; not loaded while throttled").unwrap();
+        let mut preview = Preview {
+            last_attempt: Some(Instant::now()),
+            ..Preview::default()
+        };
+        preview.set_waiting_context(path.display().to_string());
+        preview.poll(Some(path.clone()), 1, false);
+        assert_eq!(preview.checkpoint, path.display().to_string());
+        assert!(preview.note.contains("throttled"));
+        assert!(!preview.note.contains("No checkpoint"));
+        assert!(preview.job.is_none());
+        preview.set_waiting_context(
+            "First checkpoint at run end (planned step 500); current step 120".into(),
+        );
+        preview.poll(None, 1, true);
+        preview.poll(None, 1, false);
+        assert!(preview.note.contains("planned step 500"));
+        assert!(preview.note.contains("current step 120"));
     }
 
     #[test]
