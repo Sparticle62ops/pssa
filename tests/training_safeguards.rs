@@ -63,13 +63,25 @@ fn flags_off_three_link_resume_matches_unmodified_baseline_bytes() {
     let (full, _) = CLIHandler::train_corpus(raw, &opts).unwrap();
     checkpoint::save_model(&full, &full_path).unwrap();
     let full_bytes = fs::read(&full_path).unwrap();
-    // Captured with unmodified 4042886, same CPU options, before this fix.
+    // Independent captures with these exact options: unmodified main 014f617
+    // for AVX2/FMA, and pre-SIMD 4042886 for the legacy kernel. The current
+    // main intentionally changed reduction rounding; keep strict bit checks
+    // against the matching kernel, not a tolerance or a regenerated test value.
     // Includes serialized gradients, Adam moments, memory, RNG and schedule.
     let baseline_hash = full_bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| {
         (h ^ b as u64).wrapping_mul(0x100000001b3)
     });
     assert_eq!(full_bytes.len(), 15_157);
-    assert_eq!(baseline_hash, 0x446169f99aa899fe);
+    #[cfg(target_arch = "x86_64")]
+    let simd = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let simd = false;
+    let expected_hash = if simd {
+        0x3e28ad0e5cd76c7d
+    } else {
+        0x446169f99aa899fe
+    };
+    assert_eq!(baseline_hash, expected_hash);
     for link in 0..3 {
         let (model, _) = CLIHandler::train_corpus(
             raw,
