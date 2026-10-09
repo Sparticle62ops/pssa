@@ -847,7 +847,7 @@ impl Chat {
             f.render_widget(
                 Paragraph::new(format!(
                     "inference / Tab tabs\n{}\n{}\n▶ {}\nEnlarge to chat",
-                    self.status_label(),
+                    self.status_label(true),
                     clean(&self.note),
                     clean(&self.input)
                 ))
@@ -861,7 +861,7 @@ impl Chat {
             "T {:.2} • p {:.2} • k {} • max {} • rep {:.2}",
             cfg.temperature, cfg.top_p, cfg.top_k, cfg.max_new_tokens, cfg.repetition_penalty
         );
-        let status = self.status_label();
+        let status = self.status_label(false);
         let chunks = Layout::vertical([
             Constraint::Length(if area.width < 65 { 5 } else { 4 }),
             Constraint::Min(3),
@@ -950,7 +950,7 @@ impl Chat {
             chunks[3],
         );
     }
-    fn status_label(&self) -> String {
+    fn status_label(&self, compact: bool) -> String {
         if self.job.as_ref().is_some_and(|job| {
             job.progress
                 .lock()
@@ -958,6 +958,9 @@ impl Chat {
                 .speech
         }) {
             return "TRANSCRIBING / inference rate not applicable".into();
+        }
+        if compact {
+            return format!("{} tok • {} tok/s", self.tokens, self.rate_label());
         }
         format!(
             "{} • {} tok • {} tok/s",
