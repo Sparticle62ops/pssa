@@ -1,4 +1,5 @@
 mod backend_choice;
+pub(crate) mod world_model;
 pub use backend_choice::TrainingBackend;
 pub mod resource_limits;
 
@@ -1893,6 +1894,7 @@ impl CLIHandler {
         ui::panel_top("commands");
         for (name, blurb) in [
             ("train", "fit a PSSA checkpoint on a text corpus"),
+            ("world-model", "bounded CPU boxes-world model comparison"),
             ("train-transformer", "fit the CPU decoder-only baseline"),
             ("generate", "continue a prompt with a trained checkpoint"),
             (
@@ -2105,6 +2107,7 @@ impl CLIHandler {
         println!("  {}", ui::bold("COMMANDS"));
         for (name, blurb) in [
             ("train", "fit a checkpoint on a text corpus"),
+            ("world-model", "bounded CPU boxes-world model comparison"),
             ("train-transformer", "fit the CPU decoder-only baseline"),
             ("generate", "continue a prompt with a trained checkpoint"),
             (
@@ -2610,6 +2613,7 @@ impl CLIHandler {
                 );
                 println!("Example: {bin} status");
             }
+            "world-model" => world_model::help(),
             "gpu-probe" => {
                 println!("Usage: {bin} gpu-probe");
                 println!();
@@ -2695,6 +2699,7 @@ impl CLIHandler {
                 Self::print_help();
                 Ok(())
             }
+            "world-model" => world_model::execute(&args[2..]),
             "train" | "train-transformer" => {
                 let baseline = command == "train-transformer";
                 let mut allowed = vec![
