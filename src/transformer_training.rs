@@ -153,9 +153,10 @@ pub fn train_corpus(
     }
     progress.set_prior_updates(model.step_counter.saturating_sub(update));
     println!(
-        "progress_schema=2 updates_total={} prior_updates={} checkpoint_target={}",
+        "progress_schema=2 updates_total={} prior_updates={} feed_telemetry={} checkpoint_target={}",
         schedule.updates,
         model.step_counter,
+        opts.feed_telemetry,
         opts.checkpoint_path.as_deref().unwrap_or("-")
     );
     println!("last_checkpoint={}", opts.resume.as_deref().unwrap_or("-"));
