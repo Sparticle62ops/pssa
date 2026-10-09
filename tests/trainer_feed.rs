@@ -247,16 +247,8 @@ fn run_pssa_window(
         .args([
             "--backend",
             "cpu",
-            "--latent",
-            "7",
-            "--state",
-            "3",
-            "--key",
-            "4",
             "--memory",
             "4",
-            "--chunk",
-            "3",
             "--accumulate",
             "2",
             "--epochs",
@@ -279,6 +271,18 @@ fn run_pssa_window(
         .arg(&out)
         .args(extra)
         .env("RAYON_NUM_THREADS", "1");
+    // Small parity cases keep their existing shape. Timing cases supply a
+    // representative shape explicitly, without duplicate CLI options.
+    for (flag, value) in [
+        ("--latent", "7"),
+        ("--state", "3"),
+        ("--key", "4"),
+        ("--chunk", "3"),
+    ] {
+        if !extra.contains(&flag) {
+            command.args([flag, value]);
+        }
+    }
     if !telemetry {
         command.arg("--no-feed-telemetry");
     }
@@ -499,7 +503,7 @@ fn pssa_dream_off_telemetry_preserves_checkpoint_and_loss_bits_for_lanes_depth_l
 }
 
 #[test]
-#[ignore = "paired local telemetry overhead measurement; run explicitly with --ignored --nocapture"]
+#[ignore = "paired CPU telemetry overhead measurement; run explicitly with --ignored --nocapture"]
 fn telemetry_overhead_paired_cpu_measurement() {
     let fixture = Fixture::new();
     let raw = (0..256)
@@ -521,16 +525,38 @@ fn telemetry_overhead_paired_cpu_measurement() {
             "257",
             "--batch-size",
             "2",
+            "--latent",
+            "64",
+            "--state",
+            "16",
+            "--key",
+            "16",
+            "--chunk",
+            "32",
         ];
         // Keep model and selected input identical, warm both paths, then reverse
         // order on alternate pairs to reduce startup and scheduling bias.
-        let _ = run_pssa_window(&fixture, &source, "warm-disabled", false, &args, 6144);
-        let _ = run_pssa_window(&fixture, &source, "warm-enabled", true, &args, 6144);
+        let _ = run_pssa_window(
+            &fixture,
+            &source,
+            &format!("{kind}-warm-disabled"),
+            false,
+            &args,
+            6144,
+        );
+        let _ = run_pssa_window(
+            &fixture,
+            &source,
+            &format!("{kind}-warm-enabled"),
+            true,
+            &args,
+            6144,
+        );
         let mut disabled = Vec::new();
         let mut enabled = Vec::new();
         for pair in 0..7 {
-            let off = format!("pair{pair}-disabled");
-            let on = format!("pair{pair}-enabled");
+            let off = format!("{kind}-pair{pair}-disabled");
+            let on = format!("{kind}-pair{pair}-enabled");
             let (a, b) = if pair % 2 == 0 {
                 (
                     run_pssa_window(&fixture, &source, &off, false, &args, 6144),
@@ -556,7 +582,7 @@ fn telemetry_overhead_paired_cpu_measurement() {
         disabled.sort_by(f64::total_cmp);
         enabled.sort_by(f64::total_cmp);
         println!(
-            "telemetry_overhead tokenizer={kind} pairs=7 warmed=true rayon_threads=1 disabled_median_seconds={:.6} enabled_median_seconds={:.6} ratio={:.4} (subprocess wall; includes startup/tokenizer/checkpoint/CSV)",
+            "telemetry_overhead tokenizer={kind} pairs=7 warmed=true rayon_threads=1 latent=64 state=16 key=16 chunk=32 selected_tokens=6144 epochs=2 disabled_median_seconds={:.6} enabled_median_seconds={:.6} ratio={:.4} (subprocess wall; includes startup/tokenizer/checkpoint/CSV)",
             disabled[3],
             enabled[3],
             enabled[3] / disabled[3]
