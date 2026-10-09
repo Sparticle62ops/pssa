@@ -38,6 +38,7 @@ pub struct PSSAInferenceEngine<'a> {
     model: &'a mut PSSALayerV2,
     tokenizer: &'a Tokenizer,
     rng: SimpleRng,
+    prefill_enabled: bool,
 }
 impl<'a> PSSAInferenceEngine<'a> {
     pub fn try_new(model: &'a mut PSSALayerV2, tokenizer: &'a Tokenizer) -> Result<Self, String> {
@@ -70,11 +71,19 @@ impl<'a> PSSAInferenceEngine<'a> {
             model,
             tokenizer,
             rng: SimpleRng::new(1337),
+            prefill_enabled: std::env::var_os("PSSA_INFERENCE_PREFILL").is_some_and(|v| v == "1"),
         })
     }
     pub fn new(model: &'a mut PSSALayerV2, tokenizer: &'a Tokenizer) -> Self {
         Self::try_new(model, tokenizer).expect("invalid inference model/tokenizer")
     }
+    /// Override the default-off PSSA_INFERENCE_PREFILL=1 runtime switch.
+    /// Decode and sampling are unchanged; only unused prompt heads and
+    /// carry-independent first-block prompt projections are optimized.
+    pub fn set_prefill_enabled(&mut self, enabled: bool) {
+        self.prefill_enabled = enabled;
+    }
+
     pub(crate) fn validate(cfg: &InferenceConfig) -> Result<(), String> {
         if !cfg.temperature.is_finite() || cfg.temperature < 0.0 {
             return Err("temperature must be finite and >= 0".into());
@@ -334,14 +343,21 @@ impl<'a> PSSAInferenceEngine<'a> {
         let mut generated_ids = Vec::with_capacity(prompt_ids.len() + cfg.max_new_tokens);
         generated_ids.extend_from_slice(&prompt_ids);
         self.model.reset_recurrent_state();
-        for &id in &prompt_ids {
-            if cancelled() {
+        if self.prefill_enabled {
+            let output = (cfg.max_new_tokens > 0).then_some(logits.as_mut_slice());
+            if !self.model.prefill_inference(&prompt_ids, output, &cancelled)? {
                 return Ok(String::new());
             }
-            if id >= d_v {
-                return Err(format!("prompt ID {id} outside model vocabulary"));
+        } else {
+            for &id in &prompt_ids {
+                if cancelled() {
+                    return Ok(String::new());
+                }
+                if id >= d_v {
+                    return Err(format!("prompt ID {id} outside model vocabulary"));
+                }
+                self.model.forward_inference(id, &mut logits);
             }
-            self.model.forward_inference(id, &mut logits);
         }
         match self.tokenizer.kind() {
             TokenizerKind::Word => {
@@ -944,6 +960,159 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(out, "");
+        }
+    }
+
+    fn prefill_fixture(vocab: usize, width: usize, depth: usize, loops: usize, seed: u64) -> PSSALayerV2 {
+        let mut model = PSSALayerV2::new_with_depth_and_loops(
+            PSSAConfigV2 {
+                d_vocab: vocab,
+                d_latent: width,
+                d_state: 3,
+                d_mem_key: 2,
+                mem_capacity: 3,
+                chunk_len: 2, // prefill tiles must not depend on training tape size
+                ..Default::default()
+            },
+            seed,
+            depth,
+            loops,
+        );
+        for block in std::iter::once(&mut model.block).chain(&mut model.extra_blocks) {
+            block.memory.insert(&[0.1, -0.2], &vec![0.03; width]);
+            block.memory.insert(&[-0.3, 0.1], &vec![-0.04; width]);
+            block.norm_gamma.data.fill(0.9);
+            block.norm_beta.data.fill(0.01);
+            // Include active fast/slow adapters and MLP, not just initialized zeros.
+            block.adapters[0].up_proj.data.fill(0.002);
+            block.adapters[0].consolidated_up.fill(-0.001);
+            block.mlp_w2.data.fill(0.001);
+        }
+        model
+    }
+
+    fn prefill_runtime_bits(model: &PSSALayerV2) -> Vec<u32> {
+        let mut values = vec![0.0; model.recurrent_state_len()];
+        model.copy_recurrent_state_to(&mut values);
+        values.extend(&model.inf_features);
+        values.extend(&model.inf_block_out);
+        for block in std::iter::once(&model.block).chain(&model.extra_blocks) {
+            for scratch in [
+                &block.inf_x_norm, &block.inf_delta, &block.inf_b, &block.inf_c,
+                &block.inf_y_ssm, &block.inf_q_euc, &block.inf_q_pnc,
+                &block.inf_mem_weights, &block.inf_m_val, &block.inf_g_mem,
+                &block.inf_m_proj, &block.inf_ad_act, &block.inf_ad_out,
+                &block.inf_z_raw, &block.inf_mlp_act, &block.inf_mlp_out,
+                &block.inf_z_final,
+            ] {
+                values.extend(scratch);
+            }
+        }
+        values.into_iter().map(f32::to_bits).collect()
+    }
+
+    #[test]
+    fn prefill_logits_carries_memory_and_following_decode_are_bit_identical() {
+        for seed in [11, 23, 47] {
+            for (width, depth, loops) in [(4, 1, 1), (64, 2, 1), (4, 2, 3)] {
+                let mut legacy = prefill_fixture(37, width, depth, loops, seed);
+                let mut batched = prefill_fixture(37, width, depth, loops, seed);
+                let mut expected = vec![0.0; 37];
+                let mut actual = vec![0.0; 37];
+                // Do not reset between prefills: cover nonzero incoming carries.
+                for len in [1, 31, 32, 33, 67, 1024] {
+                    let ids: Vec<_> = (0..len).map(|t| (t * 17 + 3) % 37).collect();
+                    for &id in &ids {
+                        legacy.forward_inference(id, &mut expected);
+                    }
+                    assert!(batched.prefill_inference(&ids, Some(&mut actual), || false).unwrap());
+                    assert_eq!(actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                               expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+                    assert_eq!(prefill_runtime_bits(&batched), prefill_runtime_bits(&legacy));
+                    for (a, b) in std::iter::once(&batched.block).chain(&batched.extra_blocks)
+                        .zip(std::iter::once(&legacy.block).chain(&legacy.extra_blocks))
+                    {
+                        assert_eq!(a.memory, b.memory);
+                    }
+                    for id in [7, 2, 9] {
+                        legacy.forward_inference(id, &mut expected);
+                        batched.forward_inference(id, &mut actual);
+                        assert_eq!(actual, expected);
+                        assert_eq!(prefill_runtime_bits(&batched), prefill_runtime_bits(&legacy));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_cancellation_and_invalid_ids_preserve_processed_prefix() {
+        let ids: Vec<_> = (0..67).map(|t| t % 37).collect();
+        for stop in [0, 1, 31, 32, 33, 66] {
+            let mut legacy = prefill_fixture(37, 16, 2, 1, 23);
+            let mut batched = prefill_fixture(37, 16, 2, 1, 23);
+            for &id in &ids[..stop] {
+                legacy.forward_inference(id, &mut vec![0.0; 37]);
+            }
+            let mut logits = vec![-123.0; 37];
+            let checks = Cell::new(0);
+            assert!(!batched.prefill_inference(&ids, Some(&mut logits), || {
+                let n = checks.get();
+                checks.set(n + 1);
+                n == stop
+            }).unwrap());
+            assert_eq!(checks.get(), stop + 1);
+            assert_eq!(logits, vec![-123.0; 37]);
+            assert_eq!(prefill_runtime_bits(&batched), prefill_runtime_bits(&legacy));
+
+            let mut invalid = ids.clone();
+            invalid[stop] = 37;
+            let mut invalid_model = prefill_fixture(37, 16, 2, 1, 23);
+            assert_eq!(invalid_model.prefill_inference(&invalid, None, || false).unwrap_err(),
+                       "prompt ID 37 outside model vocabulary");
+            assert_eq!(prefill_runtime_bits(&invalid_model), prefill_runtime_bits(&legacy));
+        }
+        let mut model = prefill_fixture(37, 4, 1, 1, 23);
+        let before = prefill_runtime_bits(&model);
+        assert!(model.prefill_inference(&[], None, || false).is_err());
+        assert_eq!(prefill_runtime_bits(&model), before);
+    }
+
+    #[test]
+    fn prefill_engine_preserves_scored_callbacks_rng_and_cancellation() {
+        for tokenizer in [word_tokenizer("word"), bpe_tokenizer(0xc3)] {
+            for (depth, loops) in [(2, 1), (2, 3)] {
+                for (temperature, budget, stop) in [
+                    (0.0, 5, usize::MAX), (0.7, 5, usize::MAX),
+                    (0.7, 0, usize::MAX), (0.7, 5, 0), (0.7, 5, 1),
+                    (0.7, 5, 31), (0.7, 5, 32), (0.7, 5, 33), (0.7, 5, 69),
+                ] {
+                    let prompt = vec!["prompt"; 67].join(" ");
+                    let cfg = InferenceConfig { temperature, max_new_tokens: budget, ..Default::default() };
+                    let mut results = Vec::new();
+                    for enabled in [false, true] {
+                        let mut model = prefill_fixture(tokenizer.vocab_size, 16, depth, loops, 47);
+                        model.vocabulary = tokenizer.ordered_vocabulary().unwrap();
+                        model.tokenizer_json = tokenizer.serialized_metadata();
+                        let mut engine = PSSAInferenceEngine::new(&mut model, &tokenizer);
+                        engine.set_prefill_enabled(enabled);
+                        let checks = Cell::new(0);
+                        let mut events = Vec::new();
+                        let out = engine.try_generate_chat_turn_scored(
+                            &prompt, &cfg,
+                            |text, count, p| events.push((text.to_owned(), count, p.to_bits())),
+                            || {
+                                let n = checks.get();
+                                checks.set(n + 1);
+                                n == stop
+                            },
+                        ).unwrap();
+                        results.push((out, events, checks.get(), engine.rng.state,
+                                      prefill_runtime_bits(engine.model)));
+                    }
+                    assert_eq!(results[0], results[1]);
+                }
+            }
         }
     }
 

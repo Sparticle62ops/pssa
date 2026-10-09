@@ -115,6 +115,20 @@ impl ParamMatrix {
         }
     }
 
+    /// Reuse each weight row across a small prompt tile. Each dot has exactly
+    /// the same reduction order as `matvec`; this is not a reassociated GEMM.
+    fn matvec_batch(&self, inputs: &[f32], output: &mut [f32]) {
+        assert!(self.cols > 0);
+        assert_eq!(inputs.len() % self.cols, 0);
+        assert_eq!(output.len(), inputs.len() / self.cols * self.rows);
+        for r in 0..self.rows {
+            let weights = &self.data[r * self.cols..(r + 1) * self.cols];
+            for (t, input) in inputs.chunks_exact(self.cols).enumerate() {
+                output[t * self.rows + r] = dot_slice(weights, input);
+            }
+        }
+    }
+
     #[inline(always)]
     pub fn matvec_transpose(&self, g: &[f32], out: &mut [f32]) {
         assert_eq!(self.rows, g.len());
@@ -891,11 +905,6 @@ impl PSSAContinuousBlockV2 {
         assert_eq!(z_out.len(), self.cfg.d_latent);
         self.refresh_ssm_rates();
         let d_m = self.cfg.d_latent;
-        let d_s = self.cfg.d_state;
-        let d_k = self.cfg.d_mem_key;
-        let d_mlp = d_m * 2;
-        let rank = self.adapters[0].rank;
-        let ssm_scale = 1.0 / (d_s as f32).sqrt();
 
         // 1. Raw continuous input & affine RMSNorm
         let e_t = x_features;
@@ -916,17 +925,30 @@ impl PSSAContinuousBlockV2 {
         self.w_b.matvec(&self.inf_x_norm, &mut self.inf_b);
         self.w_c.matvec(&self.inf_x_norm, &mut self.inf_c);
 
+        self.forward_continuous_inference_projected(z_out);
+    }
+
+    /// Finish one inference row after its norm and data-dependent projections
+    /// have been prepared. The recurrent and retrieval portion remains in
+    /// token order so carries and final scratch values do not change.
+    #[inline(always)]
+    fn forward_continuous_inference_projected(&mut self, z_out: &mut [f32]) {
+        let d_m = self.cfg.d_latent;
+        let d_s = self.cfg.d_state;
+        let d_k = self.cfg.d_mem_key;
+        let d_mlp = d_m * 2;
+        let rank = self.adapters[0].rank;
+        let ssm_scale = 1.0 / (d_s as f32).sqrt();
+
         // 3. Multi-Channel SSM State Update (In-Place on Persistent State)
         for i in 0..d_m {
             let d_i = self.inf_delta[i];
             let mut y_i = 0.0f32;
             let row_off = i * d_s;
-
             for j in 0..d_s {
                 let idx = row_off + j;
                 let bar_a = (d_i * self.ssm_rates[idx]).exp();
                 let bar_b = d_i * self.inf_b[j];
-
                 let h_val = bar_a * self.h_persistent[idx] + bar_b * self.inf_x_norm[i];
                 self.h_persistent[idx] = h_val;
                 y_i += h_val * self.inf_c[j];
@@ -934,31 +956,27 @@ impl PSSAContinuousBlockV2 {
             self.inf_y_ssm[i] = y_i;
         }
 
-        // 4. Diffeomorphic Poincaré Memory Retrieval
+        // 4. Diffeomorphic Poincare memory retrieval.
         for r in 0..d_k {
             let row_x = &self.w_qx.data[r * d_m..(r + 1) * d_m];
             let row_h = &self.w_qh.data[r * d_m..(r + 1) * d_m];
             self.inf_q_euc[r] =
                 dot_slice(row_x, &self.inf_x_norm) + dot_slice(row_h, &self.inf_y_ssm);
         }
-
         HyperbolicEpisodicBankV2::diffeomorphic_project(&self.inf_q_euc, &mut self.inf_q_pnc);
-
         self.memory.retrieve_soft_into(
             &self.inf_q_pnc,
             self.cfg.tau_mem,
             &mut self.inf_m_val,
             &mut self.inf_mem_weights,
         );
-
         self.w_gate.matvec(&self.inf_x_norm, &mut self.inf_g_mem);
         for i in 0..d_m {
             self.inf_g_mem[i] = sigmoid(self.inf_g_mem[i]);
         }
-
         self.w_proj.matvec(&self.inf_m_val, &mut self.inf_m_proj);
 
-        // 5. Plastic Adapter
+        // 5. Plastic Adapter.
         self.adapters[0]
             .down_proj
             .matvec(&self.inf_x_norm, &mut self.inf_ad_act[..rank]);
@@ -968,26 +986,23 @@ impl PSSAContinuousBlockV2 {
         }
         self.adapters[0].total_up_matvec(&self.inf_ad_act[..rank], &mut self.inf_ad_out);
 
-        // 6. Latent Aggregation & SiLU MLP Expansion
+        // 6. Latent aggregation and SiLU MLP expansion.
         for i in 0..d_m {
             self.inf_z_raw[i] = (self.inf_y_ssm[i] * ssm_scale)
                 + (self.inf_g_mem[i] * self.inf_m_proj[i])
                 + self.inf_ad_out[i];
         }
-
         self.mlp_w1
             .matvec(&self.inf_z_raw, &mut self.inf_mlp_act[..d_mlp]);
         for i in 0..d_mlp {
             let h = self.inf_mlp_act[i];
             self.inf_mlp_act[i] = h * sigmoid(h);
         }
-
         self.mlp_w2
             .matvec(&self.inf_mlp_act[..d_mlp], &mut self.inf_mlp_out);
         for i in 0..d_m {
             self.inf_z_final[i] = self.inf_z_raw[i] + self.inf_mlp_out[i];
         }
-
         z_out.copy_from_slice(&self.inf_z_final);
     }
 
@@ -1540,6 +1555,61 @@ impl PSSAContinuousBlockV2 {
     }
 }
 
+/// Bounded, call-local prefill workspace. Only the first block's embedding
+/// inputs are known ahead of time; deeper blocks and Ouro loops stay on the
+/// token-major decode path. Nothing is published to runtime scratch ahead of
+/// the corresponding token's cancellation check.
+struct PrefillProjections {
+    x_norm: Vec<f32>,
+    delta: Vec<f32>,
+    b: Vec<f32>,
+    c: Vec<f32>,
+}
+
+impl PrefillProjections {
+    const TILE: usize = 32;
+
+    fn new(d: usize, s: usize, tokens: usize) -> Self {
+        Self {
+            x_norm: vec![0.0; tokens * d],
+            delta: vec![0.0; tokens * d],
+            b: vec![0.0; tokens * s],
+            c: vec![0.0; tokens * s],
+        }
+    }
+
+    fn prepare(&mut self, model: &PSSALayerV2, ids: &[usize]) {
+        let block = &model.block;
+        let (d, s) = (model.cfg.d_latent, model.cfg.d_state);
+        for (t, &id) in ids.iter().enumerate() {
+            let input = &model.embed_w.data[id * d..(id + 1) * d];
+            // Match forward_continuous_inference, including scalar RMS sum.
+            let sum_sq: f32 = input.iter().map(|&x| x * x).sum();
+            let inv_rms = 1.0 / (sum_sq / d as f32 + 1e-5).sqrt();
+            for i in 0..d {
+                self.x_norm[t * d + i] = block.norm_gamma.data[i] * (input[i] * inv_rms)
+                    + block.norm_beta.data[i];
+            }
+        }
+        let n = ids.len();
+        let norm = &self.x_norm[..n * d];
+        block.w_delta.matvec_batch(norm, &mut self.delta[..n * d]);
+        block.w_b.matvec_batch(norm, &mut self.b[..n * s]);
+        block.w_c.matvec_batch(norm, &mut self.c[..n * s]);
+        for delta in &mut self.delta[..n * d] {
+            *delta = softplus(*delta);
+        }
+    }
+
+    fn publish(&self, block: &mut PSSAContinuousBlockV2, t: usize) {
+        let (d, s) = (block.cfg.d_latent, block.cfg.d_state);
+        block.inf_x_norm.copy_from_slice(&self.x_norm[t * d..(t + 1) * d]);
+        block.inf_delta.copy_from_slice(&self.delta[t * d..(t + 1) * d]);
+        block.inf_b.copy_from_slice(&self.b[t * s..(t + 1) * s]);
+        block.inf_c.copy_from_slice(&self.c[t * s..(t + 1) * s]);
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DreamSequence {
     input_ids: Vec<usize>,
@@ -1846,16 +1916,25 @@ impl PSSALayerV2 {
         }
     }
 
-    pub fn forward_inference(&mut self, x_id: usize, logits_out: &mut [f32]) {
+    fn forward_inference_features(
+        &mut self,
+        x_id: usize,
+        projected: Option<(&PrefillProjections, usize)>,
+    ) {
         assert!(x_id < self.cfg.d_vocab, "token ID must be in vocabulary");
-        assert_eq!(logits_out.len(), self.cfg.d_vocab);
         let d = self.cfg.d_latent;
         let loops = self.loops();
         if loops == 1 {
-            self.block.forward_continuous_inference(
-                &self.embed_w.data[x_id * d..(x_id + 1) * d],
-                &mut self.inf_features,
-            );
+            if let Some((tile, row)) = projected {
+                self.block.refresh_ssm_rates();
+                tile.publish(&mut self.block, row);
+                self.block.forward_continuous_inference_projected(&mut self.inf_features);
+            } else {
+                self.block.forward_continuous_inference(
+                    &self.embed_w.data[x_id * d..(x_id + 1) * d],
+                    &mut self.inf_features,
+                );
+            }
             for (b, &scale) in self.extra_blocks.iter_mut().zip(&self.residual_scales) {
                 b.forward_continuous_inference(&self.inf_features, &mut self.inf_block_out);
                 for i in 0..d {
@@ -1901,11 +1980,69 @@ impl PSSALayerV2 {
                 }
             }
         }
+    }
+
+    fn inference_logits(&self, logits_out: &mut [f32]) {
         self.unembed_w.matvec(&self.inf_features, logits_out);
-        let logit_scale = 1.0 / (d as f32).sqrt();
+        let logit_scale = 1.0 / (self.cfg.d_latent as f32).sqrt();
         for logit in logits_out {
             *logit *= logit_scale;
         }
+    }
+
+    pub fn forward_inference(&mut self, x_id: usize, logits_out: &mut [f32]) {
+        assert_eq!(logits_out.len(), self.cfg.d_vocab);
+        self.forward_inference_features(x_id, None);
+        self.inference_logits(logits_out);
+    }
+
+    /// Opt-in CPU prompt prefill, continuing the current recurrent state.
+    /// Returns false on cancellation, checked before each token just like
+    /// decode. Only the final token's head is computed; pass None for a zero
+    /// generation budget. Logits are untouched on cancellation or invalid IDs.
+    /// Single-loop models batch the first block's independent projections in
+    /// 32-token tiles. Depth/loop/carry/retrieval ordering is never changed.
+    pub fn prefill_inference<C: Fn() -> bool>(
+        &mut self,
+        token_ids: &[usize],
+        logits_out: Option<&mut [f32]>,
+        cancelled: C,
+    ) -> Result<bool, String> {
+        if token_ids.is_empty() {
+            return Err("prefill requires at least one token".into());
+        }
+        if let Some(logits) = logits_out.as_ref() {
+            assert_eq!(logits.len(), self.cfg.d_vocab);
+        }
+        let mut projections = None;
+        for (index, &id) in token_ids.iter().enumerate() {
+            if cancelled() {
+                return Ok(false);
+            }
+            if id >= self.cfg.d_vocab {
+                return Err(format!("prompt ID {id} outside model vocabulary"));
+            }
+            let row = index % PrefillProjections::TILE;
+            if self.loops() == 1 && token_ids.len() > 1 && row == 0 {
+                let end = (index + PrefillProjections::TILE).min(token_ids.len());
+                // Do not validate a later ID before advancing earlier tokens.
+                let valid = token_ids[index..end]
+                    .iter()
+                    .take_while(|&&id| id < self.cfg.d_vocab)
+                    .count();
+                let tile = projections.get_or_insert_with(|| PrefillProjections::new(
+                    self.cfg.d_latent,
+                    self.cfg.d_state,
+                    token_ids.len().min(PrefillProjections::TILE),
+                ));
+                tile.prepare(self, &token_ids[index..index + valid]);
+            }
+            self.forward_inference_features(id, projections.as_ref().map(|tile| (tile, row)));
+        }
+        if let Some(logits) = logits_out {
+            self.inference_logits(logits);
+        }
+        Ok(true)
     }
 
     /// Host-only forward used to turn an episodic latent seed into generation
