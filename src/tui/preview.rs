@@ -674,17 +674,26 @@ mod tests {
 
     #[test]
     fn changing_checkpoint_drops_old_text_immediately_even_during_throttle() {
+        let temp = super::super::library::tests::Temp::new();
+        let path = temp.0.join("new.pssa");
+        std::fs::write(&path, "fixture; not read while throttled").unwrap();
         let mut preview = Preview {
             checkpoint: "old.pssa".into(),
             text: "old generated text".into(),
             last_attempt: Some(Instant::now()),
             ..Default::default()
         };
-        preview.poll(Some(PathBuf::from("new.pssa")), 1, false);
+        preview.poll(Some(path.clone()), 1, false);
         assert!(preview.text.is_empty());
         assert!(preview.marks.is_empty());
         assert!(preview.job.is_none());
         assert!(preview.note.contains("Run changed"));
+        std::fs::remove_file(&path).unwrap();
+        preview.poll(Some(path.clone()), 1, false);
+        assert!(preview.checkpoint.is_empty());
+        assert!(preview.note.contains("Checkpoint file unavailable"));
+        assert!(preview.note.contains(path.to_str().unwrap()));
+        assert!(preview.job.is_none());
     }
 
     #[test]
