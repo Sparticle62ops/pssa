@@ -418,7 +418,7 @@ impl CLIHandler {
             "science".into()
         }
     }
-    fn local_cache_source(source: &str) -> Option<String> {
+    pub(crate) fn local_cache_source(source: &str) -> Option<String> {
         if source == "science"
             || source.contains(',')
             || source.starts_with("hf:")
@@ -2261,6 +2261,8 @@ impl CLIHandler {
                 println!("  --threads N     opt-in Rayon pool size; default unchanged");
                 println!("  --ram-mib N     Linux prlimit address-space budget, not RSS/VRAM");
                 println!("  --no-tui         disable cursor updates; keep plain progress logs");
+                println!("  --no-feed-telemetry  omit bounded dataset windows (enabled by default)");
+                println!("  --token-cache PATH   opt-in cache of the actual selected token stream");
                 println!(
                     "Omit --tokenizer-from on resume; identical chunk/accumulation flags give identical updates."
                 );
@@ -2626,6 +2628,9 @@ impl CLIHandler {
                     "--loss-every",
                     "--tokens-seen",
                     "--no-tui",
+                    "--feed-telemetry",
+                    "--no-feed-telemetry",
+                    "--token-cache",
                     "--threads",
                     "--ram-mib",
                 ];
@@ -2640,7 +2645,6 @@ impl CLIHandler {
                         "--backend",
                         "--grad-clip",
                         "--memory-value-cap",
-                        "--token-cache",
                         "--dream-every",
                         "--dream-replay",
                         "--dream-mode",

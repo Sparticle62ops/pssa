@@ -248,7 +248,7 @@ impl Preview {
             self.text.clear();
             self.marks.clear();
             self.prompt.clear();
-            self.checkpoint = requested;
+            self.checkpoint = requested.clone();
             self.note = "Run changed; waiting for next throttled checkpoint sample".into();
         }
         let source_exists = path.as_ref().is_some_and(|path| path.is_file());
