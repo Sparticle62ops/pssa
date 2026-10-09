@@ -390,6 +390,10 @@ pub(super) fn draw_labeled(
             .x_bounds(plot.x_bounds)
             .y_bounds(plot.y_bounds)
             .paint(|ctx| {
+                // One shared braille layer: a separate layer per series would
+                // replace whole cells and cut holes in earlier series wherever
+                // two lines cross. Every stroke keeps all of its dots; a shared
+                // cell takes the color of the series listed last.
                 for s in series {
                     // Split at missing observations, never bridge a gap.
                     for run in s.points.split(|(x, y)| !x.is_finite() || !y.is_finite()) {
@@ -429,7 +433,6 @@ pub(super) fn draw_labeled(
                             });
                         }
                     }
-                    ctx.layer();
                 }
             }),
         graph,
@@ -755,6 +758,45 @@ mod tests {
                 "line should span most plot columns, got {cells}"
             );
         }
+    }
+
+    #[test]
+    fn crossing_series_do_not_erase_each_others_dots() {
+        let loss: Vec<(f64, f64)> = (0..=200)
+            .map(|i| (i as f64, 5.0 + (i as f64 / 15.0).sin()))
+            .collect();
+        let avg: Vec<(f64, f64)> = (0..=200).map(|i| (i as f64, 5.0)).collect();
+        let plot = || Plot {
+            title: " graph ",
+            caption: "Lower is better",
+            integer_x: true,
+            x: "training step",
+            y: "loss",
+            x_bounds: [0.0, 200.0],
+            y_bounds: [3.8, 6.2],
+        };
+        let area = Rect::new(0, 0, 100, 16);
+        let render = |series: &[Series<'_>]| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+            terminal.draw(|f| draw(f, area, plot(), series)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let alone = render(&[Series::line("loss", &loss, NORMAL_GREEN)]);
+        let both = render(&[
+            Series::line("loss", &loss, NORMAL_GREEN),
+            Series::line("moving avg", &avg, SECOND_ACCENT),
+        ]);
+        let graph = graph_rect(&alone, area);
+        let missing: Vec<_> = dots(&alone, graph)
+            .difference(&dots(&both, graph))
+            .copied()
+            .collect();
+        assert!(missing.is_empty(), "loss dots erased where lines cross: {missing:?}");
+        let avg_alone = render(&[
+            Series::line("loss", &[], NORMAL_GREEN),
+            Series::line("moving avg", &avg, SECOND_ACCENT),
+        ]);
+        assert!(dots(&avg_alone, graph).is_subset(&dots(&both, graph)));
     }
 
     fn graph_rect(buffer: &Buffer, area: Rect) -> Rect {
