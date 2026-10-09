@@ -152,7 +152,13 @@ impl Math {
         ];
         if v.model.as_deref() == Some("transformer") {
             lines = vec![
-                Line::styled("Transformer run / logged configuration", accent()),
+                Line::styled("Transformer run / configuration", accent()),
+                Line::from(
+                    state
+                        .configuration_source
+                        .as_deref()
+                        .unwrap_or("Source: trainer log (missing fields stay unrecorded)"),
+                ),
                 Line::from(format!(
                     "Width: {}",
                     state.width.as_deref().unwrap_or("unrecorded")
