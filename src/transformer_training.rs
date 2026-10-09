@@ -264,7 +264,7 @@ pub fn run_training(
     run_options.checkpoint_path = Some(out.to_string());
     run_options.dataset_source = Some(data.to_string());
     if run_options.token_cache.is_some() && run_options.token_cache_source.is_none() {
-        run_options.token_cache_source = Some(data.to_string());
+        run_options.token_cache_source = CLIHandler::local_cache_source(data);
     }
     let (model, _) = train_corpus(&raw, &run_options, tokenizer_from)?;
     transformer_checkpoint::save_model(&model, out)
