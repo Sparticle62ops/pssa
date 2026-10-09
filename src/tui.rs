@@ -703,13 +703,10 @@ impl RunState {
             && let Some(problem) = &self.problem
         {
             return if self.checkpoint_saved_current {
-                format!(
-                    "Checkpoint saved{}; run stopped at step {current}: {problem}",
-                    previous
-                )
+                format!("Checkpoint saved{previous}; reported issue at step {current}: {problem}")
             } else {
                 format!(
-                    "No new checkpoint saved; run stopped at step {current}: {problem}{previous}"
+                    "New checkpoint save unconfirmed; reported issue at step {current}: {problem}{previous}"
                 )
             };
         }
@@ -1265,8 +1262,8 @@ fn run_app(
                 }
             }
             hf_login.poll();
-            extras.poll_with(&mut state, &mut tab, &mut chat, |line| {
-                network.remote_line(line)
+            extras.poll_with(&mut state, &mut tab, &mut chat, |event| {
+                network.remote_line(event)
             });
             if poll_training_queue(&mut training, training_finished, |training| {
                 network.poll(
@@ -1288,7 +1285,11 @@ fn run_app(
                 let _ = io::stdout().write_all(b"\x07");
                 let _ = io::stdout().flush();
             }
-            let checkpoint = preview::Preview::candidate(&state);
+            let checkpoint = if extras.remote_monitor() {
+                None
+            } else {
+                preview::Preview::candidate(&state)
+            };
             let context = state.checkpoint_context();
             state.preview.set_waiting_context(context);
             state
@@ -5018,7 +5019,7 @@ mod tests {
         assert!(
             state
                 .checkpoint_context()
-                .contains("No new checkpoint saved")
+                .contains("checkpoint save unconfirmed")
         );
         assert!(state.checkpoint_context().contains("disk full"));
         assert!(
@@ -5034,6 +5035,13 @@ mod tests {
         state.ingest("saved_checkpoint=/tmp/new.pssa");
         assert_eq!(state.checkpoint_context(), "/tmp/new.pssa");
         assert_eq!(state.health_status().normal_label, "DONE");
+        state.problem = Some("loss spike (derived health alert)".into());
+        assert!(state.checkpoint_context().contains("Checkpoint saved"));
+        assert!(state.checkpoint_context().contains("reported issue"));
+        assert!(
+            !state.checkpoint_context().contains("run stopped"),
+            "a health heuristic is not a producer exit outcome"
+        );
     }
 
     #[test]
