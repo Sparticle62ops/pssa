@@ -11,6 +11,14 @@ use super::{
 };
 use crossterm::event::{KeyCode, KeyEvent};
 use std::path::PathBuf;
+
+/// Notebook output and producer lifecycle share one callback so the network
+/// coordinator receives terminal outcomes only after the last drained line.
+pub(super) enum RemoteEvent<'a> {
+    Line(&'a str),
+    Lifecycle(&'a Event),
+}
+
 pub(super) struct Extras {
     kaggle: Kaggle,
     inspector: Inspector,
@@ -101,6 +109,33 @@ impl Extras {
         }
         self.alerts.notify(ok, message);
     }
+    fn ingest_remote(
+        &mut self,
+        lines: Vec<String>,
+        events: Vec<Event>,
+        state: &mut RunState,
+        tab: &mut usize,
+        mut remote_event: impl FnMut(RemoteEvent<'_>),
+    ) {
+        let mut finished = Vec::new();
+        for event in events {
+            if matches!(event, Event::Started { .. }) {
+                remote_event(RemoteEvent::Lifecycle(&event));
+                self.kaggle_event(event, state, tab);
+            } else {
+                finished.push(event);
+            }
+        }
+        for line in lines {
+            remote_event(RemoteEvent::Line(&line));
+            self.ingest(&line);
+            state.ingest(&line);
+        }
+        for event in finished {
+            remote_event(RemoteEvent::Lifecycle(&event));
+            self.kaggle_event(event, state, tab);
+        }
+    }
     #[cfg(test)]
     pub fn poll(&mut self, state: &mut RunState, tab: &mut usize, chat: &mut Chat) {
         self.poll_with(state, tab, chat, |_| {});
@@ -110,25 +145,11 @@ impl Extras {
         state: &mut RunState,
         tab: &mut usize,
         chat: &mut Chat,
-        mut remote_line: impl FnMut(&str),
+        remote_event: impl FnMut(RemoteEvent<'_>),
     ) {
-        let remote = self.kaggle.poll();
-        let mut finished = Vec::new();
-        while let Some(event) = self.kaggle.take_event() {
-            if matches!(event, Event::Started { .. }) {
-                self.kaggle_event(event, state, tab);
-            } else {
-                finished.push(event);
-            }
-        }
-        for line in remote {
-            remote_line(&line);
-            self.ingest(&line);
-            state.ingest(&line);
-        }
-        for event in finished {
-            self.kaggle_event(event, state, tab);
-        }
+        let lines = self.kaggle.poll();
+        let events = std::iter::from_fn(|| self.kaggle.take_event()).collect();
+        self.ingest_remote(lines, events, state, tab, remote_event);
         // Remote paths are not local checkpoint files. Still collect streamed
         // occupancy/snippets, but never load a coincidentally matching path.
         self.inspector.poll(
@@ -301,6 +322,55 @@ mod tests {
             &state,
         );
         assert!(!extras.remote_busy());
+    }
+    #[test]
+    fn remote_callback_routes_started_before_lines_and_outcomes_after_final_save() {
+        for terminal in [
+            Event::Done,
+            Event::Error("save failed".into()),
+            Event::Detached,
+        ] {
+            let mut extras = Extras::new("missing-chain".into());
+            let mut state = RunState::default();
+            let mut tab = KAGGLE_TAB;
+            let mut received = Vec::new();
+            let terminal_name = format!("{terminal:?}");
+            extras.ingest_remote(
+                vec![
+                    "training_seconds=2".into(),
+                    "saved_checkpoint=/remote/model.pssa".into(),
+                ],
+                vec![
+                    Event::Started {
+                        reference: "fixture/notebook".into(),
+                    },
+                    terminal,
+                ],
+                &mut state,
+                &mut tab,
+                |event| {
+                    received.push(match event {
+                        RemoteEvent::Line(line) => line.to_owned(),
+                        RemoteEvent::Lifecycle(Event::Started { .. }) => "started".into(),
+                        RemoteEvent::Lifecycle(outcome) => format!("{outcome:?}"),
+                    })
+                },
+            );
+            assert_eq!(
+                received,
+                [
+                    "started",
+                    "training_seconds=2",
+                    "saved_checkpoint=/remote/model.pssa",
+                    terminal_name.as_str(),
+                ]
+            );
+            assert!(extras.remote_monitor());
+            assert_eq!(tab, 0);
+            assert!(!state.training_active);
+            assert_eq!(state.training_seconds, Some(2.0));
+            assert_eq!(state.problem.is_some(), terminal_name != "Done");
+        }
     }
     #[test]
     fn all_extras_render_without_overwriting_shell_at_all_sizes() {

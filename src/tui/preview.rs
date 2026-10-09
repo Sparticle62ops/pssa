@@ -164,6 +164,7 @@ impl Preview {
         if let Some(path) = state
             .last_checkpoint
             .as_deref()
+            .or(state.selected_checkpoint.as_deref())
             .or(state.resumed_from.as_deref())
         {
             let path = PathBuf::from(path);

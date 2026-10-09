@@ -147,7 +147,9 @@ impl Inspector {
                     };
                     if self.last_occupancy.is_none() {
                         self.history.push_back(new.used as u64);
-                        self.history.truncate(120);
+                        if self.history.len() > 120 {
+                            self.history.pop_front();
+                        }
                     }
                     self.snapshot = Some(new);
                     self.snapshot_at = Some(Instant::now());
@@ -170,6 +172,7 @@ impl Inspector {
         let Some(path) = state
             .last_checkpoint
             .as_ref()
+            .or(state.selected_checkpoint.as_ref())
             .or(state.resumed_from.as_ref())
             .filter(|s| s.ends_with(".pssa"))
             .map(PathBuf::from)
@@ -370,6 +373,26 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn checkpoint_observation_history_retains_the_latest_after_its_bound() {
+        let mut inspector = Inspector::default();
+        for used in 0..125 {
+            let (tx, rx) = mpsc::channel();
+            tx.send(Ok(Snapshot {
+                path: PathBuf::from("fixture.pssa"),
+                used,
+                capacity: 128,
+                slots: Vec::new(),
+            }))
+            .unwrap();
+            inspector.pending = Some(rx);
+            inspector.poll(&RunState::default(), false);
+        }
+        assert_eq!(inspector.history.len(), 120);
+        assert_eq!(inspector.history.front(), Some(&5));
+        assert_eq!(inspector.history.back(), Some(&124));
+    }
+
     #[test]
     fn occupancy_and_explicit_writes_are_distinct_and_bounded() {
         let mut inspector = Inspector::default();

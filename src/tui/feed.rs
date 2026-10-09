@@ -358,12 +358,13 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &RunState) {
         }
     }
     lines.push(Line::from(format!(
-        "Latest recorded window{}; positions do not advance between events.",
+        "Latest recorded window{}.",
         feed.updated_at.map_or(String::new(), |at| format!(
             " / {:.1}s ago",
             at.elapsed().as_secs_f64()
         ))
     )));
+    lines.push(Line::from("Positions do not advance between events."));
     let block = panel(" dataset feed / real text → tokens / PgUp/Dn scroll ");
     let inner = block.inner(area);
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });

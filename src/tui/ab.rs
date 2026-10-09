@@ -81,6 +81,14 @@ struct Output {
     error: Option<String>,
 }
 impl Output {
+    fn rate_label(&self) -> String {
+        if self.elapsed > 0.0 {
+            format!("{:.1}", self.rate())
+        } else {
+            "unmeasured".into()
+        }
+    }
+
     fn rate(&self) -> f64 {
         if self.elapsed > 0.0 {
             self.tokens as f64 / self.elapsed
@@ -341,9 +349,9 @@ impl Comparison {
         if area.width < 44 || area.height < 16 {
             f.render_widget(
                 Paragraph::new(format!(
-                    "A/B • A then B (one model in RAM)\nA {} tok • {:.1} tok/s\nB {} tok • {:.1} tok/s\n{}\n▶ {}\nEnlarge for side-by-side replies • Esc stop",
-                    self.sides[0].tokens, self.sides[0].rate(),
-                    self.sides[1].tokens, self.sides[1].rate(),
+                    "A/B • A then B (one model in RAM)\nA {} tok • {} tok/s\nB {} tok • {} tok/s\n{}\n▶ {}\nEnlarge for side-by-side replies • Esc stop",
+                    self.sides[0].tokens, self.sides[0].rate_label(),
+                    self.sides[1].tokens, self.sides[1].rate_label(),
                     clean(note), clean(input)
                 )).style(accent()),
                 area,
@@ -387,7 +395,11 @@ impl Comparison {
             ]),
             chunks[0],
         );
-        let gap = if super::shadow::enabled(f.area()) { 1 } else { 0 };
+        let gap = if super::shadow::enabled(f.area()) {
+            1
+        } else {
+            0
+        };
         let columns = Layout::horizontal([
             Constraint::Percentage(50),
             Constraint::Length(gap),
@@ -415,7 +427,7 @@ impl Comparison {
                         clean(&self.models[index])
                     }),
                     Line::styled(side.phase.label(), accent()),
-                    Line::from(format!("{} tok • {:.1} tok/s", side.tokens, side.rate())),
+                    Line::from(format!("{} tok • {} tok/s", side.tokens, side.rate_label())),
                 ]),
                 rows[0],
             );
@@ -1012,6 +1024,22 @@ mod tests {
         assert_eq!(decoded_prefix(&[0xe4, 0xb8, 0x96]), "世");
         assert_eq!(decoded_prefix(&[0xff, 0xe4, 0xb8]), "\u{fffd}");
         assert_eq!(decoded_prefix(&[0xff, 0xe4, 0xb8, 0x96]), "\u{fffd}世");
+    }
+
+    #[test]
+    fn idle_comparison_rates_are_unmeasured_until_generation_is_timed() {
+        let mut ab = Comparison {
+            enabled: true,
+            ..Comparison::default()
+        };
+        for (w, h) in [(100, 24), (40, 14)] {
+            let text = screen(&mut ab, w, h);
+            assert!(text.contains("unmeasured tok/s"), "{text}");
+            assert!(!text.contains("0.0 tok/s"));
+        }
+        ab.sides[0].tokens = 2;
+        ab.sides[0].elapsed = 1.0;
+        assert!(screen(&mut ab, 100, 24).contains("2 tok • 2.0 tok/s"));
     }
 
     #[test]
