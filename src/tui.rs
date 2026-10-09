@@ -2738,12 +2738,13 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
     let mut data: Vec<(&'static str, &[(f64, f64)], Color)> = Vec::new();
     match view {
         GraphView::Loss => {
-            data.push(("loss", loss.as_deref().unwrap_or(&[]), NORMAL_GREEN));
+            // Average first so the raw loss stays on top where they cross.
             data.push((
                 "moving avg",
                 moving_loss.as_deref().unwrap_or(&[]),
                 SECOND_ACCENT,
             ));
+            data.push(("loss", loss.as_deref().unwrap_or(&[]), NORMAL_GREEN));
         }
         GraphView::Perplexity => {
             data.push((
