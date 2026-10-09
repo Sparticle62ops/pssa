@@ -287,7 +287,21 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &RunState) {
         if !feed.split.is_empty() || !feed.field.is_empty() {
             lines.push(Line::from(format!(
                 "config {} / split {} / field {}",
-                feed.config, feed.split, feed.field
+                if feed.config.is_empty() {
+                    "unrecorded"
+                } else {
+                    &feed.config
+                },
+                if feed.split.is_empty() {
+                    "unrecorded"
+                } else {
+                    &feed.split
+                },
+                if feed.field.is_empty() {
+                    "unrecorded"
+                } else {
+                    &feed.field
+                }
             )));
         }
         lines.push(Line::from(format!(

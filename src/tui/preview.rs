@@ -308,6 +308,8 @@ impl Preview {
         // Allow an in-progress non-atomic save to settle; the checkpoint reader
         // validates it, and failure retries after the throttle instead of writing it.
         if revision.modified.elapsed().unwrap_or_default() < Duration::from_secs(2) {
+            self.checkpoint = requested;
+            self.note = "Checkpoint file changed; waiting for the 2s writer-settle guard before read-only sampling".into();
             return;
         }
         self.last_attempt = Some(Instant::now());
@@ -531,6 +533,19 @@ fn prompt_for(tok: &crate::dataset::Tokenizer) -> Result<String, String> {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn recently_written_checkpoint_reports_settling_instead_of_no_checkpoint() {
+        let temp = super::super::library::tests::Temp::new();
+        let path = temp.0.join("recent checkpoint.pssa");
+        std::fs::write(&path, "recent checkpoint fixture; not loaded").unwrap();
+        let mut preview = Preview::default();
+        preview.poll(Some(path.clone()), 1, false);
+        assert!(preview.note.contains("writer-settle"));
+        assert!(!preview.note.contains("No checkpoint"));
+        assert_eq!(preview.checkpoint, path.display().to_string());
+        assert!(preview.job.is_none());
+    }
 
     #[test]
     fn placeholder_sample_and_heatmap_render_wide_and_compact() {

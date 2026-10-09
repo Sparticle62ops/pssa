@@ -336,6 +336,12 @@ impl RunState {
             }
         }
         if line.contains("progress_schema=") {
+            if self.configuration_source.take().is_some() {
+                self.width = None;
+                self.vocab = None;
+                self.memory = None;
+                self.math = math::Values::default();
+            }
             // Start the stall clock even before the first update arrives.
             self.last_progress_at = Some(Instant::now());
             self.run_started_at = Some(Instant::now());
