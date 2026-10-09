@@ -56,9 +56,12 @@ enum Field {
     DreamLen,
     DreamLr,
     DreamSteps,
+    LossHigh,
+    LossJump,
+    LossPatience,
 }
 use Field::*;
-const LABELS: [&str; 28] = [
+const LABELS: [&str; 31] = [
     "Source",
     "Dataset",
     "HF config (optional)",
@@ -87,6 +90,9 @@ const LABELS: [&str; 28] = [
     "Dream length",
     "Dream learning rate",
     "Dream steps",
+    "Loss high factor (>1)",
+    "Loss jump factor (>1)",
+    "Loss patience updates",
 ];
 const PAGES: [&str; 4] = ["1 dataset", "2 model", "3 training", "4 review / launch"];
 const FIELDS: [&[Field]; 4] = [
@@ -106,12 +112,15 @@ const FIELDS: [&[Field]; 4] = [
         DreamLen,
         DreamLr,
         DreamSteps,
+        LossHigh,
+        LossJump,
+        LossPatience,
     ],
     &[Output, Resume, Backend, Threads, Ram],
 ];
 
 pub(super) struct Setup {
-    values: [String; 28],
+    values: [String; 31],
     devices: DevicePicker,
     page: usize,
     selected: usize,
@@ -156,6 +165,9 @@ impl Default for Setup {
                 "64",
                 "0.006",
                 "1",
+                "4",
+                "8",
+                "3",
             ]
             .map(str::to_owned),
             devices: DevicePicker::default(),
@@ -543,6 +555,18 @@ impl Setup {
         ] {
             self.number(field, min, max)?;
         }
+        crate::loss_guard::LossGuardConfig {
+            high_factor: self
+                .value(LossHigh)
+                .parse::<f32>()
+                .map_err(|_| "Invalid loss high factor")? as f64,
+            jump_factor: self
+                .value(LossJump)
+                .parse::<f32>()
+                .map_err(|_| "Invalid loss jump factor")? as f64,
+            patience: self.number(LossPatience, 1, 1_000_000)?,
+        }
+        .validate()?;
         DreamModeValue::parse(self.value(DreamMode))?;
         let dream_lr = self.value(DreamLr).parse::<f32>().map_err(|_| {
             "Dream learning rate must be a finite positive number"
@@ -643,6 +667,13 @@ impl Setup {
             }
         }
         if !transformer {
+            for (field, flag) in [
+                (LossHigh, "--loss-guard-high-factor"),
+                (LossJump, "--loss-guard-jump-factor"),
+                (LossPatience, "--loss-guard-patience"),
+            ] {
+                push(flag, self.value(field).into());
+            }
             for (field, flag, differs) in [
                 (
                     DreamEvery,
@@ -1312,6 +1343,25 @@ mod tests {
         let index = setup.args().iter().position(|arg| arg == "--resume").unwrap();
         assert_eq!(setup.args()[index + 1], path.to_str().unwrap());
         assert!(setup.prepare_resume(fixture.0.join("missing.pssa")).is_err());
+    }
+
+    #[test]
+    fn loss_guard_settings_round_trip_and_reject_invalid_values() {
+        let fixture = Fixture::new();
+        let mut setup = fixture.setup();
+        setup.values[LossHigh as usize] = "5".into();
+        setup.values[LossJump as usize] = "10".into();
+        setup.values[LossPatience as usize] = "4".into();
+        let spec = setup.validate().unwrap();
+        let parsed = crate::cli::parse_train_options_for_test(&spec.args[1..]).unwrap();
+        assert_eq!(parsed.loss_guard.high_factor, 5.0);
+        assert_eq!(parsed.loss_guard.jump_factor, 10.0);
+        assert_eq!(parsed.loss_guard.patience, 4);
+        for (field, value) in [(LossHigh, "1"), (LossJump, "NaN"), (LossPatience, "0")] {
+            let mut bad = fixture.setup();
+            bad.values[field as usize] = value.into();
+            assert!(bad.validate().is_err());
+        }
     }
 
     #[test]

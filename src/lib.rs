@@ -15,6 +15,7 @@ pub mod gpu_batch;
 pub mod inference;
 pub mod linalg;
 pub mod loss_csv;
+pub mod loss_guard;
 pub mod memory;
 pub mod pssa;
 pub mod scan_executor;
