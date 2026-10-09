@@ -1489,7 +1489,10 @@ mod tests {
             assert!(text.contains("unmeasured tok/s"), "{text}");
             assert!(!text.contains("0.0 tok/s"));
         }
-        fs::remove_dir_all(&chat.store.dir).unwrap();
+        assert!(
+            !chat.store.dir.exists(),
+            "Rendering idle chat must not invent or persist a conversation"
+        );
     }
 
     #[test]
