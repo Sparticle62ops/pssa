@@ -199,6 +199,18 @@ fn v7_exact_state_for_word_checkpoint() {
 }
 
 #[test]
+fn runtime_only_memory_retrieval_selection_is_not_checkpointed() {
+    let p = path("runtime-memory-selection");
+    let mut a = model();
+    a.memory.set_top_k(Some(1)).unwrap();
+    checkpoint::save_model(&a, &p).unwrap();
+    let b = checkpoint::load_checkpoint(&p).unwrap();
+    assert_eq!(a.memory.top_k(), Some(1));
+    assert_eq!(b.model.memory.top_k(), None);
+    fs::remove_file(p).unwrap();
+}
+
+#[test]
 fn v7_persists_fixed_schedule_horizon() {
     let mut a = model();
     a.lr_schedule_total_updates = Some(1234);
@@ -971,6 +983,9 @@ fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
     .map(vector_bytes)
     .sum::<usize>()
         + vector_bytes(bwd_g_query_pnc);
+    // `top_k` is a private runtime selector, not checkpoint state or an
+    // allocated numeric buffer. It is intentionally omitted from every
+    // checkpoint; runtime-only reset behavior is covered below.
     let pssa::memory::HyperbolicEpisodicBankV2 {
         capacity: _,
         count: _,
@@ -983,6 +998,7 @@ fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
         norm_sq,
         confidence,
         last_seen_step,
+        ..
     } = memory;
     let memory_bytes = [keys, values, norm_sq, confidence]
         .into_iter()
