@@ -479,18 +479,20 @@ impl Runs {
                 e.modified
                     .map(date)
                     .unwrap_or_else(|| "mtime unavailable".into()),
-                e.ppl.map_or("unscored".into(), |n| format!("{n:.3}")),
+                e.ppl
+                    .map_or("unscored".into(), |n| format!("{n:.3} (saved/unverified)")),
                 clean(&e.path.display().to_string())
             )));
         }
         let runs_area = panel_area(f, chunks[0]);
         f.render_widget(
-            Paragraph::new(rows).block(panel(" runs / checkpoints + logs ")),
+            Paragraph::new(rows).block(panel(" runs / checkpoints + logs / historical scores ")),
             runs_area,
         );
         let mut detail = vec![
             Line::styled(self.description.as_str(), accent()),
             Line::from(self.note.as_str()),
+            Line::from("Saved perplexity is historical sidecar data; checkpoint identity is unverified and the score may be stale."),
             Line::from("↑/↓ select • r refresh • Enter monitor • c chat • s score • Esc cancel"),
             Line::from(
                 "Perplexity comes from saved held-out .score.json, never inferred from weights.",
@@ -539,6 +541,37 @@ mod tests {
         assert_eq!(date(1709164800), "2024-02-29 UTC");
         fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn replaced_checkpoint_never_presents_a_saved_sidecar_as_a_verified_current_score() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let temp = super::super::library::tests::Temp::new();
+        let path = temp.0.join("model.pssa");
+        fs::write(&path, "checkpoint A").unwrap();
+        save_score(&path, &serde_json::json!({"perplexity": 8.5})).unwrap();
+        fs::write(&path, "checkpoint B").unwrap();
+        let mut runs = Runs::new(temp.0.clone());
+        runs.entries = scan(&[temp.0.clone()]);
+        assert_eq!(
+            runs.entries[0].ppl,
+            Some(8.5),
+            "saved metric remains historical data"
+        );
+        for (width, height) in [(120, 40), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| runs.draw(f, f.area())).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("8.500 (saved/unverified)"), "{text}");
+            assert!(text.contains("historical scores"), "{text}");
+            assert!(text.contains("score may be stale"), "{text}");
+        }
+    }
+
     #[test]
     fn open_saved_log_restores_monitor_and_missing_history_is_explicit() {
         let dir = std::env::temp_dir().join(format!("pssa-runs-open-{}", std::process::id()));
