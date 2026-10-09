@@ -92,6 +92,9 @@ fn shape(m: &PSSALayerV2) -> [usize; 8] {
 
 impl SequenceBatch {
     pub fn new(m: &mut PSSALayerV2, batch_size: usize) -> Result<Self, String> {
+        if m.local_mixing_enabled() {
+            return Err("local mixing experiments require single-lane training".into());
+        }
         if batch_size == 0 {
             return Err(
                 "batch size must be positive; use --batch-size 1 for serial training".into(),
@@ -198,6 +201,9 @@ impl SequenceBatch {
     }
 
     fn check_model(&self, m: &PSSALayerV2) -> Result<(), String> {
+        if m.local_mixing_enabled() {
+            return Err("local mixing experiments require single-lane training".into());
+        }
         let rows = self.shape[0] * self.lanes.len();
         if shape(m) != self.shape
             || m.block.tape.max_l < rows
