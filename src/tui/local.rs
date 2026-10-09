@@ -45,7 +45,8 @@ impl Local {
             && (state.training_active
                 || state.checkpoint_target.is_some()
                 || state.last_checkpoint.is_some()
-                || state.selected_checkpoint.is_some()))
+                || state.selected_checkpoint.is_some()
+                || !state.checkpoints.is_empty()))
         .then(|| state.chain_dir.clone());
         self.library.watch_run(run_dir, state.checkpoint_revision);
         let dataset = (!remote).then(|| local_dataset(state)).flatten();
