@@ -644,9 +644,12 @@ impl Timeline {
         let mut rows = Vec::new();
         if let Some((step, loss, speed)) = self.live {
             rows.push(Line::from(format!(
-                "Unsaved live run: step {} / loss {} / {} tok/s",
+                "Unsaved live run: step {} / loss {}",
                 step.map_or("unrecorded".into(), |value| value.to_string()),
                 loss.map_or("unrecorded".into(), super::charts::number),
+            )));
+            rows.push(Line::from(format!(
+                "Live throughput: {} tok/s",
                 speed.map_or("unrecorded".into(), |value| format!("{value:.0}"))
             )));
             rows.push(Line::from(

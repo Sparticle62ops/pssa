@@ -56,6 +56,24 @@ impl Values {
         }
     }
 
+    pub(super) fn ingest_header_dims(&mut self, dims: &str) {
+        self.model = Some(
+            if dims.starts_with("TRFM ") {
+                "transformer"
+            } else {
+                "pssa"
+            }
+            .into(),
+        );
+        self.vocab = parse_kv(dims, "vocab ");
+        self.latent = parse_kv(dims, "latent ").or_else(|| parse_kv(dims, "width "));
+        self.state = parse_kv(dims, "state ");
+        self.depth = parse_kv(dims, "depth ");
+        self.slots = parse_kv(dims, "slots ");
+        self.key = parse_kv(dims, "key ");
+        // Shared loop count is a runtime setting, not persisted in a checkpoint.
+    }
+
     fn dense_macs(&self) -> Option<u128> {
         let (d, s, k, v, depth, loops) = (
             self.latent? as u128,
@@ -91,8 +109,14 @@ impl Math {
         let n = |value: Option<u64>| value.map_or_else(|| "n/a".into(), |n| n.to_string());
         let mut lines = vec![
             Line::styled("PSSA / executable equations", accent()),
+            Line::from(
+                state
+                    .configuration_source
+                    .as_deref()
+                    .unwrap_or("Source: trainer log (missing fields stay unrecorded)"),
+            ),
             Line::from(format!(
-                "LIVE latent {} / state {} / vocab {}",
+                "Dimensions: latent {} / state {} / vocab {}",
                 n(v.latent),
                 n(v.state),
                 n(v.vocab)
@@ -210,7 +234,7 @@ mod tests {
                     .iter()
                     .map(|c| c.symbol())
                     .collect();
-                assert!(text.contains("LIVE latent 8"));
+                assert!(text.contains("Dimensions: latent 8"));
                 assert!(text.contains("123456"));
                 math.scroll.set(u16::MAX);
                 terminal.draw(|f| math.draw(f, f.area(), &state)).unwrap();
@@ -238,7 +262,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains("LIVE latent n/a"));
+        assert!(text.contains("Dimensions: latent n/a"));
         assert!(text.contains("softplus"));
     }
 }

@@ -58,7 +58,7 @@ pub(super) struct Entry {
     pub path: PathBuf,
     pub kind: Kind,
     pub bytes: u64,
-    pub modified: u64,
+    pub modified: Option<u64>,
     pub dims: String,
 }
 impl Entry {
@@ -80,18 +80,26 @@ pub(super) fn checkpoint_dims(path: &Path) -> Option<String> {
         |at| -> Option<u64> { Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?)) };
     match (bytes.get(..4)?, version) {
         (b"PSSA", 6..=8) => Some(format!(
-            "PSSA v{version} vocab {} latent {} state {} depth {}",
+            "PSSA v{version} vocab {} latent {} state {} depth {} slots {} key {}{}",
             word(22)?,
             word(30)?,
             word(38)?,
-            if version == 8 { word(98)? } else { 1 }
+            if version == 8 { word(98)? } else { 1 },
+            word(54)?,
+            word(46)?,
+            if version < 8 {
+                word(98).map_or_else(String::new, |step| format!(" step {step}"))
+            } else {
+                String::new()
+            }
         )),
         (b"TRFM", 1) => Some(format!(
-            "TRFM vocab {} width {} heads {} ff {}",
+            "TRFM vocab {} width {} heads {} ff {}{}",
             word(22)?,
             word(30)?,
             word(38)?,
-            word(46)?
+            word(46)?,
+            word(82).map_or_else(String::new, |step| format!(" step {step}"))
         )),
         (b"PSSA", 5) => {
             let n = |at| -> Option<u32> {
@@ -158,7 +166,7 @@ pub(super) fn scan(models: &Path, datasets: &Path) -> (Vec<Entry>, String) {
                     .modified()
                     .ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_secs()),
+                    .map(|d| d.as_secs()),
                 dims,
             });
         }
@@ -380,7 +388,10 @@ pub(super) fn dataset_stats(path: &Path) -> Result<Stats, String> {
             std::thread::sleep(Duration::from_millis(2));
         }
     }
-    let estimated = !eof && source.total.map_or(source.read_bytes < bytes, |n| n > count);
+    let estimated = !eof
+        && source
+            .total
+            .map_or(source.read_bytes < bytes, |n| n > count);
     let total = source.total.unwrap_or_else(|| {
         if estimated {
             // Rounding can hide a short unread tail. It is still a sample, not
@@ -485,6 +496,14 @@ impl Library {
                 }
                 result.0.sort_by(|a, b| a.path.cmp(&b.path));
             }
+            if let Some(path) = runtime_dataset.as_ref().filter(|path| path.is_dir()) {
+                for entry in scan(&models, path).0 {
+                    if !result.0.iter().any(|existing| existing.path == entry.path) {
+                        result.0.push(entry);
+                    }
+                }
+                result.0.sort_by(|a, b| a.path.cmp(&b.path));
+            }
             if let Some(path) = runtime_dataset
                 && !result.0.iter().any(|entry| entry.path == path)
                 && let Ok(meta) = fs::metadata(&path)
@@ -498,7 +517,7 @@ impl Library {
                         .modified()
                         .ok()
                         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                        .map_or(0, |time| time.as_secs()),
+                        .map(|time| time.as_secs()),
                     dims: String::new(),
                 });
                 result.0.sort_by(|a, b| a.path.cmp(&b.path));
@@ -684,7 +703,10 @@ impl Library {
                     if i == self.selected { "▶" } else { " " },
                     entry.name(),
                     size(entry.bytes),
-                    date(entry.modified),
+                    entry
+                        .modified
+                        .map(date)
+                        .unwrap_or_else(|| "mtime unavailable".into()),
                     entry.dims
                 )
             };
@@ -712,7 +734,10 @@ impl Library {
                 "{} / {} / {} UTC",
                 entry.name(),
                 size(entry.bytes),
-                date(entry.modified)
+                entry
+                    .modified
+                    .map(date)
+                    .unwrap_or_else(|| "mtime unavailable".into())
             )));
             if entry.kind != Kind::Dataset {
                 detail.push(Line::from(entry.dims.clone()));
@@ -831,7 +856,10 @@ pub(super) mod tests {
         assert_eq!(stats.tokens, 8192);
         fs::write(&path, format!("{}x", "one two three four\n".repeat(2048))).unwrap();
         let stats = dataset_stats(&path).unwrap();
-        assert!(stats.estimated && stats.records_estimated, "an unread short tail is still estimated");
+        assert!(
+            stats.estimated && stats.records_estimated,
+            "an unread short tail is still estimated"
+        );
         assert_eq!(stats.records, 2049);
         let path = temp.0.join("rows.jsonl");
         fs::write(&path, "{\"text\":\"hello there!\"}\n\"again\"\n").unwrap();

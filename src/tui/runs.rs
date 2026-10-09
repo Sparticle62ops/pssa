@@ -19,7 +19,7 @@ use std::{
 
 struct Entry {
     path: PathBuf,
-    modified: u64,
+    modified: Option<u64>,
     ppl: Option<f64>,
 }
 fn text(path: &Path, limit: u64) -> Result<String, String> {
@@ -100,7 +100,7 @@ fn scan(roots: &[PathBuf]) -> Vec<Entry> {
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_secs());
+                .map(|d| d.as_secs());
             let sidecar = score_path(&path);
             // Preserve older saved scores until a format-specific score exists.
             let sidecar = if sidecar.exists() {
@@ -356,26 +356,12 @@ impl Runs {
             state.last_checkpoint = last.map(|p| p.display().to_string());
             state.checkpoint_target = target.map(|p| p.display().to_string());
             if path.extension().is_some_and(|e| e != "log") {
-                // Selecting a file proves its existence, not that the latest
-                // log metrics were saved into it. Preserve only a loss already
-                // associated by an actual save event (or a .loss sidecar below).
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                let recorded = state
-                    .checkpoints
-                    .iter()
-                    .find(|(file, _)| file == name.as_ref())
-                    .and_then(|(_, loss)| *loss);
-                state.note_checkpoint(&path.display().to_string());
-                if let Some((_, loss)) = state
-                    .checkpoints
-                    .iter_mut()
-                    .find(|(file, _)| file == name.as_ref())
-                {
-                    *loss = recorded;
+                // File existence is not a trainer save event. Keep the selected
+                // read-only inference artifact separate from save provenance.
+                state.selected_checkpoint = Some(path.display().to_string());
+                if let Some(dims) = super::library::checkpoint_dims(&path) {
+                    state.use_header_dims(&path, &dims);
                 }
-                state
-                    .checkpoint_target
-                    .get_or_insert_with(|| path.display().to_string());
             }
             state.checkpoint_number = state
                 .last_checkpoint
@@ -490,7 +476,9 @@ impl Runs {
             rows.push(Line::from(format!(
                 "{} {}  ppl {}  {}",
                 if i == self.selected { "▶" } else { " " },
-                date(e.modified),
+                e.modified
+                    .map(date)
+                    .unwrap_or_else(|| "mtime unavailable".into()),
                 e.ppl.map_or("unscored".into(), |n| format!("{n:.3}")),
                 clean(&e.path.display().to_string())
             )));
@@ -571,7 +559,8 @@ mod tests {
         assert_eq!(state.live_loss, Some(2.5));
         assert_eq!(state.metric_series.len(), 1);
         assert!(!state.training_active);
-        assert_eq!(state.last_checkpoint.as_deref(), path.to_str());
+        assert!(state.last_checkpoint.is_none());
+        assert_eq!(state.selected_checkpoint.as_deref(), path.to_str());
         fs::remove_file(path.with_extension("log")).unwrap();
         runs.open_monitor(path);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -682,6 +671,15 @@ mod tests {
             "the log's training measurement is still real"
         );
         assert_eq!(state.checkpoints, [("model.pssa".into(), None)]);
+        assert!(state.last_checkpoint.is_none());
+        assert!(!state.checkpoint_saved_current);
+        assert_eq!(state.selected_checkpoint.as_deref(), path.to_str());
+        assert!(
+            state
+                .checkpoint_context()
+                .contains("save failed: disk full")
+        );
+        assert!(state.health_status().level == super::super::HealthLevel::Problem);
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "existing checkpoint must remain untouched"
@@ -788,7 +786,7 @@ mod tests {
         let mut r = Runs::new("missing-test-chain".into());
         r.entries = vec![Entry {
             path: "models/a checkpoint.pssa".into(),
-            modified: 0,
+            modified: None,
             ppl: Some(9.5),
         }];
         r.description = "PSSA • latent 256 • state 16 • depth 1".into();
