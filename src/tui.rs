@@ -169,6 +169,8 @@ struct RunState {
     dream_last_loss: Option<f64>,
     dream_update: Option<u64>,
     loss_guard_status: Option<String>,
+    memory_retrieval: Option<String>,
+    memory_growth: Option<String>,
     updates_done: Option<u64>,
     updates_total: Option<u64>,
     updates_remaining: Option<u64>,
@@ -397,6 +399,12 @@ impl RunState {
             self.dream_update = None;
         }
 
+        if let Some(mode) = parse_kv::<String>(line, "memory_retrieval=") {
+            self.memory_retrieval = Some(mode);
+        }
+        if let Some(growth) = parse_kv::<String>(line, "memory_growth=") {
+            self.memory_growth = Some(growth);
+        }
         if line.contains("loss_guard=on") {
             self.loss_guard_status = Some(format!(
                 "on / high {}x / jump {}x / patience {}",
@@ -3111,6 +3119,9 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         None => "No input window recorded / Feed tab".into(),
     };
     lines.push(Line::from(input_line));
+    lines.push(Line::from(format!("memory read {} / growth {}",
+        state.memory_retrieval.as_deref().unwrap_or("unreported"),
+        state.memory_growth.as_deref().unwrap_or("none reported"))));
     lines.push(Line::from(format!(
         "gradient norm {} / skipped updates {} / epoch loss {epoch_loss}",
         state
@@ -3750,6 +3761,16 @@ mod tests {
         finish_piped_stream(&mut empty, None);
         assert_eq!(empty.health_status().level, HealthLevel::Normal);
         assert_eq!(empty.health_status().normal_label, "WAITING");
+    }
+
+    #[test]
+    fn memory_retrieval_events_are_not_loss_samples() {
+        let mut state = RunState::default();
+        state.ingest("memory_retrieval=top-4 memory_capacity=256");
+        state.ingest("memory_growth=64->256 memory_capacity=256");
+        assert_eq!(state.memory_retrieval.as_deref(), Some("top-4"));
+        assert_eq!(state.memory_growth.as_deref(), Some("64->256"));
+        assert!(state.loss_series.is_empty());
     }
 
     #[test]
