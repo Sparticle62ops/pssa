@@ -46,6 +46,7 @@ mod support;
 mod sweep;
 mod timeline;
 mod update;
+mod world_model;
 
 use crate::ui;
 use background::HexBackground;
@@ -168,6 +169,7 @@ struct RunState {
     dream_mode: Option<String>,
     dream_last_loss: Option<f64>,
     dream_update: Option<u64>,
+    world_model: Option<world_model::Monitor>,
     loss_guard_status: Option<String>,
     memory_retrieval: Option<String>,
     memory_growth: Option<String>,
@@ -267,6 +269,9 @@ impl RunState {
         let line = strip_ansi(line);
         let line = line.trim();
         if line.is_empty() {
+            return;
+        }
+        if world_model::ingest(self, line) {
             return;
         }
         if line.starts_with("model=") && line.contains("parameters=") {
@@ -717,6 +722,9 @@ impl RunState {
     }
 
     fn checkpoint_context(&self) -> String {
+        if self.world_model.is_some() {
+            return "Boxes-world experiment: no checkpoint; results in log only".into();
+        }
         let current = feed::value(self.current_step());
         let previous = self
             .last_checkpoint
@@ -956,7 +964,9 @@ impl RunState {
     }
 
     fn health_status_at(&self, now: Instant) -> HealthStatus {
-        let normal_label = if self.dream_active {
+        let normal_label = if self.world_model.is_some() && self.training_active {
+            "WORLD MODEL"
+        } else if self.dream_active {
             "DREAMING"
         } else if self.training_active {
             "TRAINING"
@@ -1622,6 +1632,10 @@ fn draw_header_stats(f: &mut ratatui::Frame, area: Rect, state: &RunState, healt
         .title(Line::styled(title, Style::new().fg(health.color())));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    if let Some(world) = &state.world_model {
+        f.render_widget(Paragraph::new(world.header()).style(accent()), inner);
+        return;
+    }
     let done = state
         .updates_done
         .or(state.optimizer_updates)
@@ -2959,6 +2973,10 @@ fn draw_memory_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
 }
 
 fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
+    if let Some(world) = &state.world_model {
+        world.draw(f, area);
+        return;
+    }
     let area = if area.height >= 27 {
         let gap = if shadow::enabled(f.area()) && area.height >= 21 {
             1
