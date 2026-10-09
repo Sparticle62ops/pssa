@@ -571,10 +571,20 @@ fn telemetry_overhead_paired_cpu_measurement() {
             };
             assert_eq!(a.1, b.1);
             assert_eq!(a.2, b.2);
+            let training_seconds = |log: &str| {
+                log.lines()
+                    .find_map(|line| line.strip_prefix("training_seconds="))
+                    .and_then(|line| line.split_whitespace().next())
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap()
+            };
             println!(
-                "telemetry_pair tokenizer={kind} pair={pair} disabled_seconds={:.6} enabled_seconds={:.6}",
+                "telemetry_pair tokenizer={kind} pair={pair} disabled_seconds={:.6} enabled_seconds={:.6} disabled_training_seconds={:.3} enabled_training_seconds={:.3}",
                 a.3.as_secs_f64(),
-                b.3.as_secs_f64()
+                b.3.as_secs_f64(),
+                training_seconds(&a.0),
+                training_seconds(&b.0)
             );
             disabled.push(a.3.as_secs_f64());
             enabled.push(b.3.as_secs_f64());
