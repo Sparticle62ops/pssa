@@ -117,6 +117,7 @@ fn transformer_bpe_actual_window_cache_and_epochs_do_not_change_checkpoint_bits(
         !disabled.contains("feed_schema="),
         "explicit opt-out must omit dataset windows"
     );
+    assert!(disabled.contains("feed_telemetry=false checkpoint_target="));
     let (uncached, uncached_bits) = run("uncached", false, true);
     assert_eq!(
         uncached_bits, reference,
@@ -132,6 +133,7 @@ fn transformer_bpe_actual_window_cache_and_epochs_do_not_change_checkpoint_bits(
     assert!(built.contains("token_cache=built"));
     assert!(reused.contains("token_cache=reused"));
     for log in [&uncached, &built, &reused] {
+        assert!(log.contains("feed_telemetry=true checkpoint_target="));
         let samples: Vec<_> = log
             .lines()
             .filter(|line| line.contains("feed_schema=2"))
@@ -338,6 +340,7 @@ fn pssa_dream_off_telemetry_preserves_checkpoint_and_loss_bits_for_lanes_depth_l
             "explicit opt-out must omit dataset windows"
         );
         assert!(!disabled.contains("dream phase="));
+        assert!(disabled.contains("feed_telemetry=false checkpoint_target="));
         let (enabled, actual, enabled_curve, elapsed) =
             run_pssa(&fixture, &source, &format!("{label}-enabled"), true, &args);
         assert_eq!(
@@ -349,6 +352,7 @@ fn pssa_dream_off_telemetry_preserves_checkpoint_and_loss_bits_for_lanes_depth_l
             "exact losses and consumed target counts: {label}"
         );
         assert!(!enabled.contains("dream phase="));
+        assert!(enabled.contains("feed_telemetry=true checkpoint_target="));
         let tokenizer = if kind == "word" {
             Tokenizer::from_corpus(raw, true).unwrap()
         } else {

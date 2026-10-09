@@ -142,6 +142,7 @@ struct RunState {
     resource_limits: std::cell::RefCell<limits::Limits>,
     loop_count: usize,
     feed: Option<FeedState>,
+    feed_telemetry: Option<bool>,
     feed_scroll: std::cell::Cell<u16>,
     // header card
     corpus: Option<String>,
@@ -386,6 +387,7 @@ impl RunState {
             self.progress_from = None;
             self.progress_updated_at = None;
             self.feed = None;
+            self.feed_telemetry = parse_kv(line, "feed_telemetry=");
             self.feed_scroll.set(0);
             self.dream_active = false;
             self.dream_count = 0;
@@ -990,8 +992,15 @@ impl RunState {
         self.health_status_at(Instant::now())
     }
 
+    fn reported_progress(&self) -> Option<f64> {
+        self.progress_pct.or_else(|| {
+            let (done, total) = self.updates_done.zip(self.updates_total)?;
+            (total > 0).then(|| done as f64 * 100.0 / total as f64)
+        })
+    }
+
     fn displayed_progress_at(&self, now: Instant) -> f64 {
-        let target = self.progress_pct.unwrap_or(0.0).clamp(0.0, 100.0);
+        let target = self.reported_progress().unwrap_or(0.0).clamp(0.0, 100.0);
         let Some(started) = self.progress_updated_at else {
             return target;
         };
@@ -1994,12 +2003,14 @@ fn draw_neuron_frame(f: &mut ratatui::Frame, area: Rect, frame: NeuronFrame, tit
     f.render_widget(canvas, area);
 }
 
-fn progress_label(state: &RunState, pct: f64, width: u16) -> String {
+fn progress_label(state: &RunState, width: u16) -> String {
     if state.progress_pct.is_none() && state.updates_total.is_none() {
         return "No training progress recorded".into();
     }
     // Numeric labels use reported progress, not the visual bar's tween.
-    let pct = state.progress_pct.unwrap_or(pct);
+    let pct = state
+        .reported_progress()
+        .map_or_else(|| "unrecorded".into(), |pct| format!("{pct:>3.0}%"));
     let done = state
         .updates_done
         .or(state.optimizer_updates)
@@ -2011,17 +2022,17 @@ fn progress_label(state: &RunState, pct: f64, width: u16) -> String {
         .unwrap_or_else(|| "-".into());
     let eta = state.eta.as_deref().unwrap_or("-");
     if width >= 48 {
-        format!("{pct:>3.0}%   updates {done}/{total}   ETA {eta}")
+        format!("{pct}   updates {done}/{total}   ETA {eta}")
     } else if width >= 28 {
-        format!("{pct:>3.0}%  {done}/{total}  ETA {eta}")
+        format!("{pct}  {done}/{total}  ETA {eta}")
     } else {
-        format!("{pct:>3.0}% {done}/{total}")
+        format!("{pct} {done}/{total}")
     }
 }
 
 fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64) {
     if area.height == 1 {
-        let label = progress_label(state, pct, area.width);
+        let label = progress_label(state, area.width);
         let meter_width = area.width.saturating_sub(label.len() as u16 + 1);
         let meter = charts::bar(pct / 100.0, meter_width as usize);
         for (i, glyph) in meter.chars().enumerate() {
@@ -2081,7 +2092,7 @@ fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64)
         }
     }
     if inner.height >= 2 {
-        let label = progress_label(state, pct, inner.width);
+        let label = progress_label(state, inner.width);
         f.buffer_mut().set_stringn(
             inner.x,
             inner.y + 1,
@@ -4206,6 +4217,39 @@ mod tests {
         let visible = state.displayed_progress_at(Instant::now());
         assert!(visible >= state.progress_from.unwrap());
         assert!(visible <= 50.0);
+    }
+
+    #[test]
+    fn partial_progress_uses_recorded_counters_instead_of_a_fake_zero_percent() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut state = RunState::default();
+        state.ingest("progress_schema=2 prior_updates=100 updates_total=500");
+        assert_eq!(state.reported_progress(), Some(0.0));
+        state.ingest("optimizer_updates=120 updates_total=500");
+        assert_eq!(state.reported_progress(), Some(24.0));
+        assert_eq!(state.displayed_progress_at(Instant::now()), 24.0);
+        for (width, height) in [(80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| draw(f, &state, 0)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("24%"), "{width}x{height}: {text}");
+            assert!(text.contains("120/500"), "{width}x{height}: {text}");
+        }
+        state.updates_done = None;
+        assert_eq!(state.reported_progress(), None);
+        assert!(progress_label(&state, 80).contains("unrecorded"));
+        assert!(!progress_label(&state, 80).contains("0%"));
+        state.updates_done = Some(120);
+        state.updates_total = Some(0);
+        assert_eq!(state.reported_progress(), None);
+        state.ingest("training 120/500 (24%) loss=2 tokens_per_second=100");
+        assert_eq!(state.reported_progress(), Some(24.0));
     }
 
     #[test]

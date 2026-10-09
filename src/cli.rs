@@ -1143,9 +1143,10 @@ impl CLIHandler {
         }
         progress.set_prior_updates(model.step_counter.saturating_sub(update));
         println!(
-            "progress_schema=2 updates_total={} prior_updates={} checkpoint_target={}",
+            "progress_schema=2 updates_total={} prior_updates={} feed_telemetry={} checkpoint_target={}",
             total_updates,
             model.step_counter,
+            options.feed_telemetry,
             options.checkpoint_path.as_deref().unwrap_or("-")
         );
         println!(
