@@ -95,6 +95,8 @@ pub struct TrainingOptions {
     pub grad_clip: Option<f32>,
     /// Runtime-only per-vector episodic memory L2 limit; repeat on resume.
     pub memory_value_cap: Option<f32>,
+    /// Runtime-only finite-loss divergence guard, enabled by default.
+    pub loss_guard: crate::loss_guard::LossGuardConfig,
     /// Run an offline memory replay after every N optimizer updates; zero is off.
     pub dream_every: usize,
     /// Maximum number of occupied episodic entries replayed per dream.
@@ -165,6 +167,7 @@ impl Default for TrainingOptions {
             accumulate: 8,
             grad_clip: None,
             memory_value_cap: None,
+            loss_guard: Default::default(),
             dream_every: 0,
             dream_replay: 32,
             dream_mode: DreamMode::Memory,
@@ -389,6 +392,9 @@ pub(crate) fn parse_train_options_for_test(args: &[String]) -> Result<TrainingOp
         "--backend",
         "--grad-clip",
         "--memory-value-cap",
+        "--loss-guard-high-factor",
+        "--loss-guard-jump-factor",
+        "--loss-guard-patience",
         "--token-cache",
         "--dream-every",
         "--dream-replay",
@@ -497,6 +503,11 @@ impl CLIHandler {
             accumulate: parsed.usize_nonzero("--accumulate", "", 8)?,
             grad_clip: parsed.optional_positive_f32("--grad-clip")?,
             memory_value_cap: parsed.optional_positive_f32("--memory-value-cap")?,
+            loss_guard: crate::loss_guard::LossGuardConfig {
+                high_factor: parsed.f32("--loss-guard-high-factor", "", 4.0)? as f64,
+                jump_factor: parsed.f32("--loss-guard-jump-factor", "", 8.0)? as f64,
+                patience: parsed.usize_nonzero("--loss-guard-patience", "", 3)?,
+            },
             dream_every: parsed.required_usize("--dream-every", "", 0)?,
             dream_replay: parsed.usize_nonzero("--dream-replay", "", 32)?,
             dream_mode: DreamMode::parse(parsed.string("--dream-mode", "").unwrap_or("memory"))?,
@@ -562,6 +573,7 @@ impl CLIHandler {
         {
             return Err("--feed-telemetry and --no-feed-telemetry are mutually exclusive".into());
         }
+        x.loss_guard.validate()?;
         if x.loss_csv.is_none()
             && (parsed.flags.contains_key("--loss-every") || x.tokens_seen.is_some())
         {
@@ -813,6 +825,7 @@ impl CLIHandler {
             );
         }
         Self::validate_loops(options.loops)?;
+        options.loss_guard.validate()?;
         for (flag, value) in [
             ("--grad-clip", options.grad_clip),
             ("--memory-value-cap", options.memory_value_cap),
@@ -1127,6 +1140,8 @@ impl CLIHandler {
         let started = Instant::now();
         let mut update = 0;
         let mut skipped = SkippedUpdates::default();
+        let mut loss_guard =
+            crate::loss_guard::LossGuard::new(options.loss_guard, model.cfg.d_vocab)?;
         let mut dream_rng =
             (options.dream_every > 0).then(|| SimpleRng::new(options.seed ^ 0xd0e5_5eed_5eed_0001));
         // The last fresh chunk is an ephemeral guard for projected replay. It
@@ -1148,6 +1163,12 @@ impl CLIHandler {
             model.step_counter,
             options.feed_telemetry,
             options.checkpoint_path.as_deref().unwrap_or("-")
+        );
+        println!(
+            "loss_guard=on loss_guard_high_factor={} loss_guard_jump_factor={} loss_guard_patience={} (runtime-only; repeat flags on resume)",
+            options.loss_guard.high_factor,
+            options.loss_guard.jump_factor,
+            options.loss_guard.patience
         );
         println!(
             "last_checkpoint={}",
@@ -1295,6 +1316,7 @@ impl CLIHandler {
                 if feed.as_ref().is_some_and(|feed| feed.inputs_complete()) {
                     progress.report_final_inputs();
                 }
+                loss_guard.observe((loss_sum - prior_loss) / total_tokens as f64, update + 1)?;
                 let learning_rate = schedule.lr(update + 1)?;
                 let optimizer_trace = crate::training_diagnostics::StageTrace::new(
                     &model.device,
@@ -2318,6 +2340,15 @@ impl CLIHandler {
                     "      --memory-value-cap <C>    opt-in memory value L2 limit, finite >0; caps loaded banks and writes"
                 );
                 println!(
+                    "      --loss-guard-high-factor F  abort above F * ln(vocab) (default: 4, >1)"
+                );
+                println!(
+                    "      --loss-guard-jump-factor F  abort above F * healthy EWMA (default: 8, >1)"
+                );
+                println!(
+                    "      --loss-guard-patience N     consecutive suspect update groups (default: 3); no checkpoint on abort"
+                );
+                println!(
                     "      --dream-every <N>         memory replay cadence in optimizer updates (default: off)"
                 );
                 println!(
@@ -2646,6 +2677,9 @@ impl CLIHandler {
                         "--backend",
                         "--grad-clip",
                         "--memory-value-cap",
+                        "--loss-guard-high-factor",
+                        "--loss-guard-jump-factor",
+                        "--loss-guard-patience",
                         "--dream-every",
                         "--dream-replay",
                         "--dream-mode",
