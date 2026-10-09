@@ -1509,7 +1509,7 @@ fn run_app(
 fn finish_piped_stream(state: &mut RunState, completion: Option<bool>) {
     if completion == Some(false) {
         state.record_problem(
-            "Training stream ended without a completion summary and saved checkpoint",
+            "Training stream ended without a completion summary followed by a confirmed final checkpoint save",
         );
     }
     state.training_active = false;
