@@ -781,6 +781,9 @@ fn validate_matrix_shape(p: &ParamMatrix, rows: usize, cols: usize, name: &str) 
 }
 
 fn validate_persistent_shapes(model: &PSSALayerV2) -> Result<()> {
+    if model.local_mixing_enabled() {
+        return Err(invalid("local mixing is an in-memory experiment; checkpoints cannot preserve its learned weights"));
+    }
     let c = &model.cfg;
     validate_config(c)?;
     if model.step_counter == usize::MAX {

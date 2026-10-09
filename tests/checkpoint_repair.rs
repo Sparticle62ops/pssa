@@ -899,6 +899,13 @@ fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
         bwd_ssm_c,
         bwd_g_query_pnc,
         bwd_ssm_a,
+        local_conv_kernel,
+        ssm_skip,
+        local_conv_history,
+        local_conv_loop_history,
+        grad_ssm_input,
+        grad_x_norm_tokens,
+        inf_ssm_input,
     } = b;
     let params: usize = [
         a_mat, w_delta, w_b, w_c, w_qx, w_qh, w_gate, w_proj, mlp_w1, mlp_w2,
@@ -906,6 +913,9 @@ fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
     .into_iter()
     .map(matrix_bytes)
     .sum();
+    let params = params + local_conv_kernel.as_ref().map_or(0, matrix_bytes)
+        + ssm_skip.as_ref().map_or(0, |p| [&p.data, &p.grad, &p.m, &p.v]
+            .into_iter().map(vector_bytes).sum::<usize>());
     let norms: usize = [norm_gamma, norm_beta]
         .into_iter()
         .map(|p| {
@@ -982,7 +992,9 @@ fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
     .into_iter()
     .map(vector_bytes)
     .sum::<usize>()
-        + vector_bytes(bwd_g_query_pnc);
+        + vector_bytes(bwd_g_query_pnc)
+        + [local_conv_history, local_conv_loop_history, grad_ssm_input,
+            grad_x_norm_tokens, inf_ssm_input].into_iter().map(vector_bytes).sum::<usize>();
     // `top_k` is a private runtime selector, not checkpoint state or an
     // allocated numeric buffer. It is intentionally omitted from every
     // checkpoint; runtime-only reset behavior is covered below.
@@ -1037,6 +1049,8 @@ fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
         logits,
         probs,
         losses,
+        ssm_input,
+        conv_context,
     } = tape;
     let tape_bytes = [
         x_raw,
@@ -1072,7 +1086,9 @@ fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
     .map(vector_bytes)
     .sum::<usize>()
         + vector_bytes(x_ids)
-        + vector_bytes(target_ids);
+        + vector_bytes(target_ids)
+        + vector_bytes(ssm_input)
+        + vector_bytes(conv_context);
     params + norms + adapter_bytes + float_bytes + memory_bytes + tape_bytes
 }
 
