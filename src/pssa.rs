@@ -1758,6 +1758,48 @@ impl PSSALayerV2 {
         Ok(())
     }
 
+    /// Grow all memory banks at a chunk boundary. No checkpoint format change:
+    /// subsequent saves use the ordinary capacity field with larger arrays.
+    /// Parameters, Adam moments, RNG, schedule and recurrent carries are retained.
+    pub fn grow_memory(&mut self, capacity: usize) -> Result<(), String> {
+        if self.device.is_gpu() {
+            return Err("grow memory on the CPU checkpoint before selecting a GPU backend".into());
+        }
+        if capacity < self.cfg.mem_capacity {
+            return Err("memory growth cannot shrink the bank".into());
+        }
+        if capacity == self.cfg.mem_capacity {
+            return Ok(());
+        }
+        let mut cfg = self.cfg.clone();
+        cfg.mem_capacity = capacity;
+        cfg.chunk_len = self.block.tape.max_l;
+        Self::validate_loops_config(&cfg, self.loops())?;
+        for block in std::iter::once(&mut self.block).chain(&mut self.extra_blocks) {
+            let rows = block.tape.mem_weights.len() / block.cfg.mem_capacity;
+            block.memory.grow(capacity)?;
+            block.tape.mem_weights = vec![0.0; rows * capacity];
+            block.inf_mem_weights = vec![0.0; capacity];
+            block.cfg.mem_capacity = capacity;
+        }
+        self.cfg.mem_capacity = capacity;
+        Ok(())
+    }
+
+    /// Exact nearest-slot prototype is CPU-only; selection is runtime-only.
+    pub fn set_memory_top_k(&mut self, top_k: Option<usize>) -> Result<(), String> {
+        if top_k.is_some() && self.device.is_gpu() {
+            return Err("memory top-k currently requires the CPU backend".into());
+        }
+        if top_k == Some(0) {
+            return Err("memory top-k must be positive".into());
+        }
+        for block in std::iter::once(&mut self.block).chain(&mut self.extra_blocks) {
+            block.memory.set_top_k(top_k)?;
+        }
+        Ok(())
+    }
+
     pub fn reset_recurrent_state(&mut self) {
         self.block.reset_recurrent_state();
         for b in &mut self.extra_blocks {

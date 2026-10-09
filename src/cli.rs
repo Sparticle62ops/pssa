@@ -88,6 +88,10 @@ pub struct TrainingOptions {
     pub state: usize,
     pub key: usize,
     pub memory: usize,
+    /// Explicit resume-only capacity growth; never shrinks a checkpoint bank.
+    pub grow_memory: Option<usize>,
+    /// CPU-only runtime exact nearest-slot read; None is the historical full read.
+    pub memory_top_k: Option<usize>,
     pub chunk: usize,
     pub lr: f32,
     pub accumulate: usize,
@@ -162,6 +166,8 @@ impl Default for TrainingOptions {
             state: 16,
             key: 32,
             memory: 512,
+            grow_memory: None,
+            memory_top_k: None,
             chunk: 64,
             lr: 1e-3,
             accumulate: 8,
@@ -392,6 +398,8 @@ pub(crate) fn parse_train_options_for_test(args: &[String]) -> Result<TrainingOp
         "--backend",
         "--grad-clip",
         "--memory-value-cap",
+        "--grow-memory",
+        "--memory-top-k",
         "--loss-guard-high-factor",
         "--loss-guard-jump-factor",
         "--loss-guard-patience",
@@ -498,6 +506,14 @@ impl CLIHandler {
             state: parsed.usize_nonzero("--state", "", 16)?,
             key: parsed.usize_nonzero("--key", "", 32)?,
             memory: parsed.usize_nonzero("--memory", "", 512)?,
+            grow_memory: parsed
+                .string("--grow-memory", "")
+                .map(|_| parsed.usize_nonzero("--grow-memory", "", 1))
+                .transpose()?,
+            memory_top_k: parsed
+                .string("--memory-top-k", "")
+                .map(|_| parsed.usize_nonzero("--memory-top-k", "", 1))
+                .transpose()?,
             chunk: parsed.usize_nonzero("--chunk", "", 64)?,
             lr: parsed.f32("--lr", "", 1e-3)?,
             accumulate: parsed.usize_nonzero("--accumulate", "", 8)?,
@@ -574,6 +590,7 @@ impl CLIHandler {
             return Err("--feed-telemetry and --no-feed-telemetry are mutually exclusive".into());
         }
         x.loss_guard.validate()?;
+        Self::validate_memory_options(&x)?;
         if x.loss_csv.is_none()
             && (parsed.flags.contains_key("--loss-every") || x.tokens_seen.is_some())
         {
@@ -800,6 +817,29 @@ impl CLIHandler {
                 })
     }
 
+    fn validate_memory_options(options: &TrainingOptions) -> Result<(), String> {
+        if let Some(capacity) = options.grow_memory {
+            if options.resume.is_none() {
+                return Err("--grow-memory requires --resume; use --memory for a fresh run".into());
+            }
+            if !(1..=1_000_000).contains(&capacity) {
+                return Err("--grow-memory must be in 1..=1000000".into());
+            }
+        }
+        if let Some(k) = options.memory_top_k {
+            if !(1..=1_000_000).contains(&k) {
+                return Err("--memory-top-k must be in 1..=1000000".into());
+            }
+            if options.backend != TrainingBackend::Cpu {
+                return Err(
+                    "--memory-top-k requires explicit --backend cpu (prototype; no GPU fallback)"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn train_corpus(
         raw: &str,
         options: &TrainingOptions,
@@ -826,6 +866,7 @@ impl CLIHandler {
         }
         Self::validate_loops(options.loops)?;
         options.loss_guard.validate()?;
+        Self::validate_memory_options(options)?;
         for (flag, value) in [
             ("--grad-clip", options.grad_clip),
             ("--memory-value-cap", options.memory_value_cap),
@@ -931,6 +972,11 @@ impl CLIHandler {
         if options.resume.is_some() {
             model.set_loops(options.loops)?;
         }
+        if let Some(capacity) = options.grow_memory {
+            let old_capacity = model.cfg.mem_capacity;
+            model.grow_memory(capacity)?;
+            println!("memory_growth={old_capacity}->{capacity} memory_capacity={capacity}");
+        }
         // Runtime-only safeguards: never serialized, and no extra math/logging
         // on the historical flags-off path. Cap loaded values before any read.
         if options.grad_clip.is_some() || options.memory_value_cap.is_some() {
@@ -1001,6 +1047,17 @@ impl CLIHandler {
                 }
             }
         }
+        model.set_memory_top_k(options.memory_top_k)?;
+        if options.grow_memory.is_none() {
+            println!("memory_growth=none");
+        }
+        println!(
+            "memory_retrieval={} memory_capacity={} (runtime-only retrieval; repeat on resume and score)",
+            options
+                .memory_top_k
+                .map_or_else(|| "full".into(), |k| format!("top-{k}")),
+            model.cfg.mem_capacity
+        );
         if options.memory_value_cap.is_some() {
             for block in std::iter::once(&mut model.block).chain(&mut model.extra_blocks) {
                 block
@@ -1650,6 +1707,7 @@ impl CLIHandler {
         data: &str,
         slice: crate::evaluation::EvaluationSlice,
         loops: usize,
+        memory_top_k: Option<usize>,
     ) -> Result<(), String> {
         Self::validate_loops(loops)?;
         // V5 checkpoints contain no tokenizer provenance, so the evaluation
@@ -1661,6 +1719,7 @@ impl CLIHandler {
         let provenance = (format == CheckpointFormat::LegacyV5InferenceOnly).then_some(data);
         let (mut model, tokenizer) = Self::load_for_inference(model_path, provenance)?;
         model.set_loops(loops)?;
+        model.set_memory_top_k(memory_top_k)?;
         let raw = DatasetManager::try_load_dataset(Some(data))?;
         let metrics = crate::evaluation::evaluate_pssa(&mut model, &tokenizer, &raw, slice)?;
         println!("{}", metrics.json());
@@ -2284,7 +2343,9 @@ impl CLIHandler {
                 println!("  --threads N     opt-in Rayon pool size; default unchanged");
                 println!("  --ram-mib N     Linux prlimit address-space budget, not RSS/VRAM");
                 println!("  --no-tui         disable cursor updates; keep plain progress logs");
-                println!("  --no-feed-telemetry  omit bounded dataset windows (enabled by default)");
+                println!(
+                    "  --no-feed-telemetry  omit bounded dataset windows (enabled by default)"
+                );
                 println!("  --token-cache PATH   opt-in cache of the actual selected token stream");
                 println!(
                     "Omit --tokenizer-from on resume; identical chunk/accumulation flags give identical updates."
@@ -2328,6 +2389,12 @@ impl CLIHandler {
                 );
                 println!("      --key <N>                 memory key width (default: 32)");
                 println!("      --memory <N>              memory capacity (default: 512)");
+                println!(
+                    "      --grow-memory <N>         resume-only growth; preserves slots/optimizer, never shrinks"
+                );
+                println!(
+                    "      --memory-top-k <K>        CPU-only exact nearest-slot prototype; repeat on resume/score"
+                );
                 println!("      --chunk <N>               training chunk length (default: 64)");
                 println!("      --batch-size <N>          independent document lanes (default: 1)");
                 println!(
@@ -2677,6 +2744,8 @@ impl CLIHandler {
                         "--backend",
                         "--grad-clip",
                         "--memory-value-cap",
+                        "--grow-memory",
+                        "--memory-top-k",
                         "--loss-guard-high-factor",
                         "--loss-guard-jump-factor",
                         "--loss-guard-patience",
@@ -2870,7 +2939,7 @@ impl CLIHandler {
                     "--max-tokens",
                 ];
                 if command == "score" {
-                    allowed.push("--loops");
+                    allowed.extend(["--loops", "--memory-top-k"]);
                 }
                 let p = Parsed::parse(&args[2..], &allowed)?;
                 let loops = p.loops()?;
@@ -2906,6 +2975,9 @@ impl CLIHandler {
                         &data,
                         slice,
                         loops,
+                        p.string("--memory-top-k", "")
+                            .map(|_| p.usize_nonzero("--memory-top-k", "", 1))
+                            .transpose()?,
                     )
                 }
             }
