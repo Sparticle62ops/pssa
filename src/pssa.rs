@@ -349,6 +349,12 @@ pub struct ChunkActivationTape {
     pub c_proj: Vec<f32>,
     pub bar_a: Vec<f32>,
     pub bar_b: Vec<f32>,
+    /// B/C/delta selection input after the optional causal depthwise mixer.
+    /// Recurrence injection, memory, adapters and D*x still use x_norm.
+    /// Empty while disabled; allocated by set_local_conv.
+    pub ssm_input: Vec<f32>,
+    /// Initial three-token mixer context for each saved loop slot.
+    pub conv_context: Vec<f32>,
     pub h_states: Vec<f32>,
     pub y_ssm: Vec<f32>,
     pub q_euc: Vec<f32>,
@@ -418,6 +424,8 @@ impl ChunkActivationTape {
             c_proj: vec![0.0; loop_l * d_state],
             bar_a: vec![0.0; loop_l * d_latent * d_state],
             bar_b: vec![0.0; loop_l * d_latent * d_state],
+            ssm_input: Vec::new(),
+            conv_context: Vec::new(),
             // Extra loop carries are runtime-only, after the activation slots.
             h_states: vec![
                 0.0f32;
@@ -495,7 +503,16 @@ pub struct PSSAContinuousBlockV2 {
     pub w_delta: ParamMatrix,
     pub w_b: ParamMatrix,
     pub w_c: ParamMatrix,
+    /// Optional runtime-selected local token mixer. It is allocated only when
+    /// the experiment is enabled, preserving the historical model exactly.
+    pub local_conv_kernel: Option<ParamMatrix>,
+    /// Optional learned diagonal SSM input/output skip, D*x.
+    pub ssm_skip: Option<ParamVector>,
     pub h_persistent: Vec<f32>,
+    /// Active causal mixer context, oldest-to-newest, three rows of width d.
+    pub local_conv_history: Vec<f32>,
+    /// Saved contexts for nonzero Ouro loops; runtime-only like loop carries.
+    pub local_conv_loop_history: Vec<f32>,
     /// Cached transforms, checked against public raw parameters at each use.
     pub ssm_raw_snapshot: Vec<f32>,
     pub ssm_rates: Vec<f32>,
@@ -527,6 +544,8 @@ pub struct PSSAContinuousBlockV2 {
     pub grad_z_final: Vec<f32>,
     pub grad_z_raw: Vec<f32>,
     pub grad_x_norm: Vec<f32>,
+    pub grad_ssm_input: Vec<f32>,
+    pub grad_x_norm_tokens: Vec<f32>,
     pub buf_m_proj: Vec<f32>,
     pub buf_ad_out: Vec<f32>,
     pub buf_g_mlp_act: Vec<f32>,
@@ -571,6 +590,7 @@ pub struct PSSAContinuousBlockV2 {
 
     // Inference Scratch Buffers
     pub inf_x_norm: Vec<f32>,
+    pub inf_ssm_input: Vec<f32>,
     pub inf_delta: Vec<f32>,
     pub inf_b: Vec<f32>,
     pub inf_c: Vec<f32>,
@@ -663,7 +683,11 @@ impl PSSAContinuousBlockV2 {
             w_delta,
             w_b,
             w_c,
+            local_conv_kernel: None,
+            ssm_skip: None,
             h_persistent,
+            local_conv_history: Vec::new(),
+            local_conv_loop_history: Vec::new(),
             ssm_raw_snapshot: vec![f32::NAN; d_m * d_s],
             ssm_rates: vec![0.0; d_m * d_s],
             ssm_rate_derivatives: vec![0.0; d_m * d_s],
@@ -681,6 +705,8 @@ impl PSSAContinuousBlockV2 {
             grad_z_final: vec![0.0; d_m],
             grad_z_raw: vec![0.0; d_m],
             grad_x_norm: vec![0.0; d_m],
+            grad_ssm_input: Vec::new(),
+            grad_x_norm_tokens: Vec::new(),
             buf_m_proj: vec![0.0; d_m],
             buf_ad_out: vec![0.0; d_m],
             buf_g_mlp_act: vec![0.0; d_mlp],
@@ -713,6 +739,7 @@ impl PSSAContinuousBlockV2 {
             bwd_ssm_c: vec![0.0; chunk_len * d_s],
             bwd_ssm_a: vec![0.0; chunk_len * state_width],
             inf_x_norm: vec![0.0; d_m],
+            inf_ssm_input: Vec::new(),
             inf_delta: vec![0.0; d_m],
             inf_b: vec![0.0; d_s],
             inf_c: vec![0.0; d_s],
@@ -762,6 +789,119 @@ impl PSSAContinuousBlockV2 {
         self.h_persistent.fill(0.0);
         let start = self.loop_carry_start();
         self.tape.h_states[start..].fill(0.0);
+        self.local_conv_history.fill(0.0);
+        self.local_conv_loop_history.fill(0.0);
+    }
+
+    /// Enable or disable the experimental causal depthwise width-four mixer.
+    /// Its lag-zero identity initialization keeps the first enabled forward
+    /// well-conditioned while leaving the default model allocation untouched.
+    pub(crate) fn set_local_conv(&mut self, enabled: bool) {
+        if enabled {
+            if self.local_conv_kernel.is_none() {
+                let d = self.cfg.d_latent;
+                let mut kernel = ParamMatrix::zeros(d, 4);
+                for i in 0..d {
+                    kernel.data[i * 4] = 1.0;
+                }
+                self.local_conv_kernel = Some(kernel);
+            }
+            let d = self.cfg.d_latent;
+            let loops = self.loop_count();
+            let slots = if loops > 1 { loops + 1 } else { 1 };
+            self.tape.ssm_input.resize(self.tape.x_norm.len(), 0.0);
+            self.tape.conv_context.resize(slots * 3 * d, 0.0);
+            self.grad_ssm_input.resize(d, 0.0);
+            self.grad_x_norm_tokens.resize(self.tape.max_l * d, 0.0);
+            self.inf_ssm_input.resize(d, 0.0);
+            self.local_conv_history.resize(3 * d, 0.0);
+            self.local_conv_loop_history
+                .resize(loops.saturating_sub(1) * 3 * d, 0.0);
+        } else {
+            self.local_conv_kernel = None;
+            self.local_conv_history.clear();
+            self.local_conv_loop_history.clear();
+            self.tape.ssm_input.clear();
+            self.tape.conv_context.clear();
+            self.grad_ssm_input.clear();
+            self.grad_x_norm_tokens.clear();
+            self.inf_ssm_input.clear();
+        }
+    }
+
+    /// Enable or disable the learned diagonal direct SSM path D*x.
+    pub(crate) fn set_ssm_skip(&mut self, enabled: bool) {
+        if enabled {
+            if self.ssm_skip.is_none() {
+                self.ssm_skip = Some(ParamVector::new(self.cfg.d_latent, 0.0));
+            }
+        } else {
+            self.ssm_skip = None;
+        }
+    }
+
+    pub fn local_conv_enabled(&self) -> bool {
+        self.local_conv_kernel.is_some()
+    }
+
+    pub fn ssm_skip_enabled(&self) -> bool {
+        self.ssm_skip.is_some()
+    }
+
+    fn conv_context_offset(&self, loop_index: usize) -> usize {
+        loop_index * 3 * self.cfg.d_latent
+    }
+
+    /// Move the active mixer context in parallel with the nonzero-loop SSM
+    /// carry. Loop zero owns the persistent context; other loops use runtime
+    /// storage and are swapped before/after each virtual pass.
+    fn swap_loop_conv_carry(&mut self, loop_index: usize) {
+        if loop_index != 0 && self.local_conv_kernel.is_some() {
+            let d3 = 3 * self.cfg.d_latent;
+            let start = (loop_index - 1) * d3;
+            for (active, stored) in self
+                .local_conv_history
+                .iter_mut()
+                .zip(&mut self.local_conv_loop_history[start..start + d3])
+            {
+                std::mem::swap(active, stored);
+            }
+        }
+    }
+
+    /// Fill the per-token SSM input tape and advance the active causal mixer
+    /// context. The context at the chunk edge is intentionally detached, just
+    /// like the existing recurrent SSM carry.
+    fn prepare_ssm_inputs(&mut self, seq_len: usize, loop_index: usize) {
+        let d = self.cfg.d_latent;
+        let loop_l = loop_index * self.tape.max_l;
+        let context_off = self.conv_context_offset(loop_index);
+        if let Some(kernel) = self.local_conv_kernel.as_ref() {
+            self.tape.conv_context[context_off..context_off + 3 * d]
+                .copy_from_slice(&self.local_conv_history);
+            for t in 0..seq_len {
+                let xn_off = (loop_l + t) * d;
+                let out_off = xn_off;
+                for i in 0..d {
+                    let mut mixed = kernel.data[i * 4] * self.tape.x_norm[xn_off + i];
+                    for lag in 1..4 {
+                        let source = if t >= lag {
+                            self.tape.x_norm[(loop_l + t - lag) * d + i]
+                        } else {
+                            let context_row = 3 - (lag - t);
+                            self.tape.conv_context[context_off + context_row * d + i]
+                        };
+                        mixed += kernel.data[i * 4 + lag] * source;
+                    }
+                    self.tape.ssm_input[out_off + i] = mixed;
+                }
+                for i in 0..d {
+                    self.local_conv_history[i] = self.local_conv_history[d + i];
+                    self.local_conv_history[d + i] = self.local_conv_history[2 * d + i];
+                    self.local_conv_history[2 * d + i] = self.tape.x_norm[xn_off + i];
+                }
+            }
+        }
     }
 
     /// Each virtual pass has its own causal temporal carry, but shares every
@@ -797,6 +937,7 @@ impl PSSAContinuousBlockV2 {
             {
                 std::mem::swap(state, stored);
             }
+            self.swap_loop_conv_carry(loop_index);
         }
     }
 
@@ -832,6 +973,9 @@ impl PSSAContinuousBlockV2 {
         let saved_slot = self.saved_loop_slot(loop_index);
         Self::copy_loop_field_to_base(&mut self.tape.x_raw, l, d, saved_slot);
         Self::copy_loop_field_to_base(&mut self.tape.x_norm, l, d, saved_slot);
+        if self.local_conv_enabled() {
+            Self::copy_loop_field_to_base(&mut self.tape.ssm_input, l, d, saved_slot);
+        }
         Self::copy_loop_field_to_base(&mut self.tape.inv_rms, l, 1, saved_slot);
         Self::copy_loop_field_to_base(&mut self.tape.delta_raw, l, d, saved_slot);
         Self::copy_loop_field_to_base(&mut self.tape.delta, l, d, saved_slot);
@@ -855,6 +999,11 @@ impl PSSAContinuousBlockV2 {
         Self::copy_loop_field_to_base(&mut self.tape.mlp_act, l, 2 * d, saved_slot);
         Self::copy_loop_field_to_base(&mut self.tape.z_final, l, d, saved_slot);
         Self::copy_loop_field_to_base(&mut self.tape.h_states, l + 1, d * s, saved_slot);
+        if self.local_conv_kernel.is_some() {
+            let context_width = 3 * d;
+            let src = saved_slot * context_width;
+            self.tape.conv_context.copy_within(src..src + context_width, 0);
+        }
     }
 
     /// Save the batched stages' zero-offset activations into one loop slot.
@@ -868,6 +1017,9 @@ impl PSSAContinuousBlockV2 {
         let saved_slot = self.saved_loop_slot(loop_index);
         Self::copy_base_field_to_loop(&mut self.tape.x_raw, l, d, saved_slot);
         Self::copy_base_field_to_loop(&mut self.tape.x_norm, l, d, saved_slot);
+        if self.local_conv_enabled() {
+            Self::copy_base_field_to_loop(&mut self.tape.ssm_input, l, d, saved_slot);
+        }
         Self::copy_base_field_to_loop(&mut self.tape.inv_rms, l, 1, saved_slot);
         Self::copy_base_field_to_loop(&mut self.tape.delta_raw, l, d, saved_slot);
         Self::copy_base_field_to_loop(&mut self.tape.delta, l, d, saved_slot);
@@ -891,6 +1043,11 @@ impl PSSAContinuousBlockV2 {
         Self::copy_base_field_to_loop(&mut self.tape.mlp_act, l, 2 * d, saved_slot);
         Self::copy_base_field_to_loop(&mut self.tape.z_final, l, d, saved_slot);
         Self::copy_base_field_to_loop(&mut self.tape.h_states, l + 1, d * s, saved_slot);
+        if self.local_conv_kernel.is_some() {
+            let context_width = 3 * d;
+            let dst = saved_slot * context_width;
+            self.tape.conv_context.copy_within(0..context_width, dst);
+        }
     }
 
     fn forward_inference_loop(&mut self, input: &[f32], output: &mut [f32], loop_index: usize) {
@@ -916,14 +1073,31 @@ impl PSSAContinuousBlockV2 {
                 self.norm_gamma.data[i] * (e_t[i] * inv_rms) + self.norm_beta.data[i];
         }
 
-        // 2. Data-Dependent Projections
-        self.w_delta.matvec(&self.inf_x_norm, &mut self.inf_delta);
+        // 2. Optional causal local mixing, then data-dependent projections.
+        if let Some(kernel) = self.local_conv_kernel.as_ref() {
+            for i in 0..d_m {
+                let mut mixed = kernel.data[i * 4] * self.inf_x_norm[i];
+                for lag in 1..4 {
+                    mixed += kernel.data[i * 4 + lag] * self.local_conv_history[(3 - lag) * d_m + i];
+                }
+                self.inf_ssm_input[i] = mixed;
+                self.local_conv_history[i] = self.local_conv_history[d_m + i];
+                self.local_conv_history[d_m + i] = self.local_conv_history[2 * d_m + i];
+                self.local_conv_history[2 * d_m + i] = self.inf_x_norm[i];
+            }
+        }
+        let selection_input = if self.local_conv_enabled() {
+            &self.inf_ssm_input
+        } else {
+            &self.inf_x_norm
+        };
+        self.w_delta.matvec(selection_input, &mut self.inf_delta);
         for i in 0..d_m {
             self.inf_delta[i] = softplus(self.inf_delta[i]);
         }
 
-        self.w_b.matvec(&self.inf_x_norm, &mut self.inf_b);
-        self.w_c.matvec(&self.inf_x_norm, &mut self.inf_c);
+        self.w_b.matvec(selection_input, &mut self.inf_b);
+        self.w_c.matvec(selection_input, &mut self.inf_c);
 
         self.forward_continuous_inference_projected(z_out);
     }
@@ -991,6 +1165,9 @@ impl PSSAContinuousBlockV2 {
             self.inf_z_raw[i] = (self.inf_y_ssm[i] * ssm_scale)
                 + (self.inf_g_mem[i] * self.inf_m_proj[i])
                 + self.inf_ad_out[i];
+            if let Some(skip) = &self.ssm_skip {
+                self.inf_z_raw[i] += skip.data[i] * self.inf_x_norm[i];
+            }
         }
         self.mlp_w1
             .matvec(&self.inf_z_raw, &mut self.inf_mlp_act[..d_mlp]);
@@ -1004,6 +1181,18 @@ impl PSSAContinuousBlockV2 {
             self.inf_z_final[i] = self.inf_z_raw[i] + self.inf_mlp_out[i];
         }
         z_out.copy_from_slice(&self.inf_z_final);
+    }
+
+    fn normalize_train_row(&mut self, row: usize) {
+        let d = self.cfg.d_latent;
+        let raw = &self.tape.x_raw[row * d..(row + 1) * d];
+        let sum_sq: f32 = raw.iter().map(|&x| x * x).sum();
+        let inv_rms = 1.0 / (sum_sq / d as f32 + 1e-5).sqrt();
+        self.tape.inv_rms[row] = inv_rms;
+        for i in 0..d {
+            self.tape.x_norm[row * d + i] =
+                self.norm_gamma.data[i] * (raw[i] * inv_rms) + self.norm_beta.data[i];
+        }
     }
 
     /// Process raw continuous rows, detaching incoming carry at the chunk edge.
@@ -1033,25 +1222,34 @@ impl PSSAContinuousBlockV2 {
             .copy_from_slice(&self.h_persistent);
 
         self.refresh_ssm_rates();
+        let conv_enabled = self.local_conv_enabled();
+        if conv_enabled {
+            for t in 0..seq_len {
+                self.normalize_train_row(loop_l + t);
+            }
+            self.prepare_ssm_inputs(seq_len, loop_index);
+        }
 
         for t in 0..seq_len {
             // 1. Raw continuous input & affine RMSNorm
-            let e_t = &self.tape.x_raw[(loop_l + t) * d_m..(loop_l + t + 1) * d_m];
-            let sum_sq: f32 = e_t.iter().map(|&x| x * x).sum();
-            let inv_rms = 1.0 / (sum_sq / (d_m as f32) + 1e-5).sqrt();
-            self.tape.inv_rms[loop_l + t] = inv_rms;
-
-            let xn_off = (loop_l + t) * d_m;
-            for i in 0..d_m {
-                self.tape.x_norm[xn_off + i] =
-                    self.norm_gamma.data[i] * (e_t[i] * inv_rms) + self.norm_beta.data[i];
+            if !conv_enabled {
+                self.normalize_train_row(loop_l + t);
             }
+            let xn_off = (loop_l + t) * d_m;
             let x_n = &self.tape.x_norm[xn_off..xn_off + d_m];
+
+            // Mixer context is detached at the chunk boundary; projections see
+            // the mixed token while memory/query features retain x_norm.
+            let ssm_in = if conv_enabled {
+                &self.tape.ssm_input[xn_off..xn_off + d_m]
+            } else {
+                x_n
+            };
 
             // 2. Data-Dependent Projections
             let del_off = (loop_l + t) * d_m;
             self.w_delta
-                .matvec(x_n, &mut self.tape.delta_raw[del_off..del_off + d_m]);
+                .matvec(ssm_in, &mut self.tape.delta_raw[del_off..del_off + d_m]);
             for i in 0..d_m {
                 self.tape.delta[del_off + i] = softplus(self.tape.delta_raw[del_off + i]);
             }
@@ -1059,12 +1257,12 @@ impl PSSAContinuousBlockV2 {
 
             let b_off = (loop_l + t) * d_s;
             self.w_b
-                .matvec(x_n, &mut self.tape.b_proj[b_off..b_off + d_s]);
+                .matvec(ssm_in, &mut self.tape.b_proj[b_off..b_off + d_s]);
             let b_p = &self.tape.b_proj[b_off..b_off + d_s];
 
             let c_off = (loop_l + t) * d_s;
             self.w_c
-                .matvec(x_n, &mut self.tape.c_proj[c_off..c_off + d_s]);
+                .matvec(ssm_in, &mut self.tape.c_proj[c_off..c_off + d_s]);
             let c_p = &self.tape.c_proj[c_off..c_off + d_s];
 
             // 3. Multi-Channel SSM Recurrent Scan
@@ -1147,6 +1345,9 @@ impl PSSAContinuousBlockV2 {
             for i in 0..d_m {
                 self.tape.z_raw[z_off + i] =
                     (y_ssm[i] * ssm_scale) + self.tape.m_inj[m_off + i] + self.buf_ad_out[i];
+                if let Some(skip) = &self.ssm_skip {
+                    self.tape.z_raw[z_off + i] += skip.data[i] * x_n[i];
+                }
             }
             let z_raw = &self.tape.z_raw[z_off..z_off + d_m];
 
@@ -1182,6 +1383,12 @@ impl PSSAContinuousBlockV2 {
         self.w_delta.zero_grad();
         self.w_b.zero_grad();
         self.w_c.zero_grad();
+        if let Some(conv) = self.local_conv_kernel.as_mut() {
+            conv.zero_grad();
+        }
+        if let Some(skip) = self.ssm_skip.as_mut() {
+            skip.zero_grad();
+        }
         self.w_qx.zero_grad();
         self.w_qh.zero_grad();
         self.w_gate.zero_grad();
@@ -1234,7 +1441,13 @@ impl PSSAContinuousBlockV2 {
         let loop_state = loop_index * (self.tape.max_l + 1);
         assert!(loop_index < self.tape.x_raw.len() / (self.tape.max_l * d_m));
 
-        // Reverse Time Loop across sequence chunk L
+        // Reverse Time Loop across sequence chunk L. The token buffer carries
+        // mixer VJPs from later outputs into earlier x_norm rows.
+        let conv_enabled = self.local_conv_enabled();
+        let context_off = self.conv_context_offset(loop_index);
+        if conv_enabled {
+            self.grad_x_norm_tokens[..seq_len * d_m].fill(0.0);
+        }
         for t in (0..seq_len).rev() {
             let z_off = (loop_l + t) * d_m;
 
@@ -1297,6 +1510,15 @@ impl PSSAContinuousBlockV2 {
             }
 
             self.grad_x_norm.fill(0.0);
+            if conv_enabled {
+                self.grad_ssm_input.fill(0.0);
+            }
+            if let Some(skip) = self.ssm_skip.as_mut() {
+                for i in 0..d_m {
+                    self.grad_x_norm[i] += self.grad_z_raw[i] * skip.data[i];
+                    skip.grad[i] += self.grad_z_raw[i] * self.tape.x_norm[(loop_l + t) * d_m + i];
+                }
+            }
             for r in 0..rank {
                 let gad_r = self.buf_g_ad_down[r];
                 let row_off = r * d_m;
@@ -1438,15 +1660,24 @@ impl PSSAContinuousBlockV2 {
             }
 
             self.grad_h_next.copy_from_slice(&self.buf_g_h_prev);
+            let selection_grad = if conv_enabled {
+                &mut self.grad_ssm_input
+            } else {
+                &mut self.grad_x_norm
+            };
+            let selection_input = if conv_enabled {
+                &self.tape.ssm_input[(loop_l + t) * d_m..(loop_l + t + 1) * d_m]
+            } else {
+                &self.tape.x_norm[(loop_l + t) * d_m..(loop_l + t + 1) * d_m]
+            };
 
             for i in 0..d_m {
                 let d_sig = sigmoid(self.tape.delta_raw[del_off + i]);
                 let gd_i = self.buf_g_delta[i] * d_sig;
                 let row_off = i * d_m;
                 for j in 0..d_m {
-                    self.grad_x_norm[j] += gd_i * self.w_delta.data[row_off + j];
-                    self.w_delta.grad[row_off + j] +=
-                        gd_i * self.tape.x_norm[(loop_l + t) * d_m + j];
+                    selection_grad[j] += gd_i * self.w_delta.data[row_off + j];
+                    self.w_delta.grad[row_off + j] += gd_i * selection_input[j];
                 }
             }
 
@@ -1455,10 +1686,35 @@ impl PSSAContinuousBlockV2 {
                 let gc_j = self.buf_g_c_proj[j];
                 let row_off = j * d_m;
                 for k in 0..d_m {
-                    self.grad_x_norm[k] +=
+                    selection_grad[k] +=
                         gb_j * self.w_b.data[row_off + k] + gc_j * self.w_c.data[row_off + k];
-                    self.w_b.grad[row_off + k] += gb_j * self.tape.x_norm[(loop_l + t) * d_m + k];
-                    self.w_c.grad[row_off + k] += gc_j * self.tape.x_norm[(loop_l + t) * d_m + k];
+                    self.w_b.grad[row_off + k] += gb_j * selection_input[k];
+                    self.w_c.grad[row_off + k] += gc_j * selection_input[k];
+                }
+            }
+
+            // Mixer VJP: lag-zero reaches the current x_norm row; earlier
+            // rows are queued and will be consumed when their reverse step runs.
+            if let Some(kernel) = self.local_conv_kernel.as_mut() {
+                let x_off = (loop_l + t) * d_m;
+                for i in 0..d_m {
+                    let g = self.grad_ssm_input[i];
+                    kernel.grad[i * 4] += g * self.tape.x_norm[x_off + i];
+                    self.grad_x_norm[i] += g * kernel.data[i * 4];
+                    for lag in 1..4 {
+                        let row = t.checked_sub(lag);
+                        kernel.grad[i * 4 + lag] += g * if let Some(prev) = row {
+                            self.tape.x_norm[(loop_l + prev) * d_m + i]
+                        } else {
+                            self.tape.conv_context[context_off + (3 - (lag - t)) * d_m + i]
+                        };
+                        if let Some(prev) = row {
+                            self.grad_x_norm_tokens[prev * d_m + i] += g * kernel.data[i * 4 + lag];
+                        }
+                    }
+                }
+                for i in 0..d_m {
+                    self.grad_x_norm[i] += self.grad_x_norm_tokens[t * d_m + i];
                 }
             }
 
@@ -1492,6 +1748,12 @@ impl PSSAContinuousBlockV2 {
         self.w_delta.step_adamw(lr, beta1, beta2, wd, eps, step);
         self.w_b.step_adamw(lr, beta1, beta2, wd, eps, step);
         self.w_c.step_adamw(lr, beta1, beta2, wd, eps, step);
+        if let Some(conv) = self.local_conv_kernel.as_mut() {
+            conv.step_adamw(lr, beta1, beta2, wd, eps, step);
+        }
+        if let Some(skip) = self.ssm_skip.as_mut() {
+            skip.step_adamw(lr, beta1, beta2, wd, eps, step);
+        }
         self.w_qx.step_adamw(lr, beta1, beta2, wd, eps, step);
         self.w_qh.step_adamw(lr, beta1, beta2, wd, eps, step);
         self.w_gate.step_adamw(lr, beta1, beta2, wd, eps, step);
@@ -1547,6 +1809,8 @@ impl PSSAContinuousBlockV2 {
         .sum::<usize>()
             + self.norm_gamma.data.len()
             + self.norm_beta.data.len()
+            + self.local_conv_kernel.as_ref().map_or(0, |p| p.data.len())
+            + self.ssm_skip.as_ref().map_or(0, |p| p.data.len())
             + self
                 .adapters
                 .iter()
@@ -1761,6 +2025,41 @@ impl PSSALayerV2 {
         self.extra_blocks.len() + 1
     }
 
+    /// In-memory CPU architecture ablation, default off. Checkpoint writers
+    /// reject enabled experiments rather than silently discarding learned weights.
+    /// Disabling discards the experimental parameters and history.
+    pub fn set_local_conv(&mut self, enabled: bool) -> Result<(), String> {
+        self.validate_local_mixing_mode(enabled)?;
+        self.block.set_local_conv(enabled);
+        for block in &mut self.extra_blocks {
+            block.set_local_conv(enabled);
+        }
+        Ok(())
+    }
+
+    /// Independent default-off learned diagonal skip, initialized to zero.
+    /// Disabling discards D and its optimizer state.
+    pub fn set_ssm_skip(&mut self, enabled: bool) -> Result<(), String> {
+        self.validate_local_mixing_mode(enabled)?;
+        self.block.set_ssm_skip(enabled);
+        for block in &mut self.extra_blocks {
+            block.set_ssm_skip(enabled);
+        }
+        Ok(())
+    }
+
+    fn validate_local_mixing_mode(&self, enabled: bool) -> Result<(), String> {
+        if enabled && (self.device.is_gpu() || self.tape.max_l != self.cfg.chunk_len) {
+            return Err("local mixing experiments require CPU single-lane training".into());
+        }
+        Ok(())
+    }
+
+    pub fn local_mixing_enabled(&self) -> bool {
+        std::iter::once(&self.block).chain(&self.extra_blocks)
+            .any(|b| b.local_conv_enabled() || b.ssm_skip_enabled())
+    }
+
     /// Runtime-only Ouro count; it is deliberately absent from checkpoints.
     pub fn loops(&self) -> usize {
         self.scan_executor.loops
@@ -1807,6 +2106,12 @@ impl PSSALayerV2 {
             ChunkActivationTape::new_with_loops(l, self.cfg.d_vocab, d, s, k, mem, rank, loops);
         for block in &mut self.extra_blocks {
             block.tape = ChunkActivationTape::new_with_loops(l, 0, d, s, k, mem, rank, loops);
+        }
+        for block in std::iter::once(&mut self.block).chain(&mut self.extra_blocks) {
+            if block.local_conv_enabled() {
+                block.set_local_conv(true);
+                block.local_conv_loop_history.fill(0.0);
+            }
         }
         self.scan_executor = crate::scan_executor::ScanExecutor::with_loops(loops);
     }
@@ -1882,14 +2187,17 @@ impl PSSALayerV2 {
     /// are shared, so packed sequence replay must preserve every pass.
     pub(crate) fn recurrent_state_len(&self) -> usize {
         self.depth() * self.loops() * self.cfg.d_latent * self.cfg.d_state
+            + std::iter::once(&self.block).chain(&self.extra_blocks)
+                .map(|b| b.local_conv_history.len() + b.local_conv_loop_history.len()).sum::<usize>()
     }
 
     pub(crate) fn copy_recurrent_state_to(&self, out: &mut [f32]) {
         let hs = self.cfg.d_latent * self.cfg.d_state;
         assert_eq!(out.len(), self.recurrent_state_len());
+        let ssm_len = self.depth() * self.loops() * hs;
         for (block, dst) in std::iter::once(&self.block)
             .chain(&self.extra_blocks)
-            .zip(out.chunks_exact_mut(self.loops() * hs))
+            .zip(out[..ssm_len].chunks_exact_mut(self.loops() * hs))
         {
             dst[..hs].copy_from_slice(&block.h_persistent);
             if self.loops() > 1 {
@@ -1898,20 +2206,36 @@ impl PSSALayerV2 {
                     .copy_from_slice(&block.tape.h_states[start..start + (self.loops() - 1) * hs]);
             }
         }
+        let mut off = ssm_len;
+        for b in std::iter::once(&self.block).chain(&self.extra_blocks) {
+            for history in [&b.local_conv_history, &b.local_conv_loop_history] {
+                out[off..off + history.len()].copy_from_slice(history);
+                off += history.len();
+            }
+        }
     }
 
     pub(crate) fn copy_recurrent_state_from(&mut self, state: &[f32]) {
         let hs = self.cfg.d_latent * self.cfg.d_state;
         assert_eq!(state.len(), self.recurrent_state_len());
         let loops = self.loops();
+        let ssm_len = self.depth() * loops * hs;
         for (block, src) in std::iter::once(&mut self.block)
             .chain(&mut self.extra_blocks)
-            .zip(state.chunks_exact(loops * hs))
+            .zip(state[..ssm_len].chunks_exact(loops * hs))
         {
             block.h_persistent.copy_from_slice(&src[..hs]);
             if loops > 1 {
                 let start = block.loop_carry_start();
                 block.tape.h_states[start..start + (loops - 1) * hs].copy_from_slice(&src[hs..]);
+            }
+        }
+        let mut off = ssm_len;
+        for b in std::iter::once(&mut self.block).chain(&mut self.extra_blocks) {
+            for history in [&mut b.local_conv_history, &mut b.local_conv_loop_history] {
+                let len = history.len();
+                history.copy_from_slice(&state[off..off + len]);
+                off += len;
             }
         }
     }
@@ -2114,6 +2438,11 @@ impl PSSALayerV2 {
         let d = self.cfg.d_latent;
         let n = seq_len * d;
         assert!(loop_index < self.loops());
+        if self.local_mixing_enabled() {
+            assert!(!self.device.is_gpu(), "local mixing is CPU-only");
+            self.block.forward_train_chunk_loop(&self.continuous_inputs[..n], seq_len, loop_index);
+            return;
+        }
 
         self.block.swap_loop_carry(loop_index);
         self.block.tape.x_raw[..n].copy_from_slice(&self.continuous_inputs[..n]);
@@ -2144,6 +2473,12 @@ impl PSSALayerV2 {
         let d = self.cfg.d_latent;
         let n = seq_len * d;
         assert!(loop_index < self.loops());
+        if self.local_mixing_enabled() {
+            assert!(!self.device.is_gpu(), "local mixing is CPU-only");
+            self.block.backward_chunk_loop(&self.input_adjoints[..n], seq_len,
+                &mut self.residual_input_adjoints[..n], loop_index);
+            return;
+        }
 
         self.block.copy_loop_tape_to_base(loop_index);
         self.block.bwd_g_zfinal[..n].copy_from_slice(&self.input_adjoints[..n]);
@@ -2162,6 +2497,7 @@ impl PSSALayerV2 {
     }
 
     pub fn forward_train_chunk(&mut self, token_ids: &[usize], target_ids: &[usize]) -> f32 {
+        assert!(!self.local_mixing_enabled() || !self.device.is_gpu(), "local mixing is CPU-only");
         assert!(!token_ids.is_empty(), "training chunk must be nonempty");
         assert_eq!(
             token_ids.len(),
@@ -2339,6 +2675,7 @@ impl PSSALayerV2 {
     }
 
     pub fn backward_chunk(&mut self, seq_len: usize, accumulation_scale: f32) {
+        assert!(!self.local_mixing_enabled() || !self.device.is_gpu(), "local mixing is CPU-only");
         assert!(
             seq_len > 0 && seq_len <= self.cfg.chunk_len,
             "backward sequence length must be within tape capacity"
@@ -2497,6 +2834,12 @@ impl PSSALayerV2 {
             ] {
                 visit(&mut p.grad);
             }
+            if let Some(conv) = b.local_conv_kernel.as_mut() {
+                visit(&mut conv.grad);
+            }
+            if let Some(skip) = b.ssm_skip.as_mut() {
+                visit(&mut skip.grad);
+            }
             visit(&mut b.adapters[0].down_proj.grad);
             visit(&mut b.adapters[0].up_proj.grad);
         }
@@ -2539,6 +2882,18 @@ impl PSSALayerV2 {
                 &mut b.mlp_w2,
             ] {
                 tensors.push(matrix(p, wd));
+            }
+            if let Some(conv) = b.local_conv_kernel.as_mut() {
+                tensors.push(matrix(conv, wd));
+            }
+            if let Some(skip) = b.ssm_skip.as_mut() {
+                tensors.push(AdamTensor {
+                    data: &mut skip.data,
+                    grad: &mut skip.grad,
+                    m: &mut skip.m,
+                    v: &mut skip.v,
+                    weight_decay: wd,
+                });
             }
             let ad = &mut b.adapters[0];
             tensors.push(matrix(&mut ad.down_proj, wd));

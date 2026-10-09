@@ -14,6 +14,8 @@ pub mod feature_benchmark;
 pub mod gpu_batch;
 pub mod inference;
 pub mod linalg;
+#[cfg(test)]
+mod local_mixing_tests;
 pub mod loss_csv;
 pub mod loss_guard;
 pub mod memory;
