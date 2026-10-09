@@ -34,6 +34,29 @@ every step. PSSA carries one fixed-size state along the sequence in a single
 left-to-right pass, and looks things up in a memory bank instead of re-reading
 the context, so cost grows linearly with length.
 
+<h2 align="center">Training loss safety</h2>
+
+<details>
+<summary>Finite-loss blow-up guard (enabled by default)</summary>
+
+PSSA training checks each target-token-weighted optimizer-group loss before
+Adam. It aborts without writing or replacing a checkpoint after three consecutive
+suspect groups: loss above `4 * ln(vocab)` or above `8 *` the healthy running
+loss (EWMA, alpha 1/8). The reference freezes during suspect streaks so a jump
+followed by a high plateau cannot hide itself. Isolated spikes recover. This is
+not a held-out validation monitor; a resumed run starts a fresh loss history.
+
+```sh
+pssa train corpus.txt --loss-guard-high-factor 4 --loss-guard-jump-factor 8 --loss-guard-patience 3
+```
+
+Factors must be finite and greater than one; patience is a positive update-group
+count. Controls are runtime-only; repeat custom values on resume. The TUI wizard
+exposes all three settings and the monitor shows the configured guard and halt
+reason. Existing non-finite tensor checks remain in force.
+
+</details>
+
 ## The model
 
 ![The PSSA layer, one token](docs/img/pssa-block.png)

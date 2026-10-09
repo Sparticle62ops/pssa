@@ -168,6 +168,7 @@ struct RunState {
     dream_mode: Option<String>,
     dream_last_loss: Option<f64>,
     dream_update: Option<u64>,
+    loss_guard_status: Option<String>,
     updates_done: Option<u64>,
     updates_total: Option<u64>,
     updates_remaining: Option<u64>,
@@ -396,6 +397,19 @@ impl RunState {
             self.dream_update = None;
         }
 
+        if line.contains("loss_guard=on") {
+            self.loss_guard_status = Some(format!(
+                "on / high {}x / jump {}x / patience {}",
+                parse_kv::<String>(line, "loss_guard_high_factor=").unwrap_or_default(),
+                parse_kv::<String>(line, "loss_guard_jump_factor=").unwrap_or_default(),
+                parse_kv::<String>(line, "loss_guard_patience=").unwrap_or_default()
+            ));
+        }
+        if line.contains("loss_guard=halted") {
+            self.loss_guard_status = Some("HALTED / no checkpoint".into());
+            self.training_active = false;
+            self.record_problem("loss blow-up guard halted training without checkpoint");
+        }
         // Dream events are intentionally separate from ordinary loss samples:
         // a rehearsal loss must not become the live training loss or chart
         // series. Accept the structured schema emitted by the trainer and the
@@ -3087,7 +3101,10 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             "elapsed {} / {speed} tok/s / memory {memory}",
             state.elapsed_context()
         )),
-        Line::from(format!("checkpoint target {checkpoint}")),
+        Line::from(format!(
+            "checkpoint target {checkpoint} / loss guard {}",
+            state.loss_guard_status.as_deref().unwrap_or("unreported")
+        )),
     ];
     let input_line = match &state.feed {
         Some(feed) => format!("actual input / Feed tab: {}", feed.snippet),
@@ -3151,8 +3168,13 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             lines[2].clone(),
             lines[4].clone(),
             Line::from(format!(
-                "grad {norm} / skipped {} / dream {dream} / epoch {epoch_loss}",
-                feed::value(state.skipped_updates)
+                "grad {norm} / skipped {} / guard {} / dream {dream} / epoch {epoch_loss}",
+                feed::value(state.skipped_updates),
+                state
+                    .loss_guard_status
+                    .as_deref()
+                    .map(|s| s.split(" / ").next().unwrap_or(s))
+                    .unwrap_or("unreported")
             )),
         ];
     }
@@ -3728,6 +3750,28 @@ mod tests {
         finish_piped_stream(&mut empty, None);
         assert_eq!(empty.health_status().level, HealthLevel::Normal);
         assert_eq!(empty.health_status().normal_label, "WAITING");
+    }
+
+    #[test]
+    fn loss_guard_events_show_settings_and_terminal_failure() {
+        let mut state = RunState::default();
+        state.ingest(
+            "loss_guard=on loss_guard_high_factor=4 loss_guard_jump_factor=8 loss_guard_patience=3",
+        );
+        assert!(
+            state
+                .loss_guard_status
+                .as_deref()
+                .unwrap()
+                .contains("patience 3")
+        );
+        state.ingest("loss_guard=halted update_index=3 loss=28000000 high_limit=30 consecutive=3 patience=3; training aborted without checkpoint");
+        assert!(!state.training_active);
+        assert_eq!(
+            state.loss_guard_status.as_deref(),
+            Some("HALTED / no checkpoint")
+        );
+        assert!(state.health_status().label().contains("without checkpoint"));
     }
 
     #[test]
