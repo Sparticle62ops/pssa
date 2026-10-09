@@ -410,11 +410,27 @@ colors each token by the model's confidence.
 
 **Setup.** A step-by-step wizard for a new run (dataset, model size, depth and
 loops, schedule, backend). It shows the exact equivalent CLI command at the
-bottom, so you can copy it into a script.
+bottom, so you can copy it into a script. The dreaming controls live here too
+(see [Dreaming](#dreaming)).
 
 ![Setup tab: training page with the dreaming controls and the equivalent CLI command](docs/img/tui-setup.png)
 
-### Dreaming
+**Model, chain and feed.** The model tab shows the configuration the run
+reported. The chain tab lists saved checkpoints with their loss, and the feed tab
+shows the text and token ids being trained on when streaming from Hugging Face.
+
+![Model tab: run configuration](docs/img/tui-model.png)
+
+**Extras.** `Ctrl+K` opens the command palette, which reaches Hugging Face
+login, Kaggle launch and logs, the memory inspector, past runs and the matched
+benchmark. `F8` shows hardware telemetry, `F9` picks the training device, `F10`
+sets resource limits, and `F11` opens a live math reference for the layer.
+
+`F1` shows every key at any time:
+
+![Key reference overlay](docs/img/tui-keys.png)
+
+## Dreaming
 
 Dreaming is an optional sleep phase between training updates. The model replays
 some stored memories, and it can also generate short rehearsal sequences, so
@@ -452,21 +468,6 @@ On the measured five-seed probe (7, 11, 23, 42, 99), mean forgetting fell from
 `26.5%` reduction. Task B's final loss fell from `0.0040` to `0.0030`.
 
 ![Mean forgetting with dreaming](docs/img/dream-forgetting.svg)
-
-**Model, chain and feed.** The model tab shows the configuration the run
-reported. The chain tab lists saved checkpoints with their loss, and the feed tab
-shows the text and token ids being trained on when streaming from Hugging Face.
-
-![Model tab: run configuration](docs/img/tui-model.png)
-
-**Extras.** `Ctrl+K` opens the command palette, which reaches Hugging Face
-login, Kaggle launch and logs, the memory inspector, past runs and the matched
-benchmark. `F8` shows hardware telemetry, `F9` picks the training device, `F10`
-sets resource limits, and `F11` opens a live math reference for the layer.
-
-`F1` shows every key at any time:
-
-![Key reference overlay](docs/img/tui-keys.png)
 
 ## Using the CLI
 
