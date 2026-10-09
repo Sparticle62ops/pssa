@@ -251,9 +251,18 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &RunState) {
     let area = panel_area(f, area);
     let Some(feed) = &state.feed else {
         let mut lines = vec![
-            Line::styled("Waiting for dataset telemetry", accent()),
-            Line::from(if !state.metric_series.is_empty() {
-                "Progress received without a valid window; producer/log may predate dataset telemetry."
+            Line::styled(
+                if state.feed_telemetry == Some(false) {
+                    "Dataset telemetry disabled"
+                } else {
+                    "Waiting for dataset telemetry"
+                },
+                accent(),
+            ),
+            Line::from(if state.feed_telemetry == Some(false) {
+                "Dataset windows explicitly disabled by --no-feed-telemetry for this run."
+            } else if !state.metric_series.is_empty() {
+                "Progress received without a valid window; telemetry disabled, damaged, or absent in this log."
             } else if state.training_active {
                 "Training connected; first sampled window arrives with the first progress event."
             } else {
@@ -262,6 +271,12 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &RunState) {
             Line::from("pssa train --data CORPUS --no-tui | pssa tui"),
             Line::from("Local, HF and transformer runs report actual input windows."),
         ];
+        if state.feed_telemetry == Some(false) {
+            lines.push(Line::from(format!(
+                "Current step {} / restart without --no-feed-telemetry to record windows.",
+                value(state.current_step())
+            )));
+        }
         if state.corpus.is_some() {
             lines.push(Line::from(format!(
                 "Selected corpus: {}",
@@ -540,6 +555,39 @@ mod tests {
         assert_eq!((feed.tokens, feed.row, feed.rows), (None, None, None));
         assert!(feed.position().contains("unrecorded tokens"));
         assert!(!feed.position().contains("0 tokens"));
+    }
+
+    #[test]
+    fn disabled_windows_show_the_producer_setting_and_current_step_not_a_dead_wait() {
+        let mut state = RunState::default();
+        state.ingest("progress_schema=2 prior_updates=100 updates_total=500 feed_telemetry=false checkpoint_target=/tmp/model.pssa");
+        state.ingest("training 120/500 (24%) optimizer_updates=120 global_update=220 loss=2 tokens_per_second=100");
+        assert_eq!(state.feed_telemetry, Some(false));
+        assert_eq!(state.checkpoint_target.as_deref(), Some("/tmp/model.pssa"));
+        for (width, height) in [(80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| super::super::draw(f, &state, 3)).unwrap();
+            let text = rendered_text(&terminal);
+            assert!(
+                text.contains("explicitly disabled"),
+                "{width}x{height}: {text}"
+            );
+            assert!(
+                text.contains("Current step 220"),
+                "{width}x{height}: {text}"
+            );
+            assert!(!text.contains("may predate"));
+            assert!(!text.contains("Waiting for dataset telemetry"));
+        }
+        state.ingest("progress_schema=2 prior_updates=0 updates_total=500 feed_telemetry=true");
+        assert_eq!(state.feed_telemetry, Some(true));
+        state.ingest("progress_schema=2 prior_updates=0 updates_total=500");
+        assert_eq!(
+            state.feed_telemetry, None,
+            "legacy logs do not inherit a setting"
+        );
+        state.ingest(&event());
+        assert_eq!(state.feed.as_ref().unwrap().snippet, "héllo 世界");
     }
 
     #[test]
