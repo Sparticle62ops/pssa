@@ -310,6 +310,43 @@ mod tests {
     }
 
     #[test]
+    fn real_directory_source_includes_training_files_without_catalogue_extensions() {
+        let temp = super::super::library::tests::Temp::new();
+        let dir = temp.0.join("actual directory corpus");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = [dir.join("chapter.md"), dir.join("extensionless")];
+        for path in &paths {
+            std::fs::write(path, "Actual Dataset Text\n").unwrap();
+        }
+        let mut local = Local::new(temp.0.join("models"));
+        local.library.config.datasets = temp.0.join("configured datasets");
+        let configured = local.library.config.datasets.clone();
+        let mut state = RunState::default();
+        state.ingest(&format!(
+            "feed_dataset={} feed_token_ids=1 feed_snippet=Actual",
+            crate::ui::encode_log_value(&format!("dir:{}", dir.display()))
+        ));
+        assert_eq!(local_dataset(&state), Some(dir));
+        let mut setup = Setup::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !paths.iter().all(|path| {
+            local.library.entries.iter().any(|entry| entry.path == *path)
+        }) && std::time::Instant::now() < deadline
+        {
+            local.poll(&mut setup, &mut state, false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for path in paths {
+            assert!(local.library.entries.iter().any(|entry| {
+                entry.path == path && entry.kind == super::super::library::Kind::Dataset
+            }));
+            let stats = super::super::library::dataset_stats(&path).unwrap();
+            assert_eq!(stats.samples, ["Actual Dataset Text"]);
+        }
+        assert_eq!(local.library.config.datasets, configured);
+    }
+
+    #[test]
     fn resume_hints_use_only_header_and_keep_paths_with_spaces() {
         let temp = super::super::library::tests::Temp::new();
         let path = temp.0.join("resume name.pssa");

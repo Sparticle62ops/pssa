@@ -265,6 +265,7 @@ impl Inspector {
                     .checkpoint_target
                     .as_deref()
                     .or(state.last_checkpoint.as_deref())
+                    .or(state.selected_checkpoint.as_deref())
                     .is_some_and(|path| path.ends_with(".trfm"))
                 {
                     "Transformer runs have no PSSA plastic-memory bank.".into()
@@ -407,6 +408,32 @@ mod tests {
         assert_eq!(inspector.events.len(), 32);
         assert_eq!(inspector.events[0], "real write");
     }
+    #[test]
+    fn checkpoint_only_transformer_memory_is_not_applicable_not_missing_occupancy() {
+        let state = RunState {
+            selected_checkpoint: Some("selected.trfm".into()),
+            ..Default::default()
+        };
+        for (width, height) in [(120, 40), (80, 24)] {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+                width, height,
+            ))
+            .unwrap();
+            terminal
+                .draw(|f| Inspector::default().draw(f, f.area(), &state))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("no PSSA plastic-memory bank"), "{text}");
+            assert!(!text.contains("Occupancy unrecorded"));
+        }
+    }
+
     #[test]
     fn occupancy_history_uses_braille_and_labels_at_both_sizes() {
         let mut inspector = Inspector::default();

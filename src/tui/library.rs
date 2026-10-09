@@ -117,6 +117,14 @@ pub(super) fn checkpoint_dims(path: &Path) -> Option<String> {
 }
 
 pub(super) fn scan(models: &Path, datasets: &Path) -> (Vec<Entry>, String) {
+    scan_directories(models, datasets, false)
+}
+
+fn scan_directories(
+    models: &Path,
+    datasets: &Path,
+    training_directory: bool,
+) -> (Vec<Entry>, String) {
     let mut out = Vec::new();
     let mut notes = Vec::new();
     for (dir, model) in [(models, true), (datasets, false)] {
@@ -145,6 +153,9 @@ pub(super) fn scan(models: &Path, datasets: &Path) -> (Vec<Entry>, String) {
                 (true, "pssa") => Kind::Pssa,
                 (true, "trfm") => Kind::Transformer,
                 (false, "txt" | "parquet" | "jsonl") => Kind::Dataset,
+                // DatasetManager reads all immediate regular UTF-8 files in
+                // an explicitly selected dir: source, regardless of extension.
+                (false, _) if training_directory => Kind::Dataset,
                 _ => continue,
             };
             let Ok(meta) = item.metadata() else {
@@ -497,7 +508,7 @@ impl Library {
                 result.0.sort_by(|a, b| a.path.cmp(&b.path));
             }
             if let Some(path) = runtime_dataset.as_ref().filter(|path| path.is_dir()) {
-                for entry in scan(&models, path).0 {
+                for entry in scan_directories(&models, path, true).0 {
                     if !result.0.iter().any(|existing| existing.path == entry.path) {
                         result.0.push(entry);
                     }

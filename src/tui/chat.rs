@@ -363,9 +363,11 @@ impl Chat {
         let Some(job) = &self.job else {
             return;
         };
-        self.elapsed = job.started.elapsed().as_secs_f64();
         let mut p = job.progress.lock().unwrap_or_else(|e| e.into_inner());
-        self.tokens = p.tokens;
+        if !p.speech {
+            self.elapsed = job.started.elapsed().as_secs_f64();
+            self.tokens = p.tokens;
+        }
         if let Some(memory) = &p.memory
             && memory.latest().map(|snapshot| snapshot.generated_tokens)
                 != self
@@ -844,9 +846,8 @@ impl Chat {
         if area.width < 26 || area.height < 9 {
             f.render_widget(
                 Paragraph::new(format!(
-                    "inference / Tab tabs\n{} tok • {} tok/s\n{}\n▶ {}\nEnlarge to chat",
-                    self.tokens,
-                    self.rate_label(),
+                    "inference / Tab tabs\n{}\n{}\n▶ {}\nEnlarge to chat",
+                    self.status_label(),
                     clean(&self.note),
                     clean(&self.input)
                 ))
@@ -860,16 +861,7 @@ impl Chat {
             "T {:.2} • p {:.2} • k {} • max {} • rep {:.2}",
             cfg.temperature, cfg.top_p, cfg.top_k, cfg.max_new_tokens, cfg.repetition_penalty
         );
-        let status = format!(
-            "{} • {} tok • {} tok/s",
-            if self.job.is_some() {
-                "STREAMING"
-            } else {
-                "READY"
-            },
-            self.tokens,
-            self.rate_label()
-        );
+        let status = self.status_label();
         let chunks = Layout::vertical([
             Constraint::Length(if area.width < 65 { 5 } else { 4 }),
             Constraint::Min(3),
@@ -958,6 +950,27 @@ impl Chat {
             chunks[3],
         );
     }
+    fn status_label(&self) -> String {
+        if self.job.as_ref().is_some_and(|job| {
+            job.progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .speech
+        }) {
+            return "TRANSCRIBING / inference rate not applicable".into();
+        }
+        format!(
+            "{} • {} tok • {} tok/s",
+            if self.job.is_some() {
+                "STREAMING"
+            } else {
+                "READY"
+            },
+            self.tokens,
+            self.rate_label()
+        )
+    }
+
     fn rate_label(&self) -> String {
         if self.elapsed > 0.0 {
             format!("{:.1}", self.rate())
@@ -1493,6 +1506,44 @@ mod tests {
             !chat.store.dir.exists(),
             "Rendering idle chat must not invent or persist a conversation"
         );
+    }
+
+    #[test]
+    fn speech_progress_never_becomes_a_zero_inference_measurement() {
+        let mut chat = fixture();
+        chat.tokens = 12;
+        chat.elapsed = 3.0;
+        let progress = Arc::new(Mutex::new(Progress {
+            speech: true,
+            text: "actual transcript".into(),
+            ..Default::default()
+        }));
+        chat.job = Some(Job {
+            progress: progress.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            started: Instant::now() - std::time::Duration::from_secs(1),
+        });
+        chat.poll();
+        assert_eq!((chat.tokens, chat.elapsed), (12, 3.0));
+        for (width, height) in [(80, 24), (25, 8)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| chat.draw(f, f.area())).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("TRANSCRIBING"), "{text}");
+            assert!(!text.contains("STREAMING"));
+            assert!(!text.contains("tok/s"));
+        }
+        progress.lock().unwrap().done = Some(Ok(()));
+        chat.poll();
+        assert_eq!(chat.input, "actual transcript");
+        assert_eq!((chat.tokens, chat.elapsed), (12, 3.0));
+        assert_eq!(chat.rate_label(), "4.0");
     }
 
     #[test]
