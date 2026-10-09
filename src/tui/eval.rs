@@ -246,7 +246,7 @@ impl Sample {
 struct Record {
     checkpoint: String,
     fingerprint: String,
-    number: u64,
+    number: Option<u64>,
     suite: String,
     model: String,
     step: Option<u64>,
@@ -299,9 +299,11 @@ impl Record {
         Ok(Self {
             checkpoint: text(&value, "checkpoint", 4096)?,
             fingerprint: text(&value, "fingerprint", 128)?,
-            number: value["checkpoint_number"]
-                .as_u64()
-                .ok_or("missing checkpoint number")?,
+            number: value
+                .get("checkpoint_number")
+                .filter(|value| value.is_null() || value.is_u64())
+                .ok_or("invalid checkpoint number")?
+                .as_u64(),
             suite: text(&value, "suite", 64)?,
             model: text(&value, "model", 32)?,
             step: value["step"].as_u64(),
@@ -522,7 +524,7 @@ fn blank_record(path: &Path, suite: &Suite) -> Record {
     Record {
         checkpoint: path.to_string_lossy().into_owned(),
         fingerprint: fingerprint(path).unwrap_or_default(),
-        number: checkpoint_number(path).unwrap_or(0),
+        number: checkpoint_number(path),
         suite: suite.id.clone(),
         model: "unknown".into(),
         step: None,
@@ -739,7 +741,7 @@ fn evaluate_checkpoint(path: &Path, suite: &Suite, scratch: &Path, slow: bool) -
         }
         record.step = Some(step as u64);
         if checkpoint_number(path).is_none() {
-            record.number = step as u64;
+            record.number = Some(step as u64);
         }
         for prompt in &suite.prompts {
             record.samples.push(model.sample(&tok, prompt, suite, slow));
@@ -978,7 +980,13 @@ fn controller(
                 .unwrap_or(Path::new("."))
                 .join(HISTORY_FILE);
             note = match append_record(&history, &record) {
-                Ok(()) => format!("Checkpoint {}: {}", record.number, record.note),
+                Ok(()) => format!(
+                    "Checkpoint {}: {}",
+                    record
+                        .number
+                        .map_or_else(|| "unnumbered".into(), |n| n.to_string()),
+                    record.note
+                ),
                 Err(e) => format!("Result in memory only: {e}"),
             };
             seen.insert(record.key());
@@ -1337,9 +1345,16 @@ impl Eval {
             .records
             .iter()
             .filter(|r| r.suite == self.snapshot.suite)
-            .map(|r| (r.number, r.mean_nll().unwrap_or(f64::NAN)))
+            .map(|r| (r.checkpoint.as_str(), r))
             .collect();
-        let points: Vec<_> = latest.into_iter().map(|(n, y)| (n as f64, y)).collect();
+        // Distinct files can have the same saved step/number. Do not silently
+        // erase one checkpoint's real score under another checkpoint's key.
+        let mut points: Vec<_> = latest
+            .into_values()
+            .filter_map(|r| Some((r.number? as f64, r.mean_nll().unwrap_or(f64::NAN))))
+            .collect();
+        points.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let duplicate_steps = points.windows(2).any(|pair| pair[0].0 == pair[1].0);
         if !points.iter().any(|p| p.1.is_finite()) {
             let chart_area = panel_area(f, area);
             f.render_widget(Paragraph::new(format!("Reference NLL ↓ better\n{}\n{}\nUnknown words / invalid or oversized checkpoints are skipped.", self.run_context, self.snapshot.note))
@@ -1358,11 +1373,13 @@ impl Eval {
                 x_bounds: charts::domain(&points),
                 y_bounds: charts::bounds(points.iter().map(|p| p.1)),
             },
-            &[charts::Series::line(
-                "reference loss",
-                &points,
-                NORMAL_GREEN,
-            )],
+            &[charts::Series {
+                name: "reference loss",
+                points: &points,
+                color: NORMAL_GREEN,
+                // Same-step files are observations, not a vertical trend line.
+                scatter: duplicate_steps,
+            }],
         );
     }
 
@@ -1374,8 +1391,10 @@ impl Eval {
             return;
         };
         let mut lines = vec![Line::from(format!(
-            "#{} {}  step {}",
-            record.number,
+            "checkpoint {} {}  step {}",
+            record
+                .number
+                .map_or_else(|| "unnumbered".into(), |n| n.to_string()),
             record.model,
             record
                 .step
@@ -1449,7 +1468,7 @@ mod tests {
         Record {
             checkpoint: format!("/tmp/chain with spaces/ck{number}.pssa"),
             fingerprint: format!("10:{number}"),
-            number,
+            number: Some(number),
             suite: suite.id,
             model: "PSSA".into(),
             step: Some(number),
@@ -1578,7 +1597,7 @@ mod tests {
         let (records, invalid) = load_history(&path).unwrap();
         assert_eq!(invalid, 2);
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].number, 3);
+        assert_eq!(records[0].number, Some(3));
         let mut bad = record(3).json();
         bad["samples"][0]["reference_nll"] = json!(-1);
         assert!(Record::parse(&bad.to_string()).is_err());
@@ -1664,7 +1683,7 @@ mod tests {
         let original = fs::read(&path).unwrap();
         let scratch = TempDir::new().unwrap();
         let result = evaluate_checkpoint(&path, &suite(), &scratch.0, false);
-        assert_eq!(result.number, 12);
+        assert_eq!(result.number, Some(12));
         assert_eq!(result.model, "transformer");
         assert_eq!(result.samples.len(), 1, "{}", result.note);
         assert_eq!(result.samples[0].answer, "hello hello");
@@ -1756,7 +1775,7 @@ mod tests {
         let (loaded, invalid) = load_history(&history).unwrap();
         assert_eq!(invalid, 0);
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].number, 4);
+        assert_eq!(loaded[0].number, Some(4));
         assert!(loaded[0].mean_nll().is_none());
     }
 
@@ -1903,6 +1922,45 @@ mod tests {
             assert!(text.contains("AUTO EVAL / WATCHING"));
             assert!(text.contains("Prompt file ▶ custom-prompts.json"));
         }
+    }
+
+    #[test]
+    fn equal_step_different_files_keep_both_scores_and_unnumbered_skips_are_explicit() {
+        let (mut eval, _) = screen();
+        let mut first = record(1);
+        first.samples[0].nll = Some(2.0);
+        let mut second = record(1);
+        second.checkpoint = "/tmp/other-model.trfm".into();
+        second.samples[0].nll = Some(8.0);
+        eval.snapshot.records = vec![first, second];
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| eval.draw_chart(f, f.area())).unwrap();
+        let both = terminal.backend().buffer().clone();
+        eval.snapshot.records.pop();
+        terminal.draw(|f| eval.draw_chart(f, f.area())).unwrap();
+        assert_ne!(
+            terminal.backend().buffer(),
+            &both,
+            "different checkpoint at the same step must not be erased"
+        );
+        let skipped = blank_record(Path::new("/missing/model.pssa"), &suite());
+        assert_eq!(skipped.number, None);
+        assert_eq!(
+            Record::parse(&skipped.json().to_string()).unwrap().number,
+            None
+        );
+        terminal
+            .draw(|f| eval.draw_answer(f, f.area(), Some(&skipped), "selected answer"))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("unnumbered"));
+        assert!(!text.contains("#0"));
     }
 
     #[test]

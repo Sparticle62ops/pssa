@@ -176,6 +176,9 @@ struct RunState {
     checkpoint_number: Option<u64>,
     checkpoint_target: Option<String>,
     last_checkpoint: Option<String>,
+    selected_checkpoint: Option<String>,
+    checkpoint_saved_current: bool,
+    configuration_source: Option<String>,
     checkpoint_revision: u64,
     // Parsed progress samples used by the real line charts. `loss_series` is
     // retained for health checks and existing log compatibility tests.
@@ -212,6 +215,7 @@ struct RunState {
     throughput: Option<String>,
     training_seconds: Option<f64>,
     optimizer_updates: Option<u64>,
+    global_update_seen: bool,
     // chain tab
     chain_dir: PathBuf,
     checkpoints: Vec<(String, Option<f64>)>,
@@ -263,6 +267,7 @@ impl RunState {
         }
         if line.starts_with("model=") && line.contains("parameters=") {
             self.math = math::Values::default();
+            self.configuration_source = None;
             self.corpus = None;
             self.vocab = None;
             self.width = None;
@@ -339,6 +344,7 @@ impl RunState {
             self.updates_total = None;
             self.updates_remaining = None;
             self.optimizer_updates = None;
+            self.global_update_seen = false;
             self.prior_steps = parse_kv(line, "prior_updates=");
             self.elapsed_seconds = None;
             self.grad_norm = None;
@@ -359,6 +365,8 @@ impl RunState {
             self.throughput = None;
             self.training_seconds = None;
             self.last_checkpoint = None;
+            self.selected_checkpoint = None;
+            self.checkpoint_saved_current = false;
             self.checkpoint_target = None;
             self.checkpoint_number = None;
             self.problem = None;
@@ -554,7 +562,9 @@ impl RunState {
             self.training_active = false;
         }
         if let Some(u) = parse_kv(line, "optimizer_updates=") {
-            self.optimizer_updates = Some(u);
+            if !self.global_update_seen {
+                self.optimizer_updates = Some(u);
+            }
             self.updates_done = Some(u);
         }
         if let Some(prior) = parse_kv(line, "prior_updates=") {
@@ -581,6 +591,7 @@ impl RunState {
         }
         if let Some(done) = parse_kv(line, "global_update=") {
             self.optimizer_updates = Some(done);
+            self.global_update_seen = true;
         }
         if is_progress
             && self
@@ -659,6 +670,13 @@ impl RunState {
         if let Some(rest) = line.split("checkpoint written to ").nth(1) {
             self.note_checkpoint(strip_ansi(rest.trim_end()).trim());
         }
+        if line.starts_with("error:")
+            || line.starts_with("Error:")
+            || line.starts_with("save failed:")
+        {
+            self.training_active = false;
+            self.record_problem(line);
+        }
     }
 
     fn current_step(&self) -> Option<u64> {
@@ -669,43 +687,86 @@ impl RunState {
     }
 
     fn checkpoint_context(&self) -> String {
-        if let Some(path) = &self.last_checkpoint {
-            if self.training_active
-                && let Some(total) = self.updates_total
-            {
-                let end = self.prior_steps.unwrap_or(0).saturating_add(total);
-                return format!(
-                    "Last saved {path}; next save at run end (planned step {end}); current step {}",
-                    feed::value(self.current_step())
-                );
-            }
-            return path.clone();
-        }
-        let current = self
-            .current_step()
-            .map_or_else(|| "unrecorded".into(), |step| step.to_string());
+        let current = feed::value(self.current_step());
+        let previous = self
+            .last_checkpoint
+            .as_ref()
+            .map(|path| format!("; previous checkpoint {path}"))
+            .unwrap_or_default();
         if !self.training_active
             && let Some(problem) = &self.problem
         {
-            return format!("No checkpoint saved; run stopped at step {current}: {problem}");
+            return if self.checkpoint_saved_current {
+                format!(
+                    "Checkpoint saved{}; run stopped at step {current}: {problem}",
+                    previous
+                )
+            } else {
+                format!(
+                    "No new checkpoint saved; run stopped at step {current}: {problem}{previous}"
+                )
+            };
+        }
+        if self.checkpoint_saved_current
+            && !self.training_active
+            && let Some(path) = &self.last_checkpoint
+        {
+            return path.clone();
         }
         if self.checkpoint_target.is_none() {
-            return format!("No save target in this log; current step {current}");
-        }
-        if let Some(total) = self.updates_total {
-            let first = self.prior_steps.unwrap_or(0).saturating_add(total);
-            if self.training_seconds.is_some()
-                || self.updates_done.is_some_and(|done| done >= total)
-            {
-                return format!(
-                    "Training complete at step {current}; waiting for saved_checkpoint event"
-                );
+            if let Some(path) = &self.selected_checkpoint {
+                return format!("Selected local artifact {path}; run save not confirmed");
             }
+            return format!("No save target in this log; current step {current}{previous}");
+        }
+        if self.training_seconds.is_some()
+            || self
+                .updates_done
+                .zip(self.updates_total)
+                .is_some_and(|(done, total)| done >= total)
+        {
             return format!(
-                "First checkpoint at run end (planned step {first}); current step {current}"
+                "Training computation complete at step {current}; waiting for saved_checkpoint event{previous}"
             );
         }
-        format!("Save target configured; save step unrecorded; current step {current}")
+        if let Some(total) = self.updates_total {
+            let end = match self.prior_steps {
+                Some(prior) => format!("planned step {}", prior.saturating_add(total)),
+                None => format!("{total} run-local updates; global end step unrecorded"),
+            };
+            let save = if self.last_checkpoint.is_some() {
+                "Next save"
+            } else {
+                "First checkpoint"
+            };
+            return format!("{save} at run end ({end}); current step {current}{previous}");
+        }
+        format!("Save target configured; save step unrecorded; current step {current}{previous}")
+    }
+
+    fn use_header_dims(&mut self, path: &std::path::Path, dims: &str) {
+        // Header hints fill checkpoint-only sessions, never overwrite a real
+        // training banner or supply nonexistent corpus/schedule/loop telemetry.
+        if self.width.is_some() || self.run_started_at.is_some() || self.training_active {
+            return;
+        }
+        self.width = Some(dims.to_string());
+        self.vocab = parse_kv::<u64>(dims, "vocab ").map(|n| n.to_string());
+        self.memory = if dims.starts_with("TRFM ") {
+            Some("not applicable (transformer)".into())
+        } else {
+            parse_kv::<u64>(dims, "slots ")
+                .zip(parse_kv::<u64>(dims, "key "))
+                .map(|(slots, key)| format!("{slots} slots, key width {key}"))
+        };
+        self.math.ingest_header_dims(dims);
+        if self.current_step().is_none() {
+            self.optimizer_updates = parse_kv(dims, "step ");
+        }
+        self.configuration_source = Some(format!(
+            "Header hints from {} (bounded read; model/checksum not validated)",
+            ui::terminal_text(&path.display().to_string())
+        ));
     }
 
     fn elapsed_context(&self) -> String {
@@ -733,6 +794,7 @@ impl RunState {
             return;
         }
         self.last_checkpoint = Some(path.to_string());
+        self.checkpoint_saved_current = true;
         self.checkpoint_revision = self.checkpoint_revision.saturating_add(1);
         self.checkpoint_number = checkpoint_number(path);
         let name = PathBuf::from(path)
@@ -871,6 +933,11 @@ impl RunState {
             "DREAMING"
         } else if self.training_active {
             "TRAINING"
+        } else if self.checkpoint_target.is_some()
+            && self.training_seconds.is_some()
+            && !self.checkpoint_saved_current
+        {
+            "SAVE PENDING"
         } else if self.last_progress_at.is_some() || self.training_seconds.is_some() {
             // Recorded history deliberately has no live stall-clock timestamp.
             // Its completion summary still distinguishes it from an empty TUI.
@@ -1222,7 +1289,7 @@ fn run_app(
                 .preview
                 .poll(checkpoint, state.loop_count, extras.remote_monitor());
             state.hardware.poll(tab == keybindings::HARDWARE_TAB);
-            local.poll(&mut setup, &state, extras.remote_monitor());
+            local.poll(&mut setup, &mut state, extras.remote_monitor());
             terminal.draw(|f| {
                 draw_with_background(
                     f,
@@ -1483,6 +1550,7 @@ fn status_badge(health: &HealthStatus) -> Line<'static> {
         HealthLevel::Problem => "ERROR",
         HealthLevel::Warning | HealthLevel::Normal => match health.normal_label {
             "DONE" => "DONE",
+            "SAVE PENDING" => "SAVE PENDING",
             "WAITING" => "WAITING",
             "DREAMING" => "DREAMING",
             _ => "TRAINING",
@@ -2888,7 +2956,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     let chunks = if gap == 0 {
         Layout::vertical([
             Constraint::Length(if compact_graph { 1 } else { 4 }),
-            Constraint::Min(if show_graph { 8 } else { 0 }),
+            Constraint::Min(if show_graph { 7 } else { 0 }),
             Constraint::Length(if show_graph && area.height < 21 {
                 7
             } else if show_graph {
@@ -2902,7 +2970,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         Layout::vertical([
             Constraint::Length(4),
             Constraint::Length(gap),
-            Constraint::Min(if show_graph { 8 } else { 0 }),
+            Constraint::Min(if show_graph { 7 } else { 0 }),
             Constraint::Length(gap),
             Constraint::Length(if show_graph {
                 9
@@ -2987,17 +3055,7 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     };
     // Put current step, save timing and reported elapsed time first: these
     // must remain visible in the real 80x24 shell, not beneath clipped rows.
-    let saved = state
-        .last_checkpoint
-        .as_deref()
-        .map(|path| {
-            format!(
-                "last saved {} / current step {}",
-                path,
-                feed::value(state.current_step())
-            )
-        })
-        .unwrap_or_else(|| state.checkpoint_context());
+    let saved = state.checkpoint_context();
     let mut lines = vec![
         Line::from(format!(
             "step {} / optimizer {done}/{total} / lr {}",
@@ -3056,6 +3114,30 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         chunks[metrics_index]
     };
     let metrics_area = panel_area(f, metrics_area);
+    if metrics_area.height < 9 {
+        // Five content rows fit the normal 80x24 monitor. Do not silently clip
+        // real safeguard/dream measurements below a seven-row bordered card.
+        let norm = state
+            .grad_norm
+            .map_or_else(|| "unrecorded".into(), |n| format!("{n:.3e}"));
+        let dream = if state.dream_active {
+            "active".into()
+        } else if state.dream_count > 0 {
+            state.dream_count.to_string()
+        } else {
+            "no events".into()
+        };
+        lines = vec![
+            lines[0].clone(),
+            lines[1].clone(),
+            lines[2].clone(),
+            lines[4].clone(),
+            Line::from(format!(
+                "grad {norm} / skipped {} / dream {dream} / epoch {epoch_loss}",
+                feed::value(state.skipped_updates)
+            )),
+        ];
+    }
     f.render_widget(
         Paragraph::new(lines).block(panel(if show_graph {
             " run metrics / actual input "
@@ -3111,24 +3193,23 @@ fn draw_chain(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     } else if state.checkpoints.is_empty() {
         rows.push(Line::from(state.checkpoint_context()));
     } else {
-        let last = state.checkpoints.len().saturating_sub(1);
-        rows.extend(
-            state
-                .checkpoints
-                .iter()
-                .enumerate()
-                .map(|(i, (name, loss))| {
-                    let marker = if i == last { "●" } else { "○" };
-                    let loss_text = loss
-                        .map(|l| format!("{l:.4}"))
-                        .unwrap_or_else(|| "—".into());
-                    let suffix = if i == last { "  (latest)" } else { "" };
-                    Line::styled(
-                        format!("{marker} {name}  loss {loss_text}{suffix}"),
-                        accent(),
-                    )
-                }),
-        );
+        let recorded_save = state
+            .last_checkpoint
+            .as_deref()
+            .and_then(|path| std::path::Path::new(path).file_name())
+            .and_then(|name| name.to_str());
+        rows.extend(state.checkpoints.iter().map(|(name, loss)| {
+            let latest = recorded_save == Some(name.as_str());
+            let marker = if latest { "●" } else { "○" };
+            let loss_text = loss
+                .map(|l| format!("{l:.4}"))
+                .unwrap_or_else(|| "—".into());
+            let suffix = if latest { "  (last recorded save)" } else { "" };
+            Line::styled(
+                format!("{marker} {name}  loss {loss_text}{suffix}"),
+                accent(),
+            )
+        }));
     }
     let chain_area = panel_area(f, area);
     f.render_widget(
@@ -3141,7 +3222,12 @@ fn draw_chain(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
 
 fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     let mut lines = vec![
-        Line::from("Configuration from the training log"),
+        Line::from(
+            state
+                .configuration_source
+                .as_deref()
+                .unwrap_or("Configuration from the training log"),
+        ),
         divider(area.width.saturating_sub(2)),
     ];
     for (label, value) in [
@@ -3198,7 +3284,11 @@ fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
                     accent(),
                 ),
                 Line::from("pssa train [flags] --no-tui | pssa tui"),
-                Line::from("Fields above show only values reported by the run."),
+                Line::from(if state.configuration_source.is_some() {
+                    "Header dimensions only; corpus/schedule/loops require a recorded training log."
+                } else {
+                    "Fields above show only values reported by the run."
+                }),
             ],
         );
         draw_info_card(
@@ -4037,13 +4127,7 @@ mod tests {
         for (tab, values) in [
             (
                 1,
-                [
-                    "my chain",
-                    "ck01.pssa",
-                    "3.2500",
-                    "ck02.pssa",
-                    "2.5000  (latest)",
-                ],
+                ["my chain", "ck01.pssa", "3.2500", "ck02.pssa", "2.5000"],
             ),
             (
                 2,
@@ -4427,17 +4511,32 @@ mod tests {
             let data_bottom = bottom - 3;
             // The visible loss range is 3..5, padded to 2.9..5.1, not 2..6.
             let dot_height = (data_bottom - data_top + 1) * 4 - 1;
-            let mut tick_rows = Vec::new();
-            for value in [3.0, 3.5, 4.0, 4.5, 5.0] {
-                let y = data_top + (((5.1 - value) * f64::from(dot_height) / 2.2) as u16 / 4);
+            let ticks: Vec<_> = (data_top..=data_bottom)
+                .filter_map(|y| {
+                    let text = row(y);
+                    let value = text
+                        .strip_prefix('│')?
+                        .split('│')
+                        .next()?
+                        .trim()
+                        .parse::<f64>()
+                        .ok()?;
+                    Some((y, value))
+                })
+                .collect();
+            assert!(
+                ticks.len() >= 2 && ticks.len() <= 5,
+                "actual fitted ticks: {ticks:?}"
+            );
+            for &(y, value) in &ticks {
+                let expected =
+                    data_top + (((5.1 - value) * f64::from(dot_height) / 2.2) as u16 / 4);
                 assert!(
-                    row(y).starts_with(&format!("│{value:.1}│")),
-                    "tick misplaced: {}",
-                    row(y)
+                    y.abs_diff(expected) <= 1,
+                    "tick {value} misplaced at {y}, expected {expected}"
                 );
-                tick_rows.push(y);
             }
-            assert!(tick_rows.windows(2).all(|p| p[0] > p[1]));
+            assert!(ticks.windows(2).all(|p| p[0].1 > p[1].1));
             let labels = row(bottom - 1);
             for token in ["1", "76", "150", "training", "step"] {
                 assert!(
@@ -4890,6 +4989,127 @@ mod tests {
     }
 
     #[test]
+    fn resumed_completion_requires_a_new_confirmed_save_and_preserves_failure_context() {
+        let mut state = RunState::default();
+        state.ingest(
+            "progress_schema=2 updates_total=500 prior_updates=100 checkpoint_target=/tmp/new.pssa",
+        );
+        state.ingest("last_checkpoint=/tmp/old.pssa");
+        state.ingest("training 500/500 (100%) loss=2 tokens_per_second=90 optimizer_updates=500 global_update=600");
+        state.ingest("training_seconds=12 optimizer_updates=500");
+        assert!(
+            state
+                .checkpoint_context()
+                .contains("waiting for saved_checkpoint event")
+        );
+        assert!(
+            state
+                .checkpoint_context()
+                .contains("previous checkpoint /tmp/old.pssa")
+        );
+        assert_eq!(state.health_status().normal_label, "SAVE PENDING");
+        state.ingest("error: cannot save checkpoint: disk full");
+        assert!(
+            state
+                .checkpoint_context()
+                .contains("No new checkpoint saved")
+        );
+        assert!(state.checkpoint_context().contains("disk full"));
+        assert!(
+            state
+                .checkpoint_context()
+                .contains("previous checkpoint /tmp/old.pssa")
+        );
+        assert!(state.health_status().level == HealthLevel::Problem);
+        state.ingest(
+            "progress_schema=2 updates_total=500 prior_updates=100 checkpoint_target=/tmp/new.pssa",
+        );
+        state.ingest("training_seconds=12 optimizer_updates=500");
+        state.ingest("saved_checkpoint=/tmp/new.pssa");
+        assert_eq!(state.checkpoint_context(), "/tmp/new.pssa");
+        assert_eq!(state.health_status().normal_label, "DONE");
+    }
+
+    #[test]
+    fn partial_logs_do_not_invent_global_end_steps_or_filename_latest_order() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut state = RunState::default();
+        state.ingest("progress_schema=1 updates_total=500 checkpoint_target=/tmp/new.pssa");
+        assert!(state.checkpoint_context().contains("500 run-local updates"));
+        assert!(!state.checkpoint_context().contains("planned step 500"));
+        state.ingest("loss=2 tokens_per_second=90 optimizer_updates=500 global_update=600");
+        state.ingest("training_seconds=12 optimizer_updates=500");
+        assert_eq!(
+            state.current_step(),
+            Some(600),
+            "a local summary cannot erase a recorded global step"
+        );
+        state.checkpoints = vec![("ck01.pssa".into(), None), ("model.pssa".into(), None)];
+        state.ingest("saved_checkpoint=/tmp/ck01.pssa");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw_chain(f, f.area(), &state)).unwrap();
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("ck01.pssa") && row.contains("last recorded save"))
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| row.contains("model.pssa"))
+                .all(|row| !row.contains("last recorded save"))
+        );
+    }
+
+    #[test]
+    fn checkpoint_only_model_and_math_use_real_header_dimensions_without_inventing_runtime_fields()
+    {
+        use ratatui::{Terminal, backend::TestBackend};
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/depth_one_main85d9d33_trained.pssa");
+        let dims = library::checkpoint_dims(&path).unwrap();
+        let mut state = RunState::default();
+        state.use_header_dims(&path, &dims);
+        assert_eq!(state.width.as_deref(), Some(dims.as_str()));
+        assert!(state.corpus.is_none() && state.schedule.is_none() && state.feed.is_none());
+        assert!(state.memory_used.is_none() && state.learning_rate.is_none());
+        for tab in [2, keybindings::MATH_TAB] {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|f| {
+                    if tab == 2 {
+                        draw_model(f, f.area(), &state);
+                    } else {
+                        state.math_view.draw(f, f.area(), &state);
+                    }
+                })
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("Header hints from"), "{text}");
+        }
+        state.ingest("model=pssa parameters=123 vocab=256 depth=2 loops=3");
+        assert!(state.configuration_source.is_none());
+        assert!(state.width.is_none());
+        state.ingest("progress_schema=2 updates_total=100 prior_updates=0");
+        state.use_header_dims(&path, &dims);
+        assert!(
+            state.width.is_none(),
+            "old headers cannot fill a new run's missing banner"
+        );
+    }
+
+    #[test]
     fn checkpoint_waiting_context_tracks_real_run_end_step_and_output_directory() {
         let mut state = RunState::default();
         state.ingest("progress_schema=2 updates_total=500 prior_updates=100 checkpoint_target=/tmp/real run/model.pssa");
@@ -4945,6 +5165,16 @@ mod tests {
         }
         assert_eq!(state.grad_norm, Some(0.25));
         assert_eq!(state.skipped_updates, Some(2));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &state, 0)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("grad 2.500e-1 / skipped 2"), "{text}");
     }
 
     #[test]
@@ -4958,7 +5188,7 @@ mod tests {
         assert!(
             state
                 .checkpoint_context()
-                .contains("Last saved /tmp/old.pssa")
+                .contains("previous checkpoint /tmp/old.pssa")
         );
         assert!(state.checkpoint_context().contains("planned step 600"));
         assert_eq!(state.resumed_from.as_deref(), Some("/tmp/old.pssa"));

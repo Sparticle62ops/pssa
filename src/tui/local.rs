@@ -40,20 +40,30 @@ impl Local {
     pub(super) fn editing(&self, tab: usize) -> bool {
         (tab == LIBRARY_TAB && self.library.editing()) || (tab == EVAL_TAB && self.eval.editing())
     }
-    pub(super) fn poll(&mut self, setup: &mut Setup, state: &RunState, remote: bool) {
+    pub(super) fn poll(&mut self, setup: &mut Setup, state: &mut RunState, remote: bool) {
         let run_dir = (!remote
             && (state.training_active
                 || state.checkpoint_target.is_some()
-                || state.last_checkpoint.is_some()))
+                || state.last_checkpoint.is_some()
+                || state.selected_checkpoint.is_some()))
         .then(|| state.chain_dir.clone());
         self.library.watch_run(run_dir, state.checkpoint_revision);
-        let dataset = (!remote)
-            .then(|| state.feed.as_ref())
-            .flatten()
-            .filter(|feed| feed.split.is_empty() && !feed.dataset.contains("://"))
-            .map(|feed| PathBuf::from(&feed.dataset));
+        let dataset = (!remote).then(|| local_dataset(state)).flatten();
         self.library.watch_dataset(dataset);
         self.library.poll();
+        if !remote && state.run_started_at.is_none() {
+            let candidate = super::preview::Preview::candidate(state);
+            if let Some(entry) = self
+                .library
+                .entries
+                .iter()
+                .find(|entry| Some(&entry.path) == candidate.as_ref())
+            {
+                if entry.dims.starts_with("PSSA ") || entry.dims.starts_with("TRFM ") {
+                    state.use_header_dims(&entry.path, &entry.dims);
+                }
+            }
+        }
         self.mixer.sync(
             &self.library.entries,
             self.library.revision,
@@ -143,6 +153,28 @@ impl Local {
     }
 }
 
+fn local_dataset(state: &RunState) -> Option<PathBuf> {
+    let feed = state.feed.as_ref()?;
+    let source = feed.dataset.trim();
+    if !feed.split.is_empty()
+        || source.is_empty()
+        || source.ends_with('…')
+        || source.contains(',')
+        || source.contains("://")
+        || source.starts_with("hf:")
+        || matches!(source, "science" | "in-memory corpus")
+    {
+        return None;
+    }
+    // These are DatasetManager's local source prefixes, not part of a path.
+    let path = source
+        .strip_prefix("file:")
+        .or_else(|| source.strip_prefix("local:"))
+        .or_else(|| source.strip_prefix("dir:"))
+        .unwrap_or(source);
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
 // Kaggle log paths are remote, even when a same-named local file exists.
 // Only the explicitly configured local library remains eligible in that mode.
 fn eval_target<'a>(
@@ -153,11 +185,16 @@ fn eval_target<'a>(
     if !remote
         && (state.training_active
             || state.last_checkpoint.is_some()
-            || state.checkpoint_target.is_some())
+            || state.checkpoint_target.is_some()
+            || state.selected_checkpoint.is_some())
     {
         (
             &state.chain_dir,
-            state.last_checkpoint.as_deref().map(Path::new),
+            state
+                .last_checkpoint
+                .as_deref()
+                .or(state.selected_checkpoint.as_deref())
+                .map(Path::new),
         )
     } else {
         (models, None)
@@ -231,6 +268,46 @@ mod tests {
             assert!(body.right() <= w && body.bottom() <= h);
         }
     }
+    #[test]
+    fn actual_setup_source_reaches_library_and_mixer_without_config_changes() {
+        let temp = super::super::library::tests::Temp::new();
+        let path = temp.0.join("external data ü corpus.txt");
+        std::fs::write(&path, "Actual Dataset Text\n").unwrap();
+        let mut local = Local::new(temp.0.join("models"));
+        local.library.config.models = temp.0.join("configured models");
+        local.library.config.datasets = temp.0.join("configured datasets");
+        let configured = local.library.config.datasets.clone();
+        let mut state = RunState::default();
+        state.ingest(&format!(
+            "feed_dataset={} feed_token_ids=1 feed_snippet=Actual",
+            crate::ui::encode_log_value(&format!("file:{}", path.display()))
+        ));
+        assert_eq!(local_dataset(&state), Some(path.clone()));
+        let mut setup = Setup::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !local.library.entries.iter().any(|entry| entry.path == path)
+            && std::time::Instant::now() < deadline
+        {
+            local.poll(&mut setup, &mut state, false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(local.library.entries.iter().any(|entry| entry.path == path));
+        assert_eq!(local.library.config.datasets, configured);
+        for source in [
+            "hf:owner/name",
+            "science",
+            "a.txt,b.txt",
+            "file:/truncated…",
+            "https://example.invalid/data",
+        ] {
+            state.ingest(&format!(
+                "feed_dataset={}",
+                crate::ui::encode_log_value(source)
+            ));
+            assert!(local_dataset(&state).is_none(), "{source}");
+        }
+    }
+
     #[test]
     fn resume_hints_use_only_header_and_keep_paths_with_spaces() {
         let temp = super::super::library::tests::Temp::new();

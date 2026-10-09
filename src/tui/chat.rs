@@ -466,9 +466,14 @@ impl Chat {
         let (p, c) = (progress.clone(), cancel.clone());
         std::thread::spawn(move || {
             let result = (|| {
-                if Path::new(&model).extension().is_some_and(|e| e.eq_ignore_ascii_case("trfm")) {
+                if Path::new(&model)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("trfm"))
+                {
                     let text = crate::transformer_inference::generate_controlled(
-                        &model, &prompt, &cfg,
+                        &model,
+                        &prompt,
+                        &cfg,
                         &mut |text, tokens| {
                             let mut p = p.lock().unwrap_or_else(|e| e.into_inner());
                             p.text = text.to_owned();
@@ -550,7 +555,9 @@ impl Chat {
                     if let Ok(entries) = fs::read_dir(dir) {
                         for entry in entries.flatten() {
                             let p = entry.path();
-                            if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pssa") || e.eq_ignore_ascii_case("trfm")) {
+                            if p.extension().is_some_and(|e| {
+                                e.eq_ignore_ascii_case("pssa") || e.eq_ignore_ascii_case("trfm")
+                            }) {
                                 paths.push(p.display().to_string());
                             }
                         }
@@ -837,9 +844,9 @@ impl Chat {
         if area.width < 26 || area.height < 9 {
             f.render_widget(
                 Paragraph::new(format!(
-                    "inference / Tab tabs\n{} tok • {:.1} tok/s\n{}\n▶ {}\nEnlarge to chat",
+                    "inference / Tab tabs\n{} tok • {} tok/s\n{}\n▶ {}\nEnlarge to chat",
                     self.tokens,
-                    self.rate(),
+                    self.rate_label(),
                     clean(&self.note),
                     clean(&self.input)
                 ))
@@ -854,14 +861,14 @@ impl Chat {
             cfg.temperature, cfg.top_p, cfg.top_k, cfg.max_new_tokens, cfg.repetition_penalty
         );
         let status = format!(
-            "{} • {} tok • {:.1} tok/s",
+            "{} • {} tok • {} tok/s",
             if self.job.is_some() {
                 "STREAMING"
             } else {
                 "READY"
             },
             self.tokens,
-            self.rate()
+            self.rate_label()
         );
         let chunks = Layout::vertical([
             Constraint::Length(if area.width < 65 { 5 } else { 4 }),
@@ -951,6 +958,14 @@ impl Chat {
             chunks[3],
         );
     }
+    fn rate_label(&self) -> String {
+        if self.elapsed > 0.0 {
+            format!("{:.1}", self.rate())
+        } else {
+            "unmeasured".into()
+        }
+    }
+
     fn rate(&self) -> f64 {
         if self.elapsed > 0.0 {
             self.tokens as f64 / self.elapsed
@@ -1031,9 +1046,18 @@ mod tests {
             for (width, height) in [(80, 24), (120, 40), (60, 20)] {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal.draw(|f| chat.draw(f, f.area())).unwrap();
-                let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
                 // Wide glyphs reserve a second blank TestBackend cell.
-                assert!(text.contains("END"), "draft end hidden at {width}x{height}, ab={ab}: {text}");
+                assert!(
+                    text.contains("END"),
+                    "draft end hidden at {width}x{height}, ab={ab}: {text}"
+                );
             }
         }
     }
@@ -1449,6 +1473,25 @@ mod tests {
         );
         fs::remove_dir_all(&c.store.dir).unwrap();
     }
+    #[test]
+    fn idle_chat_does_not_invent_a_measured_token_rate() {
+        let mut chat = fixture();
+        for (w, h) in [(80, 24), (25, 8)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| chat.draw(f, f.area())).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("unmeasured tok/s"), "{text}");
+            assert!(!text.contains("0.0 tok/s"));
+        }
+        fs::remove_dir_all(&chat.store.dir).unwrap();
+    }
+
     #[test]
     fn keyboard_and_render_scrollback_narrow_and_streaming() {
         let mut c = fixture();

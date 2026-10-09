@@ -267,23 +267,29 @@ pub(super) struct Network {
 #[derive(Default)]
 struct RunEvents {
     active: bool,
-    completed: bool,
+    summary: bool,
     died: bool,
     saved: bool,
+    saved_after_summary: bool,
+    closed: bool,
 }
 impl RunEvents {
+    fn start(&mut self) {
+        *self = Self {
+            active: true,
+            ..Self::default()
+        };
+    }
     fn ingest(&mut self, line: &str) -> Option<super::notify::Event> {
         use super::notify::Event;
-        if line.contains("progress_schema=") {
-            *self = Self {
-                active: true,
-                ..Self::default()
-            };
+        if self.closed {
+            return None;
         }
         if saved_checkpoint(line).is_some() {
             self.saved = true;
+            self.saved_after_summary |= self.summary;
         }
-        if line.contains("tokens_per_second=") && !self.completed && !self.died {
+        if line.contains("tokens_per_second=") && !self.summary && !self.died {
             self.active = true;
         }
         if line.starts_with("error:")
@@ -295,26 +301,55 @@ impl RunEvents {
                 self.active = false;
                 return Some(Event::Died);
             }
-        } else if line.contains("training_seconds=") && !self.completed && !self.died {
-            self.completed = true;
+        } else if line.contains("training_seconds=") && !self.summary && !self.died {
+            // Computation finishes before the final checkpoint write. Only a
+            // producer outcome may turn this provisional summary into success.
+            self.summary = true;
             self.active = false;
-            return Some(Event::Finished);
         }
         None
     }
     fn eof(&mut self, success: bool) -> Option<super::notify::Event> {
         use super::notify::Event;
+        if self.closed {
+            return None;
+        }
+        self.close();
         let event = if !success && !self.died {
             Some(Event::Died)
-        } else if success && !self.completed && !self.died {
+        } else if success && !self.died {
             Some(Event::Finished)
         } else {
             None
         };
-        self.active = false;
-        self.completed |= success;
         self.died |= !success;
         event
+    }
+    fn close(&mut self) {
+        self.active = false;
+        self.closed = true;
+    }
+    fn remote_outcome(&mut self, outcome: &super::kaggle::Event) -> Option<super::notify::Event> {
+        use super::kaggle::Event;
+        if matches!(outcome, Event::Started { .. }) {
+            self.start();
+            return None;
+        }
+        // Preview/credential errors are not outcomes of a training run.
+        if self.closed || !(self.active || self.summary || self.died) {
+            return None;
+        }
+        match outcome {
+            Event::Done if self.summary && self.saved_after_summary => self.eof(true),
+            Event::Error(_) => self.eof(false),
+            // Done without a confirmed final save, or detached monitoring,
+            // leaves success unconfirmed rather than inventing a terminal result.
+            Event::Done | Event::Detached => {
+                self.close();
+                None
+            }
+            Event::Started { .. } => unreachable!(),
+        }
     }
 }
 fn saved_checkpoint(line: &str) -> Option<&str> {
@@ -344,7 +379,7 @@ impl Network {
         let stripped = super::strip_ansi(line);
         let line = stripped.trim();
         if line.contains("progress_schema=") {
-            self.local_closed = false;
+            self.started();
         }
         // Completion of owned/piped trainers is decided by EOF/exit, not a
         // summary that can precede a failed checkpoint write.
@@ -358,10 +393,7 @@ impl Network {
         }
     }
     pub(super) fn started(&mut self) {
-        self.local_events = RunEvents {
-            active: true,
-            ..Default::default()
-        };
+        self.local_events.start();
         self.local_closed = false;
     }
     pub(super) fn blocked(&mut self, message: &str) {
@@ -373,38 +405,58 @@ impl Network {
     pub(super) fn stream_eof(&mut self) -> Option<bool> {
         // Piped logs have no child exit status. Require the completion summary
         // AND a successful save, not presentation-only loss/spike health flags.
-        let active = self.local_events.active
-            || self.local_events.completed
-            || self.local_events.died;
+        let active =
+            self.local_events.active || self.local_events.summary || self.local_events.died;
         if !active {
             return None;
         }
-        let success = self.local_events.completed
-            && self.local_events.saved
-            && !self.local_events.died;
+        let success =
+            self.local_events.summary && self.local_events.saved && !self.local_events.died;
         self.eof(success);
         Some(success)
     }
     pub(super) fn eof(&mut self, success: bool) {
         if self.local_closed
-            || !(self.local_events.active || self.local_events.completed || self.local_events.died)
+            || !(self.local_events.active || self.local_events.summary || self.local_events.died)
         {
             return;
         }
         self.local_closed = true;
         // Local summaries were not sent early; release the successful terminal
         // event here exactly once, after the owned child's durable log is drained.
-        if self.local_events.completed && !self.local_events.died {
-            self.local_events.completed = false;
-        }
         if let Some(event) = self.local_events.eof(success) {
             self.notify.event(event);
         }
     }
-    pub(super) fn remote_line(&mut self, line: &str) {
+    /// Kaggle lifecycle, not replayed progress headers, owns remote run resets.
+    pub(super) fn remote_line(&mut self, input: super::extras::RemoteEvent<'_>) {
+        use super::extras::RemoteEvent;
+        let event = match input {
+            RemoteEvent::Line(line) => {
+                let stripped = super::strip_ansi(line);
+                let line = stripped.trim();
+                let event = self.kaggle_events.ingest(line);
+                if saved_checkpoint(line).is_some() {
+                    self.notify.event(super::notify::Event::Checkpoint);
+                }
+                event
+            }
+            RemoteEvent::Lifecycle(outcome) => self.kaggle_events.remote_outcome(outcome),
+        };
+        if let Some(event) = event {
+            self.notify.event(event);
+        }
+    }
+    fn cloud_line(&mut self, line: &str) {
         let stripped = super::strip_ansi(line);
         let line = stripped.trim();
-        if let Some(event) = self.kaggle_events.ingest(line) {
+        if line.contains("progress_schema=") {
+            self.cloud_events.start();
+        }
+        // Following EOF/reconnect is not the producer's exit. Even a summary
+        // plus save cannot rule out a later failure in a still-running notebook;
+        // keep completion unconfirmed, while reporting explicit saves/errors.
+        if let Some(event) = self.cloud_events.ingest(line) {
             self.notify.event(event);
         }
         if saved_checkpoint(line).is_some() {
@@ -437,12 +489,7 @@ impl Network {
         use super::keybindings::*;
         self.backup.poll();
         for line in self.logs.poll() {
-            if let Some(event) = self.cloud_events.ingest(&line) {
-                self.notify.event(event);
-            }
-            if saved_checkpoint(&line).is_some() {
-                self.notify.event(super::notify::Event::Checkpoint);
-            }
+            self.cloud_line(&line);
         }
         self.notify.poll();
         self.updates.poll();
@@ -608,6 +655,37 @@ mod tests {
             message: None,
         }
     }
+    fn notification_fixture() -> (
+        Network,
+        std::sync::Arc<Mutex<Vec<super::super::notify::Event>>>,
+    ) {
+        let sent = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&sent);
+        let mut ui = fixture();
+        ui.notify = super::super::notify::Notify::with_sender(
+            json!({"enabled":true,"target":"fixture-topic"}),
+            std::sync::Arc::new(move |_, _, event, _| {
+                recorded.lock().unwrap().push(event);
+                Ok(())
+            }),
+        );
+        (ui, sent)
+    }
+    fn delivered(
+        ui: &mut Network,
+        sent: &Mutex<Vec<super::super::notify::Event>>,
+    ) -> Vec<super::super::notify::Event> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while ui.notify.pending() && Instant::now() < deadline {
+            ui.notify.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !ui.notify.pending(),
+            "fixture notification worker timed out"
+        );
+        sent.lock().unwrap().clone()
+    }
     #[test]
     fn historical_losses_fill_gaps_without_replacing_same_path_save_metrics() {
         let root = std::env::temp_dir().join(format!("pssa-network-losses-{}", std::process::id()));
@@ -688,14 +766,177 @@ mod tests {
             assert!(saved_checkpoint(line).is_none());
         }
         let mut events = RunEvents::default();
+        events.start();
         assert_eq!(events.ingest("progress_schema=2"), None);
-        assert_eq!(events.ingest("training_seconds=2"), Some(Event::Finished));
         assert_eq!(events.ingest("training_seconds=2"), None);
+        assert_eq!(events.ingest("training_seconds=2"), None);
+        assert_eq!(events.eof(true), Some(Event::Finished));
         assert_eq!(events.eof(true), None);
-        events.ingest("progress_schema=2");
+        assert_eq!(events.eof(false), None);
+        events.start();
         assert_eq!(events.eof(false), Some(Event::Died));
         assert_eq!(events.eof(false), None);
         assert_eq!(events.ingest("error: later detail"), None);
+    }
+    #[test]
+    fn remote_error_after_summary_never_sends_success_even_with_a_save() {
+        use super::super::{extras::RemoteEvent, kaggle::Event as Remote, notify::Event};
+        for saved in [false, true] {
+            let (mut ui, sent) = notification_fixture();
+            ui.remote_line(RemoteEvent::Lifecycle(&Remote::Started {
+                reference: "fixture/notebook".into(),
+            }));
+            ui.remote_line(RemoteEvent::Line("training_seconds=2"));
+            assert!(
+                delivered(&mut ui, &sent).is_empty(),
+                "summary is provisional"
+            );
+            if saved {
+                ui.remote_line(RemoteEvent::Line("saved_checkpoint=/remote/model.pssa"));
+            } else {
+                ui.remote_line(RemoteEvent::Line("error: checkpoint write failed"));
+            }
+            ui.remote_line(RemoteEvent::Lifecycle(&Remote::Error("save failed".into())));
+            ui.remote_line(RemoteEvent::Lifecycle(&Remote::Error(
+                "later detail".into(),
+            )));
+            ui.remote_line(RemoteEvent::Lifecycle(&Remote::Done));
+            assert_eq!(
+                delivered(&mut ui, &sent),
+                if saved {
+                    vec![Event::Checkpoint, Event::Died]
+                } else {
+                    vec![Event::Died]
+                }
+            );
+        }
+    }
+    #[test]
+    fn remote_success_needs_done_and_a_final_save_and_is_delivered_once() {
+        use super::super::{extras::RemoteEvent, kaggle::Event as Remote, notify::Event};
+        let (mut ui, sent) = notification_fixture();
+        // Credential/preview errors do not describe a remote training outcome.
+        ui.remote_line(RemoteEvent::Lifecycle(&Remote::Error(
+            "preview failed".into(),
+        )));
+        assert!(delivered(&mut ui, &sent).is_empty());
+        let started = Remote::Started {
+            reference: "fixture/notebook".into(),
+        };
+        ui.remote_line(RemoteEvent::Lifecycle(&started));
+        ui.remote_line(RemoteEvent::Line("training_seconds=2"));
+        ui.remote_line(RemoteEvent::Line("saved_checkpoint=/remote/model.pssa"));
+        assert_eq!(delivered(&mut ui, &sent), [Event::Checkpoint]);
+        ui.remote_line(RemoteEvent::Lifecycle(&Remote::Done));
+        ui.remote_line(RemoteEvent::Lifecycle(&Remote::Done));
+        ui.remote_line(RemoteEvent::Lifecycle(&Remote::Error("late detail".into())));
+        // Replayed stdout must not reopen a closed producer lifecycle.
+        ui.remote_line(RemoteEvent::Line("progress_schema=2"));
+        ui.remote_line(RemoteEvent::Line("training_seconds=2"));
+        ui.remote_line(RemoteEvent::Lifecycle(&Remote::Done));
+        assert_eq!(
+            delivered(&mut ui, &sent),
+            [Event::Checkpoint, Event::Finished]
+        );
+        // A genuinely new producer gets its own terminal notification.
+        ui.remote_line(RemoteEvent::Lifecycle(&started));
+        ui.remote_line(RemoteEvent::Line("training_seconds=3"));
+        ui.remote_line(RemoteEvent::Line("saved_checkpoint=/remote/model.pssa"));
+        ui.remote_line(RemoteEvent::Lifecycle(&Remote::Done));
+        assert_eq!(
+            delivered(&mut ui, &sent),
+            [
+                Event::Checkpoint,
+                Event::Finished,
+                Event::Checkpoint,
+                Event::Finished,
+            ]
+        );
+    }
+    #[test]
+    fn remote_done_without_final_save_and_detach_leave_success_unconfirmed() {
+        use super::super::{extras::RemoteEvent, kaggle::Event as Remote, notify::Event};
+        for detached in [false, true] {
+            let (mut ui, sent) = notification_fixture();
+            ui.remote_line(RemoteEvent::Lifecycle(&Remote::Started {
+                reference: "fixture/notebook".into(),
+            }));
+            // An earlier periodic checkpoint is not the final checkpoint write.
+            ui.remote_line(RemoteEvent::Line("saved_checkpoint=/remote/periodic.pssa"));
+            ui.remote_line(RemoteEvent::Line("training_seconds=2"));
+            if detached {
+                ui.remote_line(RemoteEvent::Line("saved_checkpoint=/remote/model.pssa"));
+                delivered(&mut ui, &sent);
+            }
+            let outcome = if detached {
+                Remote::Detached
+            } else {
+                Remote::Done
+            };
+            ui.remote_line(RemoteEvent::Lifecycle(&outcome));
+            ui.remote_line(RemoteEvent::Lifecycle(&Remote::Done));
+            let delivered = delivered(&mut ui, &sent);
+            assert!(!delivered.contains(&Event::Finished));
+            assert!(
+                !delivered.contains(&Event::Died),
+                "missing outcome is not a known failure"
+            );
+            assert!(ui.kaggle_events.closed);
+        }
+    }
+    #[test]
+    fn cloud_summary_is_not_a_producer_outcome_even_with_save_confirmation() {
+        use super::super::notify::Event;
+        for saved in [false, true] {
+            let (mut ui, sent) = notification_fixture();
+            ui.cloud_line("progress_schema=2");
+            ui.cloud_line("training_seconds=2");
+            assert!(delivered(&mut ui, &sent).is_empty());
+            if saved {
+                ui.cloud_line("saved_checkpoint=/cloud/model.pssa");
+                assert_eq!(delivered(&mut ui, &sent), [Event::Checkpoint]);
+            }
+            ui.cloud_line("Error: final save/upload failed");
+            ui.cloud_line("Error: repeated detail");
+            assert_eq!(
+                delivered(&mut ui, &sent),
+                if saved {
+                    vec![Event::Checkpoint, Event::Died]
+                } else {
+                    vec![Event::Died]
+                }
+            );
+        }
+    }
+    #[test]
+    fn local_remote_and_cloud_evidence_remain_separate() {
+        use super::super::{extras::RemoteEvent, kaggle::Event as Remote, notify::Event};
+        let (mut ui, sent) = notification_fixture();
+        ui.started();
+        ui.ingest("training_seconds=2");
+        ui.ingest("saved_checkpoint=/local/model.pssa");
+        delivered(&mut ui, &sent);
+        ui.cloud_line("training_seconds=2");
+        ui.cloud_line("saved_checkpoint=/cloud/model.pssa");
+        delivered(&mut ui, &sent);
+        ui.remote_line(RemoteEvent::Lifecycle(&Remote::Started {
+            reference: "fixture/notebook".into(),
+        }));
+        ui.remote_line(RemoteEvent::Line("training_seconds=2"));
+        ui.remote_line(RemoteEvent::Lifecycle(&Remote::Done));
+        assert_eq!(
+            delivered(&mut ui, &sent),
+            [Event::Checkpoint, Event::Checkpoint]
+        );
+        ui.eof(true);
+        ui.eof(true);
+        assert_eq!(
+            delivered(&mut ui, &sent),
+            [Event::Checkpoint, Event::Checkpoint, Event::Finished,]
+        );
+        assert!(!ui.local_events.died);
+        assert!(ui.kaggle_events.closed);
+        assert!(!ui.cloud_events.closed, "cloud has no producer outcome");
     }
     #[test]
     fn all_network_tabs_preserve_shell_and_render_at_narrow_widths_offline() {
