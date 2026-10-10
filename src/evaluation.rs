@@ -180,13 +180,25 @@ pub fn evaluate_pssa(
     slice: EvaluationSlice,
 ) -> Result<Metrics, String> {
     let docs = documents(raw, tokenizer, slice)?;
+    evaluate_pssa_documents(model, tokenizer, &docs)
+}
+
+/// Prepared-document path for benchmarks: tokenization is outside timing.
+pub(crate) fn evaluate_pssa_documents(
+    model: &mut PSSALayerV2,
+    tokenizer: &Tokenizer,
+    docs: &[Vec<usize>],
+) -> Result<Metrics, String> {
     let vocab = model.cfg.d_vocab;
-    validate_model_input(tokenizer, &docs, vocab, model.cfg.chunk_len)?;
-    let mut metrics = Metrics::for_documents(&docs, model.loops());
-    let mut incoming_carries = vec![0.0; model.recurrent_state_len()];
-    model.copy_recurrent_state_to(&mut incoming_carries);
+    validate_model_input(tokenizer, docs, vocab, model.cfg.chunk_len)?;
+    if !docs.iter().any(|doc| doc.len() >= 2) {
+        return Err("evaluation documents have no next-token targets".into());
+    }
+    let mut metrics = Metrics::for_documents(docs, model.loops());
+    let mut incoming_carry = vec![0.0; model.recurrent_state_len()];
+    model.copy_recurrent_state_to(&mut incoming_carry);
     let result = (|| {
-        for doc in &docs {
+        for doc in docs {
             model.reset_recurrent_state();
             for (input, targets) in TokenChunkIterator::new(doc, model.cfg.chunk_len) {
                 // Forward only: no backward, optimizer, consolidation or memory-write path.
@@ -202,8 +214,8 @@ pub fn evaluate_pssa(
         metrics.loss /= metrics.tokens as f64;
         Ok(metrics)
     })();
-    // Restore every layer even when scoring returns a non-finite-logit error.
-    model.copy_recurrent_state_from(&incoming_carries);
+    // Restore every layer/shared-loop carry even on non-finite-logit errors.
+    model.copy_recurrent_state_from(&incoming_carry);
     result
 }
 

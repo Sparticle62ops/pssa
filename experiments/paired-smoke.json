@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "description": "A/A plumbing calibration only: identical tiny CPU models, disjoint authored word-tokenized data. Not a prototype-quality benchmark.",
+  "seeds": [11, 29, 47],
+  "env": {"RAYON_NUM_THREADS": "1"},
+  "inputs": ["experiments/paired-train.txt", "experiments/paired-validation.txt"],
+  "timeout_seconds": 240,
+  "control": [
+    ["python3", "experiments/paired_pssa.py", "train", "experiments/paired-train.txt", "--out", "{run_dir}/model.pssa", "--seed", "{seed}", "--backend", "cpu", "--tokenizer", "word", "--latent", "16", "--state", "4", "--key", "4", "--memory", "16", "--chunk", "16", "--epochs", "1", "--accumulate", "1", "--max-tokens", "128", "--lr", "0.001", "--no-tui", "--no-feed-telemetry"],
+    ["python3", "experiments/paired_pssa.py", "eval-card", "experiments/paired-validation.txt", "--model", "{run_dir}/model.pssa", "--skip-tokens", "0", "--max-tokens", "64"]
+  ],
+  "variant": [
+    ["python3", "experiments/paired_pssa.py", "train", "experiments/paired-train.txt", "--out", "{run_dir}/model.pssa", "--seed", "{seed}", "--backend", "cpu", "--tokenizer", "word", "--latent", "16", "--state", "4", "--key", "4", "--memory", "16", "--chunk", "16", "--epochs", "1", "--accumulate", "1", "--max-tokens", "128", "--lr", "0.001", "--no-tui", "--no-feed-telemetry"],
+    ["python3", "experiments/paired_pssa.py", "eval-card", "experiments/paired-validation.txt", "--model", "{run_dir}/model.pssa", "--skip-tokens", "0", "--max-tokens", "64"]
+  ]
+}
