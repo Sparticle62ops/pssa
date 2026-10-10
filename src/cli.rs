@@ -1,4 +1,5 @@
 mod backend_choice;
+mod eval_card;
 pub(crate) mod world_model;
 pub use backend_choice::TrainingBackend;
 pub mod resource_limits;
@@ -2119,6 +2120,7 @@ impl CLIHandler {
                 "score-transformer",
                 "score the baseline on held-out text (JSON)",
             ),
+            ("eval-card", "frozen PSSA CPU card for paired evaluation (JSON)"),
             ("chat", "interactive prompt loop against a checkpoint"),
             ("status", "checkpoints and corpora in this directory"),
             ("download", "pull a Hugging Face dataset to a local file"),
@@ -2519,6 +2521,12 @@ impl CLIHandler {
                 println!(
                     "  {bin} {command} \"quantum mechanics\" --temperature 0 --max-new-tokens 32"
                 );
+            }
+            "eval-card" => {
+                println!("Usage: {bin} eval-card CORPUS --model PATH --skip-tokens N --max-tokens N [--loops N]");
+                println!("Frozen CPU scoring; prints one JSON card, never writes checkpoints.");
+                println!("For paired training/seeds/bootstrap intervals use scripts/paired_eval.py.");
+                println!("This minimal port scores PSSA only. See docs/PAIRED-EVAL.md.");
             }
             "chat" | "repl" => {
                 println!("Usage: {bin} chat [DATA] [OPTIONS]");
@@ -2934,6 +2942,7 @@ impl CLIHandler {
                 println!("{text}");
                 Ok(())
             }
+            "eval-card" => eval_card::execute(&args[2..]),
             "score" | "score-transformer" => {
                 let mut allowed = vec![
                     "--model",
