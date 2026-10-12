@@ -65,6 +65,15 @@ pub(crate) fn documents(
     cache_path: Option<&Path>,
     source_path: Option<&Path>,
 ) -> Result<WindowResult, String> {
+    if let (Some(cache_path), Some(source_path)) = (cache_path, source_path)
+        && paths_refer_to_same_file(cache_path, source_path)
+    {
+        return Err(format!(
+            "token cache path '{}' must differ from the training source '{}'",
+            cache_path.display(),
+            source_path.display()
+        ));
+    }
     let started = Instant::now();
     let result = match cache_path {
         Some(path) => {
@@ -109,6 +118,16 @@ pub(crate) fn documents(
         }
     };
     Ok(result)
+}
+
+fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 fn tokenize_until_window(
