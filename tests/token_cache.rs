@@ -108,6 +108,21 @@ fn token_cache_round_trip_reuses_the_same_window() {
 }
 
 #[test]
+fn token_cache_rejects_the_training_source_path_without_replacing_it() {
+    let (root, source) = scratch("same-source");
+    let raw = "alpha beta gamma\ndelta epsilon zeta\n";
+    fs::write(&source, raw).unwrap();
+    let tokenizer = Tokenizer::from_corpus(raw, true).unwrap();
+
+    let error =
+        CLIHandler::documents_with_cache(raw, &tokenizer, Some(5), 0, Some(&source), Some(&source))
+            .unwrap_err();
+    assert!(error.contains("must differ from the training source"));
+    assert_eq!(fs::read_to_string(&source).unwrap(), raw);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn stale_and_corrupt_caches_are_rebuilt_atomically() {
     let (root, cache) = scratch("rebuild");
     let raw = "alpha beta gamma\ndelta epsilon zeta\n";
