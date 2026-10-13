@@ -669,7 +669,10 @@ fn cuda_packed_ptx_dead_scan_maps_can_be_reused_for_local_gradients() {
         REDUCE_PTX,
         "packed_reduce_rate",
         &[
-            B("future_a"), B("reduced"), B("offsets"), B("lengths"),
+            B("future_a"),
+            B("reduced"),
+            B("offsets"),
+            B("lengths"),
             U(s.stride() as u32),
         ],
         (1, s.lengths.len()),
@@ -729,13 +732,22 @@ fn cuda_packed_ptx_carries_follow_lane_ids_through_omission_and_repacking() {
         m.put("initial", &s.initial);
         m.put("carries", &s.initial);
         s.scan(&mut m, "a", "input_b", "prefix_a", "prefix_b");
-        s.launch(&mut m, "packed_materialize", &s.materialize_args(), 5 * s.dm);
+        s.launch(
+            &mut m,
+            "packed_materialize",
+            &s.materialize_args(),
+            5 * s.dm,
+        );
         close("repacked carries", &m.get("carries"), &s.carries);
         close("repacked readout", &m.get("y"), &s.y);
         let actual_states = m.get("states");
         for (lane, &len) in lengths.iter().enumerate() {
             let base = lane * (s.chunk + 1) * s.stride();
-            let written = if len == 0 { 0 } else { (len as usize + 1) * s.stride() };
+            let written = if len == 0 {
+                0
+            } else {
+                (len as usize + 1) * s.stride()
+            };
             close(
                 "active lane states",
                 &actual_states[base..base + written],

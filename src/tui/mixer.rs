@@ -454,19 +454,47 @@ mod tests {
         fs::write(&bad, "\"three four\"\n").unwrap();
         let entries = library::scan(&temp.0, &temp.0).0;
         let mut mixer = Mixer::default();
-        mixer.sources = entries.iter().cloned().map(|entry| Source {
-            stats: library::dataset_stats(&entry.path), entry, weight: 35,
-        }).collect();
+        mixer.sources = entries
+            .iter()
+            .cloned()
+            .map(|entry| Source {
+                stats: library::dataset_stats(&entry.path),
+                entry,
+                weight: 35,
+            })
+            .collect();
         fs::write(&bad, "invalid json").unwrap();
         let (tx, rx) = mpsc::channel();
-        tx.send(entries.into_iter().map(|entry| {
-            let stats = library::dataset_stats(&entry.path);
-            (entry, stats)
-        }).collect()).unwrap();
+        tx.send(
+            entries
+                .into_iter()
+                .map(|entry| {
+                    let stats = library::dataset_stats(&entry.path);
+                    (entry, stats)
+                })
+                .collect(),
+        )
+        .unwrap();
         mixer.inspect = Some(rx);
         assert!(mixer.poll().is_none());
-        assert_eq!(mixer.sources.iter().find(|s| s.entry.path == good).unwrap().weight, 35);
-        assert_eq!(mixer.sources.iter().find(|s| s.entry.path == bad).unwrap().weight, 0);
+        assert_eq!(
+            mixer
+                .sources
+                .iter()
+                .find(|s| s.entry.path == good)
+                .unwrap()
+                .weight,
+            35
+        );
+        assert_eq!(
+            mixer
+                .sources
+                .iter()
+                .find(|s| s.entry.path == bad)
+                .unwrap()
+                .weight,
+            0
+        );
         assert_eq!(mixer.quotas().iter().sum::<u64>(), 2);
     }
 

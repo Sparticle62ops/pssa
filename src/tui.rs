@@ -3138,9 +3138,11 @@ fn draw_monitor(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         None => "No input window recorded / Feed tab".into(),
     };
     lines.push(Line::from(input_line));
-    lines.push(Line::from(format!("memory read {} / growth {}",
+    lines.push(Line::from(format!(
+        "memory read {} / growth {}",
         state.memory_retrieval.as_deref().unwrap_or("unreported"),
-        state.memory_growth.as_deref().unwrap_or("none reported"))));
+        state.memory_growth.as_deref().unwrap_or("none reported")
+    )));
     lines.push(Line::from(format!(
         "gradient norm {} / skipped updates {} / epoch loss {epoch_loss}",
         state

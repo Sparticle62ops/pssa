@@ -167,7 +167,10 @@ impl MemoryView {
         let Some(snapshot) = self.latest() else {
             let reason = if self.model.is_empty() {
                 "No model selected."
-            } else if std::path::Path::new(&self.model).extension().is_some_and(|e| e.eq_ignore_ascii_case("trfm")) {
+            } else if std::path::Path::new(&self.model)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("trfm"))
+            {
                 "Transformer: no PSSA memory slots."
             } else {
                 "No token observations yet."

@@ -248,7 +248,9 @@ impl<'a> PSSAInferenceEngine<'a> {
         C: Fn() -> bool,
     {
         self.try_generate_chat_turn_impl(
-            prompt, cfg, true,
+            prompt,
+            cfg,
+            true,
             |out, _, count, probability| callback(out, count, probability),
             cancelled,
             |_, _, _, _| {},
@@ -345,7 +347,10 @@ impl<'a> PSSAInferenceEngine<'a> {
         self.model.reset_recurrent_state();
         if self.prefill_enabled {
             let output = (cfg.max_new_tokens > 0).then_some(logits.as_mut_slice());
-            if !self.model.prefill_inference(&prompt_ids, output, &cancelled)? {
+            if !self
+                .model
+                .prefill_inference(&prompt_ids, output, &cancelled)?
+            {
                 return Ok(String::new());
             }
         } else {
@@ -493,7 +498,12 @@ impl<'a> PSSAInferenceEngine<'a> {
                 if emitted < raw.len() {
                     let tail = String::from_utf8_lossy(&raw[emitted..]);
                     out.push_str(&tail);
-                    callback(&out, Some(&tail), generated_ids.len() - prompt_ids.len(), last_probability);
+                    callback(
+                        &out,
+                        Some(&tail),
+                        generated_ids.len() - prompt_ids.len(),
+                        last_probability,
+                    );
                 }
                 Ok(out)
             }
@@ -518,7 +528,11 @@ fn raw_confidence(logits: &[f32], out: &mut [f32]) {
     if out.is_empty() {
         return;
     }
-    assert_eq!(logits.len(), out.len(), "confidence output must match logits length");
+    assert_eq!(
+        logits.len(),
+        out.len(),
+        "confidence output must match logits length"
+    );
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;
     for (p, &logit) in out.iter_mut().zip(logits) {
@@ -589,23 +603,46 @@ mod tests {
             let tokenizer = word_tokenizer("word");
             let mut plain_model = tiny_model(&tokenizer);
             let mut scored_model = tiny_model(&tokenizer);
-            let cfg = InferenceConfig { temperature, top_k: 1, max_new_tokens: 3, ..Default::default() };
+            let cfg = InferenceConfig {
+                temperature,
+                top_k: 1,
+                max_new_tokens: 3,
+                ..Default::default()
+            };
             let plain = PSSAInferenceEngine::new(&mut plain_model, &tokenizer)
-                .try_generate_chat_turn_controlled("prompt", &cfg, |_, _| {}, || false).unwrap();
+                .try_generate_chat_turn_controlled("prompt", &cfg, |_, _| {}, || false)
+                .unwrap();
             let mut scores = Vec::new();
             let scored = PSSAInferenceEngine::new(&mut scored_model, &tokenizer)
-                .try_generate_chat_turn_scored("prompt", &cfg, |text, count, p| scores.push((text.to_owned(), count, p)), || false).unwrap();
+                .try_generate_chat_turn_scored(
+                    "prompt",
+                    &cfg,
+                    |text, count, p| scores.push((text.to_owned(), count, p)),
+                    || false,
+                )
+                .unwrap();
             assert_eq!(plain, scored);
             assert_eq!(scores.len(), 3);
-            for (_, _, p) in scores { assert_eq!(p, 1.0 / 3.0); } // includes unk, before top-k=1
+            for (_, _, p) in scores {
+                assert_eq!(p, 1.0 / 3.0);
+            } // includes unk, before top-k=1
             assert_eq!(plain_model.inf_features, scored_model.inf_features);
         }
         let tokenizer = bpe_tokenizer(0xc3);
         let mut model = tiny_model(&tokenizer);
         let mut scores = Vec::new();
-        PSSAInferenceEngine::new(&mut model, &tokenizer).try_generate_chat_turn_scored(
-            "a", &greedy(2), |text, count, p| scores.push((text.to_owned(), count, p)), || false).unwrap();
-        assert_eq!(scores.iter().map(|(_, n, _)| *n).collect::<Vec<_>>(), [1, 2, 2]);
+        PSSAInferenceEngine::new(&mut model, &tokenizer)
+            .try_generate_chat_turn_scored(
+                "a",
+                &greedy(2),
+                |text, count, p| scores.push((text.to_owned(), count, p)),
+                || false,
+            )
+            .unwrap();
+        assert_eq!(
+            scores.iter().map(|(_, n, _)| *n).collect::<Vec<_>>(),
+            [1, 2, 2]
+        );
         assert_eq!(scores[1].2, scores[2].2);
         assert_eq!(scores[2].0, "��");
     }
@@ -963,7 +1000,13 @@ mod tests {
         }
     }
 
-    fn prefill_fixture(vocab: usize, width: usize, depth: usize, loops: usize, seed: u64) -> PSSALayerV2 {
+    fn prefill_fixture(
+        vocab: usize,
+        width: usize,
+        depth: usize,
+        loops: usize,
+        seed: u64,
+    ) -> PSSALayerV2 {
         let mut model = PSSALayerV2::new_with_depth_and_loops(
             PSSAConfigV2 {
                 d_vocab: vocab,
@@ -998,11 +1041,22 @@ mod tests {
         values.extend(&model.inf_block_out);
         for block in std::iter::once(&model.block).chain(&model.extra_blocks) {
             for scratch in [
-                &block.inf_x_norm, &block.inf_delta, &block.inf_b, &block.inf_c,
-                &block.inf_y_ssm, &block.inf_q_euc, &block.inf_q_pnc,
-                &block.inf_mem_weights, &block.inf_m_val, &block.inf_g_mem,
-                &block.inf_m_proj, &block.inf_ad_act, &block.inf_ad_out,
-                &block.inf_z_raw, &block.inf_mlp_act, &block.inf_mlp_out,
+                &block.inf_x_norm,
+                &block.inf_delta,
+                &block.inf_b,
+                &block.inf_c,
+                &block.inf_y_ssm,
+                &block.inf_q_euc,
+                &block.inf_q_pnc,
+                &block.inf_mem_weights,
+                &block.inf_m_val,
+                &block.inf_g_mem,
+                &block.inf_m_proj,
+                &block.inf_ad_act,
+                &block.inf_ad_out,
+                &block.inf_z_raw,
+                &block.inf_mlp_act,
+                &block.inf_mlp_out,
                 &block.inf_z_final,
             ] {
                 values.extend(scratch);
@@ -1025,11 +1079,21 @@ mod tests {
                     for &id in &ids {
                         legacy.forward_inference(id, &mut expected);
                     }
-                    assert!(batched.prefill_inference(&ids, Some(&mut actual), || false).unwrap());
-                    assert_eq!(actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                               expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
-                    assert_eq!(prefill_runtime_bits(&batched), prefill_runtime_bits(&legacy));
-                    for (a, b) in std::iter::once(&batched.block).chain(&batched.extra_blocks)
+                    assert!(
+                        batched
+                            .prefill_inference(&ids, Some(&mut actual), || false)
+                            .unwrap()
+                    );
+                    assert_eq!(
+                        actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        prefill_runtime_bits(&batched),
+                        prefill_runtime_bits(&legacy)
+                    );
+                    for (a, b) in std::iter::once(&batched.block)
+                        .chain(&batched.extra_blocks)
                         .zip(std::iter::once(&legacy.block).chain(&legacy.extra_blocks))
                     {
                         assert_eq!(a.memory, b.memory);
@@ -1038,7 +1102,10 @@ mod tests {
                         legacy.forward_inference(id, &mut expected);
                         batched.forward_inference(id, &mut actual);
                         assert_eq!(actual, expected);
-                        assert_eq!(prefill_runtime_bits(&batched), prefill_runtime_bits(&legacy));
+                        assert_eq!(
+                            prefill_runtime_bits(&batched),
+                            prefill_runtime_bits(&legacy)
+                        );
                     }
                 }
             }
@@ -1056,21 +1123,35 @@ mod tests {
             }
             let mut logits = vec![-123.0; 37];
             let checks = Cell::new(0);
-            assert!(!batched.prefill_inference(&ids, Some(&mut logits), || {
-                let n = checks.get();
-                checks.set(n + 1);
-                n == stop
-            }).unwrap());
+            assert!(
+                !batched
+                    .prefill_inference(&ids, Some(&mut logits), || {
+                        let n = checks.get();
+                        checks.set(n + 1);
+                        n == stop
+                    })
+                    .unwrap()
+            );
             assert_eq!(checks.get(), stop + 1);
             assert_eq!(logits, vec![-123.0; 37]);
-            assert_eq!(prefill_runtime_bits(&batched), prefill_runtime_bits(&legacy));
+            assert_eq!(
+                prefill_runtime_bits(&batched),
+                prefill_runtime_bits(&legacy)
+            );
 
             let mut invalid = ids.clone();
             invalid[stop] = 37;
             let mut invalid_model = prefill_fixture(37, 16, 2, 1, 23);
-            assert_eq!(invalid_model.prefill_inference(&invalid, None, || false).unwrap_err(),
-                       "prompt ID 37 outside model vocabulary");
-            assert_eq!(prefill_runtime_bits(&invalid_model), prefill_runtime_bits(&legacy));
+            assert_eq!(
+                invalid_model
+                    .prefill_inference(&invalid, None, || false)
+                    .unwrap_err(),
+                "prompt ID 37 outside model vocabulary"
+            );
+            assert_eq!(
+                prefill_runtime_bits(&invalid_model),
+                prefill_runtime_bits(&legacy)
+            );
         }
         let mut model = prefill_fixture(37, 4, 1, 1, 23);
         let before = prefill_runtime_bits(&model);
@@ -1083,12 +1164,22 @@ mod tests {
         for tokenizer in [word_tokenizer("word"), bpe_tokenizer(0xc3)] {
             for (depth, loops) in [(2, 1), (2, 3)] {
                 for (temperature, budget, stop) in [
-                    (0.0, 5, usize::MAX), (0.7, 5, usize::MAX),
-                    (0.7, 0, usize::MAX), (0.7, 5, 0), (0.7, 5, 1),
-                    (0.7, 5, 31), (0.7, 5, 32), (0.7, 5, 33), (0.7, 5, 69),
+                    (0.0, 5, usize::MAX),
+                    (0.7, 5, usize::MAX),
+                    (0.7, 0, usize::MAX),
+                    (0.7, 5, 0),
+                    (0.7, 5, 1),
+                    (0.7, 5, 31),
+                    (0.7, 5, 32),
+                    (0.7, 5, 33),
+                    (0.7, 5, 69),
                 ] {
                     let prompt = vec!["prompt"; 67].join(" ");
-                    let cfg = InferenceConfig { temperature, max_new_tokens: budget, ..Default::default() };
+                    let cfg = InferenceConfig {
+                        temperature,
+                        max_new_tokens: budget,
+                        ..Default::default()
+                    };
                     let mut results = Vec::new();
                     for enabled in [false, true] {
                         let mut model = prefill_fixture(tokenizer.vocab_size, 16, depth, loops, 47);
@@ -1098,17 +1189,25 @@ mod tests {
                         engine.set_prefill_enabled(enabled);
                         let checks = Cell::new(0);
                         let mut events = Vec::new();
-                        let out = engine.try_generate_chat_turn_scored(
-                            &prompt, &cfg,
-                            |text, count, p| events.push((text.to_owned(), count, p.to_bits())),
-                            || {
-                                let n = checks.get();
-                                checks.set(n + 1);
-                                n == stop
-                            },
-                        ).unwrap();
-                        results.push((out, events, checks.get(), engine.rng.state,
-                                      prefill_runtime_bits(engine.model)));
+                        let out = engine
+                            .try_generate_chat_turn_scored(
+                                &prompt,
+                                &cfg,
+                                |text, count, p| events.push((text.to_owned(), count, p.to_bits())),
+                                || {
+                                    let n = checks.get();
+                                    checks.set(n + 1);
+                                    n == stop
+                                },
+                            )
+                            .unwrap();
+                        results.push((
+                            out,
+                            events,
+                            checks.get(),
+                            engine.rng.state,
+                            prefill_runtime_bits(engine.model),
+                        ));
                     }
                     assert_eq!(results[0], results[1]);
                 }

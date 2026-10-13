@@ -1,5 +1,9 @@
 //! Offset drop shadows for the TUI's retro window panels.
-use ratatui::{Frame, layout::Rect, style::{Color, Style}};
+use ratatui::{
+    Frame,
+    layout::Rect,
+    style::{Color, Style},
+};
 
 const MIN_WIDTH: u16 = 80;
 const MIN_HEIGHT: u16 = 24;
@@ -80,14 +84,21 @@ fn fill(frame: &mut Frame, area: Option<Rect>, shade: Color) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, widgets::{Block, Borders, Paragraph}};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        buffer::Buffer,
+        widgets::{Block, Borders, Paragraph},
+    };
 
     fn render(width: u16, height: u16, panel: Rect) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| {
-            let frame_area = frame.area();
-            paint(frame, panel, frame_area, color(Color::Rgb(7, 18, 16)));
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let frame_area = frame.area();
+                paint(frame, panel, frame_area, color(Color::Rgb(7, 18, 16)));
+            })
+            .unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -114,27 +125,36 @@ mod tests {
     #[test]
     fn shadow_is_clipped_at_frame_edges_without_panicking() {
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal.draw(|frame| {
-            let frame_area = frame.area();
-            paint(frame, Rect::new(117, 37, 2, 3), frame_area, Color::DarkGray);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let frame_area = frame.area();
+                paint(frame, Rect::new(117, 37, 2, 3), frame_area, Color::DarkGray);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(*buffer.area(), Rect::new(0, 0, 120, 40));
-        assert!(buffer.content().iter().any(|cell| cell.bg == Color::DarkGray));
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.bg == Color::DarkGray)
+        );
     }
 
     #[test]
     fn panel_content_is_not_overwritten_by_its_shadow() {
         let panel = Rect::new(3, 3, 16, 8);
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal.draw(|frame| {
-            let frame_area = frame.area();
-            paint(frame, panel, frame_area, Color::DarkGray);
-            frame.render_widget(
-                Paragraph::new("content").block(Block::default().borders(Borders::ALL)),
-                panel,
-            );
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let frame_area = frame.area();
+                paint(frame, panel, frame_area, Color::DarkGray);
+                frame.render_widget(
+                    Paragraph::new("content").block(Block::default().borders(Borders::ALL)),
+                    panel,
+                );
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(panel.x + 2, panel.y + 1)].symbol(), "o");
         assert_eq!(buffer[(panel.right(), panel.y)].bg, Color::DarkGray);

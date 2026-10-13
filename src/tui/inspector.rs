@@ -415,10 +415,8 @@ mod tests {
             ..Default::default()
         };
         for (width, height) in [(120, 40), (80, 24)] {
-            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
-                width, height,
-            ))
-            .unwrap();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|f| Inspector::default().draw(f, f.area(), &state))
                 .unwrap();

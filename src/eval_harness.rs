@@ -12,14 +12,16 @@ fn fingerprint(bytes: &[u8]) -> String {
 }
 
 fn tokenizer_identity(tokenizer: &Tokenizer) -> Result<String, String> {
-    let metadata = tokenizer.serialized_metadata()
+    let metadata = tokenizer
+        .serialized_metadata()
         .map(|text| serde_json::from_str::<Value>(&text).map_err(|e| e.to_string()))
         .transpose()?;
     serde_json::to_string(&json!({
         "kind": format!("{:?}", tokenizer.kind()),
         "vocabulary": tokenizer.ordered_vocabulary()?,
         "metadata": metadata,
-    })).map_err(|e| e.to_string())
+    }))
+    .map_err(|e| e.to_string())
 }
 
 /// Score a configured CPU model without training or memory writes. Prototype
@@ -43,7 +45,10 @@ pub fn score_model(
     let docs = evaluation::documents(raw, tokenizer, slice)?;
     let identity = tokenizer_identity(tokenizer)?;
     let mut stream = Vec::new();
-    for n in docs.iter().flat_map(|doc| std::iter::once(doc.len()).chain(doc.iter().copied())) {
+    for n in docs
+        .iter()
+        .flat_map(|doc| std::iter::once(doc.len()).chain(doc.iter().copied()))
+    {
         stream.extend_from_slice(&(n as u64).to_le_bytes());
     }
     let metrics = evaluation::evaluate_pssa_documents(model, tokenizer, &docs)?;
@@ -94,7 +99,10 @@ pub fn score_model(
 
 /// Default (no experimental runtime flags) checkpoint scoring entry point.
 pub fn checkpoint_card(
-    data: &str, path: &str, slice: EvaluationSlice, loops: usize,
+    data: &str,
+    path: &str,
+    slice: EvaluationSlice,
+    loops: usize,
 ) -> Result<Value, String> {
     let loaded = checkpoint::load_checkpoint(path).map_err(|e| e.to_string())?;
     if loaded.format == CheckpointFormat::LegacyV5InferenceOnly {

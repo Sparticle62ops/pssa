@@ -304,9 +304,7 @@ mod tests {
             let visible = area.intersection(buffer.area);
             for y in 0..24 {
                 for x in 0..80 {
-                    let shadow = (x == area.right()
-                        && y >= area.y
-                        && y < area.bottom())
+                    let shadow = (x == area.right() && y >= area.y && y < area.bottom())
                         || (y == area.bottom() && x >= area.x && x <= area.right());
                     if (x < visible.x
                         || x >= visible.right()

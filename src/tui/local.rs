@@ -330,7 +330,11 @@ mod tests {
         let mut setup = Setup::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !paths.iter().all(|path| {
-            local.library.entries.iter().any(|entry| entry.path == *path)
+            local
+                .library
+                .entries
+                .iter()
+                .any(|entry| entry.path == *path)
         }) && std::time::Instant::now() < deadline
         {
             local.poll(&mut setup, &mut state, false);

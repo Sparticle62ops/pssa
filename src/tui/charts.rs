@@ -272,7 +272,10 @@ pub(super) fn draw_solid_overlay(
             .x_bounds(plot.x_bounds)
             .y_bounds(plot.y_bounds)
             .paint(|ctx| {
-                ctx.draw(&Points { coords: points, color });
+                ctx.draw(&Points {
+                    coords: points,
+                    color,
+                });
                 for pair in points.windows(2) {
                     ctx.draw(&ThinLine {
                         from: pair[0],
@@ -461,10 +464,7 @@ fn draw_x_labels(buffer: &mut Buffer, graph: Rect, name: &str, labels: &[String]
             .max_by_key(|(_, width)| *width)
             .unwrap_or((graph.x, 0))
     };
-    if labels[1] == labels[0]
-        || labels[1] == labels[2]
-        || gap(&positions).1 < name.len() as u16
-    {
+    if labels[1] == labels[0] || labels[1] == labels[2] || gap(&positions).1 < name.len() as u16 {
         positions.remove(1);
     }
     let (start, width) = gap(&positions);
@@ -791,7 +791,10 @@ mod tests {
             .difference(&dots(&both, graph))
             .copied()
             .collect();
-        assert!(missing.is_empty(), "loss dots erased where lines cross: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "loss dots erased where lines cross: {missing:?}"
+        );
         let avg_alone = render(&[
             Series::line("loss", &[], NORMAL_GREEN),
             Series::line("moving avg", &avg, SECOND_ACCENT),
@@ -1324,10 +1327,7 @@ mod tests {
         assert!((fitted[0] - 3.795).abs() < 1e-12);
         assert!((fitted[1] - 6.105).abs() < 1e-12);
         assert_eq!(domain(&[(1.0, 6.0), (2.0, 4.0)]), [1.0, 2.0]);
-        assert_eq!(
-            domain(&[(3.0, 1.0), (1.0, 6.0), (2.0, 4.0)]),
-            [1.0, 3.0]
-        );
+        assert_eq!(domain(&[(3.0, 1.0), (1.0, 6.0), (2.0, 4.0)]), [1.0, 3.0]);
         let flat_ticks = ticks(bounds([3.0, 3.0].into_iter()));
         assert!(flat_ticks.windows(2).all(|pair| pair[0] != pair[1]));
         for v in [0.0, 3.0, 0.00025] {

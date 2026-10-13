@@ -92,10 +92,7 @@ fn blocked_cpu_output_into_matches_dot_order_for_tails_and_parallel_tiles() {
             for j in 0..n {
                 assert_eq!(
                     out[t * n + j],
-                    pssa::linalg::dot_slice(
-                        &x[t * k..(t + 1) * k],
-                        &w[j * k..(j + 1) * k]
-                    )
+                    pssa::linalg::dot_slice(&x[t * k..(t + 1) * k], &w[j * k..(j + 1) * k])
                 );
             }
         }

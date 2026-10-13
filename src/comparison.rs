@@ -36,17 +36,27 @@ struct Window {
 }
 
 fn windows(opts: &ComparisonOptions) -> Result<Vec<Window>, String> {
-    if opts.links == 0 || opts.window == 0 || opts.eval_tokens == 0 || opts.loss_every == 0
-        || opts.batch_size == 0 || opts.batch_size > 65_536 || opts.accumulate == 0
+    if opts.links == 0
+        || opts.window == 0
+        || opts.eval_tokens == 0
+        || opts.loss_every == 0
+        || opts.batch_size == 0
+        || opts.batch_size > 65_536
+        || opts.accumulate == 0
     {
         return Err("comparison counts must be positive and batch-size at most 65536".into());
     }
     if let Some(path) = &opts.link_plan {
-        let bytes = std::fs::read(path).map_err(|e| format!("cannot read link plan '{path}': {e}"))?;
-        let value: Value = serde_json::from_slice(&bytes).map_err(|e| format!("invalid link plan JSON: {e}"))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("cannot read link plan '{path}': {e}"))?;
+        let value: Value =
+            serde_json::from_slice(&bytes).map_err(|e| format!("invalid link plan JSON: {e}"))?;
         let rows = value.as_array().ok_or("link plan must be a JSON array")?;
         if rows.len() != opts.links {
-            return Err(format!("link plan must contain exactly {} entries", opts.links));
+            return Err(format!(
+                "link plan must contain exactly {} entries",
+                opts.links
+            ));
         }
         rows.iter().map(|row| {
             let object = row.as_object().ok_or("each link plan entry must be an object")?;
@@ -65,10 +75,18 @@ fn windows(opts: &ComparisonOptions) -> Result<Vec<Window>, String> {
             Ok(w)
         }).collect()
     } else {
-        (0..opts.links).map(|i| Ok(Window {
-            skip: i.checked_mul(opts.window).ok_or("chain token offset overflow")?,
-            size: opts.window, batch: opts.batch_size, accumulate: opts.accumulate,
-        })).collect()
+        (0..opts.links)
+            .map(|i| {
+                Ok(Window {
+                    skip: i
+                        .checked_mul(opts.window)
+                        .ok_or("chain token offset overflow")?,
+                    size: opts.window,
+                    batch: opts.batch_size,
+                    accumulate: opts.accumulate,
+                })
+            })
+            .collect()
     }
 }
 
@@ -76,17 +94,32 @@ fn windows(opts: &ComparisonOptions) -> Result<Vec<Window>, String> {
 /// evaluation slice. Deliberately conservative: even an unscored boundary token
 /// makes a slice unsuitable for calling it held out.
 fn check_holdout(windows: &[Window], corpus: usize, slice: EvaluationSlice) -> Result<(), String> {
-    let end = slice.skip_tokens.checked_add(slice.max_tokens.ok_or("comparison needs an evaluation token count")?)
+    let end = slice
+        .skip_tokens
+        .checked_add(
+            slice
+                .max_tokens
+                .ok_or("comparison needs an evaluation token count")?,
+        )
         .ok_or("held-out token range overflow")?;
     if end > corpus || slice.skip_tokens >= end {
-        return Err(format!("held-out slice {}..{end} exceeds corpus length {corpus}; choose --eval-skip-tokens/--eval-tokens within the original corpus", slice.skip_tokens));
+        return Err(format!(
+            "held-out slice {}..{end} exceeds corpus length {corpus}; choose --eval-skip-tokens/--eval-tokens within the original corpus",
+            slice.skip_tokens
+        ));
     }
     for (i, w) in windows.iter().enumerate() {
         let start = w.skip % corpus;
         let first = w.size.min(corpus - start);
         let overlaps = |a: usize, b: usize| a < end && slice.skip_tokens < b;
-        if w.size >= corpus || overlaps(start, start + first) || (w.size > first && overlaps(0, w.size - first)) {
-            return Err(format!("held-out slice overlaps training link {}; choose an unseen slice (training wraps at EOF)", i + 1));
+        if w.size >= corpus
+            || overlaps(start, start + first)
+            || (w.size > first && overlaps(0, w.size - first))
+        {
+            return Err(format!(
+                "held-out slice overlaps training link {}; choose an unseen slice (training wraps at EOF)",
+                i + 1
+            ));
         }
     }
     Ok(())
@@ -96,14 +129,18 @@ fn checkpoint_path(dir: &str, link: usize) -> PathBuf {
     Path::new(dir).join(format!("ck{link:02}.pssa"))
 }
 fn path_string(path: &Path) -> Result<&str, String> {
-    path.to_str().ok_or_else(|| "comparison paths must be valid UTF-8".into())
+    path.to_str()
+        .ok_or_else(|| "comparison paths must be valid UTF-8".into())
 }
 fn save_json(path: &Path, value: &Value) -> Result<(), String> {
     let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
-    std::fs::write(path, format!("{text}\n")).map_err(|e| format!("cannot write '{}': {e}", path.display()))
+    std::fs::write(path, format!("{text}\n"))
+        .map_err(|e| format!("cannot write '{}': {e}", path.display()))
 }
 fn fnv(bytes: &[u8]) -> String {
-    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3));
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3)
+    });
     format!("{hash:016x}")
 }
 
@@ -119,16 +156,32 @@ pub fn run(data: &str, opts: &ComparisonOptions) -> Result<(), String> {
     let windows = windows(opts)?;
     let out = Path::new(&opts.out_dir);
     if out.exists() {
-        return Err(format!("comparison output '{}' already exists; choose a new --out directory", out.display()));
+        return Err(format!(
+            "comparison output '{}' already exists; choose a new --out directory",
+            out.display()
+        ));
     }
     let source_path = checkpoint_path(&opts.chain_dir, 1);
     let (first, tokenizer) = CLIHandler::load_for_inference(path_string(&source_path)?, None)?;
     let raw = DatasetManager::try_load_dataset(Some(data))?;
-    let encoded = raw.lines().map(|line| tokenizer.try_encode(line, true)).collect::<Result<Vec<_>, _>>()?;
-    let corpus_tokens = encoded.iter().try_fold(0usize, |n, doc| n.checked_add(doc.len()).ok_or("corpus token count overflow"))?;
-    if corpus_tokens < 2 { return Err("comparison corpus has no token transitions".into()); }
-    let budget = windows.iter().try_fold(0usize, |n, w| n.checked_add(w.size).ok_or("chain token budget overflow"))?;
-    let slice = EvaluationSlice { skip_tokens: opts.eval_skip_tokens.unwrap_or(budget), max_tokens: Some(opts.eval_tokens) };
+    let encoded = raw
+        .lines()
+        .map(|line| tokenizer.try_encode(line, true))
+        .collect::<Result<Vec<_>, _>>()?;
+    let corpus_tokens = encoded.iter().try_fold(0usize, |n, doc| {
+        n.checked_add(doc.len())
+            .ok_or("corpus token count overflow")
+    })?;
+    if corpus_tokens < 2 {
+        return Err("comparison corpus has no token transitions".into());
+    }
+    let budget = windows.iter().try_fold(0usize, |n, w| {
+        n.checked_add(w.size).ok_or("chain token budget overflow")
+    })?;
+    let slice = EvaluationSlice {
+        skip_tokens: opts.eval_skip_tokens.unwrap_or(budget),
+        max_tokens: Some(opts.eval_tokens),
+    };
     check_holdout(&windows, corpus_tokens, slice)?;
     // Also reject transition-free slices before creating any output or training.
     evaluation::documents(&raw, &tokenizer, slice)?;
@@ -141,37 +194,77 @@ pub fn run(data: &str, opts: &ComparisonOptions) -> Result<(), String> {
     for (index, w) in windows.iter().enumerate() {
         let path = checkpoint_path(&opts.chain_dir, index + 1);
         let source = checkpoint::load_checkpoint(&path)
-            .map_err(|e| format!("cannot inspect chain link '{}': {e}; supply every ck01..ck{:02}.pssa", path.display(), opts.links))?.model;
-        if source.vocabulary != first.vocabulary || source.tokenizer_json != first.tokenizer_json
-            || source.cfg.d_vocab != first.cfg.d_vocab || source.cfg.chunk_len != first.cfg.chunk_len
-            || source.cfg.d_latent != first.cfg.d_latent || source.cfg.d_state != first.cfg.d_state
-            || source.cfg.d_mem_key != first.cfg.d_mem_key || source.cfg.mem_capacity != first.cfg.mem_capacity
+            .map_err(|e| {
+                format!(
+                    "cannot inspect chain link '{}': {e}; supply every ck01..ck{:02}.pssa",
+                    path.display(),
+                    opts.links
+                )
+            })?
+            .model;
+        if source.vocabulary != first.vocabulary
+            || source.tokenizer_json != first.tokenizer_json
+            || source.cfg.d_vocab != first.cfg.d_vocab
+            || source.cfg.chunk_len != first.cfg.chunk_len
+            || source.cfg.d_latent != first.cfg.d_latent
+            || source.cfg.d_state != first.cfg.d_state
+            || source.cfg.d_mem_key != first.cfg.d_mem_key
+            || source.cfg.mem_capacity != first.cfg.mem_capacity
         {
-            return Err(format!("chain link {} changes tokenizer or shape; provide one consistent chain", index + 1));
+            return Err(format!(
+                "chain link {} changes tokenizer or shape; provide one consistent chain",
+                index + 1
+            ));
         }
         let docs = documents_from_encoded(&encoded, Some(w.size), w.skip)?;
         let plan = sequence_plan(&docs, first.cfg.chunk_len, w.batch)?;
         let targets = docs.iter().map(|d| d.len() - 1).sum::<usize>();
         let options = TrainingOptions {
-            epochs: 1, chunk: first.cfg.chunk_len, lr: source.cfg.lr,
-            batch_size: w.batch, accumulate: w.accumulate,
-            warmup_steps: source.lr_schedule_warmup_steps.unwrap_or(opts.legacy_warmup),
+            epochs: 1,
+            chunk: first.cfg.chunk_len,
+            lr: source.cfg.lr,
+            batch_size: w.batch,
+            accumulate: w.accumulate,
+            warmup_steps: source
+                .lr_schedule_warmup_steps
+                .unwrap_or(opts.legacy_warmup),
             schedule_total_updates: source.lr_schedule_total_updates,
-            max_tokens: Some(w.size), skip_tokens: w.skip, seed: opts.seed,
+            max_tokens: Some(w.size),
+            skip_tokens: w.skip,
+            seed: opts.seed,
             loss_every: opts.loss_every,
             ..Default::default()
         };
-        let schedule = Schedule::new_with_warmup(plan.len(), prior_steps, prior_horizon, prior_warmup, &options)?;
-        let expected = prior_steps.checked_add(schedule.updates).ok_or("chain update overflow")?;
+        let schedule = Schedule::new_with_warmup(
+            plan.len(),
+            prior_steps,
+            prior_horizon,
+            prior_warmup,
+            &options,
+        )?;
+        let expected = prior_steps
+            .checked_add(schedule.updates)
+            .ok_or("chain update overflow")?;
         if source.step_counter != expected {
-            return Err(format!("chain link {} has {} updates, but supplied corpus/window/batch/accumulate plan predicts {expected}; use the original corpus/settings or --link-plan for mixed historical links", index + 1, source.step_counter));
+            return Err(format!(
+                "chain link {} has {} updates, but supplied corpus/window/batch/accumulate plan predicts {expected}; use the original corpus/settings or --link-plan for mixed historical links",
+                index + 1,
+                source.step_counter
+            ));
         }
         if source.lr_schedule_total_updates != schedule.fixed_horizon
-            || source.lr_schedule_warmup_steps.is_some_and(|n| n != schedule.warmup)
+            || source
+                .lr_schedule_warmup_steps
+                .is_some_and(|n| n != schedule.warmup)
         {
-            return Err(format!("chain link {} schedule metadata is inconsistent with its predecessor", index + 1));
+            return Err(format!(
+                "chain link {} schedule metadata is inconsistent with its predecessor",
+                index + 1
+            ));
         }
-        targets_seen = targets_seen.checked_add(targets).ok_or("chain target count overflow")?;
+        targets_seen = targets_seen
+            .checked_add(targets)
+            .ok_or("chain target count overflow")?;
         audit.push(json!({
             "link": index + 1, "pssa_checkpoint": path, "skip_tokens": w.skip, "max_tokens": w.size,
             "batch_size": w.batch, "accumulate": w.accumulate, "targets": targets,
@@ -179,16 +272,30 @@ pub fn run(data: &str, opts: &ComparisonOptions) -> Result<(), String> {
             "horizon": schedule.total, "fixed_horizon": source.lr_schedule_total_updates,
             "warmup_steps": schedule.warmup, "first_lr": schedule.lr(1)?, "last_lr": schedule.lr(schedule.updates)?,
         }));
-        println!("comparison_preflight link={} targets={targets} tokens_seen={targets_seen} updates={expected}", index + 1);
+        println!(
+            "comparison_preflight link={} targets={targets} tokens_seen={targets_seen} updates={expected}",
+            index + 1
+        );
         prior_steps = expected;
         prior_horizon = source.lr_schedule_total_updates;
         prior_warmup = source.lr_schedule_warmup_steps;
-        links.push(Link { options, end_steps: expected, targets, stored_horizon: prior_horizon, stored_warmup: prior_warmup });
+        links.push(Link {
+            options,
+            end_steps: expected,
+            targets,
+            stored_horizon: prior_horizon,
+            stored_warmup: prior_warmup,
+        });
     }
-    let mut baseline = TransformerModel::new(TransformerConfig {
-        d_vocab: tokenizer.vocab_size, chunk_len: first.cfg.chunk_len, lr: links[0].options.lr,
-        ..Default::default()
-    }, opts.seed)?;
+    let mut baseline = TransformerModel::new(
+        TransformerConfig {
+            d_vocab: tokenizer.vocab_size,
+            chunk_len: first.cfg.chunk_len,
+            lr: links[0].options.lr,
+            ..Default::default()
+        },
+        opts.seed,
+    )?;
     baseline.vocabulary = tokenizer.ordered_vocabulary()?;
     baseline.tokenizer_json = tokenizer.serialized_metadata();
     let pssa_parameters = first.parameter_count();
@@ -210,10 +317,13 @@ pub fn run(data: &str, opts: &ComparisonOptions) -> Result<(), String> {
     for (i, mut link) in links.into_iter().enumerate() {
         link.options.loss_csv = Some(path_string(&curve)?.to_owned());
         link.options.tokens_seen = Some(cumulative_targets);
-        let docs = documents_from_encoded(&encoded, link.options.max_tokens, link.options.skip_tokens)?;
+        let docs =
+            documents_from_encoded(&encoded, link.options.max_tokens, link.options.skip_tokens)?;
         println!("comparison_train link={}", i + 1);
         train_documents(&mut baseline, &docs, &link.options)?;
-        if baseline.step_counter != link.end_steps { return Err("internal comparison update mismatch".into()); }
+        if baseline.step_counter != link.end_steps {
+            return Err("internal comparison update mismatch".into());
+        }
         // Preserve the source's legacy metadata absence too: an old checkpoint
         // without warmup must not accidentally gain a reinterpreted schedule.
         baseline.lr_schedule_total_updates = link.stored_horizon;
@@ -226,8 +336,11 @@ pub fn run(data: &str, opts: &ComparisonOptions) -> Result<(), String> {
     let final_source = checkpoint_path(&opts.chain_dir, opts.links);
     let (mut pssa, _) = CLIHandler::load_for_inference(path_string(&final_source)?, None)?;
     let pssa_metrics = evaluation::evaluate_pssa(&mut pssa, &tokenizer, &raw, slice)?;
-    let transformer_metrics = evaluation::evaluate_transformer(&mut baseline, &tokenizer, &raw, slice)?;
-    let parse_metrics = |m: &evaluation::Metrics| serde_json::from_str::<Value>(&m.json()).map_err(|e| e.to_string());
+    let transformer_metrics =
+        evaluation::evaluate_transformer(&mut baseline, &tokenizer, &raw, slice)?;
+    let parse_metrics = |m: &evaluation::Metrics| {
+        serde_json::from_str::<Value>(&m.json()).map_err(|e| e.to_string())
+    };
     let results = json!({
         "tokens_seen": cumulative_targets, "updates": baseline.step_counter,
         "eval_skip_tokens": slice.skip_tokens, "eval_tokens": opts.eval_tokens,
@@ -236,7 +349,10 @@ pub fn run(data: &str, opts: &ComparisonOptions) -> Result<(), String> {
     });
     save_json(&out.join("results.json"), &results)?;
     println!("comparison_model=pssa {}", pssa_metrics.json());
-    println!("comparison_model=transformer {}", transformer_metrics.json());
+    println!(
+        "comparison_model=transformer {}",
+        transformer_metrics.json()
+    );
     println!("comparison_results={}", out.join("results.json").display());
     Ok(())
 }
@@ -246,8 +362,16 @@ mod tests {
     use super::*;
     #[test]
     fn heldout_checks_wrap_and_boundary_overlap() {
-        let w = |skip, size| Window { skip, size, batch: 8, accumulate: 1 };
-        let slice = EvaluationSlice { skip_tokens: 10, max_tokens: Some(4) };
+        let w = |skip, size| Window {
+            skip,
+            size,
+            batch: 8,
+            accumulate: 1,
+        };
+        let slice = EvaluationSlice {
+            skip_tokens: 10,
+            max_tokens: Some(4),
+        };
         assert!(check_holdout(&[w(0, 10)], 20, slice).is_ok());
         assert!(check_holdout(&[w(0, 11)], 20, slice).is_err());
         assert!(check_holdout(&[w(15, 10)], 20, slice).is_ok());

@@ -1002,7 +1002,9 @@ impl PSSAContinuousBlockV2 {
         if self.local_conv_kernel.is_some() {
             let context_width = 3 * d;
             let src = saved_slot * context_width;
-            self.tape.conv_context.copy_within(src..src + context_width, 0);
+            self.tape
+                .conv_context
+                .copy_within(src..src + context_width, 0);
         }
     }
 
@@ -1078,7 +1080,8 @@ impl PSSAContinuousBlockV2 {
             for i in 0..d_m {
                 let mut mixed = kernel.data[i * 4] * self.inf_x_norm[i];
                 for lag in 1..4 {
-                    mixed += kernel.data[i * 4 + lag] * self.local_conv_history[(3 - lag) * d_m + i];
+                    mixed +=
+                        kernel.data[i * 4 + lag] * self.local_conv_history[(3 - lag) * d_m + i];
                 }
                 self.inf_ssm_input[i] = mixed;
                 self.local_conv_history[i] = self.local_conv_history[d_m + i];
@@ -1851,8 +1854,8 @@ impl PrefillProjections {
             let sum_sq: f32 = input.iter().map(|&x| x * x).sum();
             let inv_rms = 1.0 / (sum_sq / d as f32 + 1e-5).sqrt();
             for i in 0..d {
-                self.x_norm[t * d + i] = block.norm_gamma.data[i] * (input[i] * inv_rms)
-                    + block.norm_beta.data[i];
+                self.x_norm[t * d + i] =
+                    block.norm_gamma.data[i] * (input[i] * inv_rms) + block.norm_beta.data[i];
             }
         }
         let n = ids.len();
@@ -1867,8 +1870,12 @@ impl PrefillProjections {
 
     fn publish(&self, block: &mut PSSAContinuousBlockV2, t: usize) {
         let (d, s) = (block.cfg.d_latent, block.cfg.d_state);
-        block.inf_x_norm.copy_from_slice(&self.x_norm[t * d..(t + 1) * d]);
-        block.inf_delta.copy_from_slice(&self.delta[t * d..(t + 1) * d]);
+        block
+            .inf_x_norm
+            .copy_from_slice(&self.x_norm[t * d..(t + 1) * d]);
+        block
+            .inf_delta
+            .copy_from_slice(&self.delta[t * d..(t + 1) * d]);
         block.inf_b.copy_from_slice(&self.b[t * s..(t + 1) * s]);
         block.inf_c.copy_from_slice(&self.c[t * s..(t + 1) * s]);
     }
@@ -2056,7 +2063,8 @@ impl PSSALayerV2 {
     }
 
     pub fn local_mixing_enabled(&self) -> bool {
-        std::iter::once(&self.block).chain(&self.extra_blocks)
+        std::iter::once(&self.block)
+            .chain(&self.extra_blocks)
             .any(|b| b.local_conv_enabled() || b.ssm_skip_enabled())
     }
 
@@ -2187,8 +2195,10 @@ impl PSSALayerV2 {
     /// are shared, so packed sequence replay must preserve every pass.
     pub(crate) fn recurrent_state_len(&self) -> usize {
         self.depth() * self.loops() * self.cfg.d_latent * self.cfg.d_state
-            + std::iter::once(&self.block).chain(&self.extra_blocks)
-                .map(|b| b.local_conv_history.len() + b.local_conv_loop_history.len()).sum::<usize>()
+            + std::iter::once(&self.block)
+                .chain(&self.extra_blocks)
+                .map(|b| b.local_conv_history.len() + b.local_conv_loop_history.len())
+                .sum::<usize>()
     }
 
     pub(crate) fn copy_recurrent_state_to(&self, out: &mut [f32]) {
@@ -2252,7 +2262,8 @@ impl PSSALayerV2 {
             if let Some((tile, row)) = projected {
                 self.block.refresh_ssm_rates();
                 tile.publish(&mut self.block, row);
-                self.block.forward_continuous_inference_projected(&mut self.inf_features);
+                self.block
+                    .forward_continuous_inference_projected(&mut self.inf_features);
             } else {
                 self.block.forward_continuous_inference(
                     &self.embed_w.data[x_id * d..(x_id + 1) * d],
@@ -2354,11 +2365,13 @@ impl PSSALayerV2 {
                     .iter()
                     .take_while(|&&id| id < self.cfg.d_vocab)
                     .count();
-                let tile = projections.get_or_insert_with(|| PrefillProjections::new(
-                    self.cfg.d_latent,
-                    self.cfg.d_state,
-                    token_ids.len().min(PrefillProjections::TILE),
-                ));
+                let tile = projections.get_or_insert_with(|| {
+                    PrefillProjections::new(
+                        self.cfg.d_latent,
+                        self.cfg.d_state,
+                        token_ids.len().min(PrefillProjections::TILE),
+                    )
+                });
                 tile.prepare(self, &token_ids[index..index + valid]);
             }
             self.forward_inference_features(id, projections.as_ref().map(|tile| (tile, row)));
@@ -2440,7 +2453,8 @@ impl PSSALayerV2 {
         assert!(loop_index < self.loops());
         if self.local_mixing_enabled() {
             assert!(!self.device.is_gpu(), "local mixing is CPU-only");
-            self.block.forward_train_chunk_loop(&self.continuous_inputs[..n], seq_len, loop_index);
+            self.block
+                .forward_train_chunk_loop(&self.continuous_inputs[..n], seq_len, loop_index);
             return;
         }
 
@@ -2475,8 +2489,12 @@ impl PSSALayerV2 {
         assert!(loop_index < self.loops());
         if self.local_mixing_enabled() {
             assert!(!self.device.is_gpu(), "local mixing is CPU-only");
-            self.block.backward_chunk_loop(&self.input_adjoints[..n], seq_len,
-                &mut self.residual_input_adjoints[..n], loop_index);
+            self.block.backward_chunk_loop(
+                &self.input_adjoints[..n],
+                seq_len,
+                &mut self.residual_input_adjoints[..n],
+                loop_index,
+            );
             return;
         }
 
@@ -2497,7 +2515,10 @@ impl PSSALayerV2 {
     }
 
     pub fn forward_train_chunk(&mut self, token_ids: &[usize], target_ids: &[usize]) -> f32 {
-        assert!(!self.local_mixing_enabled() || !self.device.is_gpu(), "local mixing is CPU-only");
+        assert!(
+            !self.local_mixing_enabled() || !self.device.is_gpu(),
+            "local mixing is CPU-only"
+        );
         assert!(!token_ids.is_empty(), "training chunk must be nonempty");
         assert_eq!(
             token_ids.len(),
@@ -2675,7 +2696,10 @@ impl PSSALayerV2 {
     }
 
     pub fn backward_chunk(&mut self, seq_len: usize, accumulation_scale: f32) {
-        assert!(!self.local_mixing_enabled() || !self.device.is_gpu(), "local mixing is CPU-only");
+        assert!(
+            !self.local_mixing_enabled() || !self.device.is_gpu(),
+            "local mixing is CPU-only"
+        );
         assert!(
             seq_len > 0 && seq_len <= self.cfg.chunk_len,
             "backward sequence length must be within tape capacity"

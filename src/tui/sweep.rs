@@ -601,9 +601,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         // Use the actual shell ordering; block launch until assertions complete.
-        assert!(!super::super::poll_training_queue(&mut training, true, |slot| {
-            sweep.poll(slot, &mut state, true)
-        }));
+        assert!(!super::super::poll_training_queue(
+            &mut training,
+            true,
+            |slot| { sweep.poll(slot, &mut state, true) }
+        ));
         assert!(training.is_none());
         assert_eq!(sweep.trials[0].status, Status::Done);
         assert_eq!(sweep.trials[0].loss, Some(2.5));

@@ -25,7 +25,9 @@ pub(super) fn discover() -> Result<Config, String> {
     let model=crate::env_var_os("PSSA_WHISPER_MODEL", "OXIDE_WHISPER_MODEL").map(PathBuf::from)
         .or_else(||["models/ggml-base.en.bin","models/ggml-base.bin","models/ggml-tiny.en.bin"].into_iter().map(PathBuf::from).find(|p|p.is_file()))
         .filter(|p|p.is_file()).ok_or("Set PSSA_WHISPER_MODEL to an existing local whisper.cpp ggml model. Nothing is downloaded.")?;
-    let recorder=executable("arecord").ok_or("Speech capture needs local arecord (Linux ALSA); no audio libraries are linked into pssa.")?;
+    let recorder = executable("arecord").ok_or(
+        "Speech capture needs local arecord (Linux ALSA); no audio libraries are linked into pssa.",
+    )?;
     Ok(Config {
         binary,
         model,

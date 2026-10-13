@@ -256,8 +256,8 @@ impl LogStream {
         ];
         let header = Paragraph::new(lines).wrap(Wrap { trim: false });
         let header_height = header.line_count(inner.width).min(inner.height as usize) as u16;
-        let rows = Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)])
-            .split(inner);
+        let rows =
+            Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)]).split(inner);
         f.render_widget(header, rows[0]);
         if rows[1].is_empty() {
             return;
@@ -285,7 +285,9 @@ impl LogStream {
                 "Waiting for complete lines. Partial lines survive append/reconnect."
             }));
         }
-        let scroll = wrapped_height.saturating_sub(available).min(u16::MAX as usize) as u16;
+        let scroll = wrapped_height
+            .saturating_sub(available)
+            .min(u16::MAX as usize) as u16;
         f.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -805,7 +807,8 @@ mod tests {
         for (width, height) in [(120, 40), (80, 24)] {
             let mut view = LogStream::with_opener(Arc::new(|_, _| panic!("draw must not open")));
             for i in 0..40 {
-                view.history.push_back(format!("old-{i} {}", "x".repeat(320)));
+                view.history
+                    .push_back(format!("old-{i} {}", "x".repeat(320)));
             }
             view.history
                 .push_back(format!("{} NEWEST_ENTRY", "y".repeat(320)));

@@ -2,7 +2,8 @@
 //! slow redraws (or quitting the dashboard) cannot hold up the child process.
 use super::device::DevicePicker;
 use super::{
-    AMBER, BRIGHT_RED, NORMAL_GREEN, RunState, accent, depth_zoom::DepthZoom, panel, panel_area, ring,
+    AMBER, BRIGHT_RED, NORMAL_GREEN, RunState, accent, depth_zoom::DepthZoom, panel, panel_area,
+    ring,
 };
 use crate::{
     cli::{TrainingBackend, resource_limits::ResourceLimits},
@@ -129,24 +130,42 @@ const LABELS: [&str; 48] = [
     "World gradient clip",
 ];
 const WORLD_FLAGS: [(Field, &str); 14] = [
-    (WorldSide, "--side"), (WorldHidden, "--hidden"),
-    (WorldState, "--state"), (WorldCategories, "--categories"),
-    (WorldTrain, "--train-episodes"), (WorldHeldout, "--heldout-episodes"),
-    (WorldHorizon, "--horizon"), (WorldRollout, "--rollout-horizon"),
-    (WorldEpochs, "--epochs"), (WorldLr, "--lr"), (WorldSeed, "--seed"),
-    (WorldKl, "--kl-weight"), (WorldAuxiliary, "--auxiliary-weight"),
+    (WorldSide, "--side"),
+    (WorldHidden, "--hidden"),
+    (WorldState, "--state"),
+    (WorldCategories, "--categories"),
+    (WorldTrain, "--train-episodes"),
+    (WorldHeldout, "--heldout-episodes"),
+    (WorldHorizon, "--horizon"),
+    (WorldRollout, "--rollout-horizon"),
+    (WorldEpochs, "--epochs"),
+    (WorldLr, "--lr"),
+    (WorldSeed, "--seed"),
+    (WorldKl, "--kl-weight"),
+    (WorldAuxiliary, "--auxiliary-weight"),
     (WorldClip, "--grad-clip"),
 ];
 const WORLD_FIELDS: [&[Field]; 4] = [
     &[Source, WorldSide, WorldTrain, WorldHeldout],
     &[WorldHidden, WorldState, WorldCategories],
-    &[WorldEpochs, WorldLr, WorldSeed, WorldHorizon, WorldRollout, WorldKl, WorldAuxiliary, WorldClip],
+    &[
+        WorldEpochs,
+        WorldLr,
+        WorldSeed,
+        WorldHorizon,
+        WorldRollout,
+        WorldKl,
+        WorldAuxiliary,
+        WorldClip,
+    ],
     &[Output],
 ];
 const PAGES: [&str; 4] = ["1 dataset", "2 model", "3 training", "4 review / launch"];
 const FIELDS: [&[Field]; 4] = [
     &[Source, Dataset, HfConfig, HfSplit, HfField],
-    &[Latent, State, Vocab, Depth, Loops, Memory, GrowMemory, MemoryTopK],
+    &[
+        Latent, State, Vocab, Depth, Loops, Memory, GrowMemory, MemoryTopK,
+    ],
     &[
         Lr,
         Epochs,
@@ -220,8 +239,20 @@ impl Default for Setup {
                 "",
                 "",
                 "",
-                "4", "16", "2", "16", "32", "12", "12", "8", "3",
-                "0.003", "73", "0.1", "0.25", "5",
+                "4",
+                "16",
+                "2",
+                "16",
+                "32",
+                "12",
+                "12",
+                "8",
+                "3",
+                "0.003",
+                "73",
+                "0.1",
+                "0.25",
+                "5",
             ]
             .map(str::to_owned),
             devices: DevicePicker::default(),
@@ -250,7 +281,9 @@ impl Setup {
     }
 
     pub(super) fn set_resume(&mut self, path: PathBuf) {
-        if self.is_world_model() { self.values[Source as usize] = "local".into(); }
+        if self.is_world_model() {
+            self.values[Source as usize] = "local".into();
+        }
         self.values[Resume as usize] = path.to_string_lossy().into_owned();
         self.page = 3;
         self.selected = 1;
@@ -265,11 +298,17 @@ impl Setup {
     }
 
     fn transformer_resume(&self) -> bool {
-        Path::new(self.value(Resume)).extension().is_some_and(|e| e.eq_ignore_ascii_case("trfm"))
+        Path::new(self.value(Resume))
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("trfm"))
     }
 
     fn checkpoint_name(&self) -> &'static str {
-        if self.transformer_resume() { "model.trfm" } else { "model.pssa" }
+        if self.transformer_resume() {
+            "model.trfm"
+        } else {
+            "model.pssa"
+        }
     }
 
     fn value(&self, field: Field) -> &str {
@@ -364,7 +403,10 @@ impl Setup {
         output: &Path,
     ) -> Result<RunSpec, String> {
         if self.is_world_model() {
-            return Err("Boxes-world has its own bounded comparison; text-training sweeps are unavailable.".into());
+            return Err(
+                "Boxes-world has its own bounded comparison; text-training sweeps are unavailable."
+                    .into(),
+            );
         }
         if !self.value(Resume).is_empty() {
             return Err(
@@ -402,7 +444,9 @@ impl Setup {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        if self.is_world_model() { self.values[Source as usize] = "local".into(); }
+        if self.is_world_model() {
+            self.values[Source as usize] = "local".into();
+        }
         self.values[Resume as usize] = value.into();
         self.values[Output as usize] = path
             .parent()
@@ -575,7 +619,11 @@ impl Setup {
             if output.join("train.log").symlink_metadata().is_ok() {
                 return Err("train.log already exists; choose a new output directory".into());
             }
-            return Ok(RunSpec { args, output, loops: 1 });
+            return Ok(RunSpec {
+                args,
+                output,
+                loops: 1,
+            });
         }
         match self.value(Source) {
             "local" => {
@@ -664,9 +712,10 @@ impl Setup {
         }
         .validate()?;
         DreamModeValue::parse(self.value(DreamMode))?;
-        let dream_lr = self.value(DreamLr).parse::<f32>().map_err(|_| {
-            "Dream learning rate must be a finite positive number"
-        })?;
+        let dream_lr = self
+            .value(DreamLr)
+            .parse::<f32>()
+            .map_err(|_| "Dream learning rate must be a finite positive number")?;
         if !dream_lr.is_finite() || dream_lr <= 0.0 {
             return Err("Dream learning rate must be a finite positive number".into());
         }
@@ -726,7 +775,14 @@ impl Setup {
             return args;
         }
         let transformer = self.transformer_resume();
-        let mut args = vec![if transformer { "train-transformer" } else { "train" }.into()];
+        let mut args = vec![
+            if transformer {
+                "train-transformer"
+            } else {
+                "train"
+            }
+            .into(),
+        ];
         let mut push = |flag: &str, value: String| {
             args.extend([flag.to_owned(), value]);
         };
@@ -754,7 +810,9 @@ impl Setup {
             (Accumulate, "--accumulate"),
             (Backend, "--backend"),
         ] {
-            if transformer && matches!(field, Latent | State | Depth | Loops | Backend) { continue; }
+            if transformer && matches!(field, Latent | State | Depth | Loops | Backend) {
+                continue;
+            }
             push(flag, self.value(field).into());
         }
         for (field, flag) in [
@@ -953,7 +1011,10 @@ impl Setup {
             Paragraph::new(format!("setup / {}", PAGES[self.page])).style(accent()),
             parts[0],
         );
-        let show_animation = !self.is_world_model() && self.page == 1 && f.area().width >= 80 && parts[1].height >= 7;
+        let show_animation = !self.is_world_model()
+            && self.page == 1
+            && f.area().width >= 80
+            && parts[1].height >= 7;
         let body = if show_animation {
             Layout::default()
                 .direction(Direction::Horizontal)
@@ -1025,12 +1086,14 @@ impl Setup {
             rows.push(Line::styled(
                 if self.is_world_model() {
                     "CPU boxes-world / no checkpoint / same episodes, not parameter-matched."
-                } else { match self.page {
-                    0 => "HF is cached by the CLI. Local files must be UTF-8.",
-                    1 => "Depth = stacked nets. Loops = repeated passes. +/- changes either.",
-                    2 => "Blank tokens = no cap; blank batch = 1. Batch is not a VRAM cap.",
-                    _ => "Blank limits = unchanged. RAM = Linux address space, NOT RSS/VRAM.",
-                } },
+                } else {
+                    match self.page {
+                        0 => "HF is cached by the CLI. Local files must be UTF-8.",
+                        1 => "Depth = stacked nets. Loops = repeated passes. +/- changes either.",
+                        2 => "Blank tokens = no cap; blank batch = 1. Batch is not a VRAM cap.",
+                        _ => "Blank limits = unchanged. RAM = Linux address space, NOT RSS/VRAM.",
+                    }
+                },
                 Style::new().fg(AMBER),
             ));
             if self.page == 3 && !self.is_world_model() {
@@ -1245,9 +1308,9 @@ impl TrainingRun {
             training_active: true,
             loop_count: self.loops,
             last_progress_at: Some(Instant::now()),
-            checkpoint_target: self.checkpoint_name.map(|name| {
-                self.output.join(name).to_string_lossy().into_owned()
-            }),
+            checkpoint_target: self
+                .checkpoint_name
+                .map(|name| self.output.join(name).to_string_lossy().into_owned()),
             comparison_series,
             comparison_label,
             comparison_error,
@@ -1410,29 +1473,61 @@ mod tests {
         assert!(setup.is_world_model());
         let spec = setup.validate().unwrap();
         let parsed = crate::cli::world_model::parse(&spec.args[1..]).unwrap();
-        assert_eq!(format!("{parsed:?}"), format!("{:?}", crate::world_model::WorldModelConfig::default()));
+        assert_eq!(
+            format!("{parsed:?}"),
+            format!("{:?}", crate::world_model::WorldModelConfig::default())
+        );
         assert_eq!(spec.args[0], "world-model");
         assert_eq!(spec.loops, 1);
-        for flag in ["--data", "--resume", "--out", "--memory", "--dream-every", "--backend", "--no-tui"] {
+        for flag in [
+            "--data",
+            "--resume",
+            "--out",
+            "--memory",
+            "--dream-every",
+            "--backend",
+            "--no-tui",
+        ] {
             assert!(!spec.args.iter().any(|s| s == flag));
         }
         assert!(!setup.command().contains("model.pssa"));
         assert!(setup.command().contains("train.log"));
         assert!(!spec.output.exists());
         assert!(setup.sweep_spec(".001", "16", "1", &spec.output).is_err());
-        for (field, value) in [(WorldSide, "5"), (WorldHidden, "8"), (WorldState, "3"),
-            (WorldCategories, "7"), (WorldTrain, "5"), (WorldHeldout, "3"),
-            (WorldHorizon, "5"), (WorldRollout, "2"), (WorldEpochs, "2"),
-            (WorldLr, "0.006"), (WorldSeed, "149"), (WorldKl, "0.2"),
-            (WorldAuxiliary, "0.5"), (WorldClip, "3")] {
+        for (field, value) in [
+            (WorldSide, "5"),
+            (WorldHidden, "8"),
+            (WorldState, "3"),
+            (WorldCategories, "7"),
+            (WorldTrain, "5"),
+            (WorldHeldout, "3"),
+            (WorldHorizon, "5"),
+            (WorldRollout, "2"),
+            (WorldEpochs, "2"),
+            (WorldLr, "0.006"),
+            (WorldSeed, "149"),
+            (WorldKl, "0.2"),
+            (WorldAuxiliary, "0.5"),
+            (WorldClip, "3"),
+        ] {
             setup.values[field as usize] = value.into();
         }
         let changed = setup.validate().unwrap();
         let parsed = crate::cli::world_model::parse(&changed.args[1..]).unwrap();
         let expected = crate::world_model::WorldModelConfig {
-            side: 5, hidden: 8, state: 3, categories: 7, train_episodes: 5,
-            heldout_episodes: 3, horizon: 5, rollout_horizon: 2, epochs: 2,
-            learning_rate: 0.006, seed: 149, kl_weight: 0.2, auxiliary_weight: 0.5,
+            side: 5,
+            hidden: 8,
+            state: 3,
+            categories: 7,
+            train_episodes: 5,
+            heldout_episodes: 3,
+            horizon: 5,
+            rollout_horizon: 2,
+            epochs: 2,
+            learning_rate: 0.006,
+            seed: 149,
+            kl_weight: 0.2,
+            auxiliary_weight: 0.5,
             gradient_clip: 3.0,
         };
         assert_eq!(format!("{parsed:?}"), format!("{expected:?}"));
@@ -1450,11 +1545,22 @@ mod tests {
         setup.values[Dataset as usize] = "missing.txt".into();
         setup.values[Latent as usize] = "bad".into();
         assert!(setup.validate().is_ok());
-        for (field, bad) in [(WorldSide, "2"), (WorldHidden, "49"), (WorldState, "0"),
-            (WorldCategories, "33"), (WorldTrain, "129"), (WorldHeldout, "0"),
-            (WorldHorizon, "25"), (WorldRollout, "13"), (WorldEpochs, "0"),
-            (WorldLr, "NaN"), (WorldSeed, "-1"), (WorldKl, "0"),
-            (WorldAuxiliary, "-1"), (WorldClip, "inf")] {
+        for (field, bad) in [
+            (WorldSide, "2"),
+            (WorldHidden, "49"),
+            (WorldState, "0"),
+            (WorldCategories, "33"),
+            (WorldTrain, "129"),
+            (WorldHeldout, "0"),
+            (WorldHorizon, "25"),
+            (WorldRollout, "13"),
+            (WorldEpochs, "0"),
+            (WorldLr, "NaN"),
+            (WorldSeed, "-1"),
+            (WorldKl, "0"),
+            (WorldAuxiliary, "-1"),
+            (WorldClip, "inf"),
+        ] {
             let old = std::mem::replace(&mut setup.values[field as usize], bad.into());
             assert!(setup.validate().is_err(), "{}", LABELS[field as usize]);
             setup.values[field as usize] = old;
@@ -1464,7 +1570,10 @@ mod tests {
         fs::create_dir_all(&output).unwrap();
         fs::write(output.join("train.log"), "keep").unwrap();
         assert!(setup.validate().is_err());
-        assert_eq!(fs::read_to_string(output.join("train.log")).unwrap(), "keep");
+        assert_eq!(
+            fs::read_to_string(output.join("train.log")).unwrap(),
+            "keep"
+        );
     }
 
     #[test]
@@ -1480,7 +1589,9 @@ mod tests {
                 terminal.draw(|f| setup.draw(f, f.area())).unwrap();
                 let rendered = text(&terminal);
                 assert!(!rendered.contains("Grow memory") && !rendered.contains("Dream every"));
-                if page == 3 { assert!(rendered.contains("START WORLD MODEL")); }
+                if page == 3 {
+                    assert!(rendered.contains("START WORLD MODEL"));
+                }
             }
         }
         setup.page = 3;
@@ -1511,8 +1622,14 @@ mod tests {
         assert_eq!(setup.value(Chunk), "8");
         let args = setup.validate().unwrap().args;
         assert_eq!(args[0], "train-transformer");
-        assert!(args.windows(2).any(|w| w == ["--resume", resume.to_str().unwrap()]));
-        assert!(args.windows(2).any(|w| w[0] == "--out" && w[1].ends_with("model.trfm")));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--resume", resume.to_str().unwrap()])
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--out" && w[1].ends_with("model.trfm"))
+        );
         for flag in ["--latent", "--state", "--depth", "--loops", "--backend"] {
             assert!(!args.iter().any(|s| s == flag));
         }
@@ -1532,7 +1649,10 @@ mod tests {
             assert!(!args.iter().any(|arg| arg == "--batch-size"));
         }
         setup.values[Batch as usize] = "2".into();
-        let error = setup.validate().err().expect("unsupported batch must fail preflight");
+        let error = setup
+            .validate()
+            .err()
+            .expect("unsupported batch must fail preflight");
         assert!(error.contains("Transformer resume"));
         assert!(error.contains("batch"));
         assert!(error.contains("blank or 1"));
@@ -1553,12 +1673,21 @@ mod tests {
         assert_eq!(Path::new(&spec.args[index + 1]), output.join("model.pssa"));
         assert_eq!(setup.args(), original, "the base wizard is not mutated");
         assert!(spec.launch(true).is_err());
-        assert!(!output.exists(), "busy launch does not create output or spawn");
+        assert!(
+            !output.exists(),
+            "busy launch does not create output or spawn"
+        );
         let spec = setup.sweep_spec("0.002", "64", "2", &output).unwrap();
         fs::create_dir_all(&output).unwrap();
         fs::write(output.join("train.log"), "keep this log").unwrap();
-        assert!(spec.launch(false).is_err(), "recheck reservations at launch time");
-        assert_eq!(fs::read_to_string(output.join("train.log")).unwrap(), "keep this log");
+        assert!(
+            spec.launch(false).is_err(),
+            "recheck reservations at launch time"
+        );
+        assert_eq!(
+            fs::read_to_string(output.join("train.log")).unwrap(),
+            "keep this log"
+        );
         setup.values[Resume as usize] = "checkpoint.pssa".into();
         assert!(setup.sweep_spec("0.002", "64", "2", &output).is_err());
     }
@@ -1576,10 +1705,21 @@ mod tests {
         assert!(!Path::new(setup.value(Output)).exists());
         assert!(setup.message.contains("NOT started"));
         assert!(setup.validate().is_ok());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "not checkpoint bytes; never load in timeline/setup");
-        let index = setup.args().iter().position(|arg| arg == "--resume").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "not checkpoint bytes; never load in timeline/setup"
+        );
+        let index = setup
+            .args()
+            .iter()
+            .position(|arg| arg == "--resume")
+            .unwrap();
         assert_eq!(setup.args()[index + 1], path.to_str().unwrap());
-        assert!(setup.prepare_resume(fixture.0.join("missing.pssa")).is_err());
+        assert!(
+            setup
+                .prepare_resume(fixture.0.join("missing.pssa"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1678,15 +1818,18 @@ mod tests {
                     .collect();
                 assert_eq!(positions.len(), usize::from(should_emit), "{mode} {flag}");
                 if let Some(&index) = positions.first() {
-                    assert_eq!(spec.args[index + 1], setup.value(match flag {
-                        "--dream-every" => DreamEvery,
-                        "--dream-replay" => DreamReplay,
-                        "--dream-mode" => DreamMode,
-                        "--dream-len" => DreamLen,
-                        "--dream-lr" => DreamLr,
-                        "--dream-steps" => DreamSteps,
-                        _ => unreachable!(),
-                    }));
+                    assert_eq!(
+                        spec.args[index + 1],
+                        setup.value(match flag {
+                            "--dream-every" => DreamEvery,
+                            "--dream-replay" => DreamReplay,
+                            "--dream-mode" => DreamMode,
+                            "--dream-len" => DreamLen,
+                            "--dream-lr" => DreamLr,
+                            "--dream-steps" => DreamSteps,
+                            _ => unreachable!(),
+                        })
+                    );
                 }
             }
             let parsed = crate::cli::parse_train_options_for_test(&spec.args[1..]).unwrap();
@@ -1737,7 +1880,10 @@ mod tests {
         ] {
             let mut setup = fixture.setup();
             setup.values[field as usize] = value.into();
-            assert!(setup.validate().is_err(), "wizard accepted {field:?}={value}");
+            assert!(
+                setup.validate().is_err(),
+                "wizard accepted {field:?}={value}"
+            );
             let args = setup.args();
             assert!(
                 crate::cli::parse_train_options_for_test(&args[1..]).is_err(),

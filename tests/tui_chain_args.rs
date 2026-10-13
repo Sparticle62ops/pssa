@@ -23,20 +23,36 @@ fn tui_rejects_repeated_options_and_mixed_chain_aliases() {
         vec!["--compare", "first.log", "--compare", "second.log"],
     ] {
         let args: Vec<String> = args.into_iter().map(String::from).collect();
-        assert!(tui::run(&args).is_err(), "accepted duplicate TUI args: {args:?}");
+        assert!(
+            tui::run(&args).is_err(),
+            "accepted duplicate TUI args: {args:?}"
+        );
     }
 }
 
 #[cfg(unix)]
 #[test]
 fn comparison_fifo_is_rejected_without_opening_or_hanging() {
-    use std::{process::{Command, Stdio}, time::{Duration, Instant}};
+    use std::{
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
     let fifo = std::env::temp_dir().join(format!("pssa-comparison-fifo-{}", std::process::id()));
-    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
     let mut child = Command::new(env!("CARGO_BIN_EXE_pssa"))
-        .args(["tui", "--compare"]).arg(&fifo)
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().unwrap();
+        .args(["tui", "--compare"])
+        .arg(&fifo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
     while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));

@@ -407,7 +407,7 @@ fn replay_memory_forward(m: &mut pssa::pssa::PSSALayerV2, l: usize) -> Memory {
         "memory_forward",
         &s.forward_args(m.cfg.tau_mem),
         (l + 1, 1), // Packed retrieval spreads serial token walks across blocks.
-        1, // The extra block checks the first out-of-range row.
+        1,          // The extra block checks the first out-of-range row.
     );
     s.qp = machine.get("qp");
     s.norms = machine.get("norms");

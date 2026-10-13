@@ -109,8 +109,7 @@ fn staged_and_packed_scans_reuse_storage_on_all_threads() {
         for (index, len) in [257, 256, 64].into_iter().enumerate() {
             eprintln!(
                 "round={round} len={len} alloc={} realloc={}",
-                step_counts[round][index].0,
-                step_counts[round][index].1
+                step_counts[round][index].0, step_counts[round][index].1
             );
         }
     }

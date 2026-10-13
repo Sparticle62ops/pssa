@@ -473,7 +473,10 @@ pub(crate) fn stage_input_norm_block(m: &mut PSSAContinuousBlockV2, seq_len: usi
 /// plus the softplus activation on the raw delta.
 #[inline]
 pub fn stage_projections(m: &mut PSSALayerV2, seq_len: usize) {
-    assert!(!m.local_mixing_enabled(), "local mixing requires the full CPU forward entry point");
+    assert!(
+        !m.local_mixing_enabled(),
+        "local mixing requires the full CPU forward entry point"
+    );
     let _trace =
         crate::training_diagnostics::StageTrace::new(&m.device, "forward.projections", seq_len);
     let gpu = gpu_ctx(m);

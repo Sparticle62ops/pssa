@@ -913,9 +913,14 @@ fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
     .into_iter()
     .map(matrix_bytes)
     .sum();
-    let params = params + local_conv_kernel.as_ref().map_or(0, matrix_bytes)
-        + ssm_skip.as_ref().map_or(0, |p| [&p.data, &p.grad, &p.m, &p.v]
-            .into_iter().map(vector_bytes).sum::<usize>());
+    let params = params
+        + local_conv_kernel.as_ref().map_or(0, matrix_bytes)
+        + ssm_skip.as_ref().map_or(0, |p| {
+            [&p.data, &p.grad, &p.m, &p.v]
+                .into_iter()
+                .map(vector_bytes)
+                .sum::<usize>()
+        });
     let norms: usize = [norm_gamma, norm_beta]
         .into_iter()
         .map(|p| {
@@ -993,8 +998,16 @@ fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
     .map(vector_bytes)
     .sum::<usize>()
         + vector_bytes(bwd_g_query_pnc)
-        + [local_conv_history, local_conv_loop_history, grad_ssm_input,
-            grad_x_norm_tokens, inf_ssm_input].into_iter().map(vector_bytes).sum::<usize>();
+        + [
+            local_conv_history,
+            local_conv_loop_history,
+            grad_ssm_input,
+            grad_x_norm_tokens,
+            inf_ssm_input,
+        ]
+        .into_iter()
+        .map(vector_bytes)
+        .sum::<usize>();
     // `top_k` is a private runtime selector, not checkpoint state or an
     // allocated numeric buffer. It is intentionally omitted from every
     // checkpoint; runtime-only reset behavior is covered below.

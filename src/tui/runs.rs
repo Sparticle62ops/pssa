@@ -492,7 +492,9 @@ impl Runs {
         let mut detail = vec![
             Line::styled(self.description.as_str(), accent()),
             Line::from(self.note.as_str()),
-            Line::from("Saved perplexity is historical sidecar data; checkpoint identity is unverified and the score may be stale."),
+            Line::from(
+                "Saved perplexity is historical sidecar data; checkpoint identity is unverified and the score may be stale.",
+            ),
             Line::from("↑/↓ select • r refresh • Enter monitor • c chat • s score • Esc cancel"),
             Line::from(
                 "Perplexity comes from saved held-out .score.json, never inferred from weights.",

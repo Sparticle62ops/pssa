@@ -2120,7 +2120,10 @@ impl CLIHandler {
                 "score-transformer",
                 "score the baseline on held-out text (JSON)",
             ),
-            ("eval-card", "frozen PSSA CPU card for paired evaluation (JSON)"),
+            (
+                "eval-card",
+                "frozen PSSA CPU card for paired evaluation (JSON)",
+            ),
             ("chat", "interactive prompt loop against a checkpoint"),
             ("status", "checkpoints and corpora in this directory"),
             ("download", "pull a Hugging Face dataset to a local file"),
@@ -2523,9 +2526,13 @@ impl CLIHandler {
                 );
             }
             "eval-card" => {
-                println!("Usage: {bin} eval-card CORPUS --model PATH --skip-tokens N --max-tokens N [--loops N]");
+                println!(
+                    "Usage: {bin} eval-card CORPUS --model PATH --skip-tokens N --max-tokens N [--loops N]"
+                );
                 println!("Frozen CPU scoring; prints one JSON card, never writes checkpoints.");
-                println!("For paired training/seeds/bootstrap intervals use scripts/paired_eval.py.");
+                println!(
+                    "For paired training/seeds/bootstrap intervals use scripts/paired_eval.py."
+                );
                 println!("This minimal port scores PSSA only. See docs/PAIRED-EVAL.md.");
             }
             "chat" | "repl" => {
