@@ -1093,6 +1093,10 @@ impl DatasetManager {
             .or_else(|| {
                 std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".cache/pssa/huggingface"))
             })
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(|p| PathBuf::from(p).join(".cache/pssa/huggingface"))
+            })
             .unwrap_or_else(|| std::env::temp_dir().join("pssa/huggingface"));
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         // Invalidate older caches that split one source row across several lines.

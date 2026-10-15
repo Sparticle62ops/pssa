@@ -55,9 +55,17 @@ impl Token {
         Ok(Self(value.into()))
     }
 }
-fn token_path() -> Result<PathBuf, String> {
+fn home_dir() -> Option<PathBuf> {
+    // Windows rarely sets HOME; USERPROFILE is its equivalent.
     std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".cache/huggingface/token"))
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+}
+
+fn token_path() -> Result<PathBuf, String> {
+    home_dir()
+        .map(|home| home.join(".cache/huggingface/token"))
         .ok_or_else(|| "HOME is not set; cannot locate the HF token file".into())
 }
 fn resolve(env: Option<String>, path: &Path) -> Result<Option<Token>, String> {
@@ -79,8 +87,7 @@ fn existing() -> Result<Option<Token>, String> {
     let use_saved = USE_SAVED.load(Ordering::Relaxed);
     if SIGNED_OUT.load(Ordering::Relaxed)
         || (!use_saved
-            && crate::env_var_os(CHILD_SIGNED_OUT, "OXIDE_HF_SIGNED_OUT")
-                .is_some_and(|v| v == "1"))
+            && crate::env_var_os(CHILD_SIGNED_OUT, "OXIDE_HF_SIGNED_OUT").is_some_and(|v| v == "1"))
     {
         return Ok(None);
     }
@@ -183,6 +190,11 @@ fn request(endpoint: &str, token: Option<&Token>) -> Result<serde_json::Value, S
     }
     let response = req.call().map_err(|e| match e {
         ureq::Error::Status(status, _) => http_error(status),
+        // Transport failures carry no response body. Surface the reason only
+        // for unauthenticated requests; authenticated ones stay opaque.
+        ureq::Error::Transport(t) if token.is_none() => {
+            format!("Hugging Face request failed: {t}; check network/TLS and retry")
+        }
         _ => "Hugging Face request failed; check network/TLS and retry".into(),
     })?;
     if response.status() != 200 {

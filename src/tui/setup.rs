@@ -851,11 +851,35 @@ impl Setup {
     fn command(&self) -> String {
         let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pssa"));
         let output = safe_path(self.value(Output));
+        let exe = quote(&executable.to_string_lossy());
+        let args = self
+            .args()
+            .iter()
+            .map(|v| quote(v))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let log = quote(&Path::new(&output).join("train.log").to_string_lossy());
+        if cfg!(windows) {
+            // cmd.exe: parentheses close an `if` body, so the `&&` chain keeps
+            // running when only the first condition is false. `< NUL` replaces
+            // `< /dev/null`; cmd has no noclobber equivalent, so the guard is
+            // the `if not exist` check on the checkpoint.
+            if self.is_world_model() {
+                return format!(
+                    "if not exist {} (mkdir {}) && ({} {} > {} 2>&1 < NUL)",
+                    quote(&output), quote(&output), exe, args, log
+                );
+            }
+            let checkpoint = Path::new(&output).join(self.checkpoint_name());
+            let checkpoint = quote(&checkpoint.to_string_lossy());
+            return format!(
+                "if not exist {} (mkdir {}) && (if not exist {} ({} {} > {} 2>&1 < NUL))",
+                quote(&output), quote(&output), checkpoint, exe, args, log
+            );
+        }
         if self.is_world_model() {
             return format!("mkdir -p -- {} && (set -C; {} {} > {} 2>&1 < /dev/null)",
-                quote(&output), quote(&executable.to_string_lossy()),
-                self.args().iter().map(|v| quote(v)).collect::<Vec<_>>().join(" "),
-                quote(&Path::new(&output).join("train.log").to_string_lossy()));
+                quote(&output), exe, args, log);
         }
         let checkpoint = Path::new(&output).join(self.checkpoint_name());
         format!(
@@ -863,13 +887,9 @@ impl Setup {
             quote(&output),
             quote(&checkpoint.to_string_lossy()),
             quote(&checkpoint.to_string_lossy()),
-            quote(&executable.to_string_lossy()),
-            self.args()
-                .iter()
-                .map(|v| quote(v))
-                .collect::<Vec<_>>()
-                .join(" "),
-            quote(&Path::new(&output).join("train.log").to_string_lossy())
+            exe,
+            args,
+            log
         )
     }
 
@@ -1111,6 +1131,10 @@ fn quote(value: &str) -> String {
             .all(|c| c.is_ascii_alphanumeric() || b"_+-./:=@".contains(&c))
     {
         value.into()
+    } else if cfg!(windows) {
+        // cmd.exe takes double quotes. Doubling embedded quotes matches
+        // PowerShell too; embedded quotes in paths are pathological either way.
+        format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
@@ -1864,8 +1888,13 @@ mod tests {
             assert_eq!(spec.args[index + 1], value);
         }
         assert_eq!(spec.args.last().unwrap(), "--no-tui");
-        assert!(setup.command().contains("'large config'"));
-        assert!(setup.command().contains("'\"'\"'"));
+        #[cfg(not(windows))]
+        {
+            assert!(setup.command().contains("'large config'"));
+            assert!(setup.command().contains("'\"'\"'"));
+        }
+        #[cfg(windows)]
+        assert!(setup.command().contains("\"large config\""));
         setup.values[Dataset as usize] = "invalid".into();
         assert!(setup.validate().is_err());
         setup.values[Dataset as usize] = "owner/corpus".into();
@@ -1957,13 +1986,19 @@ mod tests {
                 }
                 if width >= 80 && height >= 24 {
                     assert!(text(&terminal).contains("equivalent CLI"));
+                    #[cfg(not(windows))]
                     assert!(text(&terminal).contains("mkdir -p"));
+                    #[cfg(windows)]
+                    assert!(text(&terminal).contains("if not exist"));
                 }
             }
             if width >= 80 && height >= 24 {
                 setup.command_scroll = u16::MAX;
                 terminal.draw(|f| setup.draw(f, f.area())).unwrap();
+                #[cfg(not(windows))]
                 assert!(text(&terminal).contains("/dev/null"));
+                #[cfg(windows)]
+                assert!(text(&terminal).contains("NUL"));
                 assert!(setup.command_scroll < u16::MAX);
             }
             if width >= 60 && height >= 20 {
@@ -1991,10 +2026,16 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|f| setup.draw(f, f.area())).unwrap();
             assert!(text(&terminal).contains("equivalent CLI"));
+            #[cfg(not(windows))]
             assert!(text(&terminal).contains("mkdir -p"));
+            #[cfg(windows)]
+            assert!(text(&terminal).contains("if not exist"));
             setup.command_scroll = u16::MAX;
             terminal.draw(|f| setup.draw(f, f.area())).unwrap();
+            #[cfg(not(windows))]
             assert!(text(&terminal).contains("/dev/null"));
+            #[cfg(windows)]
+            assert!(text(&terminal).contains("NUL"));
             assert!(
                 !press(&mut setup, KeyCode::Enter),
                 "preview cannot launch a run"
