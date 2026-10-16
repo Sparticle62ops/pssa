@@ -21,6 +21,7 @@ pub mod loss_csv;
 pub mod loss_guard;
 pub mod memory;
 pub mod pssa;
+pub mod qwen3;
 pub mod scan_executor;
 pub mod sequence_batch;
 mod token_cache;

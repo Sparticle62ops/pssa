@@ -135,13 +135,14 @@ impl ResourceLimits {
             .arg(format!("--as={bytes}:{bytes}"))
             .arg("--")
             .arg(executable);
-        // The validated parser accepts flag/value pairs, with --no-tui as the
-        // only boolean. Walk pairs so a value equal to a flag is never stripped.
+        // The validated parser accepts flag/value pairs, with these three
+        // switches as the only booleans. Walk pairs so a value equal to a flag
+        // is never stripped.
         let mut i = 1;
         while i < args.len() {
             if args[i] == "--ram-mib" {
                 i += 2;
-            } else if args[i].starts_with('-') && args[i] != "--no-tui" {
+            } else if args[i].starts_with('-') && !is_boolean_option(&args[i]) {
                 command.arg(&args[i]);
                 if let Some(value) = args.get(i + 1) {
                     command.arg(value);
@@ -154,6 +155,10 @@ impl ResourceLimits {
         }
         Ok(command)
     }
+}
+
+fn is_boolean_option(arg: &str) -> bool {
+    matches!(arg, "--no-tui" | "--feed-telemetry" | "--no-feed-telemetry")
 }
 
 #[cfg(test)]
@@ -203,6 +208,46 @@ mod tests {
             args,
             ["--threads", "2", "--batch-size", "3", "--max-tokens", "77"]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ram_wrapper_removes_budget_after_every_boolean_switch() {
+        let limits = ResourceLimits {
+            ram_mib: Some(512),
+            ..Default::default()
+        };
+        for flag in ["--no-tui", "--feed-telemetry", "--no-feed-telemetry"] {
+            for budget_first in [false, true] {
+                let mut args = vec!["pssa", "train", "source with spaces"];
+                if budget_first {
+                    args.extend(["--ram-mib", "512", flag]);
+                } else {
+                    args.extend([flag, "--ram-mib", "512"]);
+                }
+                // A flag-looking value belongs to its option, not the wrapper.
+                args.extend(["--out", "--ram-mib"]);
+                let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+                let command = limits
+                    .budget_command(std::path::Path::new("/a path/pssa"), &args)
+                    .unwrap();
+                let actual = command.get_args().collect::<Vec<_>>();
+                assert_eq!(
+                    actual,
+                    [
+                        "--as=536870912:536870912",
+                        "--",
+                        "/a path/pssa",
+                        "train",
+                        "source with spaces",
+                        flag,
+                        "--out",
+                        "--ram-mib",
+                    ],
+                    "{flag}, budget_first={budget_first}"
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -285,6 +285,19 @@ fn ensure_backed_by_file(
 /// optional tokenizer strings. Returns an error on overflow or above the cap.
 /// Keep the named fields in sync with the constructor and the actual-storage test.
 pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
+    let bytes = allocation_bytes_uncapped(c)?;
+    if bytes > MAX_LOAD_ALLOCATION_BYTES {
+        return Err(invalid(format!(
+            "declared model needs {bytes} bytes, over {MAX_LOAD_ALLOCATION_BYTES} byte cap"
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Exact numeric vector storage allocated by `PSSALayerV2::new`, without the
+/// load-time cap. Conversion preflight uses this to report the real target
+/// size before the normal one-GiB construction guard rejects it.
+pub fn allocation_bytes_uncapped(c: &PSSAConfigV2) -> Result<usize> {
     validate_depth(c.depth)?;
     let (v, m, s, k, cap, l) = (
         c.d_vocab,
@@ -466,11 +479,6 @@ pub fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
         )?,
         "allocation",
     )?;
-    if bytes > MAX_LOAD_ALLOCATION_BYTES {
-        return Err(invalid(format!(
-            "declared model needs {bytes} bytes, over {MAX_LOAD_ALLOCATION_BYTES} byte cap"
-        )));
-    }
     Ok(bytes)
 }
 
