@@ -1320,7 +1320,9 @@ pub fn emit_pssa_checkpoint(
     layer.unembed_w = layer.embed_w.clone();
 
     let out_path = out_path.as_ref();
-    crate::checkpoint::save_model_v6(&layer, out_path)
+    // V6/V7 cannot serialize stacked (depth > 1) models; save_model picks
+    // V7 for depth one and V8 for stacks automatically.
+    crate::checkpoint::save_model(&layer, out_path)
         .map_err(|error| format!("checkpoint save failed: {error}"))?;
     let checkpoint_bytes = std::fs::metadata(out_path)
         .map_err(|error| format!("checkpoint metadata read failed: {error}"))?
