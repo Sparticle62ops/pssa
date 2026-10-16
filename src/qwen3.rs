@@ -10,7 +10,7 @@
 
 use crate::checkpoint::allocation_bytes_uncapped;
 use crate::linalg::SimpleRng;
-use crate::pssa::PSSAConfigV2;
+use crate::pssa::{PSSAConfigV2, PSSALayerV2};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
@@ -1233,6 +1233,104 @@ fn softmax_in_place(values: &mut [f32]) {
 #[inline]
 fn silu(value: f32) -> f32 {
     value / (1.0 + (-value).exp())
+}
+
+/// Summary of a completed Qwen3-to-PSSA emission, for logs and task notes.
+#[derive(Clone, Debug)]
+pub struct Qwen3EmissionReport {
+    pub target: Qwen3PssaTarget,
+    pub estimate: Qwen3ResourceEstimate,
+    pub checkpoint_path: std::path::PathBuf,
+    pub checkpoint_bytes: u64,
+}
+
+/// Emit a PSSA v6 checkpoint laid out for the requested target.
+///
+/// PSSA's scan, memory-bank, and adapter weights have no direct Qwen3
+/// counterpart, so they keep their seeded initialization. What transfers is
+/// the token table: every Qwen3 embedding row is pushed through a fixed
+/// seeded projection into the target latent width and rescaled to unit RMS,
+/// and the PSSA unembedding starts from the same projected table, so the
+/// tied input/output relationship survives the width change.
+pub fn emit_pssa_checkpoint(
+    model: &Qwen3Model,
+    target: &Qwen3PssaTarget,
+    out_path: impl AsRef<Path>,
+    seed: u64,
+) -> Result<Qwen3EmissionReport, String> {
+    target.validate()?;
+    if model.config.vocab_size != target.vocab_size {
+        return Err(format!(
+            "target vocab {} does not match the source checkpoint's {}",
+            target.vocab_size, model.config.vocab_size
+        ));
+    }
+    let estimate = Qwen3ResourceEstimate::for_config_with_target(&model.config, target)?;
+    let mut layer = PSSALayerV2::new(target.pssa_config(), seed);
+
+    let hidden = model.config.hidden_size;
+    let vocab = target.vocab_size;
+    let latent = target.latent_dim;
+    // Fixed seeded projection, row-major [latent][hidden], so each dot
+    // product below reads one contiguous source slice per output slot.
+    let mut projection_rng = SimpleRng::new(seed ^ 0x5a17_c0de_1234_5678);
+    let mut projection = vec![0.0f32; latent * hidden];
+    for value in projection.iter_mut() {
+        *value = projection_rng.gen_range_f32(-1.0, 1.0);
+    }
+    let projection_scale = 1.0 / (hidden as f32).sqrt();
+    for value in projection.iter_mut() {
+        *value *= projection_scale;
+    }
+
+    let mut projected = vec![0.0f32; vocab * latent];
+    for token in 0..vocab {
+        let source_row = &model.token_embedding.data[token * hidden..(token + 1) * hidden];
+        let out_row = &mut projected[token * latent..(token + 1) * latent];
+        for (j, slot) in out_row.iter_mut().enumerate() {
+            let proj_row = &projection[j * hidden..(j + 1) * hidden];
+            let mut acc = 0.0f32;
+            for (source, weight) in source_row.iter().zip(proj_row.iter()) {
+                acc += source * weight;
+            }
+            *slot = acc;
+        }
+        let mut sum_squares = 0.0f32;
+        for value in out_row.iter() {
+            sum_squares += value * value;
+        }
+        let rms = (sum_squares / latent as f32).sqrt();
+        if rms > 0.0 {
+            for value in out_row.iter_mut() {
+                *value /= rms;
+            }
+        }
+    }
+
+    layer.embed_w.data.copy_from_slice(&projected);
+    for buffer in [
+        &mut layer.embed_w.grad,
+        &mut layer.embed_w.m,
+        &mut layer.embed_w.v,
+    ] {
+        buffer.iter_mut().for_each(|value| *value = 0.0);
+    }
+    // Qwen3 ties its input and output embeddings; mirror that in the
+    // projected latent space so converted logits keep the same geometry.
+    layer.unembed_w = layer.embed_w.clone();
+
+    let out_path = out_path.as_ref();
+    crate::checkpoint::save_model_v6(&layer, out_path)
+        .map_err(|error| format!("checkpoint save failed: {error}"))?;
+    let checkpoint_bytes = std::fs::metadata(out_path)
+        .map_err(|error| format!("checkpoint metadata read failed: {error}"))?
+        .len();
+    Ok(Qwen3EmissionReport {
+        target: target.clone(),
+        estimate,
+        checkpoint_path: out_path.to_path_buf(),
+        checkpoint_bytes,
+    })
 }
 
 #[cfg(test)]

@@ -114,3 +114,56 @@ fn tiny_qwen_path_exercises_gqa_and_nonmatching_query_width() {
     assert!(logits.iter().all(|value| value.is_finite()));
     assert_eq!(model.generate_greedy(&[1], 3).unwrap().len(), 4);
 }
+
+#[test]
+fn emit_round_trips_projected_tied_embeddings() {
+    let tiny = Qwen3Config {
+        model_type: "qwen3".into(),
+        vocab_size: 17,
+        hidden_size: 6,
+        intermediate_size: 12,
+        num_hidden_layers: 1,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        head_dim: 4,
+        max_position_embeddings: 32,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1_000_000.0,
+        hidden_act: "silu".into(),
+        tie_word_embeddings: true,
+        use_qk_norm: true,
+    };
+    let model = Qwen3Model::random(tiny.clone(), 11).unwrap();
+    let mut target = Qwen3PssaTarget::compact_for(&tiny);
+    target.latent_dim = 4;
+    target.depth = 1;
+    target.chunk_len = 8;
+    target.memory_capacity = 8;
+
+    let dir = std::env::temp_dir().join(format!("qwen3_emit_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("emit_v6.bin");
+    let report = pssa::qwen3::emit_pssa_checkpoint(&model, &target, &out, 7).unwrap();
+    assert_eq!(report.target.latent_dim, 4);
+    assert!(out.metadata().unwrap().len() > 0);
+
+    let loaded = pssa::checkpoint::load_model_v6(&out).unwrap();
+    assert_eq!(loaded.cfg.d_latent, 4);
+    assert_eq!(loaded.embed_w.rows, 17);
+    assert_eq!(loaded.embed_w.cols, 4);
+    assert_eq!(loaded.embed_w.data, loaded.unembed_w.data);
+    for token in 0..17 {
+        let row = &loaded.embed_w.data[token * 4..(token + 1) * 4];
+        let rms = row.iter().map(|v| v * v).sum::<f32>() / 4.0;
+        assert!((rms.sqrt() - 1.0).abs() < 1e-4, "row {token} rms {rms}");
+    }
+
+    // Same seed reproduces the same checkpoint bytes.
+    let again = dir.join("emit_v6_again.bin");
+    pssa::qwen3::emit_pssa_checkpoint(&model, &target, &again, 7).unwrap();
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        std::fs::read(&again).unwrap()
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
