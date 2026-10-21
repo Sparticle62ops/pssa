@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/img/pssa-logo.png" alt="PSSA logo" width="220">
+</p>
+
 # PSSA: a plastic state-space architecture
 
 [![Discord](https://img.shields.io/badge/discord-join%20PSlabs-5865F2?logo=discord&logoColor=white)](https://discord.gg/9sqfKeqWYF)
