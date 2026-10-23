@@ -530,20 +530,9 @@ allocations measured in days instead of hours. Anything meaningfully above the
 entry-level card this ran on changes what can be asked.
 
 If you have compute to grant, or you work somewhere that does, that is the
-single highest-leverage thing anyone can offer this project.
-
-### Call for compute
-
-The next milestone is scaling the architecture from the matched runs above to a
-105M-parameter model, trained from scratch on a WikiText-103-class corpus. The
-bottleneck is not code or time; it is GPU access. Everything so far ran on an
-entry-level GPU, in 200,000-token links, because a session gets cut after a few
-hours. A card with real VRAM and allocations measured in days finishes the 105M
-run and its same-scale transformer comparison.
-
-If you can grant GPU compute, credits, cluster time, or hardware, get in touch
-at Sparticle62@proton.me. The project is open source: any result your hardware
-makes possible is published in full, and your support is named in it.
+single highest-leverage thing anyone can offer this project. The immediate
+milestone is a 105M-parameter run trained from scratch, with a same-scale
+transformer baseline, so the comparison above finally gets asked at scale.
 
 ### Sponsorship
 
