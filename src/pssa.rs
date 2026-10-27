@@ -373,6 +373,13 @@ pub struct ChunkActivationTape {
     pub z_final: Vec<f32>,
     pub logits: Vec<f32>,
     pub probs: Vec<f32>,
+    /// Distillation: teacher probabilities at the distill temperature, laid
+    /// out like probs ([token][vocab]). Empty while distillation is off.
+    pub teacher_probs: Vec<f32>,
+    /// Distill temperature; 0.0 means plain cross-entropy.
+    pub distill_temp: f32,
+    /// Weight on the hard-token CE term while distilling (0.0..=1.0).
+    pub distill_ce_mix: f32,
     pub losses: Vec<f32>,
 }
 
@@ -450,6 +457,9 @@ impl ChunkActivationTape {
             z_final: vec![0.0; loop_l * d_latent],
             logits: vec![0.0; max_l * d_vocab],
             probs: vec![0.0; max_l * d_vocab],
+            teacher_probs: Vec::new(),
+            distill_temp: 0.0,
+            distill_ce_mix: 1.0,
             losses: vec![0.0; max_l],
         }
     }
@@ -2512,6 +2522,27 @@ impl PSSALayerV2 {
             seq_len,
             &mut self.residual_input_adjoints[..n],
         );
+    }
+
+    /// Load distillation targets for this chunk: teacher probabilities at
+    /// `temp` ([token][vocab], like probs), the temperature, and the CE mix
+    /// weight. Call before forward_train_chunk when distilling.
+    pub fn set_distill_targets(
+        &mut self,
+        teacher_probs: &[f32],
+        temp: f32,
+        ce_mix: f32,
+        seq_len: usize,
+    ) {
+        assert!(
+            teacher_probs.len() == seq_len * self.cfg.d_vocab,
+            "teacher probability count must match seq_len * d_vocab"
+        );
+        assert!(temp > 0.0, "distill temperature must be positive");
+        self.block.tape.teacher_probs.clear();
+        self.block.tape.teacher_probs.extend_from_slice(teacher_probs);
+        self.block.tape.distill_temp = temp;
+        self.block.tape.distill_ce_mix = ce_mix.clamp(0.0, 1.0);
     }
 
     pub fn forward_train_chunk(&mut self, token_ids: &[usize], target_ids: &[usize]) -> f32 {

@@ -1065,6 +1065,107 @@ pub fn stage_mlp(m: &mut PSSALayerV2, seq_len: usize) {
     }
 }
 
+/// Temperature softmax terms for one token position: (max, inv_sum, has).
+/// (0.0, 0.0, false) when distillation is off, so plain CE is untouched.
+#[inline]
+fn distill_terms(logits: &[f32], off: usize, v: usize, temp: f32) -> (f32, f32, bool) {
+    if temp <= 0.0 {
+        return (0.0, 0.0, false);
+    }
+    let mut max_s = f32::NEG_INFINITY;
+    for i in 0..v {
+        let s = logits[off + i] / temp;
+        if s > max_s {
+            max_s = s;
+        }
+    }
+    let mut sum_s = 0.0f32;
+    for i in 0..v {
+        sum_s += (logits[off + i] / temp - max_s).exp();
+    }
+    (max_s, 1.0 / sum_s.max(1e-8), true)
+}
+
+/// dLoss/dlogit coefficient for one vocab slot under CE + temperature KL.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn distill_grad_at(
+    logits: &[f32],
+    probs: &[f32],
+    teacher_probs: &[f32],
+    off: usize,
+    v: usize,
+    i: usize,
+    target: usize,
+    temp: f32,
+    ce_mix: f32,
+    max_s: f32,
+    inv_sum_s: f32,
+    has_distill: bool,
+) -> f32 {
+    let indicator = if i == target { 1.0 } else { 0.0 };
+    let mut g = ce_mix * (probs[off + i] - indicator);
+    if has_distill && !teacher_probs.is_empty() {
+        let q_t = (logits[off + i] / temp - max_s).exp() * inv_sum_s;
+        g += (1.0 - ce_mix) * (q_t - teacher_probs[off + i]) / temp;
+    }
+    g
+}
+
+/// Fill one token row of dLoss/dlogit (scale applied by the caller).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn distill_logit_grad_row(
+    logits: &[f32],
+    probs: &[f32],
+    teacher_probs: &[f32],
+    off: usize,
+    v: usize,
+    target: usize,
+    temp: f32,
+    ce_mix: f32,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let (max_s, inv_sum_s, has) = distill_terms(logits, off, v, temp);
+    for i in 0..v {
+        out[i] = distill_grad_at(
+            logits, probs, teacher_probs, off, v, i, target, temp, ce_mix, max_s, inv_sum_s, has,
+        ) * scale;
+    }
+}
+
+/// Combined CE + temperature-KL loss for one token. `max_l` and `ln_sum` are
+/// the student T=1 softmax log-sum-exp pieces already computed by the caller.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn distill_token_loss(
+    logits: &[f32],
+    teacher_probs: &[f32],
+    off: usize,
+    v: usize,
+    target: usize,
+    max_l: f32,
+    ln_sum: f32,
+    temp: f32,
+    ce_mix: f32,
+) -> f32 {
+    let ce = (max_l - logits[off + target]) + ln_sum;
+    if temp <= 0.0 || teacher_probs.is_empty() {
+        return ce;
+    }
+    let (max_s, inv_sum_s, _) = distill_terms(logits, off, v, temp);
+    let lse = max_s + (1.0 / inv_sum_s).ln();
+    let mut kl = lse;
+    for i in 0..v {
+        let p = teacher_probs[off + i];
+        if p > 0.0 {
+            kl += p * (p.ln() - logits[off + i] / temp);
+        }
+    }
+    ce_mix * ce + (1.0 - ce_mix) * kl
+}
+
 /// Stage 7: unembed logits, stable softmax probabilities, and per-token
 /// cross-entropy losses for the whole chunk.
 #[inline]
@@ -1113,7 +1214,17 @@ pub fn stage_logits_loss(m: &mut PSSALayerV2, seq_len: usize) -> f32 {
             m.tape.probs[log_off + i] *= inv_sum;
         }
 
-        let nll_loss = (max_l - m.tape.logits[log_off + tgt_id]) + sum_exp.ln();
+        let nll_loss = distill_token_loss(
+            &m.tape.logits,
+            &m.tape.teacher_probs,
+            log_off,
+            d_v,
+            tgt_id,
+            max_l,
+            sum_exp.ln(),
+            m.tape.distill_temp,
+            m.tape.distill_ce_mix,
+        );
         m.tape.losses[t] = nll_loss;
         total_loss += nll_loss;
     }
@@ -1502,7 +1613,17 @@ fn stacked_logits_loss(
         for i in 0..v {
             block.tape.probs[off + i] *= inv;
         }
-        let loss = (max_l - block.tape.logits[off + target]) + sum.ln();
+        let loss = distill_token_loss(
+            &block.tape.logits,
+            &block.tape.teacher_probs,
+            off,
+            v,
+            target,
+            max_l,
+            sum.ln(),
+            block.tape.distill_temp,
+            block.tape.distill_ce_mix,
+        );
         block.tape.losses[t] = loss;
         total += loss;
     }
@@ -1651,11 +1772,18 @@ pub fn bwd_stage_logits_blocked(
     for t in 0..seq_len {
         let log_off = t * d_v;
         let tgt_id = m.tape.target_ids[t];
-        for i in 0..d_v {
-            let indicator = if i == tgt_id { 1.0 } else { 0.0 };
-            g_logit[log_off + i] =
-                (m.tape.probs[log_off + i] - indicator) * scale_loss * logit_scale;
-        }
+        distill_logit_grad_row(
+            &m.tape.logits,
+            &m.tape.probs,
+            &m.tape.teacher_probs,
+            log_off,
+            d_v,
+            tgt_id,
+            m.tape.distill_temp,
+            m.tape.distill_ce_mix,
+            scale_loss * logit_scale,
+            &mut g_logit[log_off..log_off + d_v],
+        );
     }
 
     if gpu.is_none() {
@@ -1717,9 +1845,23 @@ pub fn bwd_stage_logits_scalar(m: &mut PSSALayerV2, seq_len: usize, scale_loss: 
         for j in 0..d_m {
             m.bwd_g_zfinal[z_off + j] = 0.0;
         }
+        let (max_s, inv_sum_s, has_distill) = distill_terms(&m.tape.logits, log_off, d_v, m.tape.distill_temp);
         for i in 0..d_v {
-            let indicator = if i == tgt_id { 1.0 } else { 0.0 };
-            let g_logit = (m.tape.probs[log_off + i] - indicator) * scale_loss * logit_scale;
+            let g_coeff = distill_grad_at(
+                &m.tape.logits,
+                &m.tape.probs,
+                &m.tape.teacher_probs,
+                log_off,
+                d_v,
+                i,
+                tgt_id,
+                m.tape.distill_temp,
+                m.tape.distill_ce_mix,
+                max_s,
+                inv_sum_s,
+                has_distill,
+            );
+            let g_logit = g_coeff * scale_loss * logit_scale;
             let row_off = i * d_m;
             for j in 0..d_m {
                 m.bwd_g_zfinal[z_off + j] += g_logit * unembed_w.data[row_off + j];
@@ -3495,11 +3637,18 @@ pub(crate) fn stacked_backward_logits(
     for t in 0..seq_len {
         let log_off = t * v;
         let target = block.tape.target_ids[t];
-        for i in 0..v {
-            let indicator = if i == target { 1.0 } else { 0.0 };
-            block.bwd_g_logits[log_off + i] =
-                (block.tape.probs[log_off + i] - indicator) * scale_loss * logit_scale;
-        }
+        distill_logit_grad_row(
+            &block.tape.logits,
+            &block.tape.probs,
+            &block.tape.teacher_probs,
+            log_off,
+            v,
+            target,
+            block.tape.distill_temp,
+            block.tape.distill_ce_mix,
+            scale_loss * logit_scale,
+            &mut block.bwd_g_logits[log_off..log_off + v],
+        );
     }
     if let Some(gpu) = gpu {
         gemm_nn_dev_into(
