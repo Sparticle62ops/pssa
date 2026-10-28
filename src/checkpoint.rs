@@ -43,7 +43,7 @@ const HEADER_LEN: usize = 22;
 const MAX_TOKENIZER_JSON_BYTES: usize = 16 * 1024 * 1024;
 const HEADER_V5_LEN: usize = 38;
 /// Limits model data plus tape/scratch allocation, before constructing a model.
-pub const MAX_LOAD_ALLOCATION_BYTES: usize = 1024 * 1024 * 1024;
+pub const MAX_LOAD_ALLOCATION_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum CheckpointError {
