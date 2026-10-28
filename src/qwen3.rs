@@ -904,7 +904,15 @@ impl Qwen3Model {
         config: Qwen3Config,
     ) -> Result<Self, String> {
         config.validate()?;
-        let mut reader = SafeTensorReader::open(path)?;
+        let path = path.as_ref();
+        // A checkpoint directory resolves to its single-file weights, so both
+        // `--teacher <dir>` and a bare safetensors path load the same way.
+        let weights: std::path::PathBuf = if path.is_dir() {
+            path.join("model.safetensors")
+        } else {
+            path.to_path_buf()
+        };
+        let mut reader = SafeTensorReader::open(weights)?;
         let q_dim = config.query_dim();
         let kv_dim = config.key_value_dim();
         let token_embedding = read_weight_matrix(
