@@ -24,6 +24,7 @@ pub mod pssa;
 pub mod qwen3;
 pub mod scan_executor;
 pub mod sequence_batch;
+pub mod teacher_frames;
 mod token_cache;
 pub mod training;
 mod training_diagnostics;

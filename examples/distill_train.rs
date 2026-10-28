@@ -14,217 +14,12 @@
 //! student vocabulary (see gpu_batch::distill_* and tests/distill_kl.rs).
 
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
 
 use pssa::checkpoint::load_checkpoint;
 use pssa::gpu_batch::{backward_chunk_batched, forward_train_chunk_batched};
 use pssa::pssa::{GradientClipOutcome, PSSALayerV2};
 use pssa::qwen3::{Qwen3Config, Qwen3Model};
-
-const FRAME_MAGIC: u32 = 0x4B4C4431;
-
-fn read_u32le(r: &mut impl Read) -> std::io::Result<u32> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b)?;
-    Ok(u32::from_le_bytes(b))
-}
-
-fn read_u64le(r: &mut impl Read) -> std::io::Result<u64> {
-    let mut b = [0u8; 8];
-    r.read_exact(&mut b)?;
-    Ok(u64::from_le_bytes(b))
-}
-
-fn read_f32le(r: &mut impl Read, count: usize) -> std::io::Result<Vec<f32>> {
-    let mut raw = vec![0u8; count * 4];
-    r.read_exact(&mut raw)?;
-    Ok(raw
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
-}
-
-fn read_frame(r: &mut impl Read, expected_vocab: usize, max_chunk: usize) -> Option<(Vec<usize>, Vec<usize>, u64, Vec<f32>)> {
-    let magic = match read_u32le(r) {
-        Ok(m) => m,
-        Err(_) => return None,
-    };
-    if magic != FRAME_MAGIC {
-        eprintln!("distill_train: bad frame magic 0x{magic:08x}; stream is corrupt");
-        std::process::exit(2);
-    }
-    let n = read_u32le(r).ok()? as usize;
-    let vocab = read_u32le(r).ok()? as usize;
-    let chunk_index = read_u64le(r).ok()?;
-    if vocab != expected_vocab {
-        eprintln!(
-            "distill_train: frame vocab {vocab} != student vocab {expected_vocab}; teacher and student must share the tokenizer"
-        );
-        std::process::exit(2);
-    }
-    if n == 0 || n > max_chunk {
-        eprintln!("distill_train: frame token count {n} outside 1..={max_chunk}");
-        std::process::exit(2);
-    }
-    let mut raw_ids = vec![0u8; n * 4];
-    r.read_exact(&mut raw_ids).ok()?;
-    let tokens: Vec<usize> = raw_ids
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
-        .collect();
-    let mut raw_ids = vec![0u8; n * 4];
-    r.read_exact(&mut raw_ids).ok()?;
-    let targets: Vec<usize> = raw_ids
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
-        .collect();
-    let teacher = read_f32le(r, n * vocab).ok()?;
-    Some((tokens, targets, chunk_index, teacher))
-}
-
-/// Block-wise corpus reader: hands out large text blocks while keeping any
-/// trailing partial UTF-8 sequence for the next block, so multibyte
-/// characters never split at a block boundary.
-struct CorpusReader {
-    files: Vec<PathBuf>,
-    next_file: usize,
-    file: Option<BufReader<std::fs::File>>,
-    pending: Vec<u8>,
-}
-
-impl CorpusReader {
-    fn new(paths: &[String]) -> Self {
-        Self {
-            files: paths.iter().map(PathBuf::from).collect(),
-            next_file: 0,
-            file: None,
-            pending: Vec::new(),
-        }
-    }
-
-    fn next_block(&mut self) -> Option<String> {
-        loop {
-            if self.file.is_none() {
-                if self.next_file >= self.files.len() {
-                    return None;
-                }
-                let file = std::fs::File::open(&self.files[self.next_file]).ok()?;
-                self.file = Some(BufReader::with_capacity(1 << 20, file));
-                self.next_file += 1;
-                continue;
-            }
-            let mut buf = vec![0u8; 1 << 24];
-            let read = match self.file.as_mut().expect("checked above").read(&mut buf) {
-                Ok(0) => {
-                    self.file = None;
-                    continue;
-                }
-                Ok(read) => read,
-                Err(_) => {
-                    self.file = None;
-                    continue;
-                }
-            };
-            buf.truncate(read);
-            let mut bytes = std::mem::take(&mut self.pending);
-            bytes.extend_from_slice(&buf);
-            let valid = match std::str::from_utf8(&bytes) {
-                Ok(_) => bytes.len(),
-                Err(e) => {
-                    let mut keep_from = e.valid_up_to();
-                    if let Some(invalid_len) = e.error_len() {
-                        keep_from += invalid_len;
-                    }
-                    let keep = bytes.split_off(keep_from);
-                    self.pending = keep;
-                    e.valid_up_to()
-                }
-            };
-            return Some(String::from_utf8_lossy(&bytes[..valid]).into_owned());
-        }
-    }
-}
-
-/// In-process Qwen3 teacher: tokenizes the corpus with the shared tokenizer,
-/// runs the device forward per chunk, and writes temperature-softmax teacher
-/// probabilities straight into the caller's buffer.
-struct InProcessTeacher {
-    model: Qwen3Model,
-    tokenizer: tokenizers::Tokenizer,
-    gpu: Option<pssa::backend::GpuDispatch>,
-    logits: Vec<f32>,
-    reader: CorpusReader,
-    carry: Vec<u32>,
-    pos: usize,
-    emitted: u64,
-    chunk: usize,
-    temp: f32,
-    vocab: usize,
-}
-
-impl InProcessTeacher {
-    fn next_chunk(&mut self, probs_out: &mut [f32]) -> Option<(Vec<usize>, Vec<usize>, u64)> {
-        loop {
-            if self.carry.len() >= self.pos + self.chunk + 1 {
-                let n = self.chunk;
-                let tokens: Vec<usize> = self.carry[self.pos..self.pos + n]
-                    .iter()
-                    .map(|&x| x as usize)
-                    .collect();
-                let targets: Vec<usize> = self.carry[self.pos + 1..self.pos + 1 + n]
-                    .iter()
-                    .map(|&x| x as usize)
-                    .collect();
-                if let Err(e) = self
-                    .model
-                    .forward_logits_device(self.gpu.as_ref(), &tokens, &mut self.logits)
-                {
-                    eprintln!("distill_train: teacher forward failed: {e}");
-                    std::process::exit(3);
-                }
-                softmax_rows(&self.logits, probs_out, n, self.vocab, self.temp);
-                self.pos += n;
-                if self.pos > (1 << 20) {
-                    self.carry.drain(..self.pos);
-                    self.pos = 0;
-                }
-                self.emitted += 1;
-                return Some((tokens, targets, self.emitted - 1));
-            }
-            let block = self.reader.next_block()?;
-            match self.tokenizer.encode(block.as_str(), false) {
-                Ok(encoding) => self.carry.extend_from_slice(encoding.get_ids()),
-                Err(e) => {
-                    eprintln!("distill_train: tokenizer failed on a corpus block: {e}");
-                    std::process::exit(3);
-                }
-            }
-        }
-    }
-}
-
-fn softmax_rows(logits: &[f32], probs: &mut [f32], n: usize, vocab: usize, temp: f32) {
-    for t in 0..n {
-        let off = t * vocab;
-        let mut max_v = f32::NEG_INFINITY;
-        for i in 0..vocab {
-            let v = logits[off + i] / temp;
-            if v > max_v {
-                max_v = v;
-            }
-        }
-        let mut sum = 0.0f32;
-        for i in 0..vocab {
-            let e = (logits[off + i] / temp - max_v).exp();
-            probs[off + i] = e;
-            sum += e;
-        }
-        let inv = 1.0 / sum.max(1e-30);
-        for p in &mut probs[off..off + vocab] {
-            *p *= inv;
-        }
-    }
-}
+use pssa::teacher_frames::{InProcessTeacher, CorpusReader, read_frame};
 
 enum TeacherSource {
     Stream(Box<dyn Read>),
@@ -344,6 +139,23 @@ fn main() {
         model.cfg.d_vocab, model.cfg.chunk_len
     );
     let d_vocab = model.cfg.d_vocab;
+
+    // Backend selection mirrors the CLI trainer: auto picks CUDA (when built
+    // with the cuda feature) or WebGPU, and falls back to CPU only when no
+    // accelerator exists. The staged batched path reads model.device.
+    match pssa::backend::Device::try_gpu() {
+        Ok(gpu_device) => {
+            let label = gpu_device
+                .gpu()
+                .map(|g| g.backend_label())
+                .unwrap_or_else(|| "cpu".to_string());
+            eprintln!("distill_train: backend={label}");
+            model.device = gpu_device;
+        }
+        Err(e) => {
+            eprintln!("distill_train: backend=cpu ({e}); no accelerator available");
+        }
+    }
 
     let mut source = if args.corpus.is_empty() {
         let reader: Box<dyn Read> =
@@ -487,14 +299,14 @@ fn main() {
             );
         }
         if args.save_every > 0 && step % args.save_every == 0 {
-            if let Err(e) = pssa::checkpoint::save_model_v6(&model, &args.out) {
+            if let Err(e) = pssa::checkpoint::save_model(&model, &args.out) {
                 eprintln!("distill_train: save failed at step {step}: {e}");
                 std::process::exit(4);
             }
             eprintln!("distill_train: checkpoint saved to {} at step {step}", args.out);
         }
     }
-    if let Err(e) = pssa::checkpoint::save_model_v6(&model, &args.out) {
+    if let Err(e) = pssa::checkpoint::save_model(&model, &args.out) {
         eprintln!("distill_train: final save failed: {e}");
         std::process::exit(4);
     }
