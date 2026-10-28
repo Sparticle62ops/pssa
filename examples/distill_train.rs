@@ -135,8 +135,11 @@ fn main() {
         pssa::backend::Device::Cuda(_) => "cuda".to_string(),
     };
     eprintln!(
-        "distill_train: student loaded (device {device_label}, vocab {}, chunk {})",
-        model.cfg.d_vocab, model.cfg.chunk_len
+        "distill_train: student loaded (device {device_label}, vocab {}, chunk {}, depth {}, loops {})",
+        model.cfg.d_vocab,
+        model.cfg.chunk_len,
+        model.depth(),
+        model.loops()
     );
     let d_vocab = model.cfg.d_vocab;
 
@@ -258,14 +261,19 @@ fn main() {
             assert!(t < d_vocab && g < d_vocab, "token id out of vocab range");
         }
         model.set_distill_targets(&probs, args.temp, args.ce_mix, n);
+        let phase_t = std::time::Instant::now();
         let loss = forward_train_chunk_batched(&mut model, &tokens, &targets);
+        let phase_fwd = phase_t.elapsed();
         if !loss.is_finite() {
             eprintln!(
                 "distill_train: non-finite loss {loss} at chunk {chunk_index}; aborting without further updates"
             );
             std::process::exit(3);
         }
+        let phase_b0 = std::time::Instant::now();
         backward_chunk_batched(&mut model, n, 1.0);
+        let phase_bwd = phase_b0.elapsed();
+        let phase_o0 = std::time::Instant::now();
         model.insert_training_memory(loss, n);
         let lr = if args.warmup > 0 {
             args.lr * ((step + 1) as f32 / args.warmup as f32).min(1.0)
@@ -286,6 +294,15 @@ fn main() {
                 norm
             }
         };
+        let phase_opt = phase_o0.elapsed();
+        if step == 0 || step % 25 == 0 {
+            eprintln!(
+                "distill_train: phase ms fwd {:.0} bwd {:.0} opt {:.0}",
+                phase_fwd.as_secs_f64() * 1e3,
+                phase_bwd.as_secs_f64() * 1e3,
+                phase_opt.as_secs_f64() * 1e3
+            );
+        }
         step += 1;
         loss_ema = if loss_ema == 0.0 {
             loss as f64
