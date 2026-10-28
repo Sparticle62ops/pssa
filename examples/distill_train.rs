@@ -248,6 +248,7 @@ fn main() {
     let mut skipped_updates = 0usize;
     let mut loss_ema = 0.0f64;
     while args.steps == 0 || step < args.steps {
+        let phase_teacher0 = std::time::Instant::now();
         let (tokens, targets, chunk_index) =
             match source.next_chunk(&mut probs, d_vocab, model.cfg.chunk_len) {
                 Some(c) => c,
@@ -256,6 +257,7 @@ fn main() {
                     break;
                 }
             };
+        let phase_teacher = phase_teacher0.elapsed();
         let n = tokens.len();
         for (&t, &g) in tokens.iter().zip(targets.iter()) {
             assert!(t < d_vocab && g < d_vocab, "token id out of vocab range");
@@ -273,7 +275,9 @@ fn main() {
             teacher_ce /= n as f64;
             eprintln!("distill_train: teacher_ce {teacher_ce:.4} (temp {})", args.temp);
         }
+        let phase_tgt0 = std::time::Instant::now();
         model.set_distill_targets(&probs, args.temp, args.ce_mix, n);
+        let phase_tgt = phase_tgt0.elapsed();
         let phase_t = std::time::Instant::now();
         let loss = forward_train_chunk_batched(&mut model, &tokens, &targets);
         let phase_fwd = phase_t.elapsed();
@@ -287,7 +291,9 @@ fn main() {
         backward_chunk_batched(&mut model, n, 1.0);
         let phase_bwd = phase_b0.elapsed();
         let phase_o0 = std::time::Instant::now();
+        let phase_mem0 = std::time::Instant::now();
         model.insert_training_memory(loss, n);
+        let phase_mem = phase_mem0.elapsed();
         let lr = if args.warmup > 0 {
             args.lr * ((step + 1) as f32 / args.warmup as f32).min(1.0)
         } else {
@@ -310,10 +316,13 @@ fn main() {
         let phase_opt = phase_o0.elapsed();
         if step == 0 || step % 25 == 0 {
             eprintln!(
-                "distill_train: phase ms fwd {:.0} bwd {:.0} opt {:.0}",
+                "distill_train: phase ms fwd {:.0} bwd {:.0} opt {:.0} teacher {:.0} targets {:.0} mem {:.0}",
                 phase_fwd.as_secs_f64() * 1e3,
                 phase_bwd.as_secs_f64() * 1e3,
-                phase_opt.as_secs_f64() * 1e3
+                phase_opt.as_secs_f64() * 1e3,
+                phase_teacher.as_secs_f64() * 1e3,
+                phase_tgt.as_secs_f64() * 1e3,
+                phase_mem.as_secs_f64() * 1e3
             );
         }
         step += 1;
