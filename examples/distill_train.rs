@@ -1,39 +1,27 @@
-//! Qwen3-1.7B -> PSSA compact student distillation trainer.
+//! Qwen3-1.7B -> PSSA compact student distillation trainer. Pure Rust.
 //!
-//! Reads a framed binary stream of teacher targets from a file or stdin
-//! (produced by teacher_server.py: token ids, next-token targets, and teacher
-//! probabilities at the distillation temperature) and trains the student
-//! with the CE + temperature-KL loss in gpu_batch::distill_*.
+//! Two teacher sources:
+//!   1. `--corpus` (preferred): an in-process Qwen3 teacher. The repo's own
+//!      device forward (`Qwen3Model::forward_logits_device`) runs the teacher
+//!      on the same GPU as the student, tokenizing the corpus with the shared
+//!      Qwen tokenizer. No python, no pipe.
+//!   2. `--teacher-input`: a framed binary stream on stdin or a file
+//!      (u32 magic 0x4B4C4431, u32 n, u32 vocab, u64 chunk_index,
+//!      u32[n] token ids, u32[n] target ids, f32[n*vocab] teacher probs),
+//!      for externally produced teacher targets.
 //!
-//! Frame layout (little-endian):
-//!   u32 magic 0x4B4C4431 ("KLD1")
-//!   u32 n_tokens
-//!   u32 d_vocab
-//!   u64 chunk_index
-//!   u32[n] token_ids
-//!   u32[n] target_ids
-//!   f32[n * d_vocab] teacher_probs (row-major [token][vocab])
+//! Loss: ce_mix * CE + (1 - ce_mix) * KL at temperature T over the full
+//! student vocabulary (see gpu_batch::distill_* and tests/distill_kl.rs).
 
 use std::io::{BufReader, Read};
+use std::path::PathBuf;
 
 use pssa::checkpoint::load_checkpoint;
 use pssa::gpu_batch::{backward_chunk_batched, forward_train_chunk_batched};
 use pssa::pssa::{GradientClipOutcome, PSSALayerV2};
+use pssa::qwen3::{Qwen3Config, Qwen3Model};
 
 const FRAME_MAGIC: u32 = 0x4B4C4431;
-
-struct Frame {
-    chunk_index: u64,
-    tokens: Vec<usize>,
-    targets: Vec<usize>,
-    teacher: Vec<f32>,
-}
-
-fn read_u16le(r: &mut impl Read) -> std::io::Result<u16> {
-    let mut b = [0u8; 2];
-    r.read_exact(&mut b)?;
-    Ok(u16::from_le_bytes(b))
-}
 
 fn read_u32le(r: &mut impl Read) -> std::io::Result<u32> {
     let mut b = [0u8; 4];
@@ -56,19 +44,16 @@ fn read_f32le(r: &mut impl Read, count: usize) -> std::io::Result<Vec<f32>> {
         .collect())
 }
 
-fn read_frame(r: &mut impl Read, expected_vocab: usize, max_chunk: usize) -> Option<Frame> {
+fn read_frame(r: &mut impl Read, expected_vocab: usize, max_chunk: usize) -> Option<(Vec<usize>, Vec<usize>, u64, Vec<f32>)> {
     let magic = match read_u32le(r) {
         Ok(m) => m,
-        Err(_) => return None, // clean EOF between frames
+        Err(_) => return None,
     };
     if magic != FRAME_MAGIC {
         eprintln!("distill_train: bad frame magic 0x{magic:08x}; stream is corrupt");
         std::process::exit(2);
     }
-    let n = match read_u32le(r) {
-        Ok(n) => n as usize,
-        Err(_) => return None,
-    };
+    let n = read_u32le(r).ok()? as usize;
     let vocab = read_u32le(r).ok()? as usize;
     let chunk_index = read_u64le(r).ok()?;
     if vocab != expected_vocab {
@@ -82,36 +67,195 @@ fn read_frame(r: &mut impl Read, expected_vocab: usize, max_chunk: usize) -> Opt
         std::process::exit(2);
     }
     let mut raw_ids = vec![0u8; n * 4];
-    if r.read_exact(&mut raw_ids).is_err() {
-        return None;
-    }
+    r.read_exact(&mut raw_ids).ok()?;
     let tokens: Vec<usize> = raw_ids
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
         .collect();
     let mut raw_ids = vec![0u8; n * 4];
-    if r.read_exact(&mut raw_ids).is_err() {
-        return None;
-    }
+    r.read_exact(&mut raw_ids).ok()?;
     let targets: Vec<usize> = raw_ids
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
         .collect();
-    let teacher = match read_f32le(r, n * vocab) {
-        Ok(t) => t,
-        Err(_) => return None,
-    };
-    Some(Frame {
-        chunk_index,
-        tokens,
-        targets,
-        teacher,
-    })
+    let teacher = read_f32le(r, n * vocab).ok()?;
+    Some((tokens, targets, chunk_index, teacher))
+}
+
+/// Block-wise corpus reader: hands out large text blocks while keeping any
+/// trailing partial UTF-8 sequence for the next block, so multibyte
+/// characters never split at a block boundary.
+struct CorpusReader {
+    files: Vec<PathBuf>,
+    next_file: usize,
+    file: Option<BufReader<std::fs::File>>,
+    pending: Vec<u8>,
+}
+
+impl CorpusReader {
+    fn new(paths: &[String]) -> Self {
+        Self {
+            files: paths.iter().map(PathBuf::from).collect(),
+            next_file: 0,
+            file: None,
+            pending: Vec::new(),
+        }
+    }
+
+    fn next_block(&mut self) -> Option<String> {
+        loop {
+            if self.file.is_none() {
+                if self.next_file >= self.files.len() {
+                    return None;
+                }
+                let file = std::fs::File::open(&self.files[self.next_file]).ok()?;
+                self.file = Some(BufReader::with_capacity(1 << 20, file));
+                self.next_file += 1;
+                continue;
+            }
+            let mut buf = vec![0u8; 1 << 24];
+            let read = match self.file.as_mut().expect("checked above").read(&mut buf) {
+                Ok(0) => {
+                    self.file = None;
+                    continue;
+                }
+                Ok(read) => read,
+                Err(_) => {
+                    self.file = None;
+                    continue;
+                }
+            };
+            buf.truncate(read);
+            let mut bytes = std::mem::take(&mut self.pending);
+            bytes.extend_from_slice(&buf);
+            let valid = match std::str::from_utf8(&bytes) {
+                Ok(_) => bytes.len(),
+                Err(e) => {
+                    let mut keep_from = e.valid_up_to();
+                    if let Some(invalid_len) = e.error_len() {
+                        keep_from += invalid_len;
+                    }
+                    let keep = bytes.split_off(keep_from);
+                    self.pending = keep;
+                    e.valid_up_to()
+                }
+            };
+            return Some(String::from_utf8_lossy(&bytes[..valid]).into_owned());
+        }
+    }
+}
+
+/// In-process Qwen3 teacher: tokenizes the corpus with the shared tokenizer,
+/// runs the device forward per chunk, and writes temperature-softmax teacher
+/// probabilities straight into the caller's buffer.
+struct InProcessTeacher {
+    model: Qwen3Model,
+    tokenizer: tokenizers::Tokenizer,
+    gpu: Option<pssa::backend::GpuDispatch>,
+    logits: Vec<f32>,
+    reader: CorpusReader,
+    carry: Vec<u32>,
+    pos: usize,
+    emitted: u64,
+    chunk: usize,
+    temp: f32,
+    vocab: usize,
+}
+
+impl InProcessTeacher {
+    fn next_chunk(&mut self, probs_out: &mut [f32]) -> Option<(Vec<usize>, Vec<usize>, u64)> {
+        loop {
+            if self.carry.len() >= self.pos + self.chunk + 1 {
+                let n = self.chunk;
+                let tokens: Vec<usize> = self.carry[self.pos..self.pos + n]
+                    .iter()
+                    .map(|&x| x as usize)
+                    .collect();
+                let targets: Vec<usize> = self.carry[self.pos + 1..self.pos + 1 + n]
+                    .iter()
+                    .map(|&x| x as usize)
+                    .collect();
+                if let Err(e) = self
+                    .model
+                    .forward_logits_device(self.gpu.as_ref(), &tokens, &mut self.logits)
+                {
+                    eprintln!("distill_train: teacher forward failed: {e}");
+                    std::process::exit(3);
+                }
+                softmax_rows(&self.logits, probs_out, n, self.vocab, self.temp);
+                self.pos += n;
+                if self.pos > (1 << 20) {
+                    self.carry.drain(..self.pos);
+                    self.pos = 0;
+                }
+                self.emitted += 1;
+                return Some((tokens, targets, self.emitted - 1));
+            }
+            let block = self.reader.next_block()?;
+            match self.tokenizer.encode(block.as_str(), false) {
+                Ok(encoding) => self.carry.extend_from_slice(encoding.get_ids()),
+                Err(e) => {
+                    eprintln!("distill_train: tokenizer failed on a corpus block: {e}");
+                    std::process::exit(3);
+                }
+            }
+        }
+    }
+}
+
+fn softmax_rows(logits: &[f32], probs: &mut [f32], n: usize, vocab: usize, temp: f32) {
+    for t in 0..n {
+        let off = t * vocab;
+        let mut max_v = f32::NEG_INFINITY;
+        for i in 0..vocab {
+            let v = logits[off + i] / temp;
+            if v > max_v {
+                max_v = v;
+            }
+        }
+        let mut sum = 0.0f32;
+        for i in 0..vocab {
+            let e = (logits[off + i] / temp - max_v).exp();
+            probs[off + i] = e;
+            sum += e;
+        }
+        let inv = 1.0 / sum.max(1e-30);
+        for p in &mut probs[off..off + vocab] {
+            *p *= inv;
+        }
+    }
+}
+
+enum TeacherSource {
+    Stream(Box<dyn Read>),
+    InProcess(Box<InProcessTeacher>),
+}
+
+impl TeacherSource {
+    fn next_chunk(
+        &mut self,
+        probs_out: &mut [f32],
+        expected_vocab: usize,
+        max_chunk: usize,
+    ) -> Option<(Vec<usize>, Vec<usize>, u64)> {
+        match self {
+            Self::Stream(reader) => {
+                let (tokens, targets, chunk_index, teacher) =
+                    read_frame(reader, expected_vocab, max_chunk)?;
+                probs_out.copy_from_slice(&teacher);
+                Some((tokens, targets, chunk_index))
+            }
+            Self::InProcess(teacher) => teacher.next_chunk(probs_out),
+        }
+    }
 }
 
 struct Args {
     student: String,
     teacher_input: String,
+    corpus: String,
+    teacher: String,
+    tokenizer: String,
     steps: usize,
     lr: f32,
     warmup: usize,
@@ -126,6 +270,9 @@ fn parse_args() -> Args {
     let mut a = Args {
         student: String::new(),
         teacher_input: String::new(),
+        corpus: String::new(),
+        teacher: String::new(),
+        tokenizer: String::new(),
         steps: 0,
         lr: 1e-3,
         warmup: 0,
@@ -147,6 +294,9 @@ fn parse_args() -> Args {
         match argv[i].as_str() {
             "--student" => a.student = next(&mut i, "--student"),
             "--teacher-input" => a.teacher_input = next(&mut i, "--teacher-input"),
+            "--corpus" => a.corpus = next(&mut i, "--corpus"),
+            "--teacher" => a.teacher = next(&mut i, "--teacher"),
+            "--tokenizer" => a.tokenizer = next(&mut i, "--tokenizer"),
             "--steps" => a.steps = next(&mut i, "--steps").parse().expect("--steps usize"),
             "--lr" => a.lr = next(&mut i, "--lr").parse().expect("--lr f32"),
             "--warmup" => a.warmup = next(&mut i, "--warmup").parse().expect("--warmup usize"),
@@ -167,6 +317,9 @@ fn parse_args() -> Args {
     if a.student.is_empty() || a.out.is_empty() {
         panic!("--student and --out are required");
     }
+    if !a.corpus.is_empty() && a.teacher.is_empty() {
+        panic!("--corpus needs --teacher (the Qwen3 checkpoint directory)");
+    }
     a
 }
 
@@ -180,52 +333,127 @@ fn main() {
         }
     };
     let mut model: PSSALayerV2 = loaded.model;
+    let device_label = match model.device {
+        pssa::backend::Device::Cpu => "cpu".to_string(),
+        pssa::backend::Device::Gpu(_) => "gpu".to_string(),
+        #[cfg(feature = "cuda")]
+        pssa::backend::Device::Cuda(_) => "cuda".to_string(),
+    };
     eprintln!(
-        "distill_train: student loaded (device {}, vocab {}, chunk {})",
-        match model.device {
-            pssa::backend::Device::Cpu => "cpu".to_string(),
-            pssa::backend::Device::Gpu(_) => "gpu".to_string(),
-            #[cfg(feature = "cuda")]
-            pssa::backend::Device::Cuda(_) => "cuda".to_string(),
-        }, model.cfg.d_vocab, model.cfg.chunk_len
+        "distill_train: student loaded (device {device_label}, vocab {}, chunk {})",
+        model.cfg.d_vocab, model.cfg.chunk_len
     );
     let d_vocab = model.cfg.d_vocab;
 
-    let mut reader: Box<dyn Read> = if args.teacher_input == "-" || args.teacher_input.is_empty() {
-        Box::new(std::io::stdin().lock())
+    let mut source = if args.corpus.is_empty() {
+        let reader: Box<dyn Read> =
+            if args.teacher_input == "-" || args.teacher_input.is_empty() {
+                Box::new(std::io::stdin().lock())
+            } else {
+                let f = std::fs::File::open(&args.teacher_input).unwrap_or_else(|e| {
+                    panic!("cannot open teacher stream '{}': {e}", args.teacher_input)
+                });
+                Box::new(BufReader::with_capacity(1 << 20, f))
+            };
+        TeacherSource::Stream(reader)
     } else {
-        let f = std::fs::File::open(&args.teacher_input)
-            .unwrap_or_else(|e| panic!("cannot open teacher stream '{}': {e}", args.teacher_input));
-        Box::new(BufReader::with_capacity(1 << 20, f))
+        let config_path = format!("{}/config.json", args.teacher);
+        let config = match Qwen3Config::from_json_file(&config_path) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!(
+                    "distill_train: no usable config.json in '{}', falling back to the Qwen3-1.7B shape contract",
+                    args.teacher
+                );
+                Qwen3Config::qwen3_1_7b()
+            }
+        };
+        let teacher_model = match Qwen3Model::load_safetensors(&args.teacher, config) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("distill_train: cannot load teacher '{}': {e}", args.teacher);
+                std::process::exit(1);
+            }
+        };
+        if teacher_model.config.vocab_size != d_vocab {
+            eprintln!(
+                "distill_train: teacher vocab {} != student vocab {d_vocab}",
+                teacher_model.config.vocab_size
+            );
+            std::process::exit(2);
+        }
+        let tokenizer_path = if args.tokenizer.is_empty() {
+            format!("{}/tokenizer.json", args.teacher)
+        } else {
+            args.tokenizer.clone()
+        };
+        let tokenizer = match tokenizers::Tokenizer::from_file(&tokenizer_path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("distill_train: cannot load tokenizer '{tokenizer_path}': {e}");
+                std::process::exit(1);
+            }
+        };
+        let gpu = model.device.gpu();
+        match &gpu {
+            Some(_) => eprintln!("distill_train: teacher forward on the device path"),
+            None => eprintln!(
+                "distill_train: no GPU device, teacher forward runs on the CPU path (slow; fine for a smoke test)"
+            ),
+        }
+        let files: Vec<String> = args
+            .corpus
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let teacher = InProcessTeacher {
+            logits: vec![0.0f32; model.cfg.chunk_len * d_vocab],
+            model: teacher_model,
+            tokenizer,
+            gpu,
+            reader: CorpusReader::new(&files),
+            carry: Vec::new(),
+            pos: 0,
+            emitted: 0,
+            chunk: model.cfg.chunk_len,
+            temp: args.temp,
+            vocab: d_vocab,
+        };
+        eprintln!(
+            "distill_train: in-process teacher ready (temp {}, chunk {})",
+            args.temp, model.cfg.chunk_len
+        );
+        TeacherSource::InProcess(Box::new(teacher))
     };
 
+    let mut probs = vec![0.0f32; model.cfg.chunk_len * d_vocab];
     let started = std::time::Instant::now();
     let mut step = 0usize;
     let mut skipped_updates = 0usize;
     let mut loss_ema = 0.0f64;
     while args.steps == 0 || step < args.steps {
-        let frame = match read_frame(&mut reader, d_vocab, model.cfg.chunk_len) {
-            Some(f) => f,
-            None => {
-                eprintln!("distill_train: teacher stream ended after {step} updates");
-                break;
-            }
-        };
-        let n = frame.tokens.len();
-        for (&t, &g) in frame.tokens.iter().zip(frame.targets.iter()) {
-            assert!(t < d_vocab && g < d_vocab, "frame token id out of vocab range");
+        let (tokens, targets, chunk_index) =
+            match source.next_chunk(&mut probs, d_vocab, model.cfg.chunk_len) {
+                Some(c) => c,
+                None => {
+                    eprintln!("distill_train: teacher stream ended after {step} updates");
+                    break;
+                }
+            };
+        let n = tokens.len();
+        for (&t, &g) in tokens.iter().zip(targets.iter()) {
+            assert!(t < d_vocab && g < d_vocab, "token id out of vocab range");
         }
-        model.set_distill_targets(&frame.teacher, args.temp, args.ce_mix, n);
-        let loss = forward_train_chunk_batched(&mut model, &frame.tokens, &frame.targets);
+        model.set_distill_targets(&probs, args.temp, args.ce_mix, n);
+        let loss = forward_train_chunk_batched(&mut model, &tokens, &targets);
         if !loss.is_finite() {
             eprintln!(
-                "distill_train: non-finite loss {} at chunk {}; aborting without further updates",
-                loss, frame.chunk_index
+                "distill_train: non-finite loss {loss} at chunk {chunk_index}; aborting without further updates"
             );
             std::process::exit(3);
         }
         backward_chunk_batched(&mut model, n, 1.0);
-        // PSSA memory writes happen after backward, in training order.
         model.insert_training_memory(loss, n);
         let lr = if args.warmup > 0 {
             args.lr * ((step + 1) as f32 / args.warmup as f32).min(1.0)
@@ -255,8 +483,7 @@ fn main() {
         if step % 25 == 0 || step == 1 {
             let rate = step as f64 / started.elapsed().as_secs_f64().max(1e-9);
             eprintln!(
-                "distill_train: step {step} chunk {} loss {loss:.4} ema {loss_ema:.4} lr {lr:.3e} grad_norm {grad_norm:.3} skipped {skipped_updates} rate {rate:.2} upd/s",
-                frame.chunk_index
+                "distill_train: step {step} chunk {chunk_index} loss {loss:.4} ema {loss_ema:.4} lr {lr:.3e} grad_norm {grad_norm:.3} skipped {skipped_updates} rate {rate:.2} upd/s"
             );
         }
         if args.save_every > 0 && step % args.save_every == 0 {

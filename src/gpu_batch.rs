@@ -325,7 +325,7 @@ fn gpu_ctx(m: &PSSALayerV2) -> Option<crate::backend::GpuDispatch> {
 /// M=1, batch=L: that wastes 15/16 of WebGPU's row tile and gives CUDA GEMVs.
 /// The backends also fold legacy shared-weight batches at their boundary.
 #[inline]
-fn batched_matvec_dev(
+pub(crate) fn batched_matvec_dev(
     gpu: Option<&crate::backend::GpuDispatch>,
     w: &[f32],
     rows: usize,

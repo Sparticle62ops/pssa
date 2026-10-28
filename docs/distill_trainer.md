@@ -43,6 +43,22 @@ HF snapshot), streaming corpus, TokenChunkIterator for chunk-64 batching.
 - Trainer skeleton: examples/distill_train.rs (this pass).
 - KL loss/backward surgery: next pass, after skeleton compiles.
 
+## Pure-Rust pipeline (2026-10-27, python dropped)
+
+- `examples/distill_train.rs` runs standalone: `--corpus` + `--teacher` load the
+  Qwen3 teacher in-process, tokenize the corpus with the shared Qwen tokenizer
+  (`tokenizers` crate, already a dependency), and run the teacher on the repo's
+  own device path: `Qwen3Model::forward_logits_device` (new in src/qwen3.rs)
+  does every large projection through the GPU GEMM helpers, with norms, RoPE,
+  causal GQA attention and SwiGLU glue on the CPU where that is cheaper at
+  chunk sizes. Teacher weights upload once through the GpuDispatch weight
+  cache (pointer-keyed), not per chunk.
+- The old frame-stream mode (`--teacher-input`) still exists for externally
+  produced teacher targets; the python teacher_server.py was deleted.
+- Cross-check: `tests/qwen3_gpu_parity.rs` compares forward_logits_device
+  against the independent per-position CPU reference `forward_logits` on a
+  small random model; with a GPU present it exercises the real dispatch.
+
 ## Wired pipeline (2026-10-27)
 
 - `examples/distill_train.rs`: reads framed teacher targets from stdin/file, sets

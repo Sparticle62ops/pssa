@@ -1006,6 +1006,262 @@ impl Qwen3Model {
         Self::from_safetensors(path, config)
     }
 
+    /// Device-path teacher forward: full-sequence logits `[tokens x vocab]`
+    /// using the repo's device GEMM path for every large projection. Norms,
+    /// RoPE, causal GQA attention and the SwiGLU glue stay on the CPU, where
+    /// they are cheaper than a dispatch at chunk sizes. Mirrors
+    /// `forward_logits`; cross-checked by tests/qwen3_gpu_parity.rs. With
+    /// `gpu = None` this is the CPU batched-matvec path, still independent of
+    /// the per-position reference implementation.
+    pub fn forward_logits_device(
+        &self,
+        gpu: Option<&crate::backend::GpuDispatch>,
+        tokens: &[usize],
+        logits_out: &mut [f32],
+    ) -> Result<(), String> {
+        if tokens.is_empty() {
+            return Err("Qwen3 forward requires at least one token".into());
+        }
+        if tokens.len() > self.config.max_position_embeddings {
+            return Err(format!(
+                "Qwen3 sequence length {} exceeds max position {}",
+                tokens.len(),
+                self.config.max_position_embeddings
+            ));
+        }
+        if let Some(&token) = tokens.iter().find(|&&token| token >= self.config.vocab_size) {
+            return Err(format!("Qwen3 token {token} is outside vocabulary"));
+        }
+        let n = tokens.len();
+        let expected = n * self.config.vocab_size;
+        if logits_out.len() != expected {
+            return Err(format!(
+                "Qwen3 device forward needs a logits buffer of {expected}, got {}",
+                logits_out.len()
+            ));
+        }
+        let hidden_size = self.config.hidden_size;
+        let q_dim = self.config.query_dim();
+        let kv_dim = self.config.key_value_dim();
+        let head_dim = self.config.head_dim;
+        let intermediate = self.config.intermediate_size;
+        let eps = self.config.rms_norm_eps;
+
+        let mut hidden = vec![0.0f32; n * hidden_size];
+        for (position, &token) in tokens.iter().enumerate() {
+            hidden[position * hidden_size..(position + 1) * hidden_size].copy_from_slice(
+                &self.token_embedding.data[token * hidden_size..(token + 1) * hidden_size],
+            );
+        }
+
+        for layer in &self.layers {
+            let mut x_norm = vec![0.0f32; n * hidden_size];
+            for position in 0..n {
+                let row = position * hidden_size;
+                x_norm[row..row + hidden_size].copy_from_slice(&rms_norm(
+                    &hidden[row..row + hidden_size],
+                    &layer.input_norm,
+                    eps,
+                ));
+            }
+            let mut queries = vec![0.0f32; n * q_dim];
+            crate::gpu_batch::batched_matvec_dev(
+                gpu,
+                &layer.q_proj.data,
+                q_dim,
+                hidden_size,
+                &x_norm,
+                n,
+                &mut queries,
+            );
+            let mut keys = vec![0.0f32; n * kv_dim];
+            crate::gpu_batch::batched_matvec_dev(
+                gpu,
+                &layer.k_proj.data,
+                kv_dim,
+                hidden_size,
+                &x_norm,
+                n,
+                &mut keys,
+            );
+            let mut values = vec![0.0f32; n * kv_dim];
+            crate::gpu_batch::batched_matvec_dev(
+                gpu,
+                &layer.v_proj.data,
+                kv_dim,
+                hidden_size,
+                &x_norm,
+                n,
+                &mut values,
+            );
+            for position in 0..n {
+                for head in 0..self.config.num_attention_heads {
+                    let start = position * q_dim + head * head_dim;
+                    rms_norm_in_place(
+                        &mut queries[start..start + head_dim],
+                        &layer.q_norm,
+                        eps,
+                    );
+                    apply_rope(
+                        &mut queries[start..start + head_dim],
+                        position,
+                        self.config.head_dim,
+                        self.config.rope_theta,
+                    );
+                }
+                for head in 0..self.config.num_key_value_heads {
+                    let start = position * kv_dim + head * head_dim;
+                    rms_norm_in_place(
+                        &mut keys[start..start + head_dim],
+                        &layer.k_norm,
+                        eps,
+                    );
+                    apply_rope(
+                        &mut keys[start..start + head_dim],
+                        position,
+                        self.config.head_dim,
+                        self.config.rope_theta,
+                    );
+                }
+            }
+            let attended = self.attention_rows(&queries, &keys, &values, n);
+            let mut attn_out = vec![0.0f32; n * hidden_size];
+            crate::gpu_batch::batched_matvec_dev(
+                gpu,
+                &layer.o_proj.data,
+                hidden_size,
+                q_dim,
+                &attended,
+                n,
+                &mut attn_out,
+            );
+            // First residual: hidden += attn_out.
+            for position in 0..n {
+                let row = position * hidden_size;
+                for (value, update) in hidden[row..row + hidden_size]
+                    .iter_mut()
+                    .zip(&attn_out[row..row + hidden_size])
+                {
+                    *value += *update;
+                }
+            }
+            let mut post_norm = vec![0.0f32; n * hidden_size];
+            for position in 0..n {
+                let row = position * hidden_size;
+                post_norm[row..row + hidden_size].copy_from_slice(&rms_norm(
+                    &hidden[row..row + hidden_size],
+                    &layer.post_attention_norm,
+                    eps,
+                ));
+            }
+            let mut gate = vec![0.0f32; n * intermediate];
+            crate::gpu_batch::batched_matvec_dev(
+                gpu,
+                &layer.gate_proj.data,
+                intermediate,
+                hidden_size,
+                &post_norm,
+                n,
+                &mut gate,
+            );
+            let mut up = vec![0.0f32; n * intermediate];
+            crate::gpu_batch::batched_matvec_dev(
+                gpu,
+                &layer.up_proj.data,
+                intermediate,
+                hidden_size,
+                &post_norm,
+                n,
+                &mut up,
+            );
+            for (gate_value, up_value) in gate.iter_mut().zip(up) {
+                *gate_value = silu(*gate_value) * up_value;
+            }
+            let mut mlp_out = vec![0.0f32; n * hidden_size];
+            crate::gpu_batch::batched_matvec_dev(
+                gpu,
+                &layer.down_proj.data,
+                hidden_size,
+                intermediate,
+                &gate,
+                n,
+                &mut mlp_out,
+            );
+            // Second residual: hidden += mlp_out.
+            for position in 0..n {
+                let row = position * hidden_size;
+                for (value, update) in hidden[row..row + hidden_size]
+                    .iter_mut()
+                    .zip(&mlp_out[row..row + hidden_size])
+                {
+                    *value += *update;
+                }
+            }
+        }
+
+        let mut final_hidden = vec![0.0f32; n * hidden_size];
+        for position in 0..n {
+            let row = position * hidden_size;
+            final_hidden[row..row + hidden_size].copy_from_slice(&rms_norm(
+                &hidden[row..row + hidden_size],
+                &self.final_norm,
+                eps,
+            ));
+        }
+        // Tied unembed: logits[t] = token_embedding * final_hidden[t], for
+        // every position of the chunk at once.
+        crate::gpu_batch::batched_matvec_dev(
+            gpu,
+            &self.token_embedding.data,
+            self.config.vocab_size,
+            hidden_size,
+            &final_hidden,
+            n,
+            logits_out,
+        );
+        Ok(())
+    }
+
+    /// Causal grouped-query attention over a packed chunk, exactly the math of
+    /// `forward_layer`'s attention block, written once so both paths share it.
+    fn attention_rows(
+        &self,
+        queries: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        n: usize,
+    ) -> Vec<f32> {
+        let q_dim = self.config.query_dim();
+        let kv_dim = self.config.key_value_dim();
+        let head_dim = self.config.head_dim;
+        let group_size = self.config.num_attention_heads / self.config.num_key_value_heads;
+        let scale = (head_dim as f32).sqrt().recip();
+        let mut attended = vec![0.0f32; n * q_dim];
+        for position in 0..n {
+            for q_head in 0..self.config.num_attention_heads {
+                let base = position * q_dim + q_head * head_dim;
+                let q = &queries[base..base + head_dim];
+                let kv_head = q_head / group_size;
+                let mut scores = vec![0.0f32; position + 1];
+                for previous in 0..=position {
+                    let k_base = previous * kv_dim + kv_head * head_dim;
+                    let k = &keys[k_base..k_base + head_dim];
+                    scores[previous] = q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>() * scale;
+                }
+                softmax_in_place(&mut scores);
+                let context = &mut attended[base..base + head_dim];
+                for previous in 0..=position {
+                    let v_base = previous * kv_dim + kv_head * head_dim;
+                    let v = &values[v_base..v_base + head_dim];
+                    for (out, &value) in context.iter_mut().zip(v) {
+                        *out += scores[previous] * value;
+                    }
+                }
+            }
+        }
+        attended
+    }
+
     pub fn forward_logits(&self, tokens: &[usize]) -> Result<Vec<f32>, String> {
         if tokens.is_empty() {
             return Err("Qwen3 forward requires at least one token".into());
