@@ -57,11 +57,13 @@ fn main() {
     );
     let report = pssa::qwen3::emit_pssa_checkpoint(&model, &target, &out_path, seed).expect("emit PSSA checkpoint");
     println!(
-        "wrote {} ({} bytes); estimate: {} MiB target allocation, {} MiB memory bank, scan len {}",
+        "wrote {} ({} bytes); estimate: {} MiB target allocation, {} MiB memory bank, scan len {}; logit RMS before calibration {:.3}, unembed scale {:.3e}",
         report.checkpoint_path.display(),
         report.checkpoint_bytes,
         report.estimate.pssa_target_allocation_bytes / (1024 * 1024),
         report.estimate.memory_bank_bytes / (1024 * 1024),
-        report.estimate.scan_len
+        report.estimate.scan_len,
+        report.logit_rms_before,
+        report.logit_scale
     );
 }

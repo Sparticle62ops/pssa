@@ -1064,6 +1064,9 @@ fn actual_block_storage(b: &pssa::pssa::PSSAContinuousBlockV2) -> usize {
         losses,
         ssm_input,
         conv_context,
+        teacher_probs: _,
+        distill_temp: _,
+        distill_ce_mix: _,
     } = tape;
     let tape_bytes = [
         x_raw,

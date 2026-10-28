@@ -1506,6 +1506,10 @@ pub struct Qwen3EmissionReport {
     pub estimate: Qwen3ResourceEstimate,
     pub checkpoint_path: std::path::PathBuf,
     pub checkpoint_bytes: u64,
+    /// RMS of the raw logits before calibration (seeded-init stack).
+    pub logit_rms_before: f32,
+    /// Multiplier applied to the unembedding so initial logits sit near unit RMS.
+    pub logit_scale: f32,
 }
 
 /// Emit a PSSA v6 checkpoint laid out for the requested target.
@@ -1583,6 +1587,46 @@ pub fn emit_pssa_checkpoint(
     // projected latent space so converted logits keep the same geometry.
     layer.unembed_w = layer.embed_w.clone();
 
+    // ---- logit-scale calibration ------------------------------------------
+    // The scan, memory, adapter and MLP weights keep their seeded
+    // initialization, so a freshly emitted stack can drive logits far past
+    // softmax scale: the first converted compact checkpoint scored ~60
+    // CE/token against a uniform floor of ln(vocab) ~ 11.9. Push probe
+    // chunks through the stack and rescale the unembedding so the initial
+    // logits sit near unit RMS; a cold start then begins near the uniform
+    // floor instead of an exploding scale.
+    let probe_chunks = 8usize;
+    let seq = layer.cfg.chunk_len;
+    let d_v = layer.cfg.d_vocab;
+    let h_saved = layer.block.h_persistent.clone();
+    let mut probe_rng = SimpleRng::new(seed ^ 0x0ca1_b7ae_9e0b_e7a1);
+    let mut sum_sq = 0.0f64;
+    let mut max_abs = 0.0f32;
+    for _ in 0..probe_chunks {
+        let tokens: Vec<usize> = (0..seq)
+            .map(|_| ((probe_rng.gen_range_f32(0.0, 1.0) * d_v as f32) as usize).min(d_v - 1))
+            .collect();
+        let _loss = crate::gpu_batch::forward_train_chunk_batched(&mut layer, &tokens, &tokens);
+        for slot in &layer.block.tape.logits[..seq * d_v] {
+            sum_sq += (*slot as f64) * (*slot as f64);
+            max_abs = max_abs.max(slot.abs());
+        }
+        layer.block.h_persistent.copy_from_slice(&h_saved);
+    }
+    let logit_rms_before = (sum_sq / ((probe_chunks * seq * d_v) as f64)).sqrt() as f32;
+    let logit_scale = if logit_rms_before.is_finite() && logit_rms_before > 0.0 {
+        let scale = 1.0 / logit_rms_before;
+        for value in layer.unembed_w.data.iter_mut() {
+            *value *= scale;
+        }
+        for buffer in [&mut layer.unembed_w.grad, &mut layer.unembed_w.m, &mut layer.unembed_w.v] {
+            buffer.iter_mut().for_each(|value| *value = 0.0);
+        }
+        scale
+    } else {
+        1.0
+    };
+
     let out_path = out_path.as_ref();
     // V6/V7 cannot serialize stacked (depth > 1) models; save_model picks
     // V7 for depth one and V8 for stacks automatically.
@@ -1596,6 +1640,8 @@ pub fn emit_pssa_checkpoint(
         estimate,
         checkpoint_path: out_path.to_path_buf(),
         checkpoint_bytes,
+        logit_rms_before,
+        logit_scale,
     })
 }
 
