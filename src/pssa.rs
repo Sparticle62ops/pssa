@@ -2973,6 +2973,11 @@ impl PSSALayerV2 {
                 .enumerate()
                 .filter_map(|(row, &mark)| (Some(mark) == step).then_some(row))
                 .collect();
+            let adam_keys: Vec<(usize, usize)> = self
+                .adam_tensors()
+                .iter()
+                .map(|t| (t.data.as_ptr() as usize, t.data.len()))
+                .collect();
             let norm = ctx
                 .clip_adamw(
                     &mut self.adam_tensors(),
@@ -2988,7 +2993,7 @@ impl PSSALayerV2 {
                 return GradientClipOutcome::Skipped { norm };
             }
             self.step_counter = step.expect("optimizer step counter overflow");
-            ctx.invalidate_weights();
+            ctx.invalidate_weights_only(&adam_keys);
             return GradientClipOutcome::Applied { norm };
         }
         let mut tensors = self.adam_tensors();
@@ -3013,10 +3018,14 @@ impl PSSALayerV2 {
         for tensor in &mut tensors {
             tensor.step(&cfg, lr, step, scale);
         }
+        let adam_keys: Vec<(usize, usize)> = tensors
+            .iter()
+            .map(|t| (t.data.as_ptr() as usize, t.data.len()))
+            .collect();
         drop(tensors);
         self.step_counter = step;
         if let Some(ctx) = self.device.gpu() {
-            ctx.invalidate_weights();
+            ctx.invalidate_weights_only(&adam_keys);
         }
         GradientClipOutcome::Applied { norm }
     }
@@ -3037,8 +3046,13 @@ impl PSSALayerV2 {
         }
         self.unembed_w
             .step_adamw(lr, c.beta1, c.beta2, c.weight_decay, c.eps, s);
+        let adam_keys: Vec<(usize, usize)> = self
+            .adam_tensors()
+            .iter()
+            .map(|t| (t.data.as_ptr() as usize, t.data.len()))
+            .collect();
         if let Some(ctx) = self.device.gpu() {
-            ctx.invalidate_weights();
+            ctx.invalidate_weights_only(&adam_keys);
         }
     }
     pub fn backward_and_step_chunk(&mut self, seq_len: usize) {
@@ -3167,8 +3181,12 @@ impl PSSALayerV2 {
                 }
             }
         }
+        let unembed_key = (
+            self.unembed_w.data.as_ptr() as usize,
+            self.unembed_w.data.len(),
+        );
         if let Some(ctx) = self.device.gpu() {
-            ctx.invalidate_weights();
+            ctx.invalidate_weights_only(&[unembed_key]);
         }
     }
 

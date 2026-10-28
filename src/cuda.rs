@@ -239,6 +239,21 @@ impl CudaContext {
         }
     }
 
+    /// Mark only the given host-weight entries stale, keyed by data pointer
+    /// and length. Cached weights from other models (a frozen teacher) stay
+    /// valid, so they are not re-uploaded after every optimizer step.
+    pub fn invalidate_weights_only(&self, keys: &[(usize, usize)]) {
+        let mut cache = self
+            .weight_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (key, entry) in cache.iter_mut() {
+            if keys.contains(key) {
+                entry.current = false;
+            }
+        }
+    }
+
     pub fn dispatch_gemm(
         &self,
         x: &[f32],

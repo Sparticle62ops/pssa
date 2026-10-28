@@ -1114,6 +1114,20 @@ impl GpuDispatch {
         }
     }
 
+    /// Mark only the given host-weight entries stale (keyed by data pointer
+    /// and length) so cached weights of other models stay valid. The Wgpu
+    /// backend has no keyed cache and invalidates everything.
+    pub fn invalidate_weights_only(&self, keys: &[(usize, usize)]) {
+        match self {
+            GpuDispatch::Wgpu(_) => {
+                let _ = keys;
+                self.invalidate_weights();
+            }
+            #[cfg(feature = "cuda")]
+            GpuDispatch::Cuda(ctx) => ctx.invalidate_weights_only(keys),
+        }
+    }
+
     /// Row-major C(M,N) = A(M,K) * B(K,N).
     pub fn gemm_nn(&self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         match self {
