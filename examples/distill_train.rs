@@ -260,6 +260,19 @@ fn main() {
         for (&t, &g) in tokens.iter().zip(targets.iter()) {
             assert!(t < d_vocab && g < d_vocab, "token id out of vocab range");
         }
+        if chunk_index == 0 {
+            // Teacher self-CE on the raw token stream: -ln p_teacher(target) at
+            // the streaming softmax temperature. A sane Qwen teacher lands in the
+            // single digits; a garbage number indicts the loader/tokenizer/forward
+            // path rather than the converted student.
+            let mut teacher_ce = 0.0f64;
+            for t in 0..n {
+                let row = &probs[t * d_vocab..(t + 1) * d_vocab];
+                teacher_ce += (-row[targets[t]].max(1e-30).ln()) as f64;
+            }
+            teacher_ce /= n as f64;
+            eprintln!("distill_train: teacher_ce {teacher_ce:.4} (temp {})", args.temp);
+        }
         model.set_distill_targets(&probs, args.temp, args.ce_mix, n);
         let phase_t = std::time::Instant::now();
         let loss = forward_train_chunk_batched(&mut model, &tokens, &targets);
