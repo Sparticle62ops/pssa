@@ -100,6 +100,7 @@ pub(super) enum Context {
     NetworkEdit,
     Timeline,
     Feed,
+    Menu,
 }
 impl Context {
     fn mask(self) -> u32 {
@@ -174,9 +175,8 @@ const LOCAL_EDIT: u32 = LIBRARY_EDIT | EVAL_EDIT;
 const NETWORK: u32 = 1 << Context::Network as u32;
 const NETWORK_EDIT: u32 = 1 << Context::NetworkEdit as u32;
 const TIMELINE: u32 = 1 << Context::Timeline as u32;
+const MENU: u32 = 1 << Context::Menu as u32;
 const BROWSE: u32 = MONITOR | PAGES | SETUP | EXTRA_BROWSE | LOCAL_BROWSE | NETWORK | TIMELINE;
-// Setup uses Shift+Tab for its own wizard pages, so previous-tab skips it.
-const BROWSE_NO_SETUP: u32 = BROWSE & !SETUP;
 const ALL: u32 = BROWSE
     | CHAT
     | EDIT
@@ -186,13 +186,17 @@ const ALL: u32 = BROWSE
     | HELP
     | LIMIT_EDIT
     | LOCAL_EDIT
-    | NETWORK_EDIT;
+    | NETWORK_EDIT
+    | MENU;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
     Quit,
     NextTab,
     PreviousTab,
+    BackToSections,
+    MenuMove(isize),
+    MenuOpen,
     ToggleHelp,
     TogglePalette,
     Palette,
@@ -254,7 +258,7 @@ const BINDINGS: &[Binding] = &[
         description: "Quit the TUI. Training started from the setup wizard keeps running.",
         routes: &[(ALL, Quit)],
     },
-    bind!(Tab, "Tab", "Next tab. Works even while typing in an editor.", ALL => NextTab),
+    bind!(Tab, "Tab", "Next category. Works even while typing in an editor.", ALL => NextTab),
     bind!(F(6), "F6", "Toggle the token confidence heatmap: how sure the model is about each token (chat, monitor, sample).", CHAT | MONITOR | SAMPLE => Heatmap),
     bind!(F(7), "F7", "Pause or resume the live output preview (monitor, sample).", MONITOR | SAMPLE => Preview),
     bind!(F(8), "F8", "Open the hardware tab: CPU, memory and GPU use.", ALL => OpenTab(HARDWARE_TAB)),
@@ -263,10 +267,10 @@ const BINDINGS: &[Binding] = &[
     bind!(F(11), "F11", "Open the PSSA math reference.", ALL => OpenTab(MATH_TAB)),
     bind!(F(12), "F12", "Open the full sample tab: checkpoint output and token confidence.", ALL => OpenTab(SAMPLE_TAB)),
     bind!(F(1), "F1", "Open or close this help. Works even while typing.", ALL => ToggleHelp),
-    bind!(Char('?'), "?", "Open or close this help outside text editors. In an editor it just types '?'.", BROWSE | HELP => ToggleHelp),
-    bind!(Char('q'), "q", "Quit from a normal tab. When help is open, close help instead.", BROWSE => Quit, HELP => ToggleHelp),
-    bind!(Esc, "Esc", "Back out: close help/palette, cancel or clear an editor, stop chat/background work (Kaggle keeps running), or quit from dashboard, setup, local and network tabs.",
-        MONITOR | PAGES | SETUP | LOCAL_BROWSE => Quit, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, NETWORK => Quit, NETWORK_EDIT => Network, TIMELINE => Quit, PALETTE => Palette, HELP => ToggleHelp),
+    bind!(Char('?'), "?", "Open or close this help outside text editors. In an editor it just types '?'.", BROWSE | MENU | HELP => ToggleHelp),
+    bind!(Char('q'), "q", "Quit from a normal tab or the section menu. When help is open, close help instead.", BROWSE | MENU => Quit, HELP => ToggleHelp),
+    bind!(Esc, "Esc", "Back out one level: close help or the palette, cancel an edit, stop chat work, cancel a running job, or leave a screen for its section menu.",
+        MONITOR | PAGES | SETUP | LOCAL_BROWSE | NETWORK | TIMELINE => BackToSections, MENU => BackToSections, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, NETWORK_EDIT => Network, PALETTE => Palette, HELP => ToggleHelp),
     bind!(Left, "Left", "Monitor: pan to older steps. Timeline: older checkpoint. Most browse tabs: previous tab. Setup: previous page.",
         MONITOR => Pan(false), PAGES | EXTRA_BROWSE | LOCAL_BROWSE | NETWORK => PreviousTab, SETUP => Setup, TIMELINE => Network),
     bind!(Right, "Right", "Monitor: pan to newer steps. Timeline: newer checkpoint. Most browse tabs: next tab. Setup: next page.",
@@ -283,9 +287,9 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('='), "=", "Zoom in: monitor graph; mixer share (same as +).", MONITOR => Zoom(true), MIXER => Local),
     bind!(Char('-'), "-", "Zoom out: monitor graph; setup depth/loops; mixer share.", MONITOR => Zoom(false), SETUP => Setup, MIXER => Local),
     bind!(Char('0'), "0", "Monitor: reset pan and zoom.", MONITOR => ResetGraph),
-    bind!(Up, "Up", "Previous item (setup, runs, benchmark, palette, devices, limits, local, network). Scroll up (feed, math, help).", FEED => FeedScroll(-1), SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(-1), HELP => ScrollHelp(-1)),
-    bind!(Down, "Down", "Next item (setup, runs, benchmark, palette, devices, limits, local, network). Scroll down (feed, math, help).", FEED => FeedScroll(1), SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(1), HELP => ScrollHelp(1)),
-    bind!(BackTab, "Shift+Tab", "Previous tab on most browse tabs. In setup, previous wizard page.", BROWSE_NO_SETUP => PreviousTab, SETUP => Setup),
+    bind!(Up, "Up", "Move up: section menu, setup fields, run and benchmark lists, devices, limits, local and network lists. Scroll up: feed, math, help.", MENU => MenuMove(-1), FEED => FeedScroll(-1), SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(-1), HELP => ScrollHelp(-1)),
+    bind!(Down, "Down", "Move down: section menu, setup fields, run and benchmark lists, devices, limits, local and network lists. Scroll down: feed, math, help.", MENU => MenuMove(1), FEED => FeedScroll(1), SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(1), HELP => ScrollHelp(1)),
+    bind!(BackTab, "Shift+Tab", "Previous category.", ALL => PreviousTab),
     bind!(F(5), "F5", "Setup: next wizard page.", SETUP => Setup),
     bind!(Char('c'), "c", "Setup: show command preview. Runs/library: chat with the checkpoint. Network/timeline: open or copy.", SETUP => Setup, RUNS => Extras, LIBRARY => Local, NETWORK | TIMELINE => Network),
     bind!(Char('r'), "r", "Refresh or retry (memory, runs, devices, library, eval, network, timeline).", MEMORY | RUNS => Extras, DEVICE => Device, LIBRARY | EVAL => Local, NETWORK | TIMELINE => Network),
@@ -309,7 +313,7 @@ const BINDINGS: &[Binding] = &[
     bind!(PageDown, "PgDn", "Scroll down: chat, setup preview, memory, local, network, feed, math, help.", FEED => FeedScroll(8), CHAT => Chat, SETUP => Setup, MEMORY => Extras, EVAL => Local, NETWORK => Network, MATH => MathScroll(8), HELP => ScrollHelp(8)),
     bind!(Home, "Home", "First line (feed, math, help). First field (devices, limits, network). First checkpoint (timeline).", FEED => FeedTop, HELP => HelpTop, MATH => MathTop, DEVICE => Device, LIMITS => Limits, NETWORK | TIMELINE => Network),
     bind!(End, "End", "Chat: follow. Last line (feed, math, help). Last field (devices, limits, network).", FEED => FeedBottom, CHAT => Chat, HELP => HelpBottom, MATH => MathBottom, DEVICE => Device, LIMITS => Limits, NETWORK | TIMELINE => Network),
-    bind!(Enter, "Enter", "Chat: send. Setup: edit/save/start. HF: log in. Kaggle: review. Runs: monitor/score. Benchmark/local/network: edit/save/open. Palette: run. Devices/limits: select/edit/apply. Timeline: prepare resume.", CHAT => Chat, SETUP | EDIT => Setup, HF => Hf, KAGGLE_INPUT | RUNS | RUNS_EDIT | BENCHMARK | BENCHMARK_EDIT => Extras, PALETTE => Palette, DEVICE => Device, LIMITS | LIMIT_EDIT => Limits, LOCAL_BROWSE | LOCAL_EDIT => Local, NETWORK | NETWORK_EDIT | TIMELINE => Network),
+    bind!(Enter, "Enter", "Section menu: open the highlighted section. Chat: send. Setup: edit/save/start. HF: log in. Kaggle: review. Runs: monitor/score. Benchmark/local/network: edit/save/open. Palette: run. Devices/limits: select/edit/apply. Timeline: prepare resume.", MENU => MenuOpen, CHAT => Chat, SETUP | EDIT => Setup, HF => Hf, KAGGLE_INPUT | RUNS | RUNS_EDIT | BENCHMARK | BENCHMARK_EDIT => Extras, PALETTE => Palette, DEVICE => Device, LIMITS | LIMIT_EDIT => Limits, LOCAL_BROWSE | LOCAL_EDIT => Local, NETWORK | NETWORK_EDIT | TIMELINE => Network),
     bind!(Char(' '), "Space", "Activate the selected field or button (setup, devices, limits). In a text editor it types a space.", SETUP => Setup, DEVICE => Device, LIMITS => Limits),
     bind!(Backspace, "Backspace", "Delete a character in text editors and the palette.", CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA_EDIT => Extras, PALETTE => Palette, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, NETWORK_EDIT => Network),
     Binding {
@@ -395,12 +399,12 @@ impl Help {
             height,
         );
         f.render_widget(Clear, area);
-        let block = panel(" keyboard shortcuts / all tabs ");
+        let block = panel(" keyboard shortcuts / all screens ");
         let inner = block.inner(area);
         let mut lines: Vec<Line<'static>> = vec![
             Line::from("Keys on the left, what they do on the right. Press F1, ? or Esc to close; PgUp/PgDn scroll."),
-            Line::from("Tabs: Tab goes to the next tab everywhere. Shift+Tab or Left/Right moves between most browse tabs. Ctrl+K jumps to any tab."),
-            Line::from("Esc always backs out: close help/palette, cancel an edit, stop work, or quit. F7 pauses the live preview; a pauses background eval."),
+            Line::from("Navigation: Tab / Shift+Tab move between the five categories. On a category menu, arrows or j/k move and Enter opens the highlighted section; its letter opens it directly."),
+            Line::from("Esc backs out one level: close help or the palette, cancel an edit, stop chat work, cancel a running job, or leave a screen for its menu. Ctrl+K jumps to any screen."),
             Line::from(""),
         ];
         lines.extend(
@@ -493,11 +497,11 @@ mod tests {
         );
         assert_eq!(
             action(KeyEvent::new(Esc, KeyModifiers::NONE), Context::Network),
-            Some(Quit)
+            Some(BackToSections)
         );
         assert_eq!(
             action(KeyEvent::new(Esc, KeyModifiers::NONE), Context::Timeline),
-            Some(Quit)
+            Some(BackToSections)
         );
         assert_eq!(
             action(KeyEvent::new(Esc, KeyModifiers::NONE), Context::NetworkEdit),
@@ -678,7 +682,7 @@ mod tests {
             ),
         ];
         let mut indices = HashSet::new();
-        let mut contexts = vec![Context::Help, Context::Palette];
+        let mut contexts = vec![Context::Help, Context::Palette, Context::Menu];
         for (index, label, browse, edit) in tabs {
             assert!(indices.insert(index), "duplicate tab index: {label}");
             assert_eq!(SCREENS[index], label);
@@ -695,7 +699,7 @@ mod tests {
                 .fold(0, |mask, context| mask | context.mask()),
             ALL
         );
-        assert_eq!(ALL.count_ones(), 29);
+        assert_eq!(ALL.count_ones(), 30);
         for context in contexts {
             for binding in BINDINGS {
                 let matching: Vec<_> = BINDINGS
@@ -852,7 +856,7 @@ mod tests {
         );
         assert_eq!(
             action(KeyEvent::new(BackTab, KeyModifiers::SHIFT), Context::Setup),
-            Some(Setup)
+            Some(PreviousTab)
         );
         for context in [Context::Monitor, Context::Dashboard, Context::Setup] {
             assert_eq!(
