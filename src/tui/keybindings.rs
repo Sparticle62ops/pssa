@@ -30,7 +30,10 @@ pub(super) const SUPPORT_TAB: usize = 23;
 pub(super) const GITHUB_TAB: usize = 24;
 pub(super) const SWEEP_TAB: usize = 25;
 pub(super) const TIMELINE_TAB: usize = 26;
-pub(super) const TABS: [&str; 27] = [
+/// Every renderable screen, indexed by its stable numeric id. The visible
+/// navigation is the smaller category strip in `nav`; this list stays the
+/// internal registry so screen modules keep one id each.
+pub(super) const SCREENS: [&str; 27] = [
     "monitor",
     "chain",
     "model",
@@ -558,7 +561,7 @@ mod tests {
             }
         }
         // Exercise the registry used by the actual event loop in every tab/editor.
-        for tab in 0..super::super::TABS.len() {
+        for tab in 0..super::super::SCREENS.len() {
             for editing in [false, true] {
                 let context = Context::for_tab(tab, editing);
                 for binding in BINDINGS {
@@ -672,12 +675,12 @@ mod tests {
         let mut contexts = vec![Context::Help, Context::Palette];
         for (index, label, browse, edit) in tabs {
             assert!(indices.insert(index), "duplicate tab index: {label}");
-            assert_eq!(TABS[index], label);
+            assert_eq!(SCREENS[index], label);
             assert_eq!(Context::for_tab(index, false), browse, "{label}");
             assert_eq!(Context::for_tab(index, true), edit, "{label} editor");
             contexts.extend([browse, edit]);
         }
-        assert_eq!(indices.len(), TABS.len());
+        assert_eq!(indices.len(), SCREENS.len());
         // Every context retains a distinct bit, including all local/network
         // scopes beyond the tabs plus palette/help scopes.
         assert_eq!(

@@ -63,7 +63,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-use keybindings::{BENCHMARK_TAB, HF_TAB, KAGGLE_TAB, MEMORY_TAB, RUNS_TAB, TABS};
+use keybindings::{BENCHMARK_TAB, HF_TAB, KAGGLE_TAB, MEMORY_TAB, RUNS_TAB, SCREENS};
 // Five scanlines leave room for the P's stem, both S turns and the A's crossbar.
 const PSSA_LOGO: [&str; 5] = [
     "███    ███   ███   ██ ",
@@ -1455,11 +1455,11 @@ fn run_app(
                         Some(Action::Quit) => break,
                         Some(Action::NextTab) => {
                             palette.open = false;
-                            tab = (tab + 1) % TABS.len();
+                            tab = (tab + 1) % SCREENS.len();
                             help.open = false;
                         }
                         Some(Action::PreviousTab) => {
-                            tab = (tab + TABS.len() - 1) % TABS.len();
+                            tab = (tab + SCREENS.len() - 1) % SCREENS.len();
                         }
                         Some(Action::ToggleHelp) => {
                             palette.open = false;
@@ -2361,7 +2361,7 @@ fn draw_with_background(
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(
-                    format!("{} / PSSA", TABS[tab.min(TABS.len() - 1)]),
+                    format!("{} / PSSA", SCREENS[tab.min(SCREENS.len() - 1)]),
                     accent(),
                 ),
                 status_badge(&health),
@@ -2411,7 +2411,7 @@ fn draw_with_background(
     // a tab cannot silently clip its name or steal space from the controls hint.
     // The complete strip uses compact separators when it fits; otherwise
     // complete feature groups keep every tab discoverable at 80+ columns.
-    let full_width = TABS.iter().map(|tab| tab.len()).sum::<usize>() + TABS.len() - 1;
+    let full_width = SCREENS.iter().map(|tab| tab.len()).sum::<usize>() + SCREENS.len() - 1;
     let (first_tab, end_tab) = if usize::from(area.width) < full_width + 9 && f.area().width >= 80 {
         if tab < HF_TAB {
             (0, HF_TAB)
@@ -2424,13 +2424,13 @@ fn draw_with_background(
         } else if tab < keybindings::SUPPORT_TAB {
             (keybindings::BACKUP_TAB, keybindings::SUPPORT_TAB)
         } else {
-            (keybindings::SUPPORT_TAB, TABS.len())
+            (keybindings::SUPPORT_TAB, SCREENS.len())
         }
     } else {
-        (0, TABS.len())
+        (0, SCREENS.len())
     };
-    let visible_tabs = &TABS[first_tab..end_tab];
-    let compact_tabs = first_tab == 0 && end_tab == TABS.len();
+    let visible_tabs = &SCREENS[first_tab..end_tab];
+    let compact_tabs = first_tab == 0 && end_tab == SCREENS.len();
     let tabs_width = if compact_tabs {
         visible_tabs.iter().map(|tab| tab.len()).sum::<usize>() + visible_tabs.len() - 1
     } else {
@@ -2444,7 +2444,7 @@ fn draw_with_background(
         f.render_widget(
             Paragraph::new(format!(
                 " {} / Tab next tab / F1 help",
-                TABS[tab.min(TABS.len() - 1)]
+                SCREENS[tab.min(SCREENS.len() - 1)]
             ))
             .style(accent()),
             nav[0],
@@ -3951,7 +3951,7 @@ mod tests {
     fn test_backend_tab_order_is_unique_and_every_label_is_visible() {
         use ratatui::{Terminal, backend::TestBackend};
         assert_eq!(
-            TABS,
+            SCREENS,
             [
                 "monitor",
                 "chain",
@@ -3982,9 +3982,9 @@ mod tests {
                 "timeline",
             ]
         );
-        let unique: std::collections::HashSet<_> = TABS.iter().collect();
-        assert_eq!(unique.len(), TABS.len());
-        for tab in 0..TABS.len() {
+        let unique: std::collections::HashSet<_> = SCREENS.iter().collect();
+        assert_eq!(unique.len(), SCREENS.len());
+        for tab in 0..SCREENS.len() {
             let mut terminal = Terminal::new(TestBackend::new(300, 24)).unwrap();
             terminal
                 .draw(|f| draw(f, &RunState::default(), tab))
@@ -3998,10 +3998,10 @@ mod tests {
                 .collect();
             let nav = rows
                 .iter()
-                .find(|row| TABS.iter().all(|label| row.contains(label)))
+                .find(|row| SCREENS.iter().all(|label| row.contains(label)))
                 .unwrap();
             let mut previous = 0;
-            for label in TABS {
+            for label in SCREENS {
                 assert_eq!(nav.matches(label).count(), 1, "tab {tab}: {nav}");
                 let position = nav.find(label).unwrap();
                 assert!(position >= previous);
@@ -4022,7 +4022,7 @@ mod tests {
                     .collect();
                 if width < 80 {
                     assert!(
-                        text.contains(&format!("{} / Tab next tab / F1 help", TABS[tab])),
+                        text.contains(&format!("{} / Tab next tab / F1 help", SCREENS[tab])),
                         "compact navigation must show selected tab {tab} at {width}"
                     );
                 } else {
@@ -4037,17 +4037,17 @@ mod tests {
                         .map(|cell| cell.symbol())
                         .collect();
                     let page = if tab < HF_TAB {
-                        &TABS[..HF_TAB]
+                        &SCREENS[..HF_TAB]
                     } else if tab < keybindings::SAMPLE_TAB {
-                        &TABS[HF_TAB..keybindings::SAMPLE_TAB]
+                        &SCREENS[HF_TAB..keybindings::SAMPLE_TAB]
                     } else if tab < keybindings::LIBRARY_TAB {
-                        &TABS[keybindings::SAMPLE_TAB..keybindings::LIBRARY_TAB]
+                        &SCREENS[keybindings::SAMPLE_TAB..keybindings::LIBRARY_TAB]
                     } else if tab < keybindings::BACKUP_TAB {
-                        &TABS[keybindings::LIBRARY_TAB..keybindings::BACKUP_TAB]
+                        &SCREENS[keybindings::LIBRARY_TAB..keybindings::BACKUP_TAB]
                     } else if tab < keybindings::SUPPORT_TAB {
-                        &TABS[keybindings::BACKUP_TAB..keybindings::SUPPORT_TAB]
+                        &SCREENS[keybindings::BACKUP_TAB..keybindings::SUPPORT_TAB]
                     } else {
-                        &TABS[keybindings::SUPPORT_TAB..]
+                        &SCREENS[keybindings::SUPPORT_TAB..]
                     };
                     for label in page {
                         assert_eq!(nav.matches(label).count(), 1, "tab {tab} at {width}: {nav}");
@@ -4130,7 +4130,7 @@ mod tests {
         }
         for (width, height) in [(80, 24), (120, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            for tab in 0..TABS.len() {
+            for tab in 0..SCREENS.len() {
                 terminal.draw(|f| draw(f, &state, tab)).unwrap();
                 let buffer = terminal.backend().buffer();
                 let area = HexBackground::content_area(buffer.area);
@@ -4201,7 +4201,7 @@ mod tests {
         state.ingest("training 2/3 (67%) loss=7.0 tokens_per_second=100 eta=1s");
         let reason = state.health_status().reason.unwrap();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        for tab in 1..TABS.len() {
+        for tab in 1..SCREENS.len() {
             terminal.draw(|f| draw(f, &state, tab)).unwrap();
             let buffer = terminal.backend().buffer();
             let area = HexBackground::content_area(buffer.area);
@@ -5135,7 +5135,7 @@ fn braille_pixels(buffer: &ratatui::buffer::Buffer) -> u32 {
                 (10, 5),
             ] {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-                for tab in 0..TABS.len() {
+                for tab in 0..SCREENS.len() {
                     terminal.draw(|f| draw(f, &state, tab)).unwrap();
                     let text: String = terminal
                         .backend()
@@ -5144,7 +5144,7 @@ fn braille_pixels(buffer: &ratatui::buffer::Buffer) -> u32 {
                         .iter()
                         .map(|cell| cell.symbol())
                         .collect();
-                    assert!(text.contains(TABS[tab]));
+                    assert!(text.contains(SCREENS[tab]));
                     if width >= 80 {
                         assert!(!text.contains("neuron /"));
                         if tab == 0 {
@@ -5570,7 +5570,7 @@ fn braille_pixels(buffer: &ratatui::buffer::Buffer) -> u32 {
         }
         // The same hovered state must remain safe after resizing, on every tab.
         for (width, height) in [(120, 40), (80, 24), (79, 24), (30, 10), (1, 1)] {
-            for tab in 0..TABS.len() {
+            for tab in 0..SCREENS.len() {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
                     .draw(|f| {
