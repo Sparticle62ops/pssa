@@ -2365,8 +2365,8 @@ fn draw_with_background(
                 ),
                 status_badge(&health),
                 Line::from(detail),
-                Line::from("q quit / Tab tabs / ? help"),
-                Line::from("Enlarge for full view"),
+                Line::from("q quit · Tab next tab · ? help"),
+                Line::from("Enlarge the window for the full view"),
             ]),
             area,
         );
@@ -2397,7 +2397,7 @@ fn draw_with_background(
     } else {
         let halloween = if spooky() { "  \u{1F383} happy halloween" } else { "" };
         let title = if area.width >= 45 {
-            format!("PSSA / pssa tui{halloween}  Ctrl+C quit  Tab tabs  F1 help")
+            format!("PSSA / pssa tui{halloween}  Tab next tab  F1 help  Ctrl+C quit")
         } else {
             format!("PSSA / pssa tui{halloween}  F1 help")
         };
@@ -2442,7 +2442,7 @@ fn draw_with_background(
     if area.width < tabs_width {
         f.render_widget(
             Paragraph::new(format!(
-                " {} / Tab tabs / F1 help",
+                " {} / Tab next tab / F1 help",
                 TABS[tab.min(TABS.len() - 1)]
             ))
             .style(accent()),
@@ -2472,11 +2472,10 @@ fn draw_with_background(
                 " F1 help "
             } else {
                 match tab {
-                    0 => "F1 help / g/1-7 views / +/- zoom",
-                    4 => "F1 help / /help commands",
-                    5 => "F1 help / arrows move / Enter edit",
-                    HF_TAB..=BENCHMARK_TAB => "F1 help / Ctrl+K palette",
-                    _ => "F1 help / arrows tabs / q quit",
+                    0 => "F1 help · 1-7 pick graph · +/- zoom · 0 reset",
+                    4 => "F1 help · /help commands · Tab next tab",
+                    5 => "F1 help · F5/Shift+Tab pages · Enter edit",
+                    _ => "F1 help · Tab next tab · Ctrl+K jump",
                 }
             })
             .right_aligned(),
@@ -4022,7 +4021,7 @@ mod tests {
                     .collect();
                 if width < 80 {
                     assert!(
-                        text.contains(&format!("{} / Tab tabs / F1 help", TABS[tab])),
+                        text.contains(&format!("{} / Tab next tab / F1 help", TABS[tab])),
                         "compact navigation must show selected tab {tab} at {width}"
                     );
                 } else {
