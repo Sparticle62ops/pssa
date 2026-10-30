@@ -1326,9 +1326,9 @@ impl Eval {
         let hint = if self.editing() {
             "Prompt JSON: version=1, max_new_tokens=1..32, prompts=[{id,prompt,reference}]"
         } else if narrow {
-            "a pause  p prompts  r reload\n↑↓ checkpoint  PgUp/Dn prompt"
+            "a pause · p prompts · r reload\n↑↓ checkpoint · PgUp/PgDn prompt"
         } else {
-            "a pause  p prompt file  r reload  ↑↓ checkpoint  PgUp/PgDn prompt\nCPU only / 1 worker / loops=1 / NLL is tokenizer-specific, not answer correctness"
+            "a pause · p prompt file · r reload · ↑↓ checkpoint · PgUp/PgDn prompt\nCPU only / 1 worker / loops=1 / NLL is tokenizer-specific, not answer correctness"
         };
         f.render_widget(
             Paragraph::new(hint).style(Style::new().fg(second_accent())),

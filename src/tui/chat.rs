@@ -846,7 +846,7 @@ impl Chat {
         if area.width < 26 || area.height < 9 {
             f.render_widget(
                 Paragraph::new(format!(
-                    "inference / Tab tabs\n{}\n{}\n▶ {}\nEnlarge to chat",
+                    "inference / Tab next tab\n{}\n{}\n▶ {}\nEnlarge to chat",
                     self.status_label(true),
                     clean(&self.note),
                     clean(&self.input)
@@ -942,9 +942,9 @@ impl Chat {
         );
         f.render_widget(
             Paragraph::new(if area.width >= 70 {
-                "Enter send  Esc stop  Tab tabs  F1 keys  /help commands"
+                "Enter send · Esc stop · Tab next tab · F1 keys · /help commands"
             } else {
-                "Enter send / F1 keys / Tab tabs"
+                "Enter send · F1 keys · Tab next tab"
             })
             .style(ratatui::style::Style::new().fg(normal_green())),
             chunks[3],

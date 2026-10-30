@@ -468,7 +468,7 @@ impl Comparison {
             prompt_area,
         );
         f.render_widget(
-            Paragraph::new("Enter send • Esc stop • PgUp/Dn • End follow • /ab off • /help")
+            Paragraph::new("Enter send · Esc stop · PgUp/PgDn · End follow · /ab off · /help")
                 .style(accent()),
             chunks[4],
         );

@@ -270,7 +270,7 @@ impl Benchmark {
             Line::from(
                 "Replays the PSSA chain; trains ONLY the baseline; scores both on the next unseen 256 tokens.",
             ),
-            Line::from("↑/↓ choose • Enter edit • Ctrl+U clear • b run • Esc stop • Tab tabs"),
+            Line::from("↑/↓ choose · Enter edit · Ctrl+U clear · b run · Esc stop · Tab next tab"),
         ];
         let fields: Vec<_> = LABELS
             .iter()

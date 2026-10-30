@@ -401,7 +401,7 @@ impl Preview {
             Vec::new()
         } else {
             vec![
-                Line::styled("F7 pause/resume / F6 confidence / Tab tabs", accent()),
+                Line::styled("F7 pause/resume · F6 confidence · Tab next tab", accent()),
                 Line::from(format!(
                     "Checkpoint: {}",
                     if self.checkpoint.is_empty() {

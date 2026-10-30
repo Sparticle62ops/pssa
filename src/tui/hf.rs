@@ -370,7 +370,7 @@ impl Login {
                 Line::from(format!("Token: {mask}")),
                 Line::from(self.status.as_str()),
                 Line::from(""),
-                Line::from("Enter verify/save • Esc clear • Ctrl+L logout • Tab tabs"),
+                Line::from("Enter verify/save · Esc clear · Ctrl+L logout · Tab next tab"),
                 Line::from("Reads HF_TOKEN, then ~/.cache/huggingface/token; saves mode 0600."),
                 Line::from("Create a read token: https://huggingface.co/settings/tokens"),
                 Line::from(

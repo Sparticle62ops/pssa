@@ -290,7 +290,7 @@ impl Inspector {
             } else {
                 self.note.clone()
             }),
-            Line::from("r refresh • PgUp/PgDn scroll • Tab tabs"),
+            Line::from("r refresh · PgUp/PgDn scroll · Tab next tab"),
             Line::from(""),
             Line::styled(
                 "Confirmed write snippets (only explicit memory_write_snippet fields)",

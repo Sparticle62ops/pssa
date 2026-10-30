@@ -984,7 +984,7 @@ impl Setup {
                 .split(area);
             self.draw_command(f, parts[0]);
             f.render_widget(
-                Paragraph::new("c back / PgUp PgDn scroll\nTab tabs / ? help / q quit")
+                Paragraph::new("c back · PgUp/PgDn scroll\nTab next tab · ? help · q quit")
                     .style(accent()),
                 parts[1],
             );
@@ -1138,9 +1138,9 @@ impl Setup {
             Style::new().fg(if self.error { bright_red() } else { amber() }),
         )];
         footer.push(Line::from(if self.edit.is_some() {
-            "Type / Enter save / Esc cancel / Tab tabs / F1 help"
+            "Type · Enter save · Esc cancel · Tab next tab · F1 help"
         } else {
-            "Enter edit / arrows move / c CLI / Tab tabs / ? help"
+            "Enter edit · arrows move · c CLI · Tab next tab · ? help"
         }));
         f.render_widget(Paragraph::new(footer), parts[3]);
     }
@@ -1158,7 +1158,7 @@ impl Setup {
         f.render_widget(
             paragraph
                 .scroll((self.command_scroll, 0))
-                .block(panel(" same run as a CLI command / PgUp PgDn ")),
+                .block(panel(" same run as a CLI command / PgUp/PgDn ")),
             command_area,
         );
     }
