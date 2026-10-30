@@ -2,7 +2,7 @@
 //! slow redraws (or quitting the dashboard) cannot hold up the child process.
 use super::device::DevicePicker;
 use super::{
-    AMBER, BRIGHT_RED, NORMAL_GREEN, RunState, accent, depth_zoom::DepthZoom, panel, panel_area,
+    amber, bright_red, normal_green, RunState, accent, depth_zoom::DepthZoom, panel, panel_area,
     ring,
 };
 use crate::{
@@ -1094,7 +1094,7 @@ impl Setup {
                         _ => "Blank limits = unchanged. RAM = Linux address space, NOT RSS/VRAM.",
                     }
                 },
-                Style::new().fg(AMBER),
+                Style::new().fg(amber()),
             ));
             if self.page == 3 && !self.is_world_model() {
                 rows.push(Line::from(
@@ -1135,7 +1135,7 @@ impl Setup {
         }
         let mut footer = vec![Line::styled(
             &self.message,
-            Style::new().fg(if self.error { BRIGHT_RED } else { AMBER }),
+            Style::new().fg(if self.error { bright_red() } else { amber() }),
         )];
         footer.push(Line::from(if self.edit.is_some() {
             "Type / Enter save / Esc cancel / Tab tabs / F1 help"
@@ -1147,7 +1147,7 @@ impl Setup {
 
     fn draw_command(&mut self, f: &mut Frame, area: Rect) {
         let paragraph = Paragraph::new(self.command())
-            .style(Style::new().fg(NORMAL_GREEN))
+            .style(Style::new().fg(normal_green()))
             .wrap(Wrap { trim: false });
         let max_scroll = paragraph
             .line_count(area.width.saturating_sub(2))
@@ -2157,7 +2157,7 @@ mod tests {
                         .buffer()
                         .content()
                         .iter()
-                        .any(|c| c.fg == BRIGHT_RED)
+                        .any(|c| c.fg == bright_red())
                 );
             }
         }

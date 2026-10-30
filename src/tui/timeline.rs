@@ -1,7 +1,7 @@
 //! Read-only checkpoint history: filenames + bounded recorded logs, never weights.
 //! A single background scan is allowed at a time, including across run switches.
 use super::{
-    AMBER, RunState, accent, checkpoint_sort_key, panel, panel_area, parse_field, process::clean,
+    amber, RunState, accent, checkpoint_sort_key, panel, panel_area, parse_field, process::clean,
 };
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -585,11 +585,11 @@ impl Timeline {
                     y_bounds: super::charts::bounds(points.iter().map(|p| p.1)),
                 },
                 &[
-                    super::charts::Series::line("recorded loss", &points, super::NORMAL_GREEN),
+                    super::charts::Series::line("recorded loss", &points, super::normal_green()),
                     super::charts::Series {
                         name: "selected",
                         points: &selected,
-                        color: super::SECOND_ACCENT,
+                        color: super::second_accent(),
                         scatter: true,
                     },
                 ],
@@ -697,7 +697,7 @@ impl Timeline {
         }
         rows.push(Line::styled(
             "Enter prepares setup ONLY; review configuration before START.",
-            Style::new().fg(AMBER),
+            Style::new().fg(amber()),
         ));
         let selected_area = panel_area(f, parts[1]);
         f.render_widget(
@@ -1190,7 +1190,7 @@ mod tests {
                 if h == 40 { 8 } else { 3 },
             );
             assert!(terminal.backend().buffer().content().iter().any(|c| {
-                c.fg == super::super::SECOND_ACCENT
+                c.fg == super::super::second_accent()
                     && c.symbol()
                         .chars()
                         .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))

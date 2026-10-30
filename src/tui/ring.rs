@@ -236,10 +236,8 @@ mod tests {
             );
             assert!(buffer.content().iter().any(|cell| cell.fg == ELECTRIC));
             assert!(
-                buffer.content().iter().any(|cell| {
-                    matches!(cell.fg, Color::Rgb(r, g, b) if r > 0 && r < 0x39 && g > b && b > r)
-                }),
-                "dim green connections behind the bright pulse"
+                buffer.content().iter().any(|cell| cell.fg == neuron_green(0.18)),
+                "dim connections behind the bright pulse"
             );
             assert_eq!(buffer[(0, 0)].symbol(), "┌");
             assert_eq!(buffer[(63, 15)].symbol(), "┘");

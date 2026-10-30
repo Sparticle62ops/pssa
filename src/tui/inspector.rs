@@ -241,7 +241,7 @@ impl Inspector {
             &[super::charts::Series::line(
                 "used slots",
                 &history,
-                super::NORMAL_GREEN,
+                super::normal_green(),
             )],
         );
         let content = if area.width >= 80 {

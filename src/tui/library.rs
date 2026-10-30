@@ -1,5 +1,5 @@
 //! Local catalogue and bounded, off-thread dataset inspection. No weights are loaded.
-use super::{AMBER, SECOND_ACCENT, accent, panel, panel_area};
+use super::{amber, second_accent, accent, panel, panel_area};
 use crate::dataset::Tokenizer;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -726,7 +726,7 @@ impl Library {
                 if i == self.selected {
                     accent()
                 } else {
-                    ratatui::style::Style::new().fg(SECOND_ACCENT)
+                    ratatui::style::Style::new().fg(second_accent())
                 },
             ));
         }
@@ -738,7 +738,7 @@ impl Library {
         f.render_widget(Paragraph::new(rows), parts[1]);
         let mut detail = vec![Line::styled(
             clean(&self.note),
-            ratatui::style::Style::new().fg(AMBER),
+            ratatui::style::Style::new().fg(amber()),
         )];
         if let Some(entry) = self.entries.get(self.selected) {
             detail.push(Line::from(format!(

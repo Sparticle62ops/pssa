@@ -1,5 +1,5 @@
 //! Optional limits for the next training child, not the dashboard process.
-use super::{AMBER, BRIGHT_RED, SECOND_ACCENT, accent, panel, panel_area};
+use super::{amber, bright_red, second_accent, accent, panel, panel_area};
 use crate::cli::resource_limits::ResourceLimits;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -173,17 +173,17 @@ impl Limits {
         self.applied.append_args(&mut args);
         let semantics_area = panel_area(f, parts[2]);
         f.render_widget(Paragraph::new(vec![
-            Line::styled("Threads: local Rayon pool. Changing reduction order may change the last digits.", Style::new().fg(AMBER)),
+            Line::styled("Threads: local Rayon pool. Changing reduction order may change the last digits.", Style::new().fg(amber())),
             Line::from("RAM: Linux prlimit hard address-space (RLIMIT_AS) budget; NOT RSS or VRAM. Too low may abort the child; GPU mappings also count. Other OSes reject it."),
             Line::from("Batch lanes use --batch-size (default 1); not a VRAM cap. Tokens cap the corpus, not each epoch or inference reply."),
             Line::from("No CPU throttling, affinity, or GPU VRAM quota. In-process chat is not RAM-limited."),
-            Line::styled(format!("Applied CLI: {}", if args.is_empty() { "(no extra flags)".into() } else { args.join(" ") }), Style::new().fg(SECOND_ACCENT)),
+            Line::styled(format!("Applied CLI: {}", if args.is_empty() { "(no extra flags)".into() } else { args.join(" ") }), Style::new().fg(second_accent())),
         ]).wrap(Wrap { trim: false }).block(panel(" enforcement / semantics ")), semantics_area);
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(
                     self.message.clone(),
-                    Style::new().fg(if self.error { BRIGHT_RED } else { AMBER }),
+                    Style::new().fg(if self.error { bright_red() } else { amber() }),
                 ),
                 Line::from(if self.editing() {
                     "Digits / Enter save / Esc cancel / Ctrl+U clear"

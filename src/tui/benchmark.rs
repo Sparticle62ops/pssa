@@ -238,8 +238,8 @@ impl Benchmark {
                     y_bounds: [0.0, 3.0],
                 },
                 &[
-                    super::charts::Series::line("PSSA", &a, super::NORMAL_GREEN),
-                    super::charts::Series::line("transformer", &b, super::SECOND_ACCENT),
+                    super::charts::Series::line("PSSA", &a, super::normal_green()),
+                    super::charts::Series::line("transformer", &b, super::second_accent()),
                 ],
                 Some(vec![
                     "".into(),

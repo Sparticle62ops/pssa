@@ -182,13 +182,17 @@ fn neuron_raster(f: &mut Frame, inner: Rect) -> Raster {
             let Some(ch @ '\u{2800}'..='\u{28ff}') = cell.symbol().chars().next() else {
                 continue;
             };
-            let Color::Rgb(_, green, _) = cell.fg else {
+            // Band on the palette's dominant channel so the Halloween palette
+            // (ember orange) and the regular green both keep eight shades.
+            let Color::Rgb(r, g, _) = cell.fg else {
                 continue;
             };
-            if green == 0 {
+            let peak: usize = if super::spooky() { 0xff } else { 0xe0 };
+            let dominant = if super::spooky() { r } else { g };
+            if dominant == 0 {
                 continue;
             }
-            let shade = ((usize::from(green) * SHADES).div_ceil(0xe0)).clamp(1, SHADES) - 1;
+            let shade = ((usize::from(dominant) * SHADES).div_ceil(peak)).clamp(1, SHADES) - 1;
             let bits = ch as u32 - 0x2800;
             for (bit, (dx, dy)) in BRAILLE_DOTS.into_iter().enumerate() {
                 if bits & (1 << bit) != 0 {

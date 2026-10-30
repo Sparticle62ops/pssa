@@ -72,13 +72,67 @@ const PSSA_LOGO: [&str; 5] = [
     "█        █     █  █  █",
     "█     ███   ███   █  █",
 ];
-const PANEL_BG: Color = Color::Rgb(0x07, 0x12, 0x10);
-const INSET_BG: Color = Color::Rgb(0x09, 0x14, 0x1a);
-const SECOND_ACCENT: Color = Color::Rgb(0x57, 0x82, 0x91);
-const GRID_COLOR: Color = Color::Rgb(0x19, 0x30, 0x35);
-const NORMAL_GREEN: Color = Color::Rgb(0x39, 0xe0, 0x7a);
-const AMBER: Color = Color::Rgb(0xff, 0xbf, 0x00);
-const BRIGHT_RED: Color = Color::Rgb(0xff, 0x2f, 0x3f);
+
+// Halloween week palette. Every October 24-31 the TUI lights itself up
+// jack-o'-lantern orange over haunted violet; PSSA_SPOOKY=1 forces it on,
+// PSSA_SPOOKY=0 keeps the regular look any day of the year.
+const SPOOKY_ORANGE: Color = Color::Rgb(0xff, 0x8c, 0x1a);
+const SPOOKY_VIOLET: Color = Color::Rgb(0xb1, 0x6f, 0xff);
+const SPOOKY_CANDLE: Color = Color::Rgb(0xff, 0xa5, 0x00);
+const SPOOKY_EMBER: Color = Color::Rgb(0xff, 0x4f, 0x00);
+const SPOOKY_PANEL_BG: Color = Color::Rgb(0x0d, 0x06, 0x16);
+const SPOOKY_INSET_BG: Color = Color::Rgb(0x11, 0x08, 0x1e);
+const SPOOKY_GRID_COLOR: Color = Color::Rgb(0x2a, 0x1a, 0x44);
+
+fn spooky() -> bool {
+    static SPOOKY_MODE: OnceLock<bool> = OnceLock::new();
+    *SPOOKY_MODE.get_or_init(|| {
+        match std::env::var("PSSA_SPOOKY").as_deref() {
+            Ok("1") => return true,
+            Ok("0") => return false,
+            _ => {}
+        }
+        // Pacific time: the season follows the local wall clock.
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+            - 8 * 3600;
+        let days = secs.div_euclid(86_400);
+        // Howard Hinnant's civil-from-days, inlined.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let month = mp + if mp < 10 { 3 } else { -9 };
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        month == 10 && day >= 24
+    })
+}
+
+fn normal_green() -> Color {
+    if spooky() { SPOOKY_ORANGE } else { Color::Rgb(0x39, 0xe0, 0x7a) }
+}
+fn second_accent() -> Color {
+    if spooky() { SPOOKY_VIOLET } else { Color::Rgb(0x57, 0x82, 0x91) }
+}
+fn panel_bg() -> Color {
+    if spooky() { SPOOKY_PANEL_BG } else { Color::Rgb(0x07, 0x12, 0x10) }
+}
+fn inset_bg() -> Color {
+    if spooky() { SPOOKY_INSET_BG } else { Color::Rgb(0x09, 0x14, 0x1a) }
+}
+fn grid_color() -> Color {
+    if spooky() { SPOOKY_GRID_COLOR } else { Color::Rgb(0x19, 0x30, 0x35) }
+}
+fn amber() -> Color {
+    if spooky() { SPOOKY_CANDLE } else { Color::Rgb(0xff, 0xbf, 0x00) }
+}
+fn bright_red() -> Color {
+    if spooky() { SPOOKY_EMBER } else { Color::Rgb(0xff, 0x2f, 0x3f) }
+}
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const PROGRESS_INTERPOLATION: Duration = Duration::from_millis(450);
 const BRAILLE_LEVELS: [&str; 8] = ["⡀", "⡄", "⡆", "⡇", "⣇", "⣧", "⣷", "⣿"];
@@ -247,9 +301,9 @@ struct HealthStatus {
 impl HealthStatus {
     fn color(&self) -> Color {
         match self.level {
-            HealthLevel::Normal => NORMAL_GREEN,
-            HealthLevel::Warning => AMBER,
-            HealthLevel::Problem => BRIGHT_RED,
+            HealthLevel::Normal => normal_green(),
+            HealthLevel::Warning => amber(),
+            HealthLevel::Problem => bright_red(),
         }
     }
 
@@ -1569,12 +1623,12 @@ fn poll_training_queue(
 }
 
 fn accent() -> Style {
-    Style::new().fg(NORMAL_GREEN)
+    Style::new().fg(normal_green())
 }
 
 fn panel(title: &str) -> Block<'_> {
     Block::default()
-        .style(Style::new().bg(PANEL_BG))
+        .style(Style::new().bg(panel_bg()))
         .borders(Borders::ALL)
         .border_style(accent().add_modifier(Modifier::DIM))
         .title(Line::styled(title, accent().add_modifier(Modifier::BOLD)))
@@ -1585,12 +1639,12 @@ fn panel(title: &str) -> Block<'_> {
 /// the long-standing compact layout.
 fn panel_area(f: &mut ratatui::Frame, area: Rect) -> Rect {
     let frame_area = f.area();
-    shadow::paint(f, area, frame_area, shadow::color(PANEL_BG));
+    shadow::paint(f, area, frame_area, shadow::color(panel_bg()));
     area
 }
 
 fn divider(width: u16) -> Line<'static> {
-    Line::styled("╌".repeat(width.into()), Style::new().fg(SECOND_ACCENT))
+    Line::styled("╌".repeat(width.into()), Style::new().fg(second_accent()))
 }
 
 fn status_badge(health: &HealthStatus) -> Line<'static> {
@@ -1627,8 +1681,8 @@ fn draw_header_stats(f: &mut ratatui::Frame, area: Rect, state: &RunState, healt
         .map(|reason| format!(" {reason} "))
         .unwrap_or_else(|| " live telemetry ".into());
     let block = panel("")
-        .style(Style::new().bg(INSET_BG))
-        .border_style(Style::new().fg(SECOND_ACCENT))
+        .style(Style::new().bg(inset_bg()))
+        .border_style(Style::new().fg(second_accent()))
         .title(Line::styled(title, Style::new().fg(health.color())));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1693,7 +1747,7 @@ fn draw_header_stats(f: &mut ratatui::Frame, area: Rect, state: &RunState, healt
             )]),
             Line::styled(
                 format!("loss {} {range} step → / lower better", loss_trace(state)),
-                Style::new().fg(SECOND_ACCENT),
+                Style::new().fg(second_accent()),
             ),
         ]),
         inner,
@@ -1710,8 +1764,8 @@ fn loss_trace(state: &RunState) -> String {
 fn draw_info_card(f: &mut ratatui::Frame, area: Rect, title: &str, lines: Vec<Line<'_>>) {
     let area = panel_area(f, area);
     let block = panel(title)
-        .style(Style::new().bg(INSET_BG))
-        .border_style(Style::new().fg(SECOND_ACCENT));
+        .style(Style::new().bg(inset_bg()))
+        .border_style(Style::new().fg(second_accent()));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.is_empty() {
@@ -1724,7 +1778,7 @@ fn draw_info_card(f: &mut ratatui::Frame, area: Rect, title: &str, lines: Vec<Li
     f.render_widget(paragraph, Rect::new(inner.x, inner.y, inner.width, rows));
     for y in (inner.y + rows + 1..inner.bottom()).step_by(2) {
         for x in (inner.x + 1..inner.right()).step_by(4) {
-            f.buffer_mut()[(x, y)].set_symbol("·").set_fg(GRID_COLOR);
+            f.buffer_mut()[(x, y)].set_symbol("·").set_fg(grid_color());
         }
     }
 }
@@ -1764,10 +1818,15 @@ fn progress_gradient(index: u16, width: u16) -> Color {
     let channel = |start: u8, end: u8| {
         (f64::from(start) + (f64::from(end) - f64::from(start)) * t).round() as u8
     };
+    let (from, to) = if spooky() {
+        ((0x3a, 0x14, 0x08), (0xff, 0x8c, 0x1a))
+    } else {
+        ((0x16, 0x73, 0x45), (0x39, 0xe0, 0x7a))
+    };
     Color::Rgb(
-        channel(0x16, 0x39),
-        channel(0x73, 0xe0),
-        channel(0x45, 0x7a),
+        channel(from.0, to.0),
+        channel(from.1, to.1),
+        channel(from.2, to.2),
     )
 }
 
@@ -1942,10 +2001,15 @@ fn neuron_network(cycle: u64) -> Vec<NeuronNode> {
 
 fn neuron_green(intensity: f64) -> Color {
     let intensity = intensity.clamp(0.0, 1.0);
+    let (r, g, b) = if spooky() {
+        (0xff, 0x8c, 0x1a)
+    } else {
+        (0x39, 0xe0, 0x7a)
+    };
     Color::Rgb(
-        (f64::from(0x39) * intensity).round() as u8,
-        (f64::from(0xe0) * intensity).round() as u8,
-        (f64::from(0x7a) * intensity).round() as u8,
+        (f64::from(r) * intensity).round() as u8,
+        (f64::from(g) * intensity).round() as u8,
+        (f64::from(b) * intensity).round() as u8,
     )
 }
 
@@ -2113,13 +2177,24 @@ fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64)
                 Style::new().fg(progress_gradient(index, inner.width)),
             )
         } else {
-            ("·", Style::new().fg(Color::Rgb(0x0d, 0x2b, 0x1d)))
+            (
+            "·",
+            Style::new().fg(if spooky() {
+                Color::Rgb(0x2b, 0x0d, 0x24)
+            } else {
+                Color::Rgb(0x0d, 0x2b, 0x1d)
+            }),
+        )
         };
         let filled = index < full_cells || (index == full_cells && partial > 0);
         if shine == Some(index) && filled {
             // A single-cell glint keeps the bar lively without obscuring its
             // green gradient or turning it into a second status color.
-            style = Style::new().fg(Color::Rgb(0x9a, 0xff, 0xb9));
+            style = Style::new().fg(if spooky() {
+                Color::Rgb(0xff, 0xc4, 0x8a)
+            } else {
+                Color::Rgb(0x9a, 0xff, 0xb9)
+            });
         }
         style = style.bg(Color::Black);
         if let Some(cell) = f.buffer_mut().cell_mut((inner.x + index, inner.y)) {
@@ -2134,7 +2209,7 @@ fn draw_progress(f: &mut ratatui::Frame, area: Rect, state: &RunState, pct: f64)
             inner.y + 1,
             label,
             usize::from(inner.width),
-            Style::new().fg(NORMAL_GREEN).add_modifier(Modifier::BOLD),
+            Style::new().fg(normal_green()).add_modifier(Modifier::BOLD),
         );
     }
 }
@@ -2320,10 +2395,11 @@ fn draw_with_background(
             &health,
         );
     } else {
+        let halloween = if spooky() { "  \u{1F383} happy halloween" } else { "" };
         let title = if area.width >= 45 {
-            "PSSA / pssa tui  Ctrl+C quit  Tab tabs  F1 help"
+            format!("PSSA / pssa tui{halloween}  Ctrl+C quit  Tab tabs  F1 help")
         } else {
-            "PSSA / pssa tui  F1 help"
+            format!("PSSA / pssa tui{halloween}  F1 help")
         };
         f.render_widget(
             Paragraph::new(vec![Line::styled(title, accent()), status_badge(&health)]),
@@ -2742,32 +2818,32 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
             data.push((
                 "moving avg",
                 moving_loss.as_deref().unwrap_or(&[]),
-                SECOND_ACCENT,
+                second_accent(),
             ));
-            data.push(("loss", loss.as_deref().unwrap_or(&[]), NORMAL_GREEN));
+            data.push(("loss", loss.as_deref().unwrap_or(&[]), normal_green()));
         }
         GraphView::Perplexity => {
             data.push((
                 "perplexity",
                 perplexity.as_deref().unwrap_or(&[]),
-                NORMAL_GREEN,
+                normal_green(),
             ));
         }
         GraphView::TokensPerSecond => {
-            data.push(("tokens/sec", tokens.as_deref().unwrap_or(&[]), NORMAL_GREEN));
+            data.push(("tokens/sec", tokens.as_deref().unwrap_or(&[]), normal_green()));
         }
         GraphView::LearningRate => {
             data.push((
                 "learning rate",
                 learning_rate.as_deref().unwrap_or(&[]),
-                NORMAL_GREEN,
+                normal_green(),
             ));
         }
         GraphView::Comparison => {
             data.push((
                 "current loss",
                 moving_loss.as_deref().unwrap_or(&[]),
-                NORMAL_GREEN,
+                normal_green(),
             ));
             if compare_loss
                 .as_deref()
@@ -2781,7 +2857,7 @@ fn draw_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState, now: Instant
             }
         }
         GraphView::All => {
-            data.push(("loss", loss.as_deref().unwrap_or(&[]), NORMAL_GREEN));
+            data.push(("loss", loss.as_deref().unwrap_or(&[]), normal_green()));
             data.push((
                 "perplexity",
                 perplexity.as_deref().unwrap_or(&[]),
@@ -2935,7 +3011,7 @@ fn draw_memory_graph(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
     let disk_points = [charts::Series {
         name: "occupied entries",
         points: &entries,
-        color: NORMAL_GREEN,
+        color: normal_green(),
         scatter: true,
     }];
     let occupancy_label = if capacity > 0 {
@@ -3245,7 +3321,7 @@ fn draw_chain(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
             cards[0],
             " checkpoint index / 0 files ",
             vec![
-                Line::styled("FILE                 LOSS", Style::new().fg(SECOND_ACCENT)),
+                Line::styled("FILE                 LOSS", Style::new().fg(second_accent())),
                 Line::from(state.checkpoint_context()),
                 Line::from("Only saved files and recorded losses appear; no synthetic history."),
             ],
@@ -3310,7 +3386,7 @@ fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
         ("schedule", &state.schedule),
     ] {
         lines.push(Line::from(vec![
-            Span::styled(format!("{label:<14}"), Style::new().fg(SECOND_ACCENT)),
+            Span::styled(format!("{label:<14}"), Style::new().fg(second_accent())),
             Span::raw(value.as_deref().unwrap_or("not reported")),
         ]));
     }
@@ -3375,7 +3451,7 @@ fn draw_model(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
                 Line::from(format!("saved   {}", state.checkpoint_context())),
                 Line::styled(
                     "Read-only / no model or checkpoint changes",
-                    Style::new().fg(SECOND_ACCENT),
+                    Style::new().fg(second_accent()),
                 ),
             ],
         );
@@ -3823,13 +3899,13 @@ mod tests {
             state.ingest("training 1/10 (10%) loss=4.0 tokens_per_second=100 eta=1s");
         }
         assert_eq!(state.health_status().level, HealthLevel::Normal);
-        assert_eq!(state.health_status().color(), NORMAL_GREEN);
+        assert_eq!(state.health_status().color(), normal_green());
 
         state.ingest("training 2/10 (20%) loss=7.0 tokens_per_second=100 eta=1s");
         let health = state.health_status();
         assert_eq!(health.level, HealthLevel::Problem);
         assert!(health.label().contains("loss spike"));
-        assert_eq!(health.color(), BRIGHT_RED);
+        assert_eq!(health.color(), bright_red());
 
         state.ingest("training 3/10 (30%) loss=4.0 tokens_per_second=50 eta=1s");
         let health = state.health_status();
@@ -4038,7 +4114,7 @@ mod tests {
                         let cell =
                             &buffer[(origin.x + (letter * 6 + x) as u16, origin.y + y as u16)];
                         assert_eq!(cell.symbol(), if pixel == '1' { "█" } else { " " });
-                        assert_eq!(cell.fg, NORMAL_GREEN);
+                        assert_eq!(cell.fg, normal_green());
                     }
                 }
             }
@@ -4133,7 +4209,7 @@ mod tests {
                 .map(|x| buffer[(x, area.y)].symbol())
                 .collect();
             assert!(title.contains(&reason), "clipped health reason: {title}");
-            assert!(buffer.content().iter().any(|c| c.fg == BRIGHT_RED));
+            assert!(buffer.content().iter().any(|c| c.fg == bright_red()));
         }
     }
 
@@ -4199,17 +4275,17 @@ mod tests {
                 for label in labels {
                     assert!(text.contains(label), "{width}x{height} missing {label}");
                 }
-                for color in [PANEL_BG, INSET_BG] {
+                for color in [panel_bg(), inset_bg()] {
                     assert!(buffer.content().iter().any(|c| c.bg == color));
                 }
-                assert!(buffer.content().iter().any(|c| c.fg == SECOND_ACCENT));
-                assert!(!buffer.content().iter().any(|c| c.fg == BRIGHT_RED));
+                assert!(buffer.content().iter().any(|c| c.fg == second_accent()));
+                assert!(!buffer.content().iter().any(|c| c.fg == bright_red()));
                 if height >= 40 && tab != 3 {
                     assert!(
                         buffer
                             .content()
                             .iter()
-                            .any(|c| c.symbol() == "·" && c.fg == GRID_COLOR)
+                            .any(|c| c.symbol() == "·" && c.fg == grid_color())
                     );
                 }
             }
@@ -4558,7 +4634,7 @@ mod tests {
                     if matches!(cell.symbol(), "▄" | "█") {
                         pixels.insert((x, y + 1));
                     }
-                } else if cell.fg == NORMAL_GREEN
+                } else if cell.fg == normal_green()
                     && cell
                         .symbol()
                         .chars()
@@ -4692,7 +4768,7 @@ mod tests {
             for y in data_top..=data_bottom {
                 for x in axis + 1..right {
                     let cell = &b[(x, y)];
-                    assert_eq!(cell.bg, PANEL_BG);
+                    assert_eq!(cell.bg, panel_bg());
                     assert!(
                         cell.symbol() == " "
                             || cell
@@ -4785,7 +4861,7 @@ mod tests {
                 }
                 if view == GraphView::Loss {
                     assert!(buffer.content().iter().any(|c| {
-                        c.fg == SECOND_ACCENT
+                        c.fg == second_accent()
                             && c.symbol()
                                 .chars()
                                 .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
@@ -4857,7 +4933,16 @@ mod tests {
         }
     }
 
-    fn braille_pixels(buffer: &ratatui::buffer::Buffer) -> u32 {
+    fn fades_in_active_palette(fg: ratatui::style::Color) -> bool {
+    match fg {
+        // Regular dim greens and their Halloween ember counterparts.
+        ratatui::style::Color::Rgb(r, g, b) if r > 0 && r < 0x39 && g > b && b > r => true,
+        ratatui::style::Color::Rgb(r, g, b) if r > g && g > b && r < 0x60 => true,
+        _ => false,
+    }
+}
+
+fn braille_pixels(buffer: &ratatui::buffer::Buffer) -> u32 {
         buffer
             .content()
             .iter()
@@ -4894,14 +4979,15 @@ mod tests {
                     .next()
                     .is_some_and(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
             }));
-            assert!(buffer.content().iter().any(|cell| cell.fg == NORMAL_GREEN));
+            assert!(buffer.content().iter().any(|cell| cell.fg == normal_green()));
             if elapsed == Duration::ZERO || elapsed == NEURON_CYCLE - Duration::from_millis(1) {
                 assert_eq!(braille_pixels(buffer), 5, "one filled circular seed");
             } else if elapsed == Duration::from_millis(2_500) {
                 assert!(braille_pixels(buffer) > 5, "branches grow beyond the seed");
-                assert!(buffer.content().iter().any(|cell| {
-                    matches!(cell.fg, Color::Rgb(r, g, b) if r > 0 && r < 0x39 && g > b && b > r)
-                }), "branches and newly born nodes fade in green");
+                assert!(
+                    buffer.content().iter().any(|cell| fades_in_active_palette(cell.fg)),
+                    "branches and newly born nodes fade in the active palette"
+                );
             }
         }
 
@@ -5459,7 +5545,7 @@ mod tests {
             assert!(text.contains("IDs: 12, 34, 56"));
             assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "┌");
             assert_eq!(buffer.cell((79, 18)).unwrap().symbol(), "┘");
-            assert!(!buffer.content().iter().any(|c| c.fg == BRIGHT_RED));
+            assert!(!buffer.content().iter().any(|c| c.fg == bright_red()));
             frames.push(buffer.clone());
         }
         assert_eq!(
@@ -5543,6 +5629,6 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains("loss spike"));
-        assert!(buffer.content().iter().any(|cell| cell.fg == BRIGHT_RED));
+        assert!(buffer.content().iter().any(|cell| cell.fg == bright_red()));
     }
 }

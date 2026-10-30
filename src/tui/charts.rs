@@ -1,5 +1,5 @@
 //! Shared CRT plots: connected braille strokes, honest gaps, and readable scales.
-use super::{NORMAL_GREEN, PANEL_BG, SECOND_ACCENT, accent, panel, panel_area};
+use super::{normal_green, panel_bg, second_accent, accent, panel, panel_area};
 use ratatui::{
     Frame,
     buffer::Buffer,
@@ -267,7 +267,7 @@ pub(super) fn draw_solid_overlay(
     };
     f.render_widget(
         Canvas::default()
-            .background_color(PANEL_BG)
+            .background_color(panel_bg())
             .marker(Marker::HalfBlock)
             .x_bounds(plot.x_bounds)
             .y_bounds(plot.y_bounds)
@@ -318,7 +318,7 @@ pub(super) fn draw_labeled(
     }
     let block = panel("")
         .title(title)
-        .title_bottom(Line::styled(plot.caption, Style::new().fg(SECOND_ACCENT)));
+        .title_bottom(Line::styled(plot.caption, Style::new().fg(second_accent())));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width < 16 || inner.height < 5 {
@@ -388,7 +388,7 @@ pub(super) fn draw_labeled(
     draw_x_labels(buffer, graph, plot.x, &x_labels);
     f.render_widget(
         Canvas::default()
-            .background_color(PANEL_BG)
+            .background_color(panel_bg())
             .marker(Marker::Braille)
             .x_bounds(plot.x_bounds)
             .y_bounds(plot.y_bounds)
@@ -589,13 +589,13 @@ pub(super) fn sparkline(values: &[f64], width: usize) -> String {
             for run in points.split(|p| !p.1.is_finite()) {
                 ctx.draw(&Points {
                     coords: run,
-                    color: NORMAL_GREEN,
+                    color: normal_green(),
                 });
                 for pair in run.windows(2) {
                     ctx.draw(&ThinLine {
                         from: pair[0],
                         to: pair[1],
-                        color: NORMAL_GREEN,
+                        color: normal_green(),
                     });
                 }
             }
@@ -733,7 +733,7 @@ mod tests {
                         &[Series::line(
                             "loss",
                             &[(0.0, 3.0), (100.0, 1.0)],
-                            NORMAL_GREEN,
+                            normal_green(),
                         )],
                     )
                 })
@@ -781,10 +781,10 @@ mod tests {
             terminal.draw(|f| draw(f, area, plot(), series)).unwrap();
             terminal.backend().buffer().clone()
         };
-        let alone = render(&[Series::line("loss", &loss, NORMAL_GREEN)]);
+        let alone = render(&[Series::line("loss", &loss, normal_green())]);
         let both = render(&[
-            Series::line("loss", &loss, NORMAL_GREEN),
-            Series::line("moving avg", &avg, SECOND_ACCENT),
+            Series::line("loss", &loss, normal_green()),
+            Series::line("moving avg", &avg, second_accent()),
         ]);
         let graph = graph_rect(&alone, area);
         let missing: Vec<_> = dots(&alone, graph)
@@ -796,8 +796,8 @@ mod tests {
             "loss dots erased where lines cross: {missing:?}"
         );
         let avg_alone = render(&[
-            Series::line("loss", &[], NORMAL_GREEN),
-            Series::line("moving avg", &avg, SECOND_ACCENT),
+            Series::line("loss", &[], normal_green()),
+            Series::line("moving avg", &avg, second_accent()),
         ]);
         assert!(dots(&avg_alone, graph).is_subset(&dots(&both, graph)));
     }
@@ -871,7 +871,7 @@ mod tests {
                                 &[Series::line(
                                     "measured",
                                     &[(1.0, data[1]), (150.0, data[0])],
-                                    NORMAL_GREEN,
+                                    normal_green(),
                                 )],
                             )
                         })
@@ -920,7 +920,7 @@ mod tests {
                     );
                     for y in area.y + 1..area.bottom() - 1 {
                         for x in area.x + 1..area.right() - 1 {
-                            assert_eq!(b[(x, y)].bg, PANEL_BG, "plot must match its panel");
+                            assert_eq!(b[(x, y)].bg, panel_bg(), "plot must match its panel");
                         }
                     }
                     assert_eq!(b[(area.right() - 1, area.bottom() - 1)].symbol(), "┘");
@@ -975,7 +975,7 @@ mod tests {
                                 &[Series::line(
                                     "measured",
                                     &[(1.0, y_bounds[1]), (150.0, y_bounds[0])],
-                                    NORMAL_GREEN,
+                                    normal_green(),
                                 )],
                             )
                         })
@@ -1058,7 +1058,7 @@ mod tests {
                         ctx.draw(&ThinLine {
                             from,
                             to,
-                            color: NORMAL_GREEN,
+                            color: normal_green(),
                         })
                     })
                     .render(area, &mut b);
@@ -1120,7 +1120,7 @@ mod tests {
                             &[Series::line(
                                 "loss",
                                 &[(0.0, values[0]), (100.0, values[1])],
-                                NORMAL_GREEN,
+                                normal_green(),
                             )],
                         )
                     })
@@ -1180,7 +1180,7 @@ mod tests {
                             x_bounds: domain(&points),
                             y_bounds,
                         },
-                        &[Series::line("reference loss", &points, NORMAL_GREEN)],
+                        &[Series::line("reference loss", &points, normal_green())],
                     )
                 })
                 .unwrap();
@@ -1248,7 +1248,7 @@ mod tests {
                             x_bounds: domain(&points),
                             y_bounds: bounds(points.iter().map(|p| p.1)),
                         },
-                        &[Series::line("loss", &points, NORMAL_GREEN)],
+                        &[Series::line("loss", &points, normal_green())],
                     )
                 })
                 .unwrap();
@@ -1287,7 +1287,7 @@ mod tests {
                             x_bounds: [0.0, 100.0],
                             y_bounds: [0.0, 4.0],
                         },
-                        &[Series::line("loss", &points, NORMAL_GREEN)],
+                        &[Series::line("loss", &points, normal_green())],
                     )
                 })
                 .unwrap();

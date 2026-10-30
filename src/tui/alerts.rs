@@ -1,5 +1,5 @@
 //! Presentation-only, transition-triggered alerts; never emit logs or credentials.
-use super::{BRIGHT_RED, HealthLevel, NORMAL_GREEN, RunState};
+use super::{bright_red, HealthLevel, normal_green, RunState};
 use ratatui::{
     layout::Rect,
     style::Style,
@@ -89,9 +89,9 @@ impl Alerts {
                     if *ok { "[ DONE ]" } else { "[ ERROR ]" }
                 ))
                 .style(Style::new().fg(if *ok {
-                    NORMAL_GREEN
+                    normal_green()
                 } else {
-                    BRIGHT_RED
+                    bright_red()
                 })),
                 line,
             );

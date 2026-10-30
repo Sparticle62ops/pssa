@@ -1,5 +1,5 @@
 //! Equations are editable content, not another implementation of the model.
-use super::{RunState, SECOND_ACCENT, accent, panel, panel_area, parse_field, parse_kv};
+use super::{RunState, second_accent, accent, panel, panel_area, parse_field, parse_kv};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -184,10 +184,10 @@ impl Math {
             if let Some(title) = line.strip_prefix("# ") {
                 lines.push(Line::styled(format!("▌ {title}"), accent()));
             } else if line.starts_with("Source:") {
-                lines.push(Line::styled(line, Style::new().fg(SECOND_ACCENT)));
+                lines.push(Line::styled(line, Style::new().fg(second_accent())));
                 lines.push(Line::styled(
                     "╌────────────────────",
-                    Style::new().fg(SECOND_ACCENT),
+                    Style::new().fg(second_accent()),
                 ));
             } else {
                 lines.push(Line::from(line));

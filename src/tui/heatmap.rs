@@ -1,5 +1,5 @@
 //! Display-only raw-softmax confidence, never a sampling control.
-use super::{AMBER, NORMAL_GREEN, SECOND_ACCENT};
+use super::{amber, normal_green, second_accent};
 use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
@@ -79,9 +79,9 @@ fn color(probability: f32) -> Color {
     if probability < 0.1 {
         LOW
     } else if probability < 0.5 {
-        AMBER
+        amber()
     } else {
-        NORMAL_GREEN
+        normal_green()
     }
 }
 
@@ -92,9 +92,9 @@ pub(super) fn legend(enabled: bool) -> Line<'static> {
     Line::from(vec![
         Span::raw("F6 heatmap / token confidence: "),
         Span::styled("<10% low ", Style::new().fg(LOW)),
-        Span::styled("10-<50% mid ", Style::new().fg(AMBER)),
-        Span::styled(">=50% high ", Style::new().fg(NORMAL_GREEN)),
-        Span::styled("n/a unknown", Style::new().fg(SECOND_ACCENT)),
+        Span::styled("10-<50% mid ", Style::new().fg(amber())),
+        Span::styled(">=50% high ", Style::new().fg(normal_green())),
+        Span::styled("n/a unknown", Style::new().fg(second_accent())),
     ])
 }
 
@@ -122,7 +122,7 @@ pub(super) fn lines(text: &str, marks: &[TokenMark], enabled: bool) -> Vec<Line<
         append(
             text,
             if enabled {
-                Style::new().fg(SECOND_ACCENT)
+                Style::new().fg(second_accent())
             } else {
                 Style::default()
             },
@@ -200,10 +200,10 @@ mod tests {
                     assert!(output.contains(label), "{width}x{height}: missing {label}");
                 }
                 assert_eq!(b[(0, 1)].fg, LOW);
-                assert_eq!(b[(4, 1)].fg, AMBER);
-                assert_eq!(b[(11, 1)].fg, NORMAL_GREEN);
+                assert_eq!(b[(4, 1)].fg, amber());
+                assert_eq!(b[(11, 1)].fg, normal_green());
             }
-            for (word, expected) in [("l", LOW), ("m", AMBER), ("h", NORMAL_GREEN)] {
+            for (word, expected) in [("l", LOW), ("m", amber()), ("h", normal_green())] {
                 assert!(
                     b.content()
                         .iter()
@@ -232,7 +232,7 @@ mod tests {
         ));
         assert_eq!(
             lines("old chat", &[], true)[0].spans[0].style.fg,
-            Some(SECOND_ACCENT)
+            Some(second_accent())
         );
         assert_eq!(clean("a\x1bb"), "ab");
     }

@@ -4,7 +4,7 @@
 //! model cache or second worker: two large models must never coexist just to show
 //! their replies side by side. Cancellation is cooperative; loading and a single
 //! forward pass cannot be interrupted, and the UI never joins this worker.
-use super::{AMBER, accent, panel, panel_area};
+use super::{amber, accent, panel, panel_area};
 use crate::{
     cli::CLIHandler,
     dataset::{Tokenizer, TokenizerKind},
@@ -438,7 +438,7 @@ impl Comparison {
             if let Some(error) = &side.error {
                 lines.push(Line::styled(
                     format!("Error: {}", clean(error)),
-                    ratatui::style::Style::new().fg(AMBER),
+                    ratatui::style::Style::new().fg(amber()),
                 ));
             }
             if side.phase == Phase::Limited {
@@ -457,7 +457,7 @@ impl Comparison {
         f.render_widget(
             Paragraph::new(clean(note))
                 .wrap(Wrap { trim: false })
-                .style(ratatui::style::Style::new().fg(AMBER)),
+                .style(ratatui::style::Style::new().fg(amber())),
             chunks[2],
         );
         let prompt_area = panel_area(f, chunks[3]);

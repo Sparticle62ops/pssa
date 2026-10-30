@@ -1,7 +1,7 @@
 //! Small, sequential grids over the wizard's existing `train` command.
 //! The shell owns/polls the child. Dropping pending work never touches a trainer.
 use super::{
-    AMBER, RunState, accent, panel, panel_area,
+    amber, RunState, accent, panel, panel_area,
     process::clean,
     setup::{RunSpec, Setup, TrainingRun},
 };
@@ -441,7 +441,7 @@ impl Sweep {
                 &[super::charts::Series::line(
                     "loss",
                     &points,
-                    super::NORMAL_GREEN,
+                    super::normal_green(),
                 )],
             );
         }
@@ -453,7 +453,7 @@ impl Sweep {
             },
             accent(),
         )];
-        footer.push(Line::styled(clean(&self.note), Style::new().fg(AMBER)));
+        footer.push(Line::styled(clean(&self.note), Style::new().fg(amber())));
         f.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), parts[2]);
     }
 }

@@ -1,6 +1,6 @@
 //! Throttled read-only host telemetry. OS reads and GPU tools run off the UI.
 use super::{
-    NORMAL_GREEN, SECOND_ACCENT, accent,
+    normal_green, second_accent, accent,
     charts::{bar, sparkline},
     heatmap, panel, panel_area,
     preview::Process,
@@ -257,16 +257,16 @@ impl Hardware {
             let high = values.iter().copied().reduce(f64::max).unwrap_or(0.0);
             lines.push(Line::styled(
                 format!("CPU history / observed {low:.0}..{high:.0}% / time: oldest → latest"),
-                Style::new().fg(SECOND_ACCENT),
+                Style::new().fg(second_accent()),
             ));
             lines.push(Line::styled(
                 sparkline(&values, width),
-                Style::new().fg(NORMAL_GREEN),
+                Style::new().fg(normal_green()),
             ));
         }
         lines.push(Line::styled(
             "CPU meters 0..100% / ticks 0 / 50 / 100 / each logical CPU",
-            Style::new().fg(SECOND_ACCENT),
+            Style::new().fg(second_accent()),
         ));
         // Aggregate always stays visible; per-core meters use only spare rows.
         let gpu_rows = self.latest.gpu.len().max(1) * if area.width < 80 { 3 } else { 2 };
@@ -291,7 +291,7 @@ impl Hardware {
         }
         lines.push(Line::styled(
             "── GPU / available telemetry ──",
-            Style::new().fg(SECOND_ACCENT),
+            Style::new().fg(second_accent()),
         ));
         if self.latest.gpu.is_empty() {
             lines.push(Line::from(
@@ -388,7 +388,7 @@ mod tests {
                             assert!(text.contains("RAM 1.00 / 3.00 GiB used/total"));
                             assert!(text.contains(&format!("cpu 0 [{}] 50.0%", bar(0.5, 10))));
                             assert!(t.backend().buffer().content().iter().any(|cell| {
-                                cell.fg == NORMAL_GREEN
+                                cell.fg == normal_green()
                                     && cell
                                         .symbol()
                                         .chars()

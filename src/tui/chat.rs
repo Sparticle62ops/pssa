@@ -1,6 +1,6 @@
 //! Local chat UI. Checkpoints are read-only; chat documents are separate JSON files.
 use super::{
-    AMBER, NORMAL_GREEN, accent,
+    amber, normal_green, accent,
     heatmap::{self, TokenMark},
     memory_view::{MemorySnapshot, MemoryView},
     panel, panel_area,
@@ -908,7 +908,7 @@ impl Chat {
         for l in clean(&self.note).lines() {
             lines.push(Line::styled(
                 l.to_owned(),
-                ratatui::style::Style::new().fg(AMBER),
+                ratatui::style::Style::new().fg(amber()),
             ));
         }
         let conversation_area = panel_area(f, chunks[1]);
@@ -946,7 +946,7 @@ impl Chat {
             } else {
                 "Enter send / F1 keys / Tab tabs"
             })
-            .style(ratatui::style::Style::new().fg(NORMAL_GREEN)),
+            .style(ratatui::style::Style::new().fg(normal_green())),
             chunks[3],
         );
     }
@@ -1235,7 +1235,7 @@ mod tests {
             assert!(
                 cells
                     .iter()
-                    .any(|cell| cell.symbol() == "h" && cell.fg == NORMAL_GREEN)
+                    .any(|cell| cell.symbol() == "h" && cell.fg == normal_green())
             );
             let text: String = cells.iter().map(|cell| cell.symbol()).collect();
             assert!(text.contains("F6 heatmap"));

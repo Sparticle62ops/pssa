@@ -1,7 +1,7 @@
 //! Runtime backend picker. Discovery runs once on demand, away from rendering.
 //! The existing backend APIs bind CUDA visible device 0 / WebGPU's preferred
 //! adapter. Other adapters are informational, never falsely offered as bindings.
-use super::{AMBER, SECOND_ACCENT, accent, panel, panel_area};
+use super::{amber, second_accent, accent, panel, panel_area};
 use crate::{cli::TrainingBackend, ui};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -326,7 +326,7 @@ impl DevicePicker {
                     } else if entry.available {
                         accent()
                     } else {
-                        Style::new().fg(AMBER)
+                        Style::new().fg(amber())
                     },
                 )
             })
@@ -339,11 +339,11 @@ impl DevicePicker {
         let detail = &self.entries[self.selected].detail;
         f.render_widget(
             Paragraph::new(vec![
-                Line::styled(detail.clone(), Style::new().fg(SECOND_ACCENT)),
+                Line::styled(detail.clone(), Style::new().fg(second_accent())),
                 Line::from(
                     "Backend family only; CUDA visible device 0 / WebGPU preferred adapter.",
                 ),
-                Line::styled(self.message.clone(), Style::new().fg(AMBER)),
+                Line::styled(self.message.clone(), Style::new().fg(amber())),
             ])
             .wrap(Wrap { trim: false }),
             parts[2],

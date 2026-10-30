@@ -1,7 +1,7 @@
 //! Opt-in, deterministic token-share mixer. Exports plain UTF-8 for the existing
 //! trainer; neither dataset CLI defaults nor training math are changed.
 use super::{
-    AMBER, accent,
+    amber, accent,
     charts::bar,
     library::{self, Entry, Kind, Records, Stats},
     panel, panel_area,
@@ -387,7 +387,7 @@ impl Mixer {
         ));
         lines.push(Line::styled(
             library::clean(&self.note),
-            ratatui::style::Style::new().fg(AMBER),
+            ratatui::style::Style::new().fg(amber()),
         ));
         f.render_widget(
             Paragraph::new(lines)
@@ -545,7 +545,7 @@ mod tests {
                     assert_eq!(text.matches(expected.as_str()).count(), 2);
                     assert!(!text.contains(&format!("[{}]", bar(1.0, cells))));
                     assert!(t.backend().buffer().content().iter().any(|cell| {
-                        cell.fg == super::super::NORMAL_GREEN
+                        cell.fg == super::super::normal_green()
                             && cell
                                 .symbol()
                                 .chars()

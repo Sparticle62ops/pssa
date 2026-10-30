@@ -1,6 +1,6 @@
 //! Read-only chat telemetry: copied retrieval weights, never a second retrieval.
 //! Only the latest full snapshot is retained; history stores 64 token summaries.
-use super::{AMBER, BRIGHT_RED, SECOND_ACCENT, accent, charts::bar, panel, panel_area};
+use super::{amber, bright_red, second_accent, accent, charts::bar, panel, panel_area};
 use crate::{dataset::Tokenizer, pssa::PSSALayerV2};
 use ratatui::{
     Frame,
@@ -216,7 +216,7 @@ impl MemoryView {
             }
             lines.push(Line::styled(
                 "read-only / latest retrieval",
-                Style::new().fg(SECOND_ACCENT),
+                Style::new().fg(second_accent()),
             ));
             f.render_widget(Paragraph::new(lines), inner);
             return;
@@ -246,7 +246,7 @@ impl MemoryView {
                         "query/input [{}] {}",
                         snapshot.query_token_id, snapshot.query_token
                     ),
-                    Style::new().fg(SECOND_ACCENT),
+                    Style::new().fg(second_accent()),
                 ),
             ]),
             parts[0],
@@ -267,7 +267,7 @@ impl MemoryView {
                         "Retrieval strength 0..1 (0..100%); ticks 0 / 50 / 100; final loop pass {}/{}.",
                         snapshot.loops, snapshot.loops
                     ),
-                    Style::new().fg(SECOND_ACCENT),
+                    Style::new().fg(second_accent()),
                 ),
                 Line::from(
                     "Checkpoint bank is read-only in chat; no token/slot provenance stored.",
@@ -298,7 +298,7 @@ impl MemoryView {
             .collect();
         lines.push(Line::styled(
             format!("{shown}/{used} slots shown; L=layer, S=slot (0-based)"),
-            Style::new().fg(SECOND_ACCENT),
+            Style::new().fg(second_accent()),
         ));
         f.render_widget(Paragraph::new(lines), inner);
     }
@@ -348,13 +348,13 @@ fn strength_line(slot: SlotStrength, width: u16) -> Line<'static> {
         .min(40);
     let bar = strength_bar(slot.weight, bar_width);
     Line::from(vec![
-        Span::styled(label, Style::new().fg(SECOND_ACCENT)),
+        Span::styled(label, Style::new().fg(second_accent())),
         Span::styled(
             bar,
             if valid {
                 accent()
             } else {
-                Style::new().fg(BRIGHT_RED)
+                Style::new().fg(bright_red())
             },
         ),
         Span::styled(
@@ -362,7 +362,7 @@ fn strength_line(slot: SlotStrength, width: u16) -> Line<'static> {
             if valid {
                 accent()
             } else {
-                Style::new().fg(AMBER)
+                Style::new().fg(amber())
             },
         ),
     ])
@@ -572,7 +572,7 @@ mod tests {
                     );
                 }
                 assert!(terminal.backend().buffer().content().iter().any(|cell| {
-                    cell.fg == super::super::NORMAL_GREEN
+                    cell.fg == super::super::normal_green()
                         && cell
                             .symbol()
                             .chars()

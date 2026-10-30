@@ -1,6 +1,6 @@
 //! One registry for shortcut dispatch and the help overlay. Reused keys are
 //! explicitly scoped; printable input is a fallback, never a global shortcut.
-use super::{GraphView, PANEL_BG, accent, panel};
+use super::{GraphView, panel_bg, accent, panel};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
@@ -403,7 +403,7 @@ impl Help {
             paragraph
                 .scroll((self.scroll, 0))
                 .block(block)
-                .style(accent().bg(PANEL_BG)),
+                .style(accent().bg(panel_bg())),
             area,
         );
     }

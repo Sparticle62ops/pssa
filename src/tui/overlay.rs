@@ -1,5 +1,5 @@
 //! Command palette. Global shortcuts and the single help overlay live in keybindings.
-use super::{PANEL_BG, TABS, accent, panel};
+use super::{panel_bg, TABS, accent, panel};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::Rect,
@@ -118,7 +118,7 @@ impl Overlay {
         f.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .style(accent().bg(PANEL_BG))
+                .style(accent().bg(panel_bg()))
                 .block(panel(" command palette / Ctrl+K ")),
             area,
         );

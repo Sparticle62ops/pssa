@@ -17,7 +17,7 @@
 //! space for BPE continuations. OOV probes remain visible but are not charted.
 //! PSSA uses its checkpoint memory, fresh recurrent carry, and runtime loops=1.
 //! No training, optimizer, memory-write, GPU, or checkpoint-save path is called.
-use super::{AMBER, NORMAL_GREEN, SECOND_ACCENT, accent, charts, panel, panel_area};
+use super::{amber, normal_green, second_accent, accent, charts, panel, panel_area};
 use crate::{
     checkpoint,
     cli::CLIHandler,
@@ -1331,7 +1331,7 @@ impl Eval {
             "a pause  p prompt file  r reload  ↑↓ checkpoint  PgUp/PgDn prompt\nCPU only / 1 worker / loops=1 / NLL is tokenizer-specific, not answer correctness"
         };
         f.render_widget(
-            Paragraph::new(hint).style(Style::new().fg(SECOND_ACCENT)),
+            Paragraph::new(hint).style(Style::new().fg(second_accent())),
             parts[3],
         );
     }
@@ -1376,7 +1376,7 @@ impl Eval {
             &[charts::Series {
                 name: "reference loss",
                 points: &points,
-                color: NORMAL_GREEN,
+                color: normal_green(),
                 // Same-step files are observations, not a vertical trend line.
                 scatter: duplicate_steps,
             }],
@@ -1387,7 +1387,7 @@ impl Eval {
         let Some(record) = record else {
             let answer_area = panel_area(f, area);
             f.render_widget(Paragraph::new(format!("No checkpoint answer yet.\n{}\n{}\nResults are saved as auto-eval.jsonl next to checkpoints.", self.run_context, self.snapshot.note))
-                .style(Style::new().fg(SECOND_ACCENT)).wrap(Wrap { trim: false }).block(panel(label)), answer_area);
+                .style(Style::new().fg(second_accent())).wrap(Wrap { trim: false }).block(panel(label)), answer_area);
             return;
         };
         let mut lines = vec![Line::from(format!(
@@ -1408,7 +1408,7 @@ impl Eval {
             lines.push(Line::from(format!("{}: {}", sample.id, sample.prompt)));
             lines.push(Line::styled(
                 format!("Reference: {}", sample.reference),
-                Style::new().fg(SECOND_ACCENT),
+                Style::new().fg(second_accent()),
             ));
             lines.push(Line::from(match sample.nll {
                 Some(nll) => format!(
@@ -1425,10 +1425,10 @@ impl Eval {
             }));
             lines.push(Line::from(format!("Answer: {}", sample.answer)));
             if !sample.note.is_empty() {
-                lines.push(Line::styled(sample.note.clone(), Style::new().fg(AMBER)));
+                lines.push(Line::styled(sample.note.clone(), Style::new().fg(amber())));
             }
         } else {
-            lines.push(Line::styled(record.note.clone(), Style::new().fg(AMBER)));
+            lines.push(Line::styled(record.note.clone(), Style::new().fg(amber())));
         }
         let answer_area = panel_area(f, area);
         f.render_widget(
@@ -1870,7 +1870,7 @@ mod tests {
         assert_eq!(buffer[(109, 0)].symbol(), "┐");
         assert_eq!(buffer[(0, 3)].symbol(), "└");
         assert_eq!(buffer[(109, 3)].symbol(), "┘");
-        assert!(buffer.content().iter().any(|cell| cell.fg == NORMAL_GREEN));
+        assert!(buffer.content().iter().any(|cell| cell.fg == normal_green()));
     }
 
     #[test]

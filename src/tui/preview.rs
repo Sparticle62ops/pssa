@@ -610,7 +610,7 @@ mod tests {
                         .buffer()
                         .content()
                         .iter()
-                        .any(|c| c.symbol() == "s" && c.fg == super::super::NORMAL_GREEN)
+                        .any(|c| c.symbol() == "s" && c.fg == super::super::normal_green())
                 );
             }
         }
