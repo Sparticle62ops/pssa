@@ -1092,7 +1092,7 @@ impl Kaggle {
             .collect();
         let log_area = panel_area(f, sections[1]);
         f.render_widget(
-            Paragraph::new(logs).block(panel(" Kaggle live log (bounded tail) ")),
+            Paragraph::new(logs).block(panel(" Kaggle live log (latest lines) ")),
             log_area,
         );
     }

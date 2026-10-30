@@ -391,7 +391,7 @@ impl Mixer {
         ));
         f.render_widget(
             Paragraph::new(lines)
-                .block(panel(" mixer / opt-in corpus "))
+                .block(panel(" mixer / extra data you opt into "))
                 .wrap(Wrap { trim: false }),
             area,
         );

@@ -2322,10 +2322,14 @@ fn draw_with_background(
         }
         let detail = match tab {
             keybindings::SAMPLE_TAB => state.preview.note.clone(),
-            keybindings::HARDWARE_TAB => "CPU / RAM / GPU telemetry / enlarge for detail".into(),
-            keybindings::MATH_TAB => "PSSA equations / live dimensions / enlarge to read".into(),
-            keybindings::DEVICE_TAB => "CPU / CUDA / WebGPU / Enter selects".into(),
-            keybindings::LIMITS_TAB => "Threads / RAM / batch / tokens / Enter edits".into(),
+            keybindings::HARDWARE_TAB => {
+                "CPU, memory and GPU usage. Enlarge the window for details.".into()
+            }
+            keybindings::MATH_TAB => {
+                "PSSA equations and live dimensions. Enlarge the window to read.".into()
+            }
+            keybindings::DEVICE_TAB => "Choose CPU, CUDA or WebGPU. Enter selects.".into(),
+            keybindings::LIMITS_TAB => "Threads, memory, batch size and tokens. Enter edits.".into(),
             0 => {
                 let progress = state
                     .progress_pct
@@ -2336,20 +2340,20 @@ fn draw_with_background(
                     .or(state.epoch_loss)
                     .map(|value| format!("{value:.4}"))
                     .unwrap_or_else(|| "-".into());
-                format!("{progress}  loss {loss}")
+                format!("progress {progress} · loss {loss}")
             }
             1 => format!(
                 "{} checkpoints in {}",
                 state.checkpoints.len(),
                 state.chain_dir.display()
             ),
-            2 => format!("width {}", state.width.as_deref().unwrap_or("-")),
-            4 => "Local checkpoint chat / enlarge to compose".into(),
+            2 => format!("model width {}", state.width.as_deref().unwrap_or("-")),
+            4 => "Chat with a local checkpoint. Enlarge the window to type.".into(),
             _ => state.feed.as_ref().map_or_else(
                 || "Waiting for feed samples".into(),
                 |feed| {
                     format!(
-                        "{} / {} rows / {} tokens",
+                        "{} · {} rows · {} tokens",
                         feed.dataset,
                         feed::value(feed.rows),
                         feed::value(feed.tokens)
@@ -5167,7 +5171,7 @@ fn braille_pixels(buffer: &ratatui::buffer::Buffer) -> u32 {
                             "live sample",
                             "hardware",
                             "math / read-only",
-                            "runtime compute",
+                            "available compute",
                             "resource limits",
                             "library",
                             "mixer",

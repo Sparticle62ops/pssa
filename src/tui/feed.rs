@@ -394,7 +394,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &RunState) {
         ))
     )));
     lines.push(Line::from("Positions do not advance between events."));
-    let block = panel(" dataset feed / real text → tokens / PgUp/Dn scroll ");
+    let block = panel(" dataset feed / real text → tokens / PgUp/PgDn scroll ");
     let inner = block.inner(area);
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let max_scroll = paragraph

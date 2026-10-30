@@ -333,7 +333,7 @@ impl DevicePicker {
             .collect();
         let panel_rect = panel_area(f, parts[1]);
         f.render_widget(
-            Paragraph::new(lines).block(panel(" runtime compute / software GPUs skipped ")),
+            Paragraph::new(lines).block(panel(" available compute / software GPUs skipped ")),
             panel_rect,
         );
         let detail = &self.entries[self.selected].detail;

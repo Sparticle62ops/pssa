@@ -1158,7 +1158,7 @@ impl Setup {
         f.render_widget(
             paragraph
                 .scroll((self.command_scroll, 0))
-                .block(panel(" equivalent CLI / PgUp PgDn ")),
+                .block(panel(" same run as a CLI command / PgUp PgDn ")),
             command_area,
         );
     }
@@ -2131,7 +2131,7 @@ mod tests {
                     assert!(text(&terminal).contains(PAGES[page]));
                 }
                 if width >= 80 && height >= 24 {
-                    assert!(text(&terminal).contains("equivalent CLI"));
+                    assert!(text(&terminal).contains("same run as a CLI command"));
                     #[cfg(not(windows))]
                     assert!(text(&terminal).contains("mkdir -p"));
                     #[cfg(windows)]
@@ -2171,7 +2171,7 @@ mod tests {
             assert!(!press(&mut setup, KeyCode::Char('c')));
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|f| setup.draw(f, f.area())).unwrap();
-            assert!(text(&terminal).contains("equivalent CLI"));
+            assert!(text(&terminal).contains("same run as a CLI command"));
             #[cfg(not(windows))]
             assert!(text(&terminal).contains("mkdir -p"));
             #[cfg(windows)]

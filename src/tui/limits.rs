@@ -129,7 +129,7 @@ impl Limits {
         ])
         .split(area);
         f.render_widget(
-            Paragraph::new("resource limits / opt in").style(accent()),
+            Paragraph::new("resource limits / optional").style(accent()),
             parts[0],
         );
         let available = parts[1].height.saturating_sub(2) as usize;
@@ -178,7 +178,7 @@ impl Limits {
             Line::from("Batch lanes use --batch-size (default 1); not a VRAM cap. Tokens cap the corpus, not each epoch or inference reply."),
             Line::from("No CPU throttling, affinity, or GPU VRAM quota. In-process chat is not RAM-limited."),
             Line::styled(format!("Applied CLI: {}", if args.is_empty() { "(no extra flags)".into() } else { args.join(" ") }), Style::new().fg(second_accent())),
-        ]).wrap(Wrap { trim: false }).block(panel(" enforcement / semantics ")), semantics_area);
+        ]).wrap(Wrap { trim: false }).block(panel(" how limits are applied ")), semantics_area);
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(

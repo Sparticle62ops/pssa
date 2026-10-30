@@ -362,7 +362,7 @@ impl Sweep {
         ));
         let base_area = panel_area(f, parts[0]);
         f.render_widget(
-            Paragraph::new(fields).block(panel(" sweep / wizard base ")),
+            Paragraph::new(fields).block(panel(" sweep / base settings from setup ")),
             base_area,
         );
         let mut rows = vec![Line::styled(
@@ -725,7 +725,7 @@ mod tests {
                 .map(|c| c.symbol())
                 .collect();
             if width >= 45 {
-                assert!(text.contains("sweep / wizard base"));
+                assert!(text.contains("sweep / base settings from setup"));
                 assert!(text.contains("queued"));
                 assert!(text.contains("loss"));
                 assert!(text.contains("tok/s"));
