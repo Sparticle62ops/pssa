@@ -7,7 +7,7 @@ use super::keybindings::{
     BACKUP_TAB, BENCHMARK_TAB, CHAIN_TAB, DEVICE_TAB, EVAL_TAB, FEED_TAB, GITHUB_TAB,
     HARDWARE_TAB, HF_TAB, INFERENCE_TAB, KAGGLE_TAB, LIBRARY_TAB, LIMITS_TAB, LOG_STREAM_TAB,
     MATH_TAB, MEMORY_TAB, MIXER_TAB, MODEL_TAB, MONITOR_TAB, NOTIFY_TAB, RUNS_TAB, SAMPLE_TAB,
-    SCREENS, SETUP_TAB, SUPPORT_TAB, SWEEP_TAB, TIMELINE_TAB, UPDATE_TAB,
+    SETUP_TAB, SUPPORT_TAB, SWEEP_TAB, TIMELINE_TAB, UPDATE_TAB,
 };
 
 pub(super) struct Section {
@@ -250,10 +250,6 @@ impl Nav {
         CATEGORIES[self.category].sections[self.section].tab
     }
 
-    pub(super) fn section(&self) -> &'static Section {
-        &CATEGORIES[self.category].sections[self.section]
-    }
-
     /// Point at a screen and show it, used when a module opens a screen itself
     /// (for example Library -> Chat).
     pub(super) fn follow(&mut self, tab: usize) -> bool {
@@ -312,6 +308,7 @@ impl Nav {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::keybindings::SCREENS;
     use std::collections::HashSet;
 
     #[test]
