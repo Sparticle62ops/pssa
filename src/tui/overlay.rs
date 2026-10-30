@@ -1,5 +1,5 @@
 //! Command palette. Global shortcuts and the single help overlay live in keybindings.
-use super::{panel_bg, TABS, accent, panel};
+use super::{panel_bg, SCREENS, accent, panel};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::Rect,
@@ -26,7 +26,7 @@ impl Overlay {
         self.selected = 0;
     }
     fn choices(&self) -> Vec<(String, Action)> {
-        let mut all: Vec<_> = TABS
+        let mut all: Vec<_> = SCREENS
             .iter()
             .enumerate()
             .map(|(i, name)| (format!("Open {name}"), Action::Tab(i)))
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn palette_reaches_every_tab_once_in_shell_order() {
         let mut o = Overlay::default();
-        for (tab, name) in TABS.iter().enumerate() {
+        for (tab, name) in SCREENS.iter().enumerate() {
             o.toggle();
             for c in format!("Open {name}").chars() {
                 o.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));

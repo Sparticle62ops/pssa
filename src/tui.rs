@@ -30,6 +30,7 @@ mod log_stream;
 mod math;
 mod memory_view;
 mod mixer;
+mod nav;
 mod network;
 mod notify;
 mod overlay;
@@ -63,7 +64,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-use keybindings::{BENCHMARK_TAB, HF_TAB, KAGGLE_TAB, MEMORY_TAB, RUNS_TAB, TABS};
+use keybindings::{BENCHMARK_TAB, HF_TAB, KAGGLE_TAB, MEMORY_TAB, RUNS_TAB, SCREENS};
 // Five scanlines leave room for the P's stem, both S turns and the A's crossbar.
 const PSSA_LOGO: [&str; 5] = [
     "███    ███   ███   ██ ",
@@ -1298,6 +1299,7 @@ fn run_app(
         ..RunState::default()
     };
     let mut tab = 0usize;
+    let mut nav = nav::Nav::default();
     let mut last_chain_scan = std::time::Instant::now() - Duration::from_secs(60);
     let mut comparison = compare_path.map(|path| (path, comparison::ComparisonLog::default()));
     let mut input_closed = false;
@@ -1400,13 +1402,16 @@ fn run_app(
                     &background,
                     Some(&mut chat),
                     Some(&mut setup),
+                    Some(&nav),
                 );
-                if tab == HF_TAB {
-                    hf_login.draw(f, feature_area(f.area()));
+                if !nav.menu {
+                    if tab == HF_TAB {
+                        hf_login.draw(f, feature_area(f.area()));
+                    }
+                    local.draw(f, tab);
+                    extras.draw(f, &state, tab, &chat);
+                    network.draw(f, tab);
                 }
-                local.draw(f, tab);
-                extras.draw(f, &state, tab, &chat);
-                network.draw(f, tab);
                 palette.draw(f);
                 if help.open {
                     help.draw(f);
@@ -1438,6 +1443,8 @@ fn run_app(
                         Context::Help
                     } else if palette.open {
                         Context::Palette
+                    } else if nav.menu {
+                        Context::Menu
                     } else {
                         network
                             .context(tab)
@@ -1451,15 +1458,48 @@ fn run_app(
                                 Context::for_tab(tab, editing)
                             })
                     };
-                    match keybindings::action(key, context) {
+                    let action = keybindings::action(key, context);
+                    // On a section menu a plain letter opens that section. Letters
+                    // are only consumed here, so screen shortcuts keep theirs.
+                    if action.is_none()
+                        && context == Context::Menu
+                        && let crossterm::event::KeyCode::Char(c) = key.code
+                        && !c.is_control()
+                        && let Some(index) = nav.section_for_key(c)
+                    {
+                        nav.section = index;
+                        nav.open_section();
+                        tab = nav.tab();
+                    }
+                    match action {
                         Some(Action::Quit) => break,
                         Some(Action::NextTab) => {
                             palette.open = false;
-                            tab = (tab + 1) % TABS.len();
+                            nav.next_category();
+                            tab = nav.tab();
                             help.open = false;
                         }
                         Some(Action::PreviousTab) => {
-                            tab = (tab + TABS.len() - 1) % TABS.len();
+                            palette.open = false;
+                            nav.previous_category();
+                            tab = nav.tab();
+                            help.open = false;
+                        }
+                        Some(Action::BackToSections) => {
+                            if nav.menu {
+                                nav.open_section();
+                                tab = nav.tab();
+                            } else {
+                                nav.back_to_menu(tab);
+                            }
+                        }
+                        Some(Action::MenuMove(delta)) => {
+                            nav.move_section(delta);
+                            tab = nav.tab();
+                        }
+                        Some(Action::MenuOpen) => {
+                            nav.open_section();
+                            tab = nav.tab();
                         }
                         Some(Action::ToggleHelp) => {
                             palette.open = false;
@@ -1471,9 +1511,13 @@ fn run_app(
                             palette.toggle();
                         }
                         Some(Action::Palette) => match palette.key(key) {
-                            Some(overlay::Action::Tab(next)) => tab = next,
+                            Some(overlay::Action::Tab(next)) => {
+                                tab = next;
+                                nav.follow(next);
+                            }
                             Some(overlay::Action::Benchmark) => {
                                 tab = BENCHMARK_TAB;
+                                nav.follow(BENCHMARK_TAB);
                                 if state.training_active
                                     || extras.training_busy()
                                     || training.as_ref().is_some_and(|run| run.active())
@@ -1512,10 +1556,11 @@ fn run_app(
                         }
                         Some(Action::HelpTop) => help.scroll = 0,
                         Some(Action::HelpBottom) => help.scroll = u16::MAX,
-                        Some(Action::OpenTab(next)) => {
-                            tab = next;
+                        Some(Action::OpenCategory(index)) => {
                             help.open = false;
                             palette.open = false;
+                            nav.select_category(index);
+                            tab = nav.tab();
                         }
                         Some(Action::Device) => {
                             if let Some(backend) = state.device_picker.borrow_mut().key(key) {
@@ -1566,10 +1611,14 @@ fn run_app(
                         }
                         Some(Action::Pan(newer)) => state.pan_graph(newer),
                         Some(Action::CycleGraph) => state.graph_view = state.graph_view.next(),
-                        Some(Action::Graph(view)) => state.graph_view = view,
                         Some(Action::Zoom(closer)) => state.zoom_graph(closer),
                         Some(Action::ResetGraph) => state.reset_graph_navigation(),
                         None => {}
+                    }
+                    // Modules can open a screen themselves (Library -> Chat,
+                    // timeline -> Setup). Point the categories at it.
+                    if tab != old_tab && nav.tab() != tab {
+                        nav.follow(tab);
                     }
                     if tab != old_tab {
                         if tab == keybindings::DEVICE_TAB {
@@ -2279,7 +2328,7 @@ fn assert_chart_rows(buffer: &ratatui::buffer::Buffer, title: &str, minimum: u16
 
 #[cfg(test)]
 fn draw(f: &mut ratatui::Frame, state: &RunState, tab: usize) {
-    draw_with_background(f, state, tab, &HexBackground::default(), None, None);
+    draw_with_background(f, state, tab, &HexBackground::default(), None, None, None);
 }
 
 fn draw_with_background(
@@ -2289,6 +2338,7 @@ fn draw_with_background(
     background: &HexBackground,
     chat: Option<&mut chat::Chat>,
     setup: Option<&mut setup::Setup>,
+    nav: Option<&nav::Nav>,
 ) {
     let area = f.area();
     if area.is_empty() {
@@ -2301,72 +2351,88 @@ fn draw_with_background(
     background.draw(f);
     let area = HexBackground::content_area(area);
     let health = state.health_status();
+    let menu = nav.is_some_and(|nav| nav.menu);
     // Do not squeeze bordered widgets into one-cell fragments on tiny screens.
     if area.width < 30 || area.height < 10 {
-        if tab == 5 {
-            if let Some(setup) = setup {
-                setup.draw(f, area);
-            } else {
-                setup::Setup::default().draw(f, area);
+        if !menu {
+            if tab == 5 {
+                if let Some(setup) = setup {
+                    setup.draw(f, area);
+                } else {
+                    setup::Setup::default().draw(f, area);
+                }
+                return;
             }
-            return;
+            if tab == 4
+                && let Some(chat) = chat
+            {
+                chat.draw(f, area);
+                return;
+            }
         }
-        if tab == 4
-            && let Some(chat) = chat
-        {
-            chat.draw(f, area);
-            return;
-        }
-        let detail = match tab {
-            keybindings::SAMPLE_TAB => state.preview.note.clone(),
-            keybindings::HARDWARE_TAB => {
-                "CPU, memory and GPU usage. Enlarge the window for details.".into()
+        let heading = if let Some(nav) = nav.filter(|nav| nav.menu) {
+            let category = &nav::CATEGORIES[nav.category];
+            format!("{} / PSSA", category.name)
+        } else {
+            format!("{} / PSSA", SCREENS[tab.min(SCREENS.len() - 1)])
+        };
+        let detail = if let Some(nav) = nav.filter(|nav| nav.menu) {
+            let category = &nav::CATEGORIES[nav.category];
+            format!(
+                "{} sections. Press a section letter.",
+                category.sections.len()
+            )
+        } else {
+            match tab {
+                keybindings::SAMPLE_TAB => state.preview.note.clone(),
+                keybindings::HARDWARE_TAB => {
+                    "CPU, memory and GPU usage. Enlarge the window for details.".into()
+                }
+                keybindings::MATH_TAB => {
+                    "PSSA equations and live dimensions. Enlarge the window to read.".into()
+                }
+                keybindings::DEVICE_TAB => "Choose CPU, CUDA or WebGPU. Enter selects.".into(),
+                keybindings::LIMITS_TAB => {
+                    "Threads, memory, batch size and tokens. Enter edits.".into()
+                }
+                0 => {
+                    let progress = state
+                        .progress_pct
+                        .map(|pct| format!("{pct:.0}%"))
+                        .unwrap_or_else(|| "-".into());
+                    let loss = state
+                        .live_loss
+                        .or(state.epoch_loss)
+                        .map(|value| format!("{value:.4}"))
+                        .unwrap_or_else(|| "-".into());
+                    format!("progress {progress} · loss {loss}")
+                }
+                1 => format!(
+                    "{} checkpoints in {}",
+                    state.checkpoints.len(),
+                    state.chain_dir.display()
+                ),
+                2 => format!("model width {}", state.width.as_deref().unwrap_or("-")),
+                4 => "Chat with a local checkpoint. Enlarge the window to type.".into(),
+                _ => state.feed.as_ref().map_or_else(
+                    || "Waiting for feed samples".into(),
+                    |feed| {
+                        format!(
+                            "{} · {} rows · {} tokens",
+                            feed.dataset,
+                            feed::value(feed.rows),
+                            feed::value(feed.tokens)
+                        )
+                    },
+                ),
             }
-            keybindings::MATH_TAB => {
-                "PSSA equations and live dimensions. Enlarge the window to read.".into()
-            }
-            keybindings::DEVICE_TAB => "Choose CPU, CUDA or WebGPU. Enter selects.".into(),
-            keybindings::LIMITS_TAB => "Threads, memory, batch size and tokens. Enter edits.".into(),
-            0 => {
-                let progress = state
-                    .progress_pct
-                    .map(|pct| format!("{pct:.0}%"))
-                    .unwrap_or_else(|| "-".into());
-                let loss = state
-                    .live_loss
-                    .or(state.epoch_loss)
-                    .map(|value| format!("{value:.4}"))
-                    .unwrap_or_else(|| "-".into());
-                format!("progress {progress} · loss {loss}")
-            }
-            1 => format!(
-                "{} checkpoints in {}",
-                state.checkpoints.len(),
-                state.chain_dir.display()
-            ),
-            2 => format!("model width {}", state.width.as_deref().unwrap_or("-")),
-            4 => "Chat with a local checkpoint. Enlarge the window to type.".into(),
-            _ => state.feed.as_ref().map_or_else(
-                || "Waiting for feed samples".into(),
-                |feed| {
-                    format!(
-                        "{} · {} rows · {} tokens",
-                        feed.dataset,
-                        feed::value(feed.rows),
-                        feed::value(feed.tokens)
-                    )
-                },
-            ),
         };
         f.render_widget(
             Paragraph::new(vec![
-                Line::styled(
-                    format!("{} / PSSA", TABS[tab.min(TABS.len() - 1)]),
-                    accent(),
-                ),
+                Line::styled(heading, accent()),
                 status_badge(&health),
                 Line::from(detail),
-                Line::from("q quit · Tab next tab · ? help"),
+                Line::from("q quit · Tab categories · ? help"),
                 Line::from("Enlarge the window for the full view"),
             ]),
             area,
@@ -2398,119 +2464,152 @@ fn draw_with_background(
     } else {
         let halloween = if spooky() { "  \u{1F383} happy halloween" } else { "" };
         let title = if area.width >= 45 {
-            format!("PSSA / pssa tui{halloween}  Tab next tab  F1 help  Ctrl+C quit")
+            format!("PSSA / pssa tui{halloween}  Tab categories  ? help  Ctrl+C quit")
         } else {
-            format!("PSSA / pssa tui{halloween}  F1 help")
+            format!("PSSA / pssa tui{halloween}  ? help")
         };
         f.render_widget(
             Paragraph::new(vec![Line::styled(title, accent()), status_badge(&health)]),
             header,
         );
     }
-    // Derive the width from the actual labels, padding and separators so adding
-    // a tab cannot silently clip its name or steal space from the controls hint.
-    // The complete strip uses compact separators when it fits; otherwise
-    // complete feature groups keep every tab discoverable at 80+ columns.
-    let full_width = TABS.iter().map(|tab| tab.len()).sum::<usize>() + TABS.len() - 1;
-    let (first_tab, end_tab) = if usize::from(area.width) < full_width + 9 && f.area().width >= 80 {
-        if tab < HF_TAB {
-            (0, HF_TAB)
-        } else if tab < keybindings::SAMPLE_TAB {
-            (HF_TAB, keybindings::SAMPLE_TAB)
-        } else if tab < keybindings::LIBRARY_TAB {
-            (keybindings::SAMPLE_TAB, keybindings::LIBRARY_TAB)
-        } else if tab < keybindings::BACKUP_TAB {
-            (keybindings::LIBRARY_TAB, keybindings::BACKUP_TAB)
-        } else if tab < keybindings::SUPPORT_TAB {
-            (keybindings::BACKUP_TAB, keybindings::SUPPORT_TAB)
-        } else {
-            (keybindings::SUPPORT_TAB, TABS.len())
-        }
-    } else {
-        (0, TABS.len())
-    };
-    let visible_tabs = &TABS[first_tab..end_tab];
-    let compact_tabs = first_tab == 0 && end_tab == TABS.len();
-    let tabs_width = if compact_tabs {
-        visible_tabs.iter().map(|tab| tab.len()).sum::<usize>() + visible_tabs.len() - 1
-    } else {
-        visible_tabs.iter().map(|tab| tab.len() + 2).sum::<usize>() + (visible_tabs.len() - 1) * 3
-    } as u16;
-    let nav = Layout::default()
+    // The top strip lists categories, not every screen. Each category's
+    // sections live one level down in a menu, so the strip stays short.
+    let category = nav.map_or_else(|| nav::category_of(tab), |nav| nav.category);
+    let menu = nav.is_some_and(|nav| nav.menu);
+    let strip_width = nav::CATEGORIES
+        .iter()
+        .map(|entry| entry.name.len())
+        .sum::<usize>()
+        + nav::CATEGORIES.len()
+        - 1;
+    let strip = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(tabs_width), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(strip_width as u16),
+            Constraint::Min(0),
+        ])
         .split(chunks[1]);
-    if area.width < tabs_width {
+    if usize::from(area.width) < strip_width + 1 {
+        let current = if menu {
+            "sections".to_string()
+        } else {
+            SCREENS[tab.min(SCREENS.len() - 1)].to_string()
+        };
         f.render_widget(
             Paragraph::new(format!(
-                " {} / Tab next tab / F1 help",
-                TABS[tab.min(TABS.len() - 1)]
+                " {} / {current} / ?",
+                nav::CATEGORIES[category].name
             ))
             .style(accent()),
-            nav[0],
+            strip[0],
         );
     } else {
         f.render_widget(
-            Tabs::new(visible_tabs.iter().copied())
-                .select(tab.saturating_sub(first_tab))
+            Tabs::new(nav::CATEGORIES.iter().map(|entry| entry.name))
+                .select(category)
                 .style(accent().add_modifier(Modifier::DIM))
                 .highlight_style(
                     accent()
                         .add_modifier(Modifier::BOLD | Modifier::REVERSED)
                         .remove_modifier(Modifier::DIM),
                 )
-                .divider(if compact_tabs { "·" } else { " / " })
-                .padding(
-                    if compact_tabs { "" } else { " " },
-                    if compact_tabs { "" } else { " " },
-                ),
-            nav[0],
+                .divider("·")
+                .padding("", ""),
+            strip[0],
         );
     }
-    if large_title {
-        f.render_widget(
-            Paragraph::new(if nav[1].width < 32 {
-                " F1 help "
-            } else {
-                match tab {
-                    0 => "F1 help · 1-7 pick graph · +/- zoom · 0 reset",
-                    4 => "F1 help · /help commands · Tab next tab",
-                    5 => "F1 help · F5/Shift+Tab pages · Enter edit",
-                    _ => "F1 help · Tab/Shift+Tab tabs · Ctrl+K jump",
-                }
-            })
-            .right_aligned(),
-            nav[1],
-        );
+    if strip[1].width >= 9 {
+        let screen = SCREENS[tab.min(SCREENS.len() - 1)];
+        let hint = if menu {
+            " pick a section · Enter open ".to_string()
+        } else if strip[1].width >= 32 {
+            format!(" {screen} · F1 help ")
+        } else if strip[1].width >= screen.len() as u16 + 5 {
+            format!(" {screen} · ? ")
+        } else {
+            format!(" {screen} ")
+        };
+        f.render_widget(Paragraph::new(hint).right_aligned(), strip[1]);
     }
     f.render_widget(Paragraph::new(divider(area.width)), chunks[2]);
 
-    match tab {
-        keybindings::SAMPLE_TAB => state.preview.draw(f, chunks[3], false),
-        keybindings::HARDWARE_TAB => state.hardware.draw(f, chunks[3]),
-        keybindings::MATH_TAB => state.math_view.draw(f, chunks[3], state),
-        keybindings::DEVICE_TAB => state.device_picker.borrow_mut().draw(f, chunks[3]),
-        keybindings::LIMITS_TAB => state.resource_limits.borrow_mut().draw(f, chunks[3]),
-        0 => draw_monitor(f, chunks[3], state),
-        1 => draw_chain(f, chunks[3], state),
-        2 => draw_model(f, chunks[3], state),
-        4 => {
-            if let Some(chat) = chat {
-                chat.draw(f, chunks[3]);
-            } else {
-                chat::Chat::new(PathBuf::from("chats"), state.chain_dir.clone()).draw(f, chunks[3]);
+    if menu {
+        draw_section_menu(f, chunks[3], nav.expect("menu requires navigation state"));
+    } else {
+        match tab {
+            keybindings::SAMPLE_TAB => state.preview.draw(f, chunks[3], false),
+            keybindings::HARDWARE_TAB => state.hardware.draw(f, chunks[3]),
+            keybindings::MATH_TAB => state.math_view.draw(f, chunks[3], state),
+            keybindings::DEVICE_TAB => state.device_picker.borrow_mut().draw(f, chunks[3]),
+            keybindings::LIMITS_TAB => state.resource_limits.borrow_mut().draw(f, chunks[3]),
+            0 => draw_monitor(f, chunks[3], state),
+            1 => draw_chain(f, chunks[3], state),
+            2 => draw_model(f, chunks[3], state),
+            4 => {
+                if let Some(chat) = chat {
+                    chat.draw(f, chunks[3]);
+                } else {
+                    chat::Chat::new(PathBuf::from("chats"), state.chain_dir.clone())
+                        .draw(f, chunks[3]);
+                }
             }
-        }
-        5 => {
-            if let Some(setup) = setup {
-                setup.draw(f, chunks[3]);
-            } else {
-                setup::Setup::default().draw(f, chunks[3]);
+            5 => {
+                if let Some(setup) = setup {
+                    setup.draw(f, chunks[3]);
+                } else {
+                    setup::Setup::default().draw(f, chunks[3]);
+                }
             }
+            HF_TAB.. => {} // rendered by independent feature modules after the shell
+            _ => draw_feed(f, chunks[3], state),
         }
-        HF_TAB.. => {} // rendered by independent feature modules after the shell
-        _ => draw_feed(f, chunks[3], state),
     }
+}
+
+/// Section menu for one category: related screens grouped in place, with a
+/// letter, title and plain-language summary for each.
+fn draw_section_menu(f: &mut ratatui::Frame, area: Rect, nav: &nav::Nav) {
+    let category = &nav::CATEGORIES[nav.category];
+    let title = format!(" {} / pick a section ", category.name);
+    let block = panel(&title);
+    let inner = block.inner(area);
+    f.render_widget(block.style(Style::new().bg(panel_bg())), area);
+    if inner.is_empty() {
+        return;
+    }
+    let mut lines = vec![
+        Line::styled(category.blurb, Style::new().fg(second_accent())),
+        Line::from("Enter opens the highlighted section · its letter opens it directly"),
+    ];
+    let rows = usize::from(inner.height).saturating_sub(lines.len());
+    let first = nav.section.saturating_sub(rows.saturating_sub(1));
+    for (index, section) in category
+        .sections
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+    {
+        let selected = index == nav.section;
+        let mut title = Style::new().fg(normal_green());
+        if selected {
+            title = title.add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} {}  ", if selected { "▶" } else { " " }, section.key),
+                if selected {
+                    accent().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().fg(second_accent())
+                },
+            ),
+            Span::styled(format!("{:<11}", section.title), title),
+            Span::styled(section.blurb, Style::new().fg(Color::Gray)),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_feed(f: &mut ratatui::Frame, area: Rect, state: &RunState) {
@@ -3948,44 +4047,19 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_tab_order_is_unique_and_every_label_is_visible() {
+    fn category_tabs_are_unique_and_section_menus_reach_every_screen() {
         use ratatui::{Terminal, backend::TestBackend};
+        let names: Vec<&str> = nav::CATEGORIES.iter().map(|entry| entry.name).collect();
         assert_eq!(
-            TABS,
-            [
-                "monitor",
-                "chain",
-                "model",
-                "feed",
-                "inference",
-                "setup",
-                "HF login",
-                "Kaggle",
-                "memory",
-                "runs",
-                "benchmark",
-                "sample",
-                "hardware",
-                "math",
-                "devices",
-                "limits",
-                "library",
-                "mixer",
-                "eval",
-                "HF backup",
-                "cloud log",
-                "phone ping",
-                "updates",
-                "support",
-                "GitHub",
-                "sweeps",
-                "timeline",
-            ]
+            names,
+            ["Overview", "Model", "Data & Eval", "Training", "Settings"]
         );
-        let unique: std::collections::HashSet<_> = TABS.iter().collect();
-        assert_eq!(unique.len(), TABS.len());
-        for tab in 0..TABS.len() {
-            let mut terminal = Terminal::new(TestBackend::new(300, 24)).unwrap();
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len());
+
+        // Every screen names its category in the strip and stays identifiable.
+        for tab in 0..SCREENS.len() {
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
             terminal
                 .draw(|f| draw(f, &RunState::default(), tab))
                 .unwrap();
@@ -3993,22 +4067,79 @@ mod tests {
                 .backend()
                 .buffer()
                 .content()
-                .chunks(300)
+                .chunks(120)
                 .map(|row| row.iter().map(|cell| cell.symbol()).collect())
                 .collect();
-            let nav = rows
+            let strip = rows
                 .iter()
-                .find(|row| TABS.iter().all(|label| row.contains(label)))
-                .unwrap();
-            let mut previous = 0;
-            for label in TABS {
-                assert_eq!(nav.matches(label).count(), 1, "tab {tab}: {nav}");
-                let position = nav.find(label).unwrap();
-                assert!(position >= previous);
-                previous = position + label.len();
+                .find(|row| names.iter().all(|name| row.contains(name)))
+                .unwrap_or_else(|| panic!("category strip missing for {tab}"));
+            let category = nav::CATEGORIES[nav::category_of(tab)].name;
+            assert_eq!(
+                strip.matches(category).count(),
+                1,
+                "tab {tab} highlights {category}: {strip}"
+            );
+            assert!(
+                strip.contains(SCREENS[tab]),
+                "tab {tab} must stay identifiable: {strip}"
+            );
+            assert!(strip.contains("F1 help"), "help must be discoverable: {strip}");
+        }
+
+        // Each category menu lists its sections, letters and plain summaries.
+        for (index, category) in nav::CATEGORIES.iter().enumerate() {
+            let mut nav = nav::Nav::default();
+            nav.select_category(index);
+            for (width, height) in [(80, 40), (120, 24), (300, 24)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| {
+                        draw_with_background(
+                            f,
+                            &RunState::default(),
+                            nav.tab(),
+                            &HexBackground::default(),
+                            None,
+                            None,
+                            Some(&nav),
+                        )
+                    })
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(text.contains("pick a section"), "{width}x{height}");
+                assert!(text.contains(category.name), "{width}x{height}");
+                assert!(text.contains(category.blurb), "{width}x{height}");
+                for section in category.sections {
+                    assert!(
+                        text.contains(section.title),
+                        "{width}x{height} missing {}",
+                        section.title
+                    );
+                    assert!(
+                        text.contains(section.blurb),
+                        "{width}x{height} missing {}",
+                        section.blurb
+                    );
+                    assert!(
+                        text.contains(&format!("{}  {}", section.key, section.title)),
+                        "{width}x{height} missing letter {}",
+                        section.title
+                    );
+                }
+                assert_eq!(text.matches('▶').count(), 1, "{width}x{height}");
             }
-            assert!(nav.contains("help"), "help must be discoverable: {nav}");
-            for width in [79, 80, 120] {
+        }
+
+        // Narrow windows keep the category and current screen discoverable.
+        for width in [79u16, 60, 30] {
+            for tab in [0, 2, 6, 21, 26] {
                 let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
                 terminal
                     .draw(|f| draw(f, &RunState::default(), tab))
@@ -4020,40 +4151,10 @@ mod tests {
                     .iter()
                     .map(|cell| cell.symbol())
                     .collect();
-                if width < 80 {
-                    assert!(
-                        text.contains(&format!("{} / Tab next tab / F1 help", TABS[tab])),
-                        "compact navigation must show selected tab {tab} at {width}"
-                    );
-                } else {
-                    let nav: String = terminal
-                        .backend()
-                        .buffer()
-                        .content()
-                        .chunks(width as usize)
-                        .nth(6)
-                        .unwrap()
-                        .iter()
-                        .map(|cell| cell.symbol())
-                        .collect();
-                    let page = if tab < HF_TAB {
-                        &TABS[..HF_TAB]
-                    } else if tab < keybindings::SAMPLE_TAB {
-                        &TABS[HF_TAB..keybindings::SAMPLE_TAB]
-                    } else if tab < keybindings::LIBRARY_TAB {
-                        &TABS[keybindings::SAMPLE_TAB..keybindings::LIBRARY_TAB]
-                    } else if tab < keybindings::BACKUP_TAB {
-                        &TABS[keybindings::LIBRARY_TAB..keybindings::BACKUP_TAB]
-                    } else if tab < keybindings::SUPPORT_TAB {
-                        &TABS[keybindings::BACKUP_TAB..keybindings::SUPPORT_TAB]
-                    } else {
-                        &TABS[keybindings::SUPPORT_TAB..]
-                    };
-                    for label in page {
-                        assert_eq!(nav.matches(label).count(), 1, "tab {tab} at {width}: {nav}");
-                    }
-                    assert!(nav.contains("F1 help"), "tab {tab} at {width}: {nav}");
-                }
+                let category = nav::CATEGORIES[nav::category_of(tab)].name;
+                assert!(text.contains(category), "{width}: {tab}");
+                assert!(text.contains(SCREENS[tab]), "{width}: {tab}");
+                assert!(text.contains('?'), "{width}: {tab}");
             }
         }
     }
@@ -4130,7 +4231,7 @@ mod tests {
         }
         for (width, height) in [(80, 24), (120, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            for tab in 0..TABS.len() {
+            for tab in 0..SCREENS.len() {
                 terminal.draw(|f| draw(f, &state, tab)).unwrap();
                 let buffer = terminal.backend().buffer();
                 let area = HexBackground::content_area(buffer.area);
@@ -4201,7 +4302,7 @@ mod tests {
         state.ingest("training 2/3 (67%) loss=7.0 tokens_per_second=100 eta=1s");
         let reason = state.health_status().reason.unwrap();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        for tab in 1..TABS.len() {
+        for tab in 1..SCREENS.len() {
             terminal.draw(|f| draw(f, &state, tab)).unwrap();
             let buffer = terminal.backend().buffer();
             let area = HexBackground::content_area(buffer.area);
@@ -5135,7 +5236,7 @@ fn braille_pixels(buffer: &ratatui::buffer::Buffer) -> u32 {
                 (10, 5),
             ] {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-                for tab in 0..TABS.len() {
+                for tab in 0..SCREENS.len() {
                     terminal.draw(|f| draw(f, &state, tab)).unwrap();
                     let text: String = terminal
                         .backend()
@@ -5144,7 +5245,7 @@ fn braille_pixels(buffer: &ratatui::buffer::Buffer) -> u32 {
                         .iter()
                         .map(|cell| cell.symbol())
                         .collect();
-                    assert!(text.contains(TABS[tab]));
+                    assert!(text.contains(SCREENS[tab]));
                     if width >= 80 {
                         assert!(!text.contains("neuron /"));
                         if tab == 0 {
@@ -5570,11 +5671,19 @@ fn braille_pixels(buffer: &ratatui::buffer::Buffer) -> u32 {
         }
         // The same hovered state must remain safe after resizing, on every tab.
         for (width, height) in [(120, 40), (80, 24), (79, 24), (30, 10), (1, 1)] {
-            for tab in 0..TABS.len() {
+            for tab in 0..SCREENS.len() {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
                     .draw(|f| {
-                        draw_with_background(f, &RunState::default(), tab, &pressed, None, None)
+                        draw_with_background(
+                            f,
+                            &RunState::default(),
+                            tab,
+                            &pressed,
+                            None,
+                            None,
+                            None,
+                        )
                     })
                     .unwrap();
                 let buffer = terminal.backend().buffer();
