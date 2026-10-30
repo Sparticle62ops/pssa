@@ -9,6 +9,12 @@ use ratatui::{
     widgets::{Clear, Paragraph, Wrap},
 };
 
+pub(super) const MONITOR_TAB: usize = 0;
+pub(super) const CHAIN_TAB: usize = 1;
+pub(super) const MODEL_TAB: usize = 2;
+pub(super) const FEED_TAB: usize = 3;
+pub(super) const INFERENCE_TAB: usize = 4;
+pub(super) const SETUP_TAB: usize = 5;
 pub(super) const HF_TAB: usize = 6;
 pub(super) const KAGGLE_TAB: usize = 7;
 pub(super) const MEMORY_TAB: usize = 8;

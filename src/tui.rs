@@ -30,6 +30,7 @@ mod log_stream;
 mod math;
 mod memory_view;
 mod mixer;
+mod nav;
 mod network;
 mod notify;
 mod overlay;
