@@ -1,7 +1,7 @@
 # Qwen3-1.7B -> PSSA distillation trainer (design, v2)
 
 Student = qwen3-1-7b-pssa-compact.v6 (vocab 151936, latent 256, depth 28,
-state 16, key 32, capacity 512, chunk 64). Danil locked the token space at
+state 16, key 32, capacity 512, chunk 64). The token space was locked at
 full 151,936 on 2026-10-27: the compact already has that vocab, so no
 architecture change is needed for the distill student.
 
@@ -34,7 +34,7 @@ Qwen2 tokenizer via the tokenizers crate (tokenizer.json from the Qwen3-1.7B
 HF snapshot), streaming corpus, TokenChunkIterator for chunk-64 batching.
 
 ## Run shape (per plan P2)
-1. Smoke: ~10 min on L4, measure tok/s, verify KL falls, then quote Danil
+1. Smoke: ~10 min on L4, measure tok/s, verify KL falls, then quote
    the real budget before the full 500M-token run (~$110 on L4 vs burner
    Starter credits ~$30/mo).
 2. Checkpoint every link, upload to volume pssa-artifacts.
