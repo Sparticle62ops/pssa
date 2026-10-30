@@ -1556,10 +1556,11 @@ fn run_app(
                         }
                         Some(Action::HelpTop) => help.scroll = 0,
                         Some(Action::HelpBottom) => help.scroll = u16::MAX,
-                        Some(Action::OpenTab(next)) => {
-                            tab = next;
+                        Some(Action::OpenCategory(index)) => {
                             help.open = false;
                             palette.open = false;
+                            nav.select_category(index);
+                            tab = nav.tab();
                         }
                         Some(Action::Device) => {
                             if let Some(backend) = state.device_picker.borrow_mut().key(key) {
@@ -1610,7 +1611,6 @@ fn run_app(
                         }
                         Some(Action::Pan(newer)) => state.pan_graph(newer),
                         Some(Action::CycleGraph) => state.graph_view = state.graph_view.next(),
-                        Some(Action::Graph(view)) => state.graph_view = view,
                         Some(Action::Zoom(closer)) => state.zoom_graph(closer),
                         Some(Action::ResetGraph) => state.reset_graph_navigation(),
                         None => {}

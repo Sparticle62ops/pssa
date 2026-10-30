@@ -1,6 +1,6 @@
 //! One registry for shortcut dispatch and the help overlay. Reused keys are
 //! explicitly scoped; printable input is a fallback, never a global shortcut.
-use super::{GraphView, panel_bg, accent, panel};
+use super::{nav, panel_bg, accent, panel};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
@@ -205,7 +205,7 @@ pub(super) enum Action {
     Hf,
     Extras,
     Network,
-    OpenTab(usize),
+    OpenCategory(usize),
     Heatmap,
     Preview,
     MathScroll(i16),
@@ -219,7 +219,6 @@ pub(super) enum Action {
     Local,
     Pan(bool),
     CycleGraph,
-    Graph(GraphView),
     Zoom(bool),
     ResetGraph,
     ScrollHelp(i16),
@@ -261,28 +260,56 @@ const BINDINGS: &[Binding] = &[
     bind!(Tab, "Tab", "Next category. Works even while typing in an editor.", ALL => NextTab),
     bind!(F(6), "F6", "Toggle the token confidence heatmap: how sure the model is about each token (chat, monitor, sample).", CHAT | MONITOR | SAMPLE => Heatmap),
     bind!(F(7), "F7", "Pause or resume the live output preview (monitor, sample).", MONITOR | SAMPLE => Preview),
-    bind!(F(8), "F8", "Open the hardware tab: CPU, memory and GPU use.", ALL => OpenTab(HARDWARE_TAB)),
-    bind!(F(9), "F9", "Open the device picker: choose CPU, CUDA or WebGPU.", ALL => OpenTab(DEVICE_TAB)),
-    bind!(F(10), "F10", "Open resource limits for the next run: threads, memory, batch, tokens.", ALL => OpenTab(LIMITS_TAB)),
-    bind!(F(11), "F11", "Open the PSSA math reference.", ALL => OpenTab(MATH_TAB)),
-    bind!(F(12), "F12", "Open the full sample tab: checkpoint output and token confidence.", ALL => OpenTab(SAMPLE_TAB)),
     bind!(F(1), "F1", "Open or close this help. Works even while typing.", ALL => ToggleHelp),
     bind!(Char('?'), "?", "Open or close this help outside text editors. In an editor it just types '?'.", BROWSE | MENU | HELP => ToggleHelp),
     bind!(Char('q'), "q", "Quit from a normal tab or the section menu. When help is open, close help instead.", BROWSE | MENU => Quit, HELP => ToggleHelp),
+    bind!(Char('1'), "1", "Open the Overview category menu.", BROWSE | MENU => OpenCategory(0)),
+    bind!(Char('2'), "2", "Open the Model category menu.", BROWSE | MENU => OpenCategory(1)),
+    bind!(Char('3'), "3", "Open the Data & Eval category menu.", BROWSE | MENU => OpenCategory(2)),
+    bind!(Char('4'), "4", "Open the Training category menu.", BROWSE | MENU => OpenCategory(3)),
+    bind!(Char('5'), "5", "Open the Settings category menu.", BROWSE | MENU => OpenCategory(4)),
+    Binding {
+        code: Char('1'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+1",
+        description: "Open the Overview category menu, even while typing.",
+        routes: &[(ALL, OpenCategory(0))],
+    },
+    Binding {
+        code: Char('2'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+2",
+        description: "Open the Model category menu, even while typing.",
+        routes: &[(ALL, OpenCategory(1))],
+    },
+    Binding {
+        code: Char('3'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+3",
+        description: "Open the Data & Eval category menu, even while typing.",
+        routes: &[(ALL, OpenCategory(2))],
+    },
+    Binding {
+        code: Char('4'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+4",
+        description: "Open the Training category menu, even while typing.",
+        routes: &[(ALL, OpenCategory(3))],
+    },
+    Binding {
+        code: Char('5'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+5",
+        description: "Open the Settings category menu, even while typing.",
+        routes: &[(ALL, OpenCategory(4))],
+    },
     bind!(Esc, "Esc", "Back out one level: close help or the palette, cancel an edit, stop chat work, cancel a running job, or leave a screen for its section menu.",
         MONITOR | PAGES | SETUP | LOCAL_BROWSE | NETWORK | TIMELINE => BackToSections, MENU => BackToSections, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, NETWORK_EDIT => Network, PALETTE => Palette, HELP => ToggleHelp),
-    bind!(Left, "Left", "Monitor: pan to older steps. Timeline: older checkpoint. Most browse tabs: previous tab. Setup: previous page.",
-        MONITOR => Pan(false), PAGES | EXTRA_BROWSE | LOCAL_BROWSE | NETWORK => PreviousTab, SETUP => Setup, TIMELINE => Network),
-    bind!(Right, "Right", "Monitor: pan to newer steps. Timeline: newer checkpoint. Most browse tabs: next tab. Setup: next page.",
-        MONITOR => Pan(true), PAGES | EXTRA_BROWSE | LOCAL_BROWSE | NETWORK => NextTab, SETUP => Setup, TIMELINE => Network),
-    bind!(Char('g'), "g", "Monitor: cycle through the graph views.", MONITOR => CycleGraph),
-    bind!(Char('1'), "1", "Monitor: show loss.", MONITOR => Graph(GraphView::Loss)),
-    bind!(Char('2'), "2", "Monitor: show perplexity.", MONITOR => Graph(GraphView::Perplexity)),
-    bind!(Char('3'), "3", "Monitor: show tokens per second.", MONITOR => Graph(GraphView::TokensPerSecond)),
-    bind!(Char('4'), "4", "Monitor: show learning rate.", MONITOR => Graph(GraphView::LearningRate)),
-    bind!(Char('5'), "5", "Monitor: show comparison.", MONITOR => Graph(GraphView::Comparison)),
-    bind!(Char('6'), "6", "Monitor: show all metrics.", MONITOR => Graph(GraphView::All)),
-    bind!(Char('7'), "7", "Monitor: show memory.", MONITOR => Graph(GraphView::Memory)),
+    bind!(Left, "Left", "Monitor: pan to older steps. Timeline: older checkpoint. Setup: previous page.",
+        MONITOR => Pan(false), SETUP => Setup, TIMELINE => Network),
+    bind!(Right, "Right", "Monitor: pan to newer steps. Timeline: newer checkpoint. Setup: next page.",
+        MONITOR => Pan(true), SETUP => Setup, TIMELINE => Network),
+    bind!(Char('g'), "g", "Monitor: cycle the graph view: loss, perplexity, tokens per second, learning rate, comparison, all metrics, memory.", MONITOR => CycleGraph),
     bind!(Char('+'), "+", "Zoom in: monitor graph; setup depth/loops; mixer share.", MONITOR => Zoom(true), SETUP => Setup, MIXER => Local),
     bind!(Char('='), "=", "Zoom in: monitor graph; mixer share (same as +).", MONITOR => Zoom(true), MIXER => Local),
     bind!(Char('-'), "-", "Zoom out: monitor graph; setup depth/loops; mixer share.", MONITOR => Zoom(false), SETUP => Setup, MIXER => Local),
@@ -356,7 +383,42 @@ fn normalized_modifiers(key: KeyEvent) -> KeyModifiers {
     modifiers
 }
 
+impl Context {
+    /// Contexts where a letter or digit must reach the editor, chat or palette
+    /// query instead of acting as navigation.
+    fn types_text(self) -> bool {
+        matches!(
+            self,
+            Context::Chat
+                | Context::SetupEdit
+                | Context::HfInput
+                | Context::KaggleInput
+                | Context::RunsEdit
+                | Context::BenchmarkEdit
+                | Context::Palette
+                | Context::LimitsEdit
+                | Context::LibraryEdit
+                | Context::EvalEdit
+                | Context::NetworkEdit
+        )
+    }
+}
+
+/// j/k move like the arrow keys outside text editors, so menus and lists share
+/// one grammar.
+fn motion_key(key: KeyEvent, context: Context) -> KeyEvent {
+    if context.types_text() || !normalized_modifiers(key).is_empty() {
+        return key;
+    }
+    match key.code {
+        Char('j') => KeyEvent::new(Down, KeyModifiers::NONE),
+        Char('k') => KeyEvent::new(Up, KeyModifiers::NONE),
+        _ => key,
+    }
+}
+
 pub(super) fn action(key: KeyEvent, context: Context) -> Option<Action> {
+    let key = motion_key(key, context);
     let modifiers = normalized_modifiers(key);
     if let Some(action) = BINDINGS
         .iter()
@@ -403,7 +465,7 @@ impl Help {
         let inner = block.inner(area);
         let mut lines: Vec<Line<'static>> = vec![
             Line::from("Keys on the left, what they do on the right. Press F1, ? or Esc to close; PgUp/PgDn scroll."),
-            Line::from("Navigation: Tab / Shift+Tab move between the five categories. On a category menu, arrows or j/k move and Enter opens the highlighted section; its letter opens it directly."),
+            Line::from("Navigation: Tab / Shift+Tab move between the five categories; 1-5 (or Alt+1-5 while typing) jump straight to one. On a category menu, arrows or j/k move, Enter opens the highlighted section, and its letter opens it directly."),
             Line::from("Esc backs out one level: close help or the palette, cancel an edit, stop chat work, cancel a running job, or leave a screen for its menu. Ctrl+K jumps to any screen."),
             Line::from(""),
         ];
@@ -412,6 +474,15 @@ impl Help {
                 .iter()
                 .map(|binding| Line::from(format!("{:<10} {}", binding.label, binding.description))),
         );
+        lines.push(Line::from(""));
+        lines.push(Line::from("Category menus and their section letters:"));
+        lines.extend(nav::CATEGORIES.iter().enumerate().map(|(index, category)| {
+            let mut text = format!("{} {}:", index + 1, category.name);
+            for section in category.sections {
+                text.push_str(&format!("  {} {}", section.key, section.title));
+            }
+            Line::from(text)
+        }));
         lines.push(Line::from(
             "Other printable characters type into editors/palette, including library folders and eval prompts; limits accept digits. BPE byte groups share their minimum confidence color. Chat and A/B slash commands: /help.",
         ));
@@ -524,14 +595,14 @@ mod tests {
         }
         for context in [Context::SetupEdit, Context::LimitsEdit] {
             assert_eq!(action(key(F(6)), context), None);
-            assert_eq!(action(key(F(9)), context), Some(OpenTab(DEVICE_TAB)));
+            assert_eq!(action(key(F(9)), context), None);
         }
         assert_eq!(action(key(Char('2')), Context::LimitsEdit), Some(Limits));
         assert_eq!(action(key(Esc), Context::LimitsEdit), Some(Limits));
         assert_eq!(action(key(Char('d')), Context::Limits), Some(Limits));
         assert_eq!(action(key(Char('r')), Context::Device), Some(Device));
         assert_eq!(action(key(PageDown), Context::Math), Some(MathScroll(8)));
-        for code in [F(6), F(7), F(8), F(9), F(10), F(11), F(12)] {
+        for code in [F(1), F(5), F(6), F(7)] {
             assert!(
                 BINDINGS
                     .iter()
@@ -727,11 +798,7 @@ mod tests {
                 (F(1), KeyModifiers::NONE, ToggleHelp),
                 (Char('c'), KeyModifiers::CONTROL, Quit),
                 (Char('k'), KeyModifiers::CONTROL, TogglePalette),
-                (F(8), KeyModifiers::NONE, OpenTab(HARDWARE_TAB)),
-                (F(9), KeyModifiers::NONE, OpenTab(DEVICE_TAB)),
-                (F(10), KeyModifiers::NONE, OpenTab(LIMITS_TAB)),
-                (F(11), KeyModifiers::NONE, OpenTab(MATH_TAB)),
-                (F(12), KeyModifiers::NONE, OpenTab(SAMPLE_TAB)),
+                (Char('2'), KeyModifiers::ALT, OpenCategory(1)),
             ] {
                 assert_eq!(
                     action(KeyEvent::new(code, modifiers), context),
@@ -954,5 +1021,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn one_key_grammar_moves_opens_and_jumps_categories() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        // Menu: arrows or j/k move, Enter opens, Esc backs out, Tab switches.
+        assert_eq!(action(key(Tab), Context::Menu), Some(NextTab));
+        assert_eq!(action(key(BackTab), Context::Menu), Some(PreviousTab));
+        assert_eq!(action(key(Up), Context::Menu), Some(MenuMove(-1)));
+        assert_eq!(action(key(Down), Context::Menu), Some(MenuMove(1)));
+        assert_eq!(action(key(Char('k')), Context::Menu), Some(MenuMove(-1)));
+        assert_eq!(action(key(Char('j')), Context::Menu), Some(MenuMove(1)));
+        assert_eq!(action(key(Enter), Context::Menu), Some(MenuOpen));
+        assert_eq!(action(key(Esc), Context::Menu), Some(BackToSections));
+        assert_eq!(action(key(Char('?')), Context::Menu), Some(ToggleHelp));
+        assert_eq!(action(key(Char('q')), Context::Menu), Some(Quit));
+
+        // 1-5 pick a category on any browse screen. Alt+1-5 also work while
+        // typing, which keeps two-key reachability from chat and editors.
+        for (index, digit) in ['1', '2', '3', '4', '5'].into_iter().enumerate() {
+            assert_eq!(
+                action(key(Char(digit)), Context::Menu),
+                Some(OpenCategory(index))
+            );
+            for context in [
+                Context::Monitor,
+                Context::Runs,
+                Context::KaggleBusy,
+                Context::Timeline,
+            ] {
+                assert_eq!(
+                    action(key(Char(digit)), context),
+                    Some(OpenCategory(index)),
+                    "{context:?}"
+                );
+            }
+            for context in [Context::Chat, Context::SetupEdit, Context::Palette] {
+                assert_eq!(
+                    action(KeyEvent::new(Char(digit), KeyModifiers::ALT), context),
+                    Some(OpenCategory(index)),
+                    "{context:?}"
+                );
+            }
+            // Plain digits still type inside editors and chat.
+            assert!(matches!(
+                action(key(Char(digit)), Context::Chat),
+                Some(Chat)
+            ));
+            assert!(matches!(
+                action(key(Char(digit)), Context::SetupEdit),
+                Some(Setup)
+            ));
+        }
+
+        // j/k mirror the arrows outside text editors.
+        assert_eq!(action(key(Char('j')), Context::Feed), Some(FeedScroll(1)));
+        assert_eq!(action(key(Char('k')), Context::Feed), Some(FeedScroll(-1)));
+        assert_eq!(action(key(Char('j')), Context::Runs), Some(Extras));
+        assert_eq!(action(key(Char('j')), Context::Help), Some(ScrollHelp(1)));
+        assert_eq!(action(key(Char('j')), Context::Chat), Some(Chat));
+        assert_eq!(action(key(Char('j')), Context::Palette), Some(Palette));
+
+        // Redundant direct jumps are gone; g still reaches every graph view.
+        for code in [F(8), F(9), F(10), F(11), F(12), Char('6'), Char('7')] {
+            assert_eq!(action(key(code), Context::Monitor), None, "{code:?}");
+        }
+        assert_eq!(action(key(Char('g')), Context::Monitor), Some(CycleGraph));
+        // Left/Right no longer cycle categories on list screens.
+        assert_eq!(action(key(Left), Context::Runs), None);
+        assert_eq!(action(key(Right), Context::Runs), None);
     }
 }
