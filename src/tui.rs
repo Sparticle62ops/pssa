@@ -1651,10 +1651,7 @@ fn status_badge(health: &HealthStatus) -> Line<'static> {
     let label = match health.level {
         HealthLevel::Problem => "ERROR",
         HealthLevel::Warning | HealthLevel::Normal => match health.normal_label {
-            "DONE" => "DONE",
-            "SAVE PENDING" => "SAVE PENDING",
-            "WAITING" => "WAITING",
-            "DREAMING" => "DREAMING",
+            "DONE" | "SAVE PENDING" | "WAITING" | "DREAMING" => health.normal_label,
             _ => "TRAINING",
         },
     };
