@@ -166,6 +166,8 @@ const NETWORK: u32 = 1 << Context::Network as u32;
 const NETWORK_EDIT: u32 = 1 << Context::NetworkEdit as u32;
 const TIMELINE: u32 = 1 << Context::Timeline as u32;
 const BROWSE: u32 = MONITOR | PAGES | SETUP | EXTRA_BROWSE | LOCAL_BROWSE | NETWORK | TIMELINE;
+// Setup uses Shift+Tab for its own wizard pages, so previous-tab skips it.
+const BROWSE_NO_SETUP: u32 = BROWSE & !SETUP;
 const ALL: u32 = BROWSE
     | CHAT
     | EDIT
@@ -274,7 +276,7 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('0'), "0", "Monitor: reset pan and zoom.", MONITOR => ResetGraph),
     bind!(Up, "Up", "Previous item (setup, runs, benchmark, palette, devices, limits, local, network). Scroll up (feed, math, help).", FEED => FeedScroll(-1), SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(-1), HELP => ScrollHelp(-1)),
     bind!(Down, "Down", "Next item (setup, runs, benchmark, palette, devices, limits, local, network). Scroll down (feed, math, help).", FEED => FeedScroll(1), SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(1), HELP => ScrollHelp(1)),
-    bind!(BackTab, "Shift+Tab", "Setup: previous wizard page.", SETUP => Setup),
+    bind!(BackTab, "Shift+Tab", "Previous tab on most browse tabs. In setup, previous wizard page.", BROWSE_NO_SETUP => PreviousTab, SETUP => Setup),
     bind!(F(5), "F5", "Setup: next wizard page.", SETUP => Setup),
     bind!(Char('c'), "c", "Setup: show command preview. Runs/library: chat with the checkpoint. Network/timeline: open or copy.", SETUP => Setup, RUNS => Extras, LIBRARY => Local, NETWORK | TIMELINE => Network),
     bind!(Char('r'), "r", "Refresh or retry (memory, runs, devices, library, eval, network, timeline).", MEMORY | RUNS => Extras, DEVICE => Device, LIBRARY | EVAL => Local, NETWORK | TIMELINE => Network),
@@ -388,7 +390,7 @@ impl Help {
         let inner = block.inner(area);
         let mut lines: Vec<Line<'static>> = vec![
             Line::from("Keys on the left, what they do on the right. Press F1, ? or Esc to close; PgUp/PgDn scroll."),
-            Line::from("Tabs: Tab goes to the next tab everywhere. Left/Right move between most browse tabs. Ctrl+K jumps to any tab."),
+            Line::from("Tabs: Tab goes to the next tab everywhere. Shift+Tab or Left/Right moves between most browse tabs. Ctrl+K jumps to any tab."),
             Line::from("Esc always backs out: close help/palette, cancel an edit, stop work, or quit. F7 pauses the live preview; a pauses background eval."),
             Line::from(""),
         ];

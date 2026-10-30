@@ -1743,7 +1743,7 @@ fn draw_header_stats(f: &mut ratatui::Frame, area: Rect, state: &RunState, healt
                 Style::new().fg(health.color()),
             )]),
             Line::styled(
-                format!("loss {} {range} step → / lower better", loss_trace(state)),
+                format!("loss {} {range} · steps → · lower better", loss_trace(state)),
                 Style::new().fg(second_accent()),
             ),
         ]),
@@ -2476,7 +2476,7 @@ fn draw_with_background(
                     0 => "F1 help · 1-7 pick graph · +/- zoom · 0 reset",
                     4 => "F1 help · /help commands · Tab next tab",
                     5 => "F1 help · F5/Shift+Tab pages · Enter edit",
-                    _ => "F1 help · Tab next tab · Ctrl+K jump",
+                    _ => "F1 help · Tab/Shift+Tab tabs · Ctrl+K jump",
                 }
             })
             .right_aligned(),
@@ -4143,7 +4143,7 @@ mod tests {
                     "loss 2",
                     "tok/s 125",
                     "ETA 2h 14m 09s",
-                    "step → / lower better",
+                    "steps → · lower better",
                     "2/3/4",
                 ] {
                     assert!(header.contains(expected), "missing {expected}: {header}");
