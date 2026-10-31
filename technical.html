@@ -6,12 +6,30 @@
 <title>PSSA — Technical Deep Dive</title>
 <meta name="description" content="The full technical detail behind PSSA: the selective recurrence, the 512-slot hyperbolic memory, plasticity by ridge consolidation, and the verification harness.">
 <meta name="theme-color" content="#050505">
+<link rel="canonical" href="https://sparticle62ops.github.io/pssa/technical.html">
+<meta name="keywords" content="state space model architecture, selective scan, hyperbolic memory, Poincare ball, ridge regression consolidation, gradient verification, CUDA, WebGPU, Rust">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://sparticle62ops.github.io/pssa/technical.html">
+<meta property="og:image" content="https://sparticle62ops.github.io/pssa/assets/mark.png">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="PSSA — Technical Deep Dive">
+<meta name="twitter:description" content="The full technical detail behind PSSA: the selective recurrence, the 512-slot hyperbolic memory, plasticity by ridge consolidation, and the verification harness.">
+<meta name="twitter:image" content="https://sparticle62ops.github.io/pssa/assets/mark.png">
+<meta name="robots" content="index, follow">
 <meta property="og:title" content="PSSA — Technical Deep Dive">
 <meta property="og:description" content="How PSSA works, in full: a diagonal state-space recurrence, hyperbolic episodic memory, closed-form consolidation, and a gradient harness checked on every commit.">
-<meta property="og:image" content="assets/pssa-mark.svg">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect x='3' y='3' width='12' height='12' fill='%23E9FFF1'/%3E%3Crect x='18' y='3' width='12' height='12' fill='%2396EFB7'/%3E%3Crect x='33' y='3' width='12' height='12' fill='%233BCB78'/%3E%3Crect x='3' y='18' width='12' height='12' fill='%23C4F8D8'/%3E%3Crect x='18' y='18' width='12' height='12' fill='%2322A85D'/%3E%3Crect x='33' y='18' width='12' height='12' fill='%23178348'/%3E%3Crect x='3' y='33' width='12' height='12' fill='%2362E096'/%3E%3Crect x='18' y='33' width='12' height='12' fill='%23115E36'/%3E%3Crect x='33' y='33' width='12' height='12' fill='%230B3823'/%3E%3C/svg%3E">
 <script>document.documentElement.classList.add('js');</script>
 <link rel="stylesheet" href="assets/site.css">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "TechArticle",
+ "headline": "PSSA: the architecture in full",
+ "description": "Selective recurrence, hyperbolic episodic memory, closed-form consolidation, and a gradient harness checked on every commit.",
+ "url": "https://sparticle62ops.github.io/pssa/technical.html"
+}
+</script>
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>

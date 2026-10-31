@@ -6,12 +6,29 @@
 <title>Blog · PSSA</title>
 <meta name="description" content="Short notes on PSSA: training runs, ports, benchmarks and what is being built around the architecture.">
 <meta name="theme-color" content="#050505">
+<link rel="canonical" href="https://sparticle62ops.github.io/pssa/blog.html">
+<meta name="keywords" content="state space model blog, training language model from scratch, Rust ML, small language model, SSM training notes, checkpoints">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://sparticle62ops.github.io/pssa/blog.html">
+<meta property="og:image" content="https://sparticle62ops.github.io/pssa/assets/mark.png">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Blog · PSSA">
+<meta name="twitter:description" content="Short notes on PSSA: training runs, ports, benchmarks and what is being built around the architecture.">
+<meta name="twitter:image" content="https://sparticle62ops.github.io/pssa/assets/mark.png">
+<meta name="robots" content="index, follow">
 <meta property="og:title" content="Blog · PSSA">
 <meta property="og:description" content="Short notes on PSSA: training runs, ports, benchmarks and what is being built around the architecture.">
-<meta property="og:image" content="assets/pssa-mark.svg">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect x='3' y='3' width='12' height='12' fill='%23E9FFF1'/%3E%3Crect x='18' y='3' width='12' height='12' fill='%2396EFB7'/%3E%3Crect x='33' y='3' width='12' height='12' fill='%233BCB78'/%3E%3Crect x='3' y='18' width='12' height='12' fill='%23C4F8D8'/%3E%3Crect x='18' y='18' width='12' height='12' fill='%2322A85D'/%3E%3Crect x='33' y='18' width='12' height='12' fill='%23178348'/%3E%3Crect x='3' y='33' width='12' height='12' fill='%2362E096'/%3E%3Crect x='18' y='33' width='12' height='12' fill='%23115E36'/%3E%3Crect x='33' y='33' width='12' height='12' fill='%230B3823'/%3E%3C/svg%3E">
 <script>document.documentElement.classList.add('js');</script>
 <link rel="stylesheet" href="assets/site.css">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "Blog",
+ "name": "PSSA build notes",
+ "url": "https://sparticle62ops.github.io/pssa/blog.html"
+}
+</script>
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
@@ -62,6 +79,16 @@
       </div>
 
       <div class="post-list">
+        <article class="card post reveal">
+          <p class="post-date">Oct 31, 2026 · explainer</p>
+          <h3 class="post-title">What is PSSA? A state space language model in pure Rust</h3>
+          <div class="post-body">
+            <p>PSSA is a small language model built on a state space architecture instead of attention. Where a transformer re-reads its whole context window for every token, a state space model carries a fixed-size recurrent state forward, so the cost of the next token does not grow with the length of what came before. It belongs to the same family of architectures as S4 and Mamba: selective state space models.</p>
+            <p>Three things set PSSA apart from a standard selective scan. A 512-slot episodic memory bank is read and written during the run, with keys retrieved by hyperbolic distance inside the Poincaré ball. Part of the weights are plastic: fast updates reinforce what works while a refractory gate rate-limits overwrites, and a closed-form ridge regression folds the fast updates back into the base weights. And there is no ML framework underneath: the whole thing is hand-written Rust with a scalar CPU reference that every gradient is checked against.</p>
+            <p>On a parameter-matched run over the same 12.7M-token corpus, PSSA finished at 3.98 training cross-entropy against 4.43 for the transformer, and the gap holds on unseen text (3.997 vs 4.429 on a 198,939-token held-out slice). On the same CPU it trains 4.1x faster and generates 200 tokens in 226 ms against 2,735 ms.</p>
+            <p>Everything is open: the <a href="https://github.com/Sparticle62ops/pssa">Rust source on GitHub</a>, the <a href="technical.html">full architecture write-up</a>, and the model card on <a href="https://huggingface.co/sparticle62/pssa">Hugging Face</a>.</p>
+          </div>
+        </article>
 
         <article class="card post reveal">
           <p class="post-date">Oct 30, 2026 · collab</p>
