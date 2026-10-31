@@ -31,11 +31,18 @@
           io.unobserve(e.target);
         }
       });
-    }, { threshold: .12, rootMargin: '0px 0px -8% 0px' });
+    }, { threshold: 0, rootMargin: '0px 0px -8% 0px' });
     revealEls.forEach(function (el) { io.observe(el); });
   } else {
     revealEls.forEach(function (el) { el.classList.add('is-in'); });
   }
+  var revealed_any = false, io_seen_scroll = false;
+  window.addEventListener('scroll', function () { io_seen_scroll = true; }, { passive: true, once: true });
+  setTimeout(function () {
+    if (io_seen_scroll && !revealEls.some(function (el) { return el.classList.contains('is-in'); })) {
+      revealEls.forEach(function (el) { el.classList.add('is-in'); });
+    }
+  }, 1200);
 
   /* number counters */
   var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
