@@ -765,6 +765,7 @@ html:not(.walk-ready) .phase-panel + .phase-panel{margin-top:26px;border-top:1px
   background:var(--bg);font-size:17px;
 }
 .resource-icon svg{width:22px;height:22px}
+.resource-icon .hf-emoji{width:22px;height:22px;display:block}
 .resource-icon .hf{font-family:var(--mono);font-size:12px;font-weight:600;letter-spacing:.02em}
 .resource-copy{min-width:0;flex:1}
 .resource-copy h3{font-size:15.5px;font-weight:500;letter-spacing:-.01em}
