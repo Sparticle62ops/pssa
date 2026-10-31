@@ -54,7 +54,7 @@ On the held-out slice and on matched CPU hardware:
 ## Models and weights
 
 - [NSC64/pssa-100m](https://huggingface.co/NSC64/pssa-100m) — a 109M-parameter PyTorch port of this architecture, trained from scratch by NSC64 on 4B tokens of TinyStories and FineWeb-Edu. Ships bf16 safetensors weights, a 16k byte-level BPE tokenizer and a self-contained loader (plain scan on CPU, fused Triton kernel on CUDA).
-- [sparticle62/pssa-checkpoints-run2](https://huggingface.co/sparticle62/pssa-checkpoints-run2) — training checkpoints from the 105M run in progress (raw .pssa resume files, not a packaged model).
+- [sparticle62/pssa-checkpoints-105m](https://huggingface.co/sparticle62/pssa-checkpoints-105m) — training checkpoints from the 105M run in progress (raw .pssa resume files, not a packaged model).
 
 ## What makes it different
 
@@ -167,7 +167,7 @@ entry-level card this ran on changes what can be asked.
 If you have compute to grant, or you work somewhere that does, that is the
 single highest-leverage thing anyone can offer this project. The 105M-parameter run is
 underway: training checkpoints land on
-[sparticle62/pssa-checkpoints-run2](https://huggingface.co/sparticle62/pssa-checkpoints-run2)
+[sparticle62/pssa-checkpoints-105m](https://huggingface.co/sparticle62/pssa-checkpoints-105m)
 as it goes, and the same-scale transformer baseline is still the milestone this
 all builds toward.
 
