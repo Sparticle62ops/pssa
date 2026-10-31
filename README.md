@@ -38,6 +38,19 @@ competitor to anything you have heard of. The full curves, the matched-run
 methodology, the caveats and the reproduction scripts are in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+On the held-out slice and on matched CPU hardware:
+
+| Held-out slice, 198,939 unseen tokens | PSSA | Transformer |
+| --- | --- | --- |
+| Cross-entropy | **3.997** | 4.429 |
+| Perplexity | **54.4** | 83.8 |
+| Next-token accuracy | **24.1%** | 18.0% |
+
+| Same CPU, fixed work | PSSA | Transformer |
+| --- | --- | --- |
+| Training throughput | **1,716 tok/s** | 415 tok/s (4.13x) |
+| Generate 200 tokens | **226 ms** | 2,735 ms (12x faster) |
+
 ## Models and weights
 
 - [NSC64/pssa-100m](https://huggingface.co/NSC64/pssa-100m) — a 109M-parameter PyTorch port of this architecture, trained from scratch by NSC64 on 4B tokens of TinyStories and FineWeb-Edu. Ships bf16 safetensors weights, a 16k byte-level BPE tokenizer and a self-contained loader (plain scan on CPU, fused Triton kernel on CUDA).
@@ -92,6 +105,11 @@ and long-corpus training chains are covered in [docs/setup.md](docs/setup.md).
   capacity experiments and the boxes-world world model.
 - [docs/contributors.md](docs/contributors.md) — building and testing locally,
   commit and PR expectations, code layout, roadmap and where help is needed.
+- [MODELMATH.md](MODELMATH.md) — the equations behind the layer, the memory
+  bank and the plastic write path, with the measured results.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — the short version of how to build, test
+  and open a PR.
+- [DONATE.md](DONATE.md) — where sponsorship goes and how to get in touch.
 
 Deeper write-ups for specific features and experiments:
 
