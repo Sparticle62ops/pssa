@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PSSA — Plastic State-Space Architecture</title>
+<meta name="description" content="PSSA is a 1.54M-parameter language model that is not a transformer: a selective recurrent state, a 512-slot episodic memory in hyperbolic space, and closed-form weight consolidation. Pure Rust, reproducible benchmarks.">
+<meta name="theme-color" content="#050505">
+<meta property="og:title" content="PSSA — Plastic State-Space Architecture">
+<meta property="og:description" content="Remember, then rewrite. A recurrent state, a bounded episodic memory, and weights that consolidate experience.">
+<meta property="og:image" content="assets/pssa-mark.svg">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect x='3' y='3' width='12' height='12' fill='%23E9FFF1'/%3E%3Crect x='18' y='3' width='12' height='12' fill='%2396EFB7'/%3E%3Crect x='33' y='3' width='12' height='12' fill='%233BCB78'/%3E%3Crect x='3' y='18' width='12' height='12' fill='%23C4F8D8'/%3E%3Crect x='18' y='18' width='12' height='12' fill='%2322A85D'/%3E%3Crect x='33' y='18' width='12' height='12' fill='%23178348'/%3E%3Crect x='3' y='33' width='12' height='12' fill='%2362E096'/%3E%3Crect x='18' y='33' width='12' height='12' fill='%23115E36'/%3E%3Crect x='33' y='33' width='12' height='12' fill='%230B3823'/%3E%3C/svg%3E">
+<script>document.documentElement.classList.add('js');</script>
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header" data-header>
+  <div class="wrap header-inner">
+    <a class="brand" href="#top" aria-label="PSSA — Plastic State-Space Architecture, back to top">
+      <svg class="mark" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+        <rect class="lg-sq" x="3" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="3" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="3" y="33" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="33" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="33" width="12" height="12"/>
+      </svg>
+      <span class="brand-text">
+        <span class="brand-name">PSSA</span>
+        <span class="brand-sep" aria-hidden="true">-</span>
+        <span class="brand-sub">Plastic State-Space Architecture</span>
+      </span>
+    </a>
+    <nav class="primary-nav" aria-label="Primary">
+      <a href="#overview" aria-current="page">Overview</a>
+      <a href="#how">How It Works</a>
+      <a href="technical.html">Deep Dive</a>
+      <a href="#results">Results</a>
+      <a href="#get">Resources</a>
+      <a href="donate.html">Support</a>
+      <a href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">GitHub <span class="nav-arrow" aria-hidden="true">↗</span></a>
+    </nav>
+  </div>
+  <span class="scroll-progress" aria-hidden="true" data-scroll-progress></span>
+</header>
+
+<div class="announce">
+  <span class="pill">release</span>
+  <span>64 public checkpoints · every benchmark on this page reproduces from the repo</span>
+  <a href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">github ↗</a>
+</div>
+
+<main id="main">
+  <section class="hero" id="top" aria-labelledby="hero-title">
+    <div class="wrap">
+      <svg class="mark" viewBox="0 0 48 48" role="img" aria-label="PSSA logo: nine green squares">
+        <rect class="lg-sq" x="3" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="3" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="3" y="33" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="33" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="33" width="12" height="12"/>
+      </svg>
+      <h1 id="hero-title">Remember, then rewrite.</h1>
+      <p class="hero-lede">PSSA is a 1.54M-parameter language model that is <strong>not a transformer</strong>. A fixed-size recurrent state carries the context. A bounded episodic memory looks it up. Closed-form consolidation folds experience back into the weights.</p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="technical.html">Read the technical deep dive</a>
+        <a class="btn btn-ghost" href="#how">Follow one token through the block</a>
+      </div>
+      <div class="hero-meta" aria-label="Architecture summary">
+        <span><i aria-hidden="true"></i>1,544,704 parameters</span>
+        <span><i aria-hidden="true"></i>512 episodic slots</span>
+        <span><i aria-hidden="true"></i>linear in sequence length</span>
+        <span><i aria-hidden="true"></i>no attention map</span>
+      </div>
+
+      <figure class="shot" aria-label="PSSA command-line report, checkpoint 64">
+        <div class="shot-bar">
+          <span class="shot-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="shot-title">pssa — checkpoint 64 / 64</span>
+          <span aria-hidden="true">bash · 80×24</span>
+        </div>
+        <div class="shot-body">
+          <pre><span class="dim">$</span> pssa --checkpoint 64 --report
+
+  <span class="k">model</span>            <span class="v">pssa</span>
+  <span class="k">parameters</span>       <span class="v">1,544,704</span>                       <span class="dim">baseline 1,541,120</span>
+  <span class="k">vocabulary</span>       <span class="v">2,048 bpe</span>
+  <span class="k">latent width</span>     <span class="v">256</span>
+  <span class="k">state</span>            <span class="v">256 × 16 · 16 log-spaced time constants</span>
+  <span class="k">memory</span>           <span class="v">512 slots · 32-d keys · 256-d values</span>
+  <span class="k">framework</span>        <span class="v">none · linear algebra written directly</span>
+  <span class="k">held-out CE</span>      <span class="v">3.997</span>                           <span class="dim">transformer 4.429</span>
+  <span class="k">held-out PPL</span>     <span class="v">54.4</span>                            <span class="dim">transformer 83.8</span>
+  <span class="k">generation</span>       <span class="v">~12×</span>                             <span class="dim">226 ms vs 2,735 ms · 200 tokens</span>
+  <span class="ok">✓</span> <span class="k">grad check</span>    <span class="v">max |∂batched − ∂scalar| = 2.98e−8</span>
+                   <span class="dim">gate 3e−8</span></pre>
+        </div>
+        <div class="shot-progress">
+          <span>training · 64 checkpoints · CE 5.73 → 3.98</span>
+          <span class="prog-track"><span class="prog-fill" style="--w:100%"></span></span>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <section class="section" id="overview" aria-labelledby="overview-title">
+    <div class="wrap">
+      <div class="section-head split reveal">
+        <div>
+          <p class="kicker"><span class="num">01</span> · Overview</p>
+          <h2 id="overview-title">Three ideas, one small block.</h2>
+        </div>
+        <div>
+          <p class="section-lede">PSSA is built around a persistent state, an episodic memory with a hard size limit, and weights that absorb experience during training. Each mechanism is deliberately small enough to measure, ablate, and inspect.</p>
+          <p class="section-lede">It is a different accounting of context: carry a state, look things up, and consolidate what matters.</p>
+        </div>
+      </div>
+
+      <div class="card-grid" data-stagger>
+        <article class="feature card card-hover reveal">
+          <div class="feature-top"><span class="feature-index">01</span><span class="tag" aria-hidden="true">recurrent core</span></div>
+          <svg class="feature-icon" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+            <circle cx="24" cy="24" r="16" class="glyph-thin"/>
+            <circle cx="24" cy="24" r="7" class="glyph-line"/>
+            <circle cx="24" cy="24" r="2" class="glyph-fill"/>
+            <path d="M24 8a16 16 0 0 1 14.2 8" class="glyph-line"/>
+            <circle cx="38.2" cy="16" r="2" class="glyph-fill glyph-pulse"/>
+            <path d="M8 24h5M35 24h5" class="glyph-thin"/>
+          </svg>
+          <h3>A state instead of a window</h3>
+          <p>A selective diagonal state-space recurrence carries 256 × 16 values left to right. Every token updates that state once; no context window is re-read and no attention matrix is built.</p>
+          <p class="feature-eq" aria-label="h sub t equals f theta of h sub t minus one and x sub t">h<sub>t</sub> = f<sub>θ</sub>(h<sub>t−1</sub>, x<sub>t</sub>)</p>
+        </article>
+
+        <article class="feature card card-hover reveal">
+          <div class="feature-top"><span class="feature-index">02</span><span class="tag" aria-hidden="true">episodic memory</span></div>
+          <svg class="feature-icon" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+            <circle cx="24" cy="24" r="18" class="glyph-thin"/>
+            <circle cx="24" cy="24" r="12" class="glyph-thin" stroke-dasharray="1 4"/>
+            <g class="glyph-orbit">
+              <circle cx="24" cy="6" r="1.8" class="glyph-fill"/>
+              <circle cx="42" cy="24" r="1.3" class="glyph-fill" opacity=".55"/>
+              <circle cx="24" cy="42" r="1.6" class="glyph-fill" opacity=".35"/>
+              <circle cx="6" cy="24" r="1.4" class="glyph-fill" opacity=".7"/>
+            </g>
+            <circle cx="24" cy="24" r="4.5" class="glyph-line"/>
+            <circle cx="24" cy="24" r="1.6" class="glyph-fill"/>
+          </svg>
+          <h3>Memory with a boundary</h3>
+          <p>512 episodic slots hold keys in a Poincaré ball and values in Euclidean space. Reads are an exact softmax over every key; writes rotate round-robin, so the bank can never grow.</p>
+          <p class="feature-eq" aria-label="m equals the sum over s of w sub s times v sub s">m = Σ<sub>s</sub> w<sub>s</sub>v<sub>s</sub></p>
+        </article>
+
+        <article class="feature card card-hover reveal">
+          <div class="feature-top"><span class="feature-index">03</span><span class="tag" aria-hidden="true">plasticity</span></div>
+          <svg class="feature-icon" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+            <path d="M7 32c6.5-10 13-15 21-15 6 0 9 3 12 7" class="glyph-line"/>
+            <path d="M7 39c6.5-10 13-15 21-15 6 0 9 3 12 7" class="glyph-thin" opacity=".45"/>
+            <circle cx="28" cy="17" r="2" class="glyph-fill glyph-pulse"/>
+            <circle cx="40" cy="25" r="1.5" class="glyph-fill glyph-pulse two" opacity=".7"/>
+            <path d="M31 32v8M27 36h8" class="glyph-thin"/>
+          </svg>
+          <h3>Weights that move</h3>
+          <p>A rank-16 adapter shapes every block output. At consolidation boundaries, a ridge solve folds accumulated statistics into a base matrix — a weight update with no second backward pass.</p>
+          <p class="feature-eq" aria-label="A base is updated with a ridge solve of H and delta H">A<sub>base</sub> ← A<sub>base</sub> + ridge(H, ΔH)</p>
+        </article>
+      </div>
+
+      <p class="scope-note reveal"><b>Scope.</b>&nbsp;PSSA is a 1.54M-parameter research prototype, trained once on a small corpus and measured against a size-matched baseline. Read the numbers as an existence proof, not a production claim. <a class="text-link" href="technical.html#limits">The method and the limits are part of the result.</a></p>
+    </div>
+  </section>
+
+  <section class="section" id="how" aria-labelledby="how-title">
+    <div class="wrap">
+      <div class="section-head split reveal">
+        <div>
+          <p class="kicker"><span class="num">02</span> · Architecture</p>
+          <h2 id="how-title">One token, five moves.</h2>
+        </div>
+        <div>
+          <p class="section-lede">Everything is computed once per token, left to right. No context window is re-read and no attention matrix is materialized. Step through the block below, or turn on narration and listen.</p>
+          <p class="section-lede">The equations are the actual operations, simplified only where the deep dive goes further: the memory read is a full scan by default, and consolidation runs at explicit boundaries.</p>
+        </div>
+      </div>
+
+      <div class="walkthrough card reveal" data-walk>
+        <div class="walk-head">
+          <div>
+            <p class="kicker">Interactive walkthrough</p>
+            <h3>Follow one token through the block.</h3>
+            <p>Select a phase, hover a node, or use the narration control.</p>
+          </div>
+          <button class="narration-btn" type="button" data-narration aria-pressed="false" aria-label="Read walkthrough steps aloud">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 8.2v3.6h2.8L10 15V5L5.8 8.2H3Z"/>
+              <path class="wave" d="M12.4 7.6a3.2 3.2 0 0 1 0 4.8M14.7 5.3a6.5 6.5 0 0 1 0 9.4"/>
+              <path class="slash" d="M12.6 6.8l4.9 6.4"/>
+            </svg>
+            <span class="narrate-dot" aria-hidden="true"></span>
+            <span>Narrate</span>
+          </button>
+        </div>
+
+        <div class="step-tabs" role="group" aria-label="Choose a walkthrough phase">
+          <button class="step-tab" type="button" data-step="0" aria-pressed="true" aria-controls="phase-0"><span class="tab-num">01</span>Project</button>
+          <button class="step-tab" type="button" data-step="1" aria-pressed="false" aria-controls="phase-1"><span class="tab-num">02</span>Recur</button>
+          <button class="step-tab" type="button" data-step="2" aria-pressed="false" aria-controls="phase-2"><span class="tab-num">03</span>Read</button>
+          <button class="step-tab" type="button" data-step="3" aria-pressed="false" aria-controls="phase-3"><span class="tab-num">04</span>Adapt</button>
+          <button class="step-tab" type="button" data-step="4" aria-pressed="false" aria-controls="phase-4"><span class="tab-num">05</span>Predict</button>
+        </div>
+
+        <div class="walk-body">
+          <div class="walk-diagram">
+            <div class="diagram-topline">
+              <span class="diagram-label">The block · one token</span>
+              <span class="diagram-callout" data-callout>01 · project</span>
+              <span class="sr-only" data-walk-status aria-live="polite">Phase 1 of 5: project</span>
+            </div>
+            <div class="pipeline" role="group" aria-label="Architecture stages">
+              <button class="node" type="button" data-node data-target="0" data-phases="0" data-label="project" aria-controls="phase-0">
+                <span class="node-top"><span class="node-num">01</span><span class="node-dot" aria-hidden="true"></span></span>
+                <span class="node-title">Project</span>
+                <span class="node-sub">token → vector</span>
+              </button>
+              <span class="pipe-link" aria-hidden="true"></span>
+              <button class="node" type="button" data-node data-target="1" data-phases="1" data-label="selective recurrence" aria-controls="phase-1">
+                <span class="node-top"><span class="node-num">02</span><span class="node-dot" aria-hidden="true"></span></span>
+                <span class="node-title">Recur</span>
+                <span class="node-sub">state update</span>
+              </button>
+              <span class="pipe-link" aria-hidden="true"></span>
+              <button class="node" type="button" data-node data-target="2" data-phases="2 4" data-label="episodic memory read" aria-controls="phase-2">
+                <span class="node-top"><span class="node-num">03</span><span class="node-dot" aria-hidden="true"></span></span>
+                <span class="node-title">Read</span>
+                <span class="node-sub">512-slot scan</span>
+              </button>
+              <span class="pipe-link" aria-hidden="true"></span>
+              <button class="node" type="button" data-node data-target="3" data-phases="3" data-label="gate and adapter" aria-controls="phase-3">
+                <span class="node-top"><span class="node-num">04</span><span class="node-dot" aria-hidden="true"></span></span>
+                <span class="node-title">Adapt</span>
+                <span class="node-sub">mix + adapter</span>
+              </button>
+              <span class="pipe-link" aria-hidden="true"></span>
+              <button class="node" type="button" data-node data-target="4" data-phases="4" data-label="prediction and write" aria-controls="phase-4">
+                <span class="node-top"><span class="node-num">05</span><span class="node-dot" aria-hidden="true"></span></span>
+                <span class="node-title">Predict</span>
+                <span class="node-sub">logits + write</span>
+              </button>
+            </div>
+
+            <div class="bank-row">
+              <button class="node bank-node" type="button" data-node data-target="2" data-phases="2 4" data-label="episodic memory bank" aria-controls="phase-2">
+                <span class="bank-copy">
+                  <span class="bank-kicker">Episodic bank • 512 slots</span>
+                  <span class="bank-title">Poincaré keys · Euclidean values</span>
+                </span>
+                <span class="bank-dots" aria-hidden="true"><i style="--i:0"></i><i style="--i:1"></i><i style="--i:2"></i><i style="--i:3"></i><i style="--i:4"></i><i style="--i:5"></i><i style="--i:6"></i><i style="--i:7"></i><i style="--i:8"></i><i style="--i:9"></i><i style="--i:10"></i><i style="--i:11"></i><i style="--i:12"></i><i style="--i:13"></i><i style="--i:14"></i><i style="--i:15"></i><i style="--i:16"></i><i style="--i:17"></i><i style="--i:18"></i><i style="--i:19"></i><i style="--i:20"></i><i style="--i:21"></i><i style="--i:22"></i><i style="--i:23"></i></span>
+              </button>
+              <button class="node consolidate-node" type="button" data-node data-target="3" data-phases="3" data-label="consolidation" aria-controls="phase-3">
+                <span class="node-top"><span class="node-num">S</span><span class="node-dot" aria-hidden="true"></span></span>
+                <span class="node-title">Consolidate</span>
+                <span class="node-sub">ridge solve</span>
+              </button>
+            </div>
+            <div class="diagram-foot">
+              <span>one pass · left to right</span>
+              <span>state h · 256 × 16</span>
+              <span>cost linear in tokens</span>
+            </div>
+          </div>
+
+          <div class="phase-panels">
+            <section class="phase-panel" id="phase-0" data-panel="0" aria-label="Phase 1: project">
+              <p class="phase-kicker">Phase 01 · project</p>
+              <h3>A token becomes a vector.</h3>
+              <p class="phase-copy">The token ID indexes a 2,048-entry embedding table. The resulting 256-dimensional vector is the only thing the recurrent core sees; there is no context window to re-read and no positional attention to compute.</p>
+              <div class="phase-eq">
+                <p class="eq-tag">embedding</p>
+                <div class="eq" role="math" aria-label="x sub t equals E of token sub t, a vector in R to the 256">
+                  <span class="eq-line"><span class="v">x</span><sub>t</sub> <span class="op">=</span> <span class="fn">E</span><span class="op">[</span><span class="v">tok</span><sub>t</sub><span class="op">]</span> <span class="op">∈</span> ℝ<sup>256</sup></span>
+                </div>
+                <p class="math-caption">2,048-entry vocabulary · 256 latent dimensions per token</p>
+              </div>
+            </section>
+
+            <section class="phase-panel" id="phase-1" data-panel="1" aria-label="Phase 2: selective recurrence">
+              <p class="phase-kicker">Phase 02 · selective recurrence</p>
+              <h3>The state is updated, not rebuilt.</h3>
+              <p class="phase-copy">A diagonal selective state-space layer carries the context. Its step size, input projection and output projection are read from the current token, so each channel can open slowly or close quickly from one step to the next. The update is elementwise, and total cost stays linear in sequence length.</p>
+              <div class="phase-eq">
+                <p class="eq-tag">selective SSM</p>
+                <div class="eq" role="math" aria-label="delta t equals softplus of W delta x t; A bar sub t equals exp of delta t A; B bar sub t equals delta t B t; h sub t equals A bar sub t times h sub t minus one plus B bar sub t times x sub t">
+                  <span class="eq-line"><span class="v">δ</span><sub>t</sub> <span class="op">=</span> <span class="fn">softplus</span><span class="op">(</span><span class="v">W</span><sub>δ</sub><span class="v">x</span><sub>t</sub><span class="op">)</span></span>
+                  <span class="eq-line"><span class="v">Ā</span><sub>t</sub> <span class="op">=</span> <span class="fn">exp</span><span class="op">(</span><span class="v">δ</span><sub>t</sub><span class="v">A</span><span class="op">)</span><span class="op">,</span>&nbsp;&nbsp;<span class="v">B̄</span><sub>t</sub> <span class="op">=</span> <span class="v">δ</span><sub>t</sub><span class="v">B</span><sub>t</sub></span>
+                  <span class="eq-line"><span class="v">h</span><sub>t</sub> <span class="op">=</span> <span class="v">Ā</span><sub>t</sub> <span class="op">⊙</span> <span class="v">h</span><sub>t−1</sub> <span class="op">+</span> <span class="v">B̄</span><sub>t</sub> <span class="op">⊙</span> <span class="v">x</span><sub>t</sub></span>
+                </div>
+                <p class="math-caption">256 × 16 state persists between tokens · 16 log-spaced time constants, 1.5–200 tokens</p>
+              </div>
+            </section>
+
+            <section class="phase-panel" id="phase-2" data-panel="2" aria-label="Phase 3: episodic memory read">
+              <p class="phase-kicker">Phase 03 · episodic read</p>
+              <h3>Look up the past by distance.</h3>
+              <p class="phase-copy">The query mixes the current token with the recurrent output. It is projected inside a Poincaré ball, where distance grows toward the boundary and can encode hierarchy. The read scans every one of the 512 keys, scores them by hyperbolic distance, and mixes their Euclidean values.</p>
+              <div class="phase-eq">
+                <p class="eq-tag">full-scan read</p>
+                <div class="eq" role="math" aria-label="q sub h equals proj of W qx x t plus W qh h t; w equals softmax of negative d sub H of q sub h and k sub s divided by tau mem; m equals the sum of w sub s v sub s">
+                  <span class="eq-line"><span class="v">q</span><sub>h</sub> <span class="op">=</span> <span class="fn">proj</span><span class="op">(</span><span class="v">W</span><sub>qx</sub><span class="v">x</span><sub>t</sub> <span class="op">+</span> <span class="v">W</span><sub>qh</sub><span class="v">h</span><sub>t</sub><span class="op">)</span></span>
+                  <span class="eq-line"><span class="v">w</span> <span class="op">=</span> <span class="fn">softmax</span><span class="op">(</span><span class="frac"><span class="num"><span class="op">−</span><span class="v">d</span><sub>H</sub><span class="op">(</span><span class="v">q</span><sub>h</sub><span class="op">,</span> <span class="v">k</span><sub>s</sub><span class="op">)</span></span><span class="den"><span class="v">τ</span><sub>mem</sub></span></span><span class="op">)</span></span>
+                  <span class="eq-line"><span class="v">m</span> <span class="op">=</span> <span class="op">Σ</span><sub>s</sub> <span class="v">w</span><sub>s</sub><span class="v">v</span><sub>s</sub></span>
+                </div>
+                <p class="math-caption">512 hyperbolic distances per read · optional top-k still scans all keys, then mixes only K values</p>
+              </div>
+            </section>
+
+            <section class="phase-panel" id="phase-3" data-panel="3" aria-label="Phase 4: gate, adapter and consolidation">
+              <p class="phase-kicker">Phase 04 · adaptation</p>
+              <h3>Mix, adapt, consolidate.</h3>
+              <p class="phase-copy">A sigmoid gate decides how much of the memory read enters the block. A rank-16 adapter then makes a learned correction. At consolidation boundaries, accumulated statistics are solved rather than gradient-stepped: the base weights absorb a closed-form delta.</p>
+              <div class="phase-eq">
+                <p class="eq-tag">gate and adapter</p>
+                <div class="eq" role="math" aria-label="g equals sigmoid of w gate dot x t; A of x t equals W 2 silu of W 1 x t">
+                  <span class="eq-line"><span class="v">g</span> <span class="op">=</span> <span class="fn">sigmoid</span><span class="op">(</span><span class="v">w</span><sub>gate</sub> <span class="op">·</span> <span class="v">x</span><sub>t</sub><span class="op">)</span></span>
+                  <span class="eq-line"><span class="v">A</span><span class="op">(</span><span class="v">x</span><sub>t</sub><span class="op">)</span> <span class="op">=</span> <span class="v">W</span><sub>2</sub> <span class="fn">silu</span><span class="op">(</span><span class="v">W</span><sub>1</sub><span class="v">x</span><sub>t</sub><span class="op">)</span></span>
+                </div>
+                <div class="eq" role="math" aria-label="A base is replaced by A base plus the inverse of H transpose H plus lambda I, times H transpose delta H">
+                  <span class="eq-line"><span class="v">A</span><sub>base</sub> <span class="op">←</span> <span class="v">A</span><sub>base</sub> <span class="op">+</span> <span class="op">(</span><span class="v">H</span><sup>T</sup><span class="v">H</span> <span class="op">+</span> <span class="v">λ</span><span class="fn">I</span><span class="op">)</span><sup>−1</sup><span class="v">H</span><sup>T</sup><span class="v">ΔH</span></span>
+                </div>
+                <p class="math-caption">rank-16 adapter · ridge consolidation folds accumulated input/output statistics into the base matrix</p>
+              </div>
+            </section>
+
+            <section class="phase-panel" id="phase-4" data-panel="4" aria-label="Phase 5: prediction and memory write">
+              <p class="phase-kicker">Phase 05 · prediction &amp; write</p>
+              <h3>Predict, then decide what to keep.</h3>
+              <p class="phase-copy">The adapted block output is projected to the 2,048-token vocabulary. After the step, the state summary becomes a candidate key and value. A round-robin target slot accepts the write only when the entry is novel enough and the slot has cleared its refractory window.</p>
+              <div class="phase-eq">
+                <p class="eq-tag">vocabulary projection</p>
+                <div class="eq" role="math" aria-label="p sub t equals softmax of W out z t, where z is the adapted block output">
+                  <span class="eq-line"><span class="v">p</span><sub>t</sub> <span class="op">=</span> <span class="fn">softmax</span><span class="op">(</span><span class="v">W</span><sub>out</sub><span class="v">z</span><sub>t</sub><span class="op">)</span></span>
+                </div>
+                <p class="math-caption">z is the adapted block output · writes require novelty above a threshold and a target slot outside its refractory window</p>
+              </div>
+            </section>
+
+            <div class="phase-nav">
+              <button class="phase-btn" type="button" data-prev>
+                <svg viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M7.5 1.8 3.3 6l4.2 4.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                Previous
+              </button>
+              <span class="phase-count" data-count-phase>01 / 05</span>
+              <button class="phase-btn" type="button" data-next>
+                Next
+                <svg viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M4.5 1.8 8.7 6l-4.2 4.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section-continued" id="demo" aria-labelledby="demo-title">
+    <div class="wrap">
+      <div class="subhead reveal">
+        <div>
+          <p class="kicker">Interactive schematic</p>
+          <h3 id="demo-title">Send a sentence through the block.</h3>
+        </div>
+        <p>Type a few words. The page splits them into visible token chips, animates them through a schematic of the block, and shows a small slice of the state, the memory gate, and the slots that fire. Everything is deterministic and local; nothing is sent to the model. The four stages are a compact summary of the five walkthrough phases: the gate-and-adapt step is folded into Predict.</p>
+      </div>
+
+      <div class="demo-card card reveal" data-demo>
+        <div class="demo-head">
+          <div>
+            <p class="demo-title">A schematic forward pass</p>
+            <p class="demo-sub">Token by token · 8 state channels shown · 512-slot memory</p>
+          </div>
+          <span class="schematic-badge">schematic, not live inference</span>
+        </div>
+
+        <form class="demo-form" data-demo-form>
+          <label for="demo-sentence">Your sentence</label>
+          <div class="demo-input-row">
+            <input id="demo-sentence" name="sentence" type="text" maxlength="140" value="the river remembers its shape" autocomplete="off" autocapitalize="sentences" spellcheck="false" enterkeyhint="go" data-demo-input>
+            <button class="btn btn-primary" type="submit" data-demo-run>Run schematic</button>
+          </div>
+        </form>
+
+        <div class="demo-tokens">
+          <div class="demo-line-label"><span>Token chips</span><em>words + punctuation · capped at 24</em></div>
+          <div class="chips" data-chips>
+            <span class="token-chip"><span class="chip-text">the</span><span class="chip-id">#0184</span></span>
+            <span class="token-chip"><span class="chip-text">river</span><span class="chip-id">#0912</span></span>
+            <span class="token-chip"><span class="chip-text">remembers</span><span class="chip-id">#0761</span></span>
+            <span class="token-chip"><span class="chip-text">its</span><span class="chip-id">#1240</span></span>
+            <span class="token-chip"><span class="chip-text">shape</span><span class="chip-id">#0338</span></span>
+          </div>
+        </div>
+
+        <div class="demo-pipeline" aria-label="Schematic stages">
+          <div class="stage" data-stage="0">
+            <span class="stage-num">01</span>
+            <h4>Project</h4>
+            <p>embedding · 256 dims</p>
+            <div class="stage-live"><span class="placeholder">idle</span><span class="live-chip"></span></div>
+          </div>
+          <div class="stage" data-stage="1">
+            <span class="stage-num">02</span>
+            <h4>Recur</h4>
+            <p>selective update</p>
+            <div class="stage-live"><span class="placeholder">idle</span><span class="live-chip"></span></div>
+          </div>
+          <div class="stage" data-stage="2">
+            <span class="stage-num">03</span>
+            <h4>Read</h4>
+            <p>full 512-key scan</p>
+            <div class="stage-live"><span class="placeholder">idle</span><span class="live-chip"></span></div>
+          </div>
+          <div class="stage" data-stage="3">
+            <span class="stage-num">04</span>
+            <h4>Predict</h4>
+            <p>logits + write gate</p>
+            <div class="stage-live"><span class="placeholder">idle</span><span class="live-chip"></span></div>
+          </div>
+        </div>
+
+        <div class="demo-readout">
+          <div class="readout-card">
+            <div class="readout-head"><span>State</span><em>8 of 256 channels</em></div>
+            <div class="state-grid" aria-hidden="true">
+              <div class="state-cell" data-state="0"><div class="state-meter"><span class="state-fill" style="height:9%;bottom:50%"></span></div><span class="state-label">h₁</span><span class="state-num">+0.18</span></div>
+              <div class="state-cell" data-state="1"><div class="state-meter"><span class="state-fill neg" style="height:16%;top:50%"></span></div><span class="state-label">h₂</span><span class="state-num">−0.32</span></div>
+              <div class="state-cell" data-state="2"><div class="state-meter"><span class="state-fill" style="height:23%;bottom:50%"></span></div><span class="state-label">h₃</span><span class="state-num">+0.46</span></div>
+              <div class="state-cell" data-state="3"><div class="state-meter"><span class="state-fill neg" style="height:6%;top:50%"></span></div><span class="state-label">h₄</span><span class="state-num">−0.12</span></div>
+              <div class="state-cell" data-state="4"><div class="state-meter"><span class="state-fill" style="height:14%;bottom:50%"></span></div><span class="state-label">h₅</span><span class="state-num">+0.28</span></div>
+              <div class="state-cell" data-state="5"><div class="state-meter"><span class="state-fill neg" style="height:20.5%;top:50%"></span></div><span class="state-label">h₆</span><span class="state-num">−0.41</span></div>
+              <div class="state-cell" data-state="6"><div class="state-meter"><span class="state-fill" style="height:4.5%;bottom:50%"></span></div><span class="state-label">h₇</span><span class="state-num">+0.09</span></div>
+              <div class="state-cell" data-state="7"><div class="state-meter"><span class="state-fill" style="height:17.5%;bottom:50%"></span></div><span class="state-label">h₈</span><span class="state-num">+0.35</span></div>
+            </div>
+          </div>
+
+          <div class="readout-card">
+            <div class="readout-head"><span>Gate</span><em>sigmoid</em></div>
+            <div class="gate-value" data-gate-value>0.50</div>
+            <div class="gate-meter"><span class="gate-fill" data-gate-fill style="width:50%"></span></div>
+            <p class="gate-sub">How much of the memory read enters the block at this step.</p>
+          </div>
+
+          <div class="readout-card memory-readout">
+            <div class="readout-head"><span>Memory</span><em>512 slots · full scan</em></div>
+            <div class="bank-grid" data-bank aria-hidden="true"></div>
+            <div class="fired-list" data-fired><span class="fired-empty" data-fired-empty>run a sentence to fire slots</span></div>
+          </div>
+        </div>
+
+        <div class="demo-status">
+          <span class="status-note" data-demo-status aria-live="polite">Idle · run a sentence to animate the block.</span>
+          <span>no network · deterministic illustration</span>
+        </div>
+        <noscript><p class="scope-note">The animated token schematic needs JavaScript. The written explanation above is complete without it.</p></noscript>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="results" aria-labelledby="results-title">
+    <div class="wrap">
+      <div class="section-head split reveal">
+        <div>
+          <p class="kicker"><span class="num">03</span> · Evidence</p>
+          <h2 id="results-title">Small scale. Real measurements.</h2>
+        </div>
+        <div>
+          <p class="section-lede">One seed. 12.7M cleaned WikiText-103 tokens. A 1.54M-parameter PSSA and a parameter-matched transformer trained under the same 30,000-update cosine horizon, then evaluated on 198,939 held-out tokens neither model saw.</p>
+          <p class="section-lede">The comparison is deliberately narrow. Every number below is reproducible from the repository; the method and its limits are written down in the <a class="text-link" href="technical.html#training">technical deep dive</a>.</p>
+        </div>
+      </div>
+
+      <div class="result-stats reveal">
+        <div class="result-stat">
+          <p class="stat-label">Held-out perplexity</p>
+          <p class="stat-big"><span data-count="54.4" data-decimals="1">54.4</span><span class="unit">PPL</span></p>
+          <p>Against 83.8 for the parameter-matched transformer.</p>
+        </div>
+        <div class="result-stat">
+          <p class="stat-label">Held-out cross-entropy gap</p>
+          <p class="stat-big"><span data-count="0.43" data-decimals="2">0.43</span><span class="unit">nats</span></p>
+          <p>3.997 for PSSA, 4.429 for the baseline.</p>
+        </div>
+        <div class="result-stat">
+          <p class="stat-label">CPU training throughput</p>
+          <p class="stat-big"><span data-count="4.13" data-decimals="2" data-suffix="×">4.13×</span></p>
+          <p>1,716 vs 415 tokens per second on matched work.</p>
+        </div>
+        <div class="result-stat">
+          <p class="stat-label">Generation speed</p>
+          <p class="stat-big"><span data-count="12.1" data-decimals="1" data-suffix="× faster">12.1× faster</span></p>
+          <p>226 ms vs 2,735 ms for 200 generated tokens.</p>
+        </div>
+      </div>
+
+      <figure class="chart-card card reveal" aria-labelledby="chart-title">
+        <div class="chart-head">
+          <div>
+            <h3 class="chart-title" id="chart-title">Training loss, checkpoint by checkpoint</h3>
+            <p class="chart-sub" id="chart-desc">Cross-entropy on supervised target tokens across 64 links. The series is embedded from the training log; hover, tap, or focus the plot to inspect a point.</p>
+          </div>
+          <div class="chart-readout" aria-live="polite">
+            <span class="readout-step" data-readout-step>checkpoint 64 / 64</span>
+            <strong data-readout-loss>3.982</strong>
+            <span class="readout-meta" data-readout-meta>≈12.7M tokens seen · train CE</span>
+          </div>
+        </div>
+
+        <div class="chart-shell" data-loss-chart>
+          <div class="chart-body">
+            <div class="chart-yticks" aria-hidden="true">
+              <span style="top:4.8%">5.75</span>
+              <span style="top:28.6%">5.25</span>
+              <span style="top:52.4%">4.75</span>
+              <span style="top:76.2%">4.25</span>
+              <span style="top:100%">3.75</span>
+            </div>
+            <div class="chart-frame" data-chart-frame tabindex="0" role="group" aria-label="Training loss chart. Use left and right arrow keys to inspect checkpoints." aria-describedby="chart-desc">
+              <svg class="chart-svg" viewBox="0 0 1000 420" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+                <defs>
+                  <linearGradient id="lossFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0" stop-color="#3BCB78" stop-opacity=".14"/>
+                    <stop offset="1" stop-color="#3BCB78" stop-opacity="0"/>
+                  </linearGradient>
+                </defs>
+                <g aria-hidden="true">
+                  <line class="chart-grid" x1="0" y1="20" x2="1000" y2="20"/>
+                  <line class="chart-grid" x1="0" y1="120" x2="1000" y2="120"/>
+                  <line class="chart-grid" x1="0" y1="220" x2="1000" y2="220"/>
+                  <line class="chart-grid" x1="0" y1="320" x2="1000" y2="320"/>
+                  <line class="chart-grid v" x1="238.1" y1="0" x2="238.1" y2="420"/>
+                  <line class="chart-grid v" x1="492.1" y1="0" x2="492.1" y2="420"/>
+                  <line class="chart-grid v" x1="746" y1="0" x2="746" y2="420"/>
+                </g>
+                <path class="loss-area" d="" fill="url(#lossFill)"/>
+                <path class="loss-line static" d="M0 23.4 L63.5 246.6 L142.9 280.6 L222.2 311.6 L301.6 333.0 L381.0 325.6 L460.3 356.0 L539.7 362.2 L619.0 375.4 L698.4 379.4 L777.8 377.8 L857.1 401.6 L936.5 375.6 L1000 373.6"/>
+                <path class="loss-line dynamic" pathLength="1" d=""/>
+              </svg>
+              <span class="chart-cursor" data-chart-cursor aria-hidden="true"></span>
+              <span class="chart-dot" data-chart-dot aria-hidden="true"></span>
+              <span class="chart-endlabel" aria-hidden="true">3.982</span>
+              <span class="chart-startlabel" aria-hidden="true">start · 5.733</span>
+            </div>
+          </div>
+          <div class="chart-axis-x" aria-hidden="true">
+            <span></span>
+            <div class="x-ticks">
+              <span style="left:0%">1</span>
+              <span style="left:23.8%">16</span>
+              <span style="left:49.2%">32</span>
+              <span style="left:74.6%">48</span>
+              <span style="left:100%">64</span>
+            </div>
+          </div>
+          <p class="chart-x-title">checkpoint · ≈199k training tokens each</p>
+          <p class="chart-x-title note">The run ends slightly above its checkpoint-56 low (3.887 → 3.982): per-link variance on a single seed, not divergence. The full 64-point series ships in loss.csv.</p>
+
+          <details class="chart-details">
+            <summary>Inspect the sampled data table</summary>
+            <table class="chart-data-table">
+              <caption>The chart plots 14 sampled checkpoints of the 64 saved; the table samples nine points from loss.csv.</caption>
+              <thead><tr><th scope="col">Checkpoint</th><th scope="col">Training loss</th><th scope="col">Approx. tokens seen</th></tr></thead>
+              <tbody>
+                <tr><td>1</td><td>5.733</td><td>0.2M</td></tr>
+                <tr><td>8</td><td>4.447</td><td>1.6M</td></tr>
+                <tr><td>16</td><td>4.187</td><td>3.2M</td></tr>
+                <tr><td>24</td><td>4.088</td><td>4.8M</td></tr>
+                <tr><td>32</td><td>3.988</td><td>6.4M</td></tr>
+                <tr><td>40</td><td>3.973</td><td>8.0M</td></tr>
+                <tr><td>48</td><td>3.937</td><td>9.5M</td></tr>
+                <tr><td>56</td><td>3.887</td><td>11.1M</td></tr>
+                <tr><td>64</td><td>3.982</td><td>12.7M</td></tr>
+              </tbody>
+            </table>
+          </details>
+        </div>
+
+        <figcaption class="chart-foot">
+          <span class="hint">hover · tap · <kbd>←</kbd><kbd>→</kbd> inspect</span>
+          <span>single seed · 64 checkpoints · loss.csv</span>
+        </figcaption>
+      </figure>
+
+      <div class="bench card reveal" data-bench>
+        <div class="bench-head">
+          <div>
+            <h3>Head-to-head, same budget</h3>
+            <p>PSSA against a parameter-matched transformer. Bars are drawn from the measured values and normalized per row; the numbers are the result, not the bars.</p>
+          </div>
+        </div>
+        <table class="bench-table">
+          <caption class="sr-only">PSSA versus a parameter-matched transformer across training, held-out evaluation, throughput, and generation.</caption>
+          <thead>
+            <tr>
+              <th scope="col">Measure</th>
+              <th scope="col">PSSA</th>
+              <th scope="col">Transformer</th>
+              <th scope="col">Gap</th>
+              <th scope="col">Relative scale</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">Training cross-entropy<span class="metric-note">final checkpoint · nats / token · lower is better</span></th>
+              <td data-label="PSSA"><span class="bench-val bench-best">3.98</span></td>
+              <td data-label="Transformer"><span class="bench-val">4.43</span></td>
+              <td data-label="Gap"><span class="bench-gap">−0.45</span></td>
+              <td class="bench-visual" data-label="Relative scale" aria-hidden="true">
+                <div class="bars">
+                  <div class="bar-row"><span class="bar-key">PSSA</span><span class="bar-track"><span class="bar-fill" data-value="3.98" data-max="5" style="--w:79.6%"></span></span></div>
+                  <div class="bar-row"><span class="bar-key">base</span><span class="bar-track"><span class="bar-fill base" data-value="4.43" data-max="5" style="--w:88.6%"></span></span></div>
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">Held-out cross-entropy<span class="metric-note">198,939 unseen tokens · nats / token</span></th>
+              <td data-label="PSSA"><span class="bench-val bench-best">3.997</span></td>
+              <td data-label="Transformer"><span class="bench-val">4.429</span></td>
+              <td data-label="Gap"><span class="bench-gap">−0.43</span></td>
+              <td class="bench-visual" data-label="Relative scale" aria-hidden="true">
+                <div class="bars">
+                  <div class="bar-row"><span class="bar-key">PSSA</span><span class="bar-track"><span class="bar-fill" data-value="3.997" data-max="5" style="--w:79.9%"></span></span></div>
+                  <div class="bar-row"><span class="bar-key">base</span><span class="bar-track"><span class="bar-fill base" data-value="4.429" data-max="5" style="--w:88.6%"></span></span></div>
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">Held-out perplexity<span class="metric-note">per-token perplexity · lower is better</span></th>
+              <td data-label="PSSA"><span class="bench-val bench-best">54.4</span></td>
+              <td data-label="Transformer"><span class="bench-val">83.8</span></td>
+              <td data-label="Gap"><span class="bench-gap">−29.4</span></td>
+              <td class="bench-visual" data-label="Relative scale" aria-hidden="true">
+                <div class="bars">
+                  <div class="bar-row"><span class="bar-key">PSSA</span><span class="bar-track"><span class="bar-fill" data-value="54.4" data-max="90" style="--w:60.4%"></span></span></div>
+                  <div class="bar-row"><span class="bar-key">base</span><span class="bar-track"><span class="bar-fill base" data-value="83.8" data-max="90" style="--w:93.1%"></span></span></div>
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">Next-token accuracy<span class="metric-note">top-1 on the held-out slice · higher is better</span></th>
+              <td data-label="PSSA"><span class="bench-val bench-best">24.1<small>%</small></span></td>
+              <td data-label="Transformer"><span class="bench-val">18.0<small>%</small></span></td>
+              <td data-label="Gap"><span class="bench-gap">+6.1 pts</span></td>
+              <td class="bench-visual" data-label="Relative scale" aria-hidden="true">
+                <div class="bars">
+                  <div class="bar-row"><span class="bar-key">PSSA</span><span class="bar-track"><span class="bar-fill" data-value="24.1" data-max="30" style="--w:80.3%"></span></span></div>
+                  <div class="bar-row"><span class="bar-key">base</span><span class="bar-track"><span class="bar-fill base" data-value="18" data-max="30" style="--w:60.0%"></span></span></div>
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">CPU training throughput<span class="metric-note">2 vCPU · matched fixed work · higher is better</span></th>
+              <td data-label="PSSA"><span class="bench-val bench-best">1,716<small>tok/s</small></span></td>
+              <td data-label="Transformer"><span class="bench-val">415<small>tok/s</small></span></td>
+              <td data-label="Gap"><span class="bench-gap">4.13×</span></td>
+              <td class="bench-visual" data-label="Relative scale" aria-hidden="true">
+                <div class="bars">
+                  <div class="bar-row"><span class="bar-key">PSSA</span><span class="bar-track"><span class="bar-fill" data-value="1716" data-max="1800" style="--w:95.3%"></span></span></div>
+                  <div class="bar-row"><span class="bar-key">base</span><span class="bar-track"><span class="bar-fill base" data-value="415" data-max="1800" style="--w:23.1%"></span></span></div>
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">Generation latency<span class="metric-note">200 generated tokens · lower is better</span></th>
+              <td data-label="PSSA"><span class="bench-val bench-best">226<small>ms</small></span></td>
+              <td data-label="Transformer"><span class="bench-val">2,735<small>ms</small></span></td>
+              <td data-label="Gap"><span class="bench-gap">12.1× faster</span></td>
+              <td class="bench-visual" data-label="Relative scale" aria-hidden="true">
+                <div class="bars">
+                  <div class="bar-row"><span class="bar-key">PSSA</span><span class="bar-track"><span class="bar-fill" data-value="226" data-max="3000" style="--w:7.5%"></span></span></div>
+                  <div class="bar-row"><span class="bar-key">base</span><span class="bar-track"><span class="bar-fill base" data-value="2735" data-max="3000" style="--w:91.2%"></span></span></div>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="bench-note">
+          <span>Bars are normalized per metric, so lengths are not comparable across rows. Loss, perplexity, and latency are lower-is-better.</span>
+          <span><b>Scope:</b> single seed · CPU training pair on matched 2-vCPU machines · a T4 GPU probe reached 1,699 tok/s for PSSA only, with no matched transformer run.</span>
+        </div>
+      </div>
+
+      <div class="caveat-band card reveal">
+        <div>
+          <h3>What this does not prove</h3>
+          <p>The limitations are part of the result, not a footnote. Read them before generalizing from any number on this page.</p>
+        </div>
+        <ul class="caveat-list">
+          <li><span><strong>Scale.</strong> Both models are 1.5M-parameter prototypes. Text quality is poor at this size, for PSSA and the baseline alike.</span></li>
+          <li><span><strong>Evidence.</strong> One seed, one cleaned corpus slice. There is no memory-bank ablation yet and no measured skill-retention test after a corpus switch.</span></li>
+          <li><span><strong>Hardware.</strong> Training rates are not all hardware-matched. The table labels the CPU pair; the T4 probe has no transformer counterpart.</span></li>
+          <li><span><strong>Dreaming.</strong> The experimental consolidation mode is off by default and is not part of the headline results.</span></li>
+          <li><span><strong>Novelty.</strong> The selective state-space layer is established machinery. The specific claims are the state-conditioned hyperbolic read, the novelty and refractory write gates, and ridge consolidation.</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="build" aria-labelledby="build-title">
+    <div class="wrap">
+      <div class="section-head split reveal">
+        <div>
+          <p class="kicker"><span class="num">04</span> · Under the hood</p>
+          <h2 id="build-title">The build, in numbers.</h2>
+        </div>
+        <div>
+          <p class="section-lede">Every figure here is taken from the repository configuration and logs. Nothing is rounded up to sound bigger.</p>
+        </div>
+      </div>
+      <dl class="specbox reveal">
+        <div class="spec-item"><dt>Parameters</dt><dd>1,544,704<span class="sub">1,541,120 in the matched transformer</span></dd></div>
+        <div class="spec-item"><dt>Latent width</dt><dd>256</dd></div>
+        <div class="spec-item"><dt>State channels</dt><dd>16<span class="sub">256 × 16 recurrent state</span></dd></div>
+        <div class="spec-item"><dt>Vocabulary</dt><dd>2,048 BPE</dd></div>
+        <div class="spec-item"><dt>Episodic slots</dt><dd>512<span class="sub">32-d keys · 256-d values</span></dd></div>
+        <div class="spec-item"><dt>Training corpus</dt><dd>12.7M tokens<span class="sub">WikiText-103, cleaned</span></dd></div>
+        <div class="spec-item"><dt>Horizon</dt><dd>30,000 updates<span class="sub">cosine schedule</span></dd></div>
+        <div class="spec-item"><dt>Held-out eval</dt><dd>198,939 tokens</dd></div>
+        <div class="spec-item"><dt>Hardware</dt><dd>One Tesla T4</dd></div>
+        <div class="spec-item"><dt>Implementation</dt><dd>Pure Rust<span class="sub">no ML framework</span></dd></div>
+      </dl>
+      <div class="faq reveal">
+        <h3>Questions people actually ask</h3>
+        <details>
+          <summary>Why no attention?</summary>
+          <p>Attention costs grow with context length. PSSA carries a fixed-size state, reads a bounded memory with an exact full scan, and writes with a round-robin slot policy, so per-token cost stays flat no matter how far the context reaches back.</p>
+        </details>
+        <details>
+          <summary>Is this a transformer replacement?</summary>
+          <p>No. It is a different accounting of context, tested at prototype scale against a parameter-matched baseline. The comparison is deliberately narrow and the limits are written down.</p>
+        </details>
+        <details>
+          <summary>What can it not do?</summary>
+          <p>At 1.5M parameters, text quality is poor for both PSSA and the baseline. One seed, one corpus, no memory-bank ablation yet. Those are the honest edges of the result.</p>
+        </details>
+        <details>
+          <summary>Where do the numbers come from?</summary>
+          <p>From the repository: the training logs, the 64-checkpoint loss series in loss.csv, and the evaluation scripts that produced the held-out figures. Re-run them and you get the same table.</p>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="get" aria-labelledby="get-title">
+    <div class="wrap">
+      <div class="section-head split reveal">
+        <div>
+          <p class="kicker"><span class="num">05</span> · Get it</p>
+          <h2 id="get-title">Code, weights, and a place to argue.</h2>
+        </div>
+        <div>
+          <p class="section-lede">The repository is the artifact: model code, data preparation, loss logs, evaluation scripts, and release notes. The weights are public. If a number here does not reproduce, open an issue.</p>
+        </div>
+      </div>
+
+      <div class="resource-grid" data-stagger>
+        <a class="resource card card-hover reveal" href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer" aria-label="PSSA source code on GitHub, opens in a new tab">
+          <span class="resource-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor" focusable="false"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.28-.01-1.02-.02-2-3.2.7-3.88-1.54-3.88-1.54-.52-1.33-1.28-1.68-1.28-1.68-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11.1 11.1 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.69 5.38-5.25 5.67.41.35.77 1.05.77 2.12 0 1.53-.01 2.76-.01 3.14 0 .31.21.67.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>
+          </span>
+          <div class="resource-copy">
+            <h3>Source &amp; training harness</h3>
+            <span class="resource-handle">github.com/Sparticle62ops/pssa</span>
+            <p>Model definition, data preparation, loss logs, evaluation scripts, and the gradient-verification harness.</p>
+          </div>
+          <svg class="resource-arrow" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 12 12 4M5.5 4H12v6.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </a>
+
+        <a class="resource card card-hover reveal" href="https://huggingface.co/sparticle62/pssa" target="_blank" rel="noopener noreferrer" aria-label="PSSA weights on Hugging Face, opens in a new tab">
+          <span class="resource-icon" aria-hidden="true"><span class="hf">HF</span></span>
+          <div class="resource-copy">
+            <h3>Weights &amp; model card</h3>
+            <span class="resource-handle">huggingface.co/sparticle62/pssa</span>
+            <p>Released checkpoints, configuration, and the evaluation numbers behind this page.</p>
+          </div>
+          <svg class="resource-arrow" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 12 12 4M5.5 4H12v6.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </a>
+      </div>
+
+      <div class="community-band card reveal">
+        <div class="community-copy">
+          <span class="community-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor" focusable="false"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.45.87-.61 1.26a18.27 18.27 0 0 0-5.48 0 12.6 12.6 0 0 0-.62-1.26.08.08 0 0 0-.08-.04 19.74 19.74 0 0 0-4.88 1.52.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06a.08.08 0 0 0 .03.05 19.9 19.9 0 0 0 6 3.03.08.08 0 0 0 .08-.03c.46-.63.87-1.3 1.23-2a.08.08 0 0 0-.04-.11c-.65-.25-1.27-.55-1.87-.9a.08.08 0 0 1-.01-.13l.37-.29a.07.07 0 0 1 .08-.01 14.2 14.2 0 0 0 12.06 0 .07.07 0 0 1 .08.01l.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.65-1.87.9a.08.08 0 0 0-.04.11c.36.7.77 1.37 1.23 2a.08.08 0 0 0 .08.03 19.84 19.84 0 0 0 6.01-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.15-1.08-2.15-2.41 0-1.33.95-2.42 2.15-2.42 1.21 0 2.17 1.1 2.15 2.42 0 1.33-.95 2.41-2.15 2.41Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.41 0-1.33.95-2.42 2.15-2.42 1.21 0 2.17 1.1 2.15 2.42 0 1.33-.94 2.41-2.15 2.41Z"/></svg>
+          </span>
+          <div>
+            <h3>Discord</h3>
+            <p>Questions, reproductions, and counterexamples are welcome.</p>
+          </div>
+        </div>
+        <a class="btn btn-ghost" href="https://discord.gg/9sqfKeqWYF" target="_blank" rel="noopener noreferrer">Join the Discord</a>
+      </div>
+
+      <div class="support-band card reveal">
+        <div>
+          <strong>Support PSSA</strong>
+          <span>SOL tips, Ko-fi, and the free ways to help live on one page.</span>
+        </div>
+        <a class="btn btn-ghost" href="donate.html">Open support page</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="footer-top">
+      <div class="footer-brand">
+        <svg class="mark mark-static" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+          <rect class="lg-sq" x="3" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="3" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="3" y="33" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="33" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="33" width="12" height="12"/>
+        </svg>
+        <span class="footer-wordmark"><strong>PSSA</strong><span>Plastic State-Space Architecture</span></span>
+      </div>
+      <nav class="footer-nav" aria-label="Footer">
+        <a href="#overview">Overview</a><span class="sep" aria-hidden="true">/</span>
+        <a href="#how">How It Works</a><span class="sep" aria-hidden="true">/</span>
+        <a href="technical.html">Technical deep dive</a><span class="sep" aria-hidden="true">/</span>
+        <a href="#results">Results</a><span class="sep" aria-hidden="true">/</span>
+        <a href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">GitHub</a>
+      </nav>
+    </div>
+    <div class="footer-bottom">
+      <span>A 1,544,704-parameter research prototype. No attention map.</span>
+      <span>© 2026 PSSA · <a href="https://discord.gg/9sqfKeqWYF" target="_blank" rel="noopener noreferrer">Discord</a> · <a href="https://huggingface.co/sparticle62/pssa" target="_blank" rel="noopener noreferrer">Hugging Face</a></span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+<script src="assets/index.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="PSSA mark: a 3 by 3 grid of nine green squares">
+  <rect width="48" height="48" fill="#050505"/>
+  <rect x="3" y="3" width="12" height="12" fill="#E9FFF1"/>
+  <rect x="18" y="3" width="12" height="12" fill="#96EFB7"/>
+  <rect x="33" y="3" width="12" height="12" fill="#3BCB78"/>
+  <rect x="3" y="18" width="12" height="12" fill="#C4F8D8"/>
+  <rect x="18" y="18" width="12" height="12" fill="#22A85D"/>
+  <rect x="33" y="18" width="12" height="12" fill="#178348"/>
+  <rect x="3" y="33" width="12" height="12" fill="#62E096"/>
+  <rect x="18" y="33" width="12" height="12" fill="#115E36"/>
+  <rect x="33" y="33" width="12" height="12" fill="#0B3823"/>
+</svg>
