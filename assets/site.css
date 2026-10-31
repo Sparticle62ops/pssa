@@ -1024,7 +1024,7 @@ html.reveal-ready .reveal.is-in{opacity:1;transform:none}
 }
 @media (max-width: 430px){
   .wrap{padding-left:18px;padding-right:18px}
-  .btn{font-size:9px;padding:0 14px;gap:7px}
+  .btn{font-size:8.5px;padding:0 13px;gap:7px;letter-spacing:0}
   .btn svg{width:12px;height:12px}
   .brand-text{font-size:11px}
   .brand-sub{font-size:9px}
