@@ -1067,3 +1067,31 @@ html.reveal-ready .reveal.is-in{opacity:1;transform:none}
   .post{padding:20px 18px}
   .post-title{font-size:13px}
 }
+
+
+/* -------- display math: serif, textbook styling -------- */
+.math,.eq{
+  font-family:"STIX Two Math","Cambria Math","Latin Modern Math","Times New Roman",Cambria,Georgia,serif;
+}
+.math{
+  font-size:clamp(15px,2vw,18px);line-height:2;
+  padding:24px clamp(18px,3.5vw,34px);
+  background:linear-gradient(180deg,rgba(34,168,93,.05),rgba(34,168,93,0) 62%),var(--bg);
+  position:relative;
+}
+.math .v{color:var(--ink);font-style:italic}
+.math .op{color:var(--faint);font-style:normal;margin:0 .06em}
+.math .fn{color:var(--muted);font-style:normal;font-size:.95em}
+.math .rm{color:var(--ink-soft)}
+.math .big{font-size:1.28em;line-height:1;color:var(--ink-soft)}
+.math sub,.math sup{font-size:.7em;color:var(--muted)}
+.math .frac{display:inline-flex;flex-direction:column;align-items:center;vertical-align:middle;margin:0 .3em;line-height:1.35}
+.math .frac .num{padding:0 .35em .09em}
+.math .frac .den{padding:.09em .35em 0;border-top:1.5px solid var(--line-strong)}
+.math .eqno{position:absolute;right:16px;top:50%;transform:translateY(-50%);font-family:var(--mono);font-size:10px;letter-spacing:.06em;color:var(--faint)}
+.math-defs{background:var(--bg-2)}
+.eq .v{color:var(--ink);font-style:italic}
+.eq .op{color:var(--faint);font-style:normal}
+.eq .fn{color:var(--muted);font-style:normal}
+.eq sub,.eq sup{font-size:.68em;line-height:1;color:var(--muted)}
+.eq{color:var(--ink-soft)}

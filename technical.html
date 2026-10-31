@@ -123,7 +123,7 @@
           <span class="v">d</span><sub>H</sub><span class="op">(</span><span class="v">u</span><span class="op">,</span> <span class="v">v</span><span class="op">)</span> <span class="op">=</span> <span class="fn">arccosh</span><span class="op">(</span><span class="rm">1</span> <span class="op">+</span>
           <span class="frac"><span class="num">2&thinsp;‖<span class="v">u</span> − <span class="v">v</span>‖<sup>2</sup></span><span class="den"><span class="op">(</span>1 − ‖<span class="v">u</span>‖<sup>2</sup><span class="op">)(</span>1 − ‖<span class="v">v</span>‖<sup>2</sup><span class="op">)</span></span></span>
           <span class="op">)</span>
-        </div>
+        <span class="eqno">(1)</span></div>
         <div class="math-defs">
           <div><b>d<sub>H</sub></b> — hyperbolic distance on the Poincaré ball.</div>
           <div><b>‖·‖</b> — Euclidean norm of the slot key.</div>
@@ -132,12 +132,12 @@
         <p class="section-lede">The read is an exact scan. A query is formed from the current token embedding and the recurrent state, every occupied key is scored, and a softmax over negative distance turns the scores into a mix:</p>
         <div class="math" role="math" aria-label="q sub h equals proj of W qx times x sub t plus W qh times h sub t">
           <span class="v">q</span><sub>h</sub> <span class="op">=</span> <span class="fn">proj</span><span class="op">(</span><span class="v">W</span><sub>qx</sub>&thinsp;<span class="v">x</span><sub>t</sub> <span class="op">+</span> <span class="v">W</span><sub>qh</sub>&thinsp;<span class="v">h</span><sub>t</sub><span class="op">)</span>
-        </div>
+        <span class="eqno">(2)</span></div>
         <div class="math" role="math" aria-label="w sub s equals softmax of negative d sub H of q sub h and k sub s over tau mem, and m equals the sum over s of w sub s v sub s">
           <span class="v">w</span><sub>s</sub> <span class="op">=</span> <span class="fn">softmax</span><span class="op">(</span><span class="frac"><span class="num">−&thinsp;<span class="v">d</span><sub>H</sub><span class="op">(</span><span class="v">q</span><sub>h</sub><span class="op">,</span> <span class="v">k</span><sub>s</sub><span class="op">)</span></span><span class="den"><span class="v">τ</span><sub>mem</sub></span></span><span class="op">)</span>
           <span class="big">&nbsp;,&nbsp;</span>
           <span class="v">m</span> <span class="op">=</span> <span class="big">Σ</span><sub>s</sub>&thinsp;<span class="v">w</span><sub>s</sub>&thinsp;<span class="v">v</span><sub>s</sub>
-        </div>
+        <span class="eqno">(3)</span></div>
         <div class="math-defs">
           <div><b>q<sub>h</sub></b> — state-conditioned query, projected to the ball.</div>
           <div><b>k<sub>s</sub></b>, <b>v<sub>s</sub></b> — key and value of slot s.</div>
@@ -166,10 +166,10 @@
           <span class="v">A</span><sub>t</sub> <span class="op">=</span> <span class="fn">exp</span><span class="op">(</span><span class="v">δ</span><sub>t</sub>&thinsp;<span class="v">A</span><span class="op">)</span>
           <span class="big">&nbsp;,&nbsp;</span>
           <span class="v">B</span><sub>t</sub> <span class="op">=</span> <span class="v">δ</span><sub>t</sub>&thinsp;<span class="v">B</span>
-        </div>
+        <span class="eqno">(4)</span></div>
         <div class="math" role="math" aria-label="h sub t equals A sub t elementwise times h sub t minus one, plus B sub t elementwise times x sub t">
           <span class="v">h</span><sub>t</sub> <span class="op">=</span> <span class="v">A</span><sub>t</sub> <span class="big">⊙</span> <span class="v">h</span><sub>t−1</sub> <span class="op">+</span> <span class="v">B</span><sub>t</sub> <span class="big">⊙</span> <span class="v">x</span><sub>t</sub>
-        </div>
+        <span class="eqno">(5)</span></div>
         <div class="math-defs">
           <div><b>x<sub>t</sub></b> — the embedded token, 256 channels.</div>
           <div><b>h<sub>t</sub></b> — the state, 256 × 16, carried across tokens.</div>
@@ -195,13 +195,13 @@
           <span class="v">g</span> <span class="op">=</span> <span class="fn">sigmoid</span><span class="op">(</span><span class="v">w</span><sub>gate</sub> <span class="op">·</span> <span class="v">x</span><sub>t</sub><span class="op">)</span>
           <span class="big">&nbsp;,&nbsp;</span>
           <span class="v">A</span><span class="op">(</span><span class="v">x</span><sub>t</sub><span class="op">)</span> <span class="op">=</span> <span class="v">W</span><sub>2</sub>&thinsp;<span class="fn">silu</span><span class="op">(</span><span class="v">W</span><sub>1</sub>&thinsp;<span class="v">x</span><sub>t</sub><span class="op">)</span>
-        </div>
+        <span class="eqno">(6)</span></div>
         <p class="section-lede">At consolidation boundaries, the statistics the adapter accumulated are folded back into the base transition matrix by a ridge solve:</p>
         <div class="math" role="math" aria-label="A base is replaced by A base plus the inverse of H transpose H plus lambda I, times H transpose delta H">
           <span class="v">A</span><sub>base</sub> <span class="op">←</span> <span class="v">A</span><sub>base</sub> <span class="op">+</span>
           <span class="op">(</span><span class="v">H</span><sup>T</sup><span class="v">H</span> <span class="op">+</span> <span class="v">λ</span><span class="fn">I</span><span class="op">)</span><sup>−1</sup>
           <span class="v">H</span><sup>T</sup>&thinsp;<span class="v">ΔH</span>
-        </div>
+        <span class="eqno">(7)</span></div>
         <div class="math-defs">
           <div><b>H</b> — the accumulated input statistics since the last boundary.</div>
           <div><b>ΔH</b> — what the fast path changed for those inputs.</div>
@@ -225,7 +225,7 @@
       <div class="technical-body">
         <div class="math" role="math" aria-label="max absolute difference between batched and scalar gradients is approximately 2.98 times 10 to the minus 8">
           <span class="fn">max</span>&thinsp;| <span class="v">∂</span><sub>batched</sub> <span class="op">−</span> <span class="v">∂</span><sub>scalar</sub> | <span class="op">≈</span> <span class="rm">2.98 × 10<sup>−8</sup></span>
-        </div>
+        <span class="eqno">(8)</span></div>
         <p class="section-lede">The measured maximum disagreement across the kernel set is 2.98 × 10<sup>−8</sup>, within the 3 × 10<sup>−8</sup> gate. Finite-difference spot checks run alongside. This is why the results below can be quoted as model behavior rather than as artifacts of a fast-but-wrong kernel.</p>
       </div>
     </div>
