@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blog · PSSA</title>
+<meta name="description" content="Short notes on PSSA: training runs, ports, benchmarks and what is being built around the architecture.">
+<meta name="theme-color" content="#050505">
+<meta property="og:title" content="Blog · PSSA">
+<meta property="og:description" content="Short notes on PSSA: training runs, ports, benchmarks and what is being built around the architecture.">
+<meta property="og:image" content="assets/pssa-mark.svg">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect x='3' y='3' width='12' height='12' fill='%23E9FFF1'/%3E%3Crect x='18' y='3' width='12' height='12' fill='%2396EFB7'/%3E%3Crect x='33' y='3' width='12' height='12' fill='%233BCB78'/%3E%3Crect x='3' y='18' width='12' height='12' fill='%23C4F8D8'/%3E%3Crect x='18' y='18' width='12' height='12' fill='%2322A85D'/%3E%3Crect x='33' y='18' width='12' height='12' fill='%23178348'/%3E%3Crect x='3' y='33' width='12' height='12' fill='%2362E096'/%3E%3Crect x='18' y='33' width='12' height='12' fill='%23115E36'/%3E%3Crect x='33' y='33' width='12' height='12' fill='%230B3823'/%3E%3C/svg%3E">
+<script>document.documentElement.classList.add('js');</script>
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header" data-header>
+  <div class="wrap header-inner">
+    <a class="brand" href="index.html" aria-label="PSSA blog, back to the main site">
+      <svg class="mark" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+        <rect class="lg-sq" x="3" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="3" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="3" y="33" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="33" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="33" width="12" height="12"/>
+      </svg>
+      <span class="brand-text">
+        <span class="brand-name">PSSA</span>
+        <span class="brand-sep" aria-hidden="true">-</span>
+        <span class="brand-sub">Plastic State-Space Architecture</span>
+      </span>
+    </a>
+    <nav class="primary-nav" aria-label="Primary">
+      <a href="index.html#overview">Overview</a>
+      <a href="index.html#how">How It Works</a>
+      <a href="technical.html">Deep Dive</a>
+      <a href="blog.html" aria-current="page">Blog</a>
+      <a href="index.html#results">Results</a>
+      <a href="index.html#get">Resources</a>
+      <a href="donate.html">Support</a>
+      <a href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">GitHub <span class="nav-arrow" aria-hidden="true">↗</span></a>
+    </nav>
+  </div>
+  <span class="scroll-progress" aria-hidden="true" data-scroll-progress></span>
+</header>
+
+<main id="main">
+  <section class="section" id="blog" aria-labelledby="blog-title">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <div>
+          <p class="kicker"><span class="num">NB</span> · Notes</p>
+          <h2 id="blog-title">Notes from the build.</h2>
+        </div>
+        <p class="section-lede">Short updates on PSSA and the things built around it. Everything here links back to the repo or the model cards, so the claims stay checkable.</p>
+      </div>
+
+      <div class="post-list">
+
+        <article class="card post reveal">
+          <p class="post-date">Oct 30, 2026 · collab</p>
+          <h3 class="post-title">NSC64 trained a 109M PSSA in PyTorch</h3>
+          <div class="post-body">
+            <p>NSC64 ported the architecture to PyTorch and trained the result from scratch: 4B tokens in two phases, 50/50 TinyStories and FineWeb-Edu, then an 85/15 web/story fine-tune. The port keeps the same scan and memory-bank design as the Rust reference; the two departures it needed at this scale are backprop truncated at 256 tokens and the scan running as a fused Triton kernel with a hand-written backward that matches a plain PyTorch loop to about 1e-7.</p>
+            <p>Held-out scores, 1M unseen tokens per corpus, batch 8, sequence length 512: <strong>TinyStories 1.312 cross-entropy</strong> (3.71 perplexity, 64.8% next-token accuracy) and <strong>FineWeb-Edu web 2.866</strong> (17.6 perplexity, 44.2% next-token accuracy). Web loss was still falling at 4B, so more tokens would help.</p>
+            <p>The weights are public: bf16 <a href="https://huggingface.co/NSC64/pssa-100m/blob/main/model.safetensors">model.safetensors</a>, a 16k byte-level BPE <a href="https://huggingface.co/NSC64/pssa-100m">tokenizer and a self-contained loader</a> that runs a plain scan on CPU and the Triton kernel on CUDA. See the <a href="https://huggingface.co/NSC64/pssa-100m">model card</a> for samples and the full write-up.</p>
+          </div>
+        </article>
+
+        <article class="card post reveal">
+          <p class="post-date">Oct 26, 2026 · training</p>
+          <h3 class="post-title">The 105M run is underway</h3>
+          <div class="post-body">
+            <p>Training checkpoints from the 105M run land on <a href="https://huggingface.co/sparticle62/pssa-checkpoints-run2">pssa-checkpoints-run2</a> as the run goes. They are raw .pssa resume files rather than a packaged model, so they are useful for resuming and auditing, not for direct inference.</p>
+            <p>The goal stays the same as the roadmap says: a same-scale transformer baseline, so the small-scale gap gets asked at a scale that matters.</p>
+          </div>
+        </article>
+
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="footer-top">
+      <div class="footer-brand">
+        <svg class="mark mark-static" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+          <rect class="lg-sq" x="3" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="3" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="3" y="33" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="33" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="33" width="12" height="12"/>
+        </svg>
+        <span class="footer-wordmark"><strong>PSSA</strong><span>Plastic State-Space Architecture</span></span>
+      </div>
+      <nav class="footer-nav" aria-label="Footer">
+        <a href="#overview">Overview</a><span class="sep" aria-hidden="true">/</span>
+        <a href="#how">How It Works</a><span class="sep" aria-hidden="true">/</span>
+        <a href="technical.html">Technical deep dive</a><span class="sep" aria-hidden="true">/</span>
+        <a href="blog.html">Blog</a><span class="sep" aria-hidden="true">/</span>
+        <a href="#results">Results</a><span class="sep" aria-hidden="true">/</span>
+        <a href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">GitHub</a>
+      </nav>
+    </div>
+    <div class="footer-bottom">
+      <span>A 1,544,704-parameter research prototype. No attention map.</span>
+      <span>© 2026 PSSA · <a href="https://discord.gg/9sqfKeqWYF" target="_blank" rel="noopener noreferrer">Discord</a> · <a href="https://huggingface.co/sparticle62/pssa" target="_blank" rel="noopener noreferrer">Hugging Face</a></span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+<script src="assets/index.js"></script>
+</body>
+</html>
