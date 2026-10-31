@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/img/pssa-logo.png" alt="PSSA logo" width="220">
+  <img src="docs/img/pssa-mark.svg" alt="PSSA mark" width="220">
 </p>
 
 # PSSA: a plastic state-space architecture
@@ -37,6 +37,11 @@ These are 1.5M-parameter models on 12.7M tokens: a research prototype, not a
 competitor to anything you have heard of. The full curves, the matched-run
 methodology, the caveats and the reproduction scripts are in
 [docs/benchmarks.md](docs/benchmarks.md).
+
+## Models and weights
+
+- [NSC64/pssa-100m](https://huggingface.co/NSC64/pssa-100m) — a 109M-parameter PyTorch port of this architecture, trained from scratch by NSC64 on 4B tokens of TinyStories and FineWeb-Edu. Ships bf16 safetensors weights, a 16k byte-level BPE tokenizer and a self-contained loader (plain scan on CPU, fused Triton kernel on CUDA).
+- [sparticle62/pssa-checkpoints-run2](https://huggingface.co/sparticle62/pssa-checkpoints-run2) — training checkpoints from the 105M run in progress (raw .pssa resume files, not a packaged model).
 
 ## What makes it different
 
@@ -142,9 +147,11 @@ allocations measured in days instead of hours. Anything meaningfully above the
 entry-level card this ran on changes what can be asked.
 
 If you have compute to grant, or you work somewhere that does, that is the
-single highest-leverage thing anyone can offer this project. The immediate
-milestone is a 105M-parameter run trained from scratch, with a same-scale
-transformer baseline, so the comparison above finally gets asked at scale.
+single highest-leverage thing anyone can offer this project. The 105M-parameter run is
+underway: training checkpoints land on
+[sparticle62/pssa-checkpoints-run2](https://huggingface.co/sparticle62/pssa-checkpoints-run2)
+as it goes, and the same-scale transformer baseline is still the milestone this
+all builds toward.
 
 ### Sponsorship
 
