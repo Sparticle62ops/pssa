@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What is PSSA? A state space language model in pure Rust · PSSA blog</title>
+<meta name="description" content="What PSSA is: a state space language model in pure Rust with a plastic memory bank, and how it compares to a parameter-matched transformer.">
+<meta name="theme-color" content="#050505">
+<link rel="canonical" href="https://sparticle62ops.github.io/pssa/posts/what-is-pssa.html">
+<meta name="keywords" content="state space model, PSSA, Rust language model, download, release binaries">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://sparticle62ops.github.io/pssa/posts/what-is-pssa.html">
+<meta property="og:image" content="https://sparticle62ops.github.io/pssa/assets/mark.png">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="What is PSSA? A state space language model in pure Rust · PSSA blog">
+<meta name="twitter:description" content="What PSSA is: a state space language model in pure Rust with a plastic memory bank, and how it compares to a parameter-matched transformer.">
+<meta name="twitter:image" content="https://sparticle62ops.github.io/pssa/assets/mark.png">
+<meta name="robots" content="index, follow">
+<meta property="og:title" content="What is PSSA? A state space language model in pure Rust · PSSA blog">
+<meta property="og:description" content="What PSSA is: a state space language model in pure Rust with a plastic memory bank, and how it compares to a parameter-matched transformer.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect x='3' y='3' width='12' height='12' fill='%23E9FFF1'/%3E%3Crect x='18' y='3' width='12' height='12' fill='%2396EFB7'/%3E%3Crect x='33' y='3' width='12' height='12' fill='%233BCB78'/%3E%3Crect x='3' y='18' width='12' height='12' fill='%23C4F8D8'/%3E%3Crect x='18' y='18' width='12' height='12' fill='%2322A85D'/%3E%3Crect x='33' y='18' width='12' height='12' fill='%23178348'/%3E%3Crect x='3' y='33' width='12' height='12' fill='%2362E096'/%3E%3Crect x='18' y='33' width='12' height='12' fill='%23115E36'/%3E%3Crect x='33' y='33' width='12' height='12' fill='%230B3823'/%3E%3C/svg%3E">
+<script>document.documentElement.classList.add('js');</script>
+<link rel="stylesheet" href="assets/site.css?v=3">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "BlogPosting",
+ "name": "What is PSSA? A state space language model in pure Rust · PSSA blog",
+ "url": "https://sparticle62ops.github.io/pssa/posts/what-is-pssa.html"
+}
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header" data-header>
+  <div class="wrap header-inner">
+    <a class="brand" href="index.html" aria-label="PSSA blog, back to the main site">
+      <svg class="mark" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+        <rect class="lg-sq" x="3" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="3" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="3" y="33" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="33" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="33" width="12" height="12"/>
+      </svg>
+      <span class="brand-text">
+        <span class="brand-name">PSSA</span>
+        <span class="brand-sep" aria-hidden="true">-</span>
+        <span class="brand-sub">Plastic State-Space Architecture</span>
+      </span>
+    </a>
+    <nav class="primary-nav" aria-label="Primary">
+      <a href="index.html#overview">Overview</a>
+      <a href="index.html#how">How It Works</a>
+      <a href="technical.html">Deep Dive</a>
+      <a href="blog.html">Blog</a>
+      <a href="index.html#results">Results</a>
+      <a href="index.html#get">Resources</a>
+      <a href="donate.html">Support</a>
+      <a href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">GitHub <span class="nav-arrow" aria-hidden="true">↗</span></a>
+    </nav>
+  </div>
+  <span class="scroll-progress" aria-hidden="true" data-scroll-progress></span>
+</header>
+
+<main id="main">
+  <section class="section" id="post" aria-labelledby="post-title">
+    <div class="wrap wrap-narrow">
+      <p class="post-date reveal"><a href="../blog.html">← All notes</a></p>
+      <article class="card post reveal">
+        <p class="post-date">Oct 31, 2026 · explainer</p>
+        <h1 id="post-title" class="post-title">What is PSSA? A state space language model in pure Rust</h1>
+        <div class="post-body">
+          <p>PSSA is a small language model built on a state space architecture instead of attention. Where a transformer re-reads its whole context window for every token, a state space model carries a fixed-size recurrent state forward, so the cost of the next token does not grow with the length of what came before. It belongs to the same family of architectures as S4 and Mamba: selective state space models.</p>
+          <p>Three things set PSSA apart from a standard selective scan. A 512-slot episodic memory bank is read and written during the run, with keys retrieved by hyperbolic distance inside the Poincaré ball. Part of the weights are plastic: fast updates reinforce what works while a refractory gate rate-limits overwrites, and a closed-form ridge regression folds the fast updates back into the base weights. And there is no ML framework underneath: the whole thing is hand-written Rust with a scalar CPU reference that every gradient is checked against.</p>
+          <p>On a parameter-matched run over the same 12.7M-token corpus, PSSA finished at 3.98 training cross-entropy against 4.43 for the transformer, and the gap holds on unseen text (3.997 vs 4.429 on a 198,939-token held-out slice). On the same CPU it trains 4.1x faster and generates 200 tokens in 226 ms against 2,735 ms.</p>
+          <p>Everything is open: the <a href="https://github.com/Sparticle62ops/pssa">Rust source on GitHub</a>, the <a href="technical.html">full architecture write-up</a>, and the model card on <a href="https://huggingface.co/sparticle62/pssa">Hugging Face</a>.</p>
+        </div>
+      </article>
+    </div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="footer-top">
+      <div class="footer-brand">
+        <svg class="mark mark-static" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+          <rect class="lg-sq" x="3" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="3" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="3" y="33" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="33" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="33" width="12" height="12"/>
+        </svg>
+        <span class="footer-wordmark"><strong>PSSA</strong><span>Plastic State-Space Architecture</span></span>
+      </div>
+      <nav class="footer-nav" aria-label="Footer">
+        <a href="index.html#overview">Overview</a><span class="sep" aria-hidden="true">/</span>
+        <a href="index.html#how">How It Works</a><span class="sep" aria-hidden="true">/</span>
+        <a href="technical.html">Technical deep dive</a><span class="sep" aria-hidden="true">/</span>
+        <a href="blog.html">Blog</a><span class="sep" aria-hidden="true">/</span>
+        <a href="index.html#results">Results</a><span class="sep" aria-hidden="true">/</span>
+        <a href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">GitHub</a>
+      </nav>
+    </div>
+    <div class="footer-bottom">
+      <span>A 1,544,704-parameter research prototype. No attention map.</span>
+      <span>© 2026 PSSA · <a href="https://discord.gg/9sqfKeqWYF" target="_blank" rel="noopener noreferrer">Discord</a> · <a href="https://huggingface.co/sparticle62/pssa" target="_blank" rel="noopener noreferrer">Hugging Face</a></span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+<script src="assets/index.js"></script>
+</body>
+</html>

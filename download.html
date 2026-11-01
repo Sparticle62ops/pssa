@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Download · PSSA</title>
+<meta name="description" content="Download PSSA: prebuilt release binaries for Linux, macOS and Windows, build from source, and model weights on Hugging Face.">
+<meta name="theme-color" content="#050505">
+<link rel="canonical" href="https://sparticle62ops.github.io/pssa/download.html">
+<meta name="keywords" content="state space model, PSSA, Rust language model, download, release binaries">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://sparticle62ops.github.io/pssa/download.html">
+<meta property="og:image" content="https://sparticle62ops.github.io/pssa/assets/mark.png">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Download · PSSA">
+<meta name="twitter:description" content="Download PSSA: prebuilt release binaries for Linux, macOS and Windows, build from source, and model weights on Hugging Face.">
+<meta name="twitter:image" content="https://sparticle62ops.github.io/pssa/assets/mark.png">
+<meta name="robots" content="index, follow">
+<meta property="og:title" content="Download · PSSA">
+<meta property="og:description" content="Download PSSA: prebuilt release binaries for Linux, macOS and Windows, build from source, and model weights on Hugging Face.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect x='3' y='3' width='12' height='12' fill='%23E9FFF1'/%3E%3Crect x='18' y='3' width='12' height='12' fill='%2396EFB7'/%3E%3Crect x='33' y='3' width='12' height='12' fill='%233BCB78'/%3E%3Crect x='3' y='18' width='12' height='12' fill='%23C4F8D8'/%3E%3Crect x='18' y='18' width='12' height='12' fill='%2322A85D'/%3E%3Crect x='33' y='18' width='12' height='12' fill='%23178348'/%3E%3Crect x='3' y='33' width='12' height='12' fill='%2362E096'/%3E%3Crect x='18' y='33' width='12' height='12' fill='%23115E36'/%3E%3Crect x='33' y='33' width='12' height='12' fill='%230B3823'/%3E%3C/svg%3E">
+<script>document.documentElement.classList.add('js');</script>
+<link rel="stylesheet" href="assets/site.css?v=3">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "WebPage",
+ "name": "Download · PSSA",
+ "url": "https://sparticle62ops.github.io/pssa/download.html"
+}
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header" data-header>
+  <div class="wrap header-inner">
+    <a class="brand" href="index.html" aria-label="PSSA blog, back to the main site">
+      <svg class="mark" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+        <rect class="lg-sq" x="3" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="3" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="3" y="33" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="33" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="33" width="12" height="12"/>
+      </svg>
+      <span class="brand-text">
+        <span class="brand-name">PSSA</span>
+        <span class="brand-sep" aria-hidden="true">-</span>
+        <span class="brand-sub">Plastic State-Space Architecture</span>
+      </span>
+    </a>
+    <nav class="primary-nav" aria-label="Primary">
+      <a href="index.html#overview">Overview</a>
+      <a href="index.html#how">How It Works</a>
+      <a href="technical.html">Deep Dive</a>
+      <a href="blog.html">Blog</a>
+      <a href="index.html#results">Results</a>
+      <a href="index.html#get">Resources</a>
+      <a href="donate.html">Support</a>
+      <a href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">GitHub <span class="nav-arrow" aria-hidden="true">↗</span></a>
+    </nav>
+  </div>
+  <span class="scroll-progress" aria-hidden="true" data-scroll-progress></span>
+</header>
+
+<main id="main">
+  <section class="section" id="get" aria-labelledby="get-title">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <div>
+          <p class="kicker"><span class="num">DL</span> · Download</p>
+          <h2 id="get-title">Get PSSA.</h2>
+        </div>
+        <p class="section-lede">Everything ships from GitHub and Hugging Face. No installers, no accounts, no telemetry: binaries, source, and model weights are public.</p>
+      </div>
+
+      <div class="resource-grid reveal">
+        <a class="resource card card-hover" href="https://github.com/Sparticle62ops/pssa/releases" target="_blank" rel="noopener noreferrer">
+          <p class="resource-tag">release binaries</p>
+          <h3>Prebuilt binaries</h3>
+          <p>Tagged releases carry builds for Linux x64 and ARM64 (glibc and musl), macOS Apple Silicon and Intel, and Windows x64. Grab one, chmod if needed, run.</p>
+        </a>
+        <a class="resource card card-hover" href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">
+          <p class="resource-tag">source</p>
+          <h3>Build from source</h3>
+          <p>Plain Rust, no framework underneath. Clone the repo and <code>cargo run --release</code> gets you the CLI and the TUI. Works on CPU, CUDA and WebGPU.</p>
+        </a>
+        <a class="resource card card-hover" href="https://huggingface.co/sparticle62/pssa" target="_blank" rel="noopener noreferrer">
+          <p class="resource-tag">weights</p>
+          <h3>Model card &amp; checkpoints</h3>
+          <p>The trained PSSA weights and the full model card live on Hugging Face, with training checkpoints published as the runs go.</p>
+        </a>
+      </div>
+
+      <div class="card reveal" style="margin-top:24px">
+        <h3 class="h-like">Quick start</h3>
+        <p>From a release tarball:</p>
+        <pre><code>tar xzf pssa-x86_64-unknown-linux-gnu.tar.gz
+./pssa --help</code></pre>
+        <p>From source:</p>
+        <pre><code>git clone https://github.com/Sparticle62ops/pssa
+cd pssa
+cargo run --release</code></pre>
+        <p>The README in the repo covers training, the TUI, and converting checkpoints. Questions land in the <a href="https://discord.gg/9sqfKeqWYF" target="_blank" rel="noopener noreferrer">Discord</a>.</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="footer-top">
+      <div class="footer-brand">
+        <svg class="mark mark-static" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+          <rect class="lg-sq" x="3" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="3" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="3" y="33" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="33" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="33" width="12" height="12"/>
+        </svg>
+        <span class="footer-wordmark"><strong>PSSA</strong><span>Plastic State-Space Architecture</span></span>
+      </div>
+      <nav class="footer-nav" aria-label="Footer">
+        <a href="index.html#overview">Overview</a><span class="sep" aria-hidden="true">/</span>
+        <a href="index.html#how">How It Works</a><span class="sep" aria-hidden="true">/</span>
+        <a href="technical.html">Technical deep dive</a><span class="sep" aria-hidden="true">/</span>
+        <a href="blog.html">Blog</a><span class="sep" aria-hidden="true">/</span>
+        <a href="index.html#results">Results</a><span class="sep" aria-hidden="true">/</span>
+        <a href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">GitHub</a>
+      </nav>
+    </div>
+    <div class="footer-bottom">
+      <span>A 1,544,704-parameter research prototype. No attention map.</span>
+      <span>© 2026 PSSA · <a href="https://discord.gg/9sqfKeqWYF" target="_blank" rel="noopener noreferrer">Discord</a> · <a href="https://huggingface.co/sparticle62/pssa" target="_blank" rel="noopener noreferrer">Hugging Face</a></span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+<script src="assets/index.js"></script>
+</body>
+</html>

@@ -20,7 +20,7 @@
 <meta property="og:description" content="Short notes on PSSA: training runs, ports, benchmarks and what is being built around the architecture.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect x='3' y='3' width='12' height='12' fill='%23E9FFF1'/%3E%3Crect x='18' y='3' width='12' height='12' fill='%2396EFB7'/%3E%3Crect x='33' y='3' width='12' height='12' fill='%233BCB78'/%3E%3Crect x='3' y='18' width='12' height='12' fill='%23C4F8D8'/%3E%3Crect x='18' y='18' width='12' height='12' fill='%2322A85D'/%3E%3Crect x='33' y='18' width='12' height='12' fill='%23178348'/%3E%3Crect x='3' y='33' width='12' height='12' fill='%2362E096'/%3E%3Crect x='18' y='33' width='12' height='12' fill='%23115E36'/%3E%3Crect x='33' y='33' width='12' height='12' fill='%230B3823'/%3E%3C/svg%3E">
 <script>document.documentElement.classList.add('js');</script>
-<link rel="stylesheet" href="assets/site.css">
+<link rel="stylesheet" href="assets/site.css?v=3">
 <script type="application/ld+json">
 {
  "@context": "https://schema.org",
@@ -60,6 +60,7 @@
       <a href="blog.html" aria-current="page">Blog</a>
       <a href="index.html#results">Results</a>
       <a href="index.html#get">Resources</a>
+      <a href="download.html">Download</a>
       <a href="donate.html">Support</a>
       <a href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">GitHub <span class="nav-arrow" aria-hidden="true">↗</span></a>
     </nav>
@@ -81,33 +82,31 @@
       <div class="post-list">
         <article class="card post reveal">
           <p class="post-date">Oct 31, 2026 · explainer</p>
-          <h3 class="post-title">What is PSSA? A state space language model in pure Rust</h3>
+          <h3 class="post-title"><a href="posts/what-is-pssa.html">What is PSSA? A state space language model in pure Rust</a></h3>
           <div class="post-body">
             <p>PSSA is a small language model built on a state space architecture instead of attention. Where a transformer re-reads its whole context window for every token, a state space model carries a fixed-size recurrent state forward, so the cost of the next token does not grow with the length of what came before. It belongs to the same family of architectures as S4 and Mamba: selective state space models.</p>
-            <p>Three things set PSSA apart from a standard selective scan. A 512-slot episodic memory bank is read and written during the run, with keys retrieved by hyperbolic distance inside the Poincaré ball. Part of the weights are plastic: fast updates reinforce what works while a refractory gate rate-limits overwrites, and a closed-form ridge regression folds the fast updates back into the base weights. And there is no ML framework underneath: the whole thing is hand-written Rust with a scalar CPU reference that every gradient is checked against.</p>
-            <p>On a parameter-matched run over the same 12.7M-token corpus, PSSA finished at 3.98 training cross-entropy against 4.43 for the transformer, and the gap holds on unseen text (3.997 vs 4.429 on a 198,939-token held-out slice). On the same CPU it trains 4.1x faster and generates 200 tokens in 226 ms against 2,735 ms.</p>
-            <p>Everything is open: the <a href="https://github.com/Sparticle62ops/pssa">Rust source on GitHub</a>, the <a href="technical.html">full architecture write-up</a>, and the model card on <a href="https://huggingface.co/sparticle62/pssa">Hugging Face</a>.</p>
           </div>
+          <p class="post-more"><a class="text-link" href="posts/what-is-pssa.html">Read the full note →</a></p>
         </article>
 
         <article class="card post reveal">
           <p class="post-date">Oct 30, 2026 · collab</p>
-          <h3 class="post-title">NSC64 trained a 109M PSSA in PyTorch</h3>
+          <h3 class="post-title"><a href="posts/nsc64-109m.html">NSC64 trained a 109M PSSA in PyTorch</a></h3>
           <div class="post-body">
             <p>NSC64 ported the architecture to PyTorch and trained the result from scratch: 4B tokens in two phases, 50/50 TinyStories and FineWeb-Edu, then an 85/15 web/story fine-tune. The port keeps the same scan and memory-bank design as the Rust reference; the two departures it needed at this scale are backprop truncated at 256 tokens and the scan running as a fused Triton kernel with a hand-written backward that matches a plain PyTorch loop to about 1e-7.</p>
-            <p>Held-out scores, 1M unseen tokens per corpus, batch 8, sequence length 512: <strong>TinyStories 1.312 cross-entropy</strong> (3.71 perplexity, 64.8% next-token accuracy) and <strong>FineWeb-Edu web 2.866</strong> (17.6 perplexity, 44.2% next-token accuracy). Web loss was still falling at 4B, so more tokens would help.</p>
-            <p>The weights are public: bf16 <a href="https://huggingface.co/NSC64/pssa-100m/blob/main/model.safetensors">model.safetensors</a>, a 16k byte-level BPE <a href="https://huggingface.co/NSC64/pssa-100m">tokenizer and a self-contained loader</a> that runs a plain scan on CPU and the Triton kernel on CUDA. See the <a href="https://huggingface.co/NSC64/pssa-100m">model card</a> for samples and the full write-up.</p>
           </div>
+          <p class="post-more"><a class="text-link" href="posts/nsc64-109m.html">Read the full note →</a></p>
         </article>
 
         <article class="card post reveal">
           <p class="post-date">Oct 26, 2026 · training</p>
-          <h3 class="post-title">The 105M run is underway</h3>
+          <h3 class="post-title"><a href="posts/105m-run.html">The 105M run is underway</a></h3>
           <div class="post-body">
             <p>Training checkpoints from the 105M run land on <a href="https://huggingface.co/sparticle62/pssa-checkpoints-105m">pssa-checkpoints-105m</a> as the run goes. They are raw .pssa resume files rather than a packaged model, so they are useful for resuming and auditing, not for direct inference.</p>
-            <p>The goal stays the same as the roadmap says: a same-scale transformer baseline, so the small-scale gap gets asked at a scale that matters.</p>
           </div>
+          <p class="post-more"><a class="text-link" href="posts/105m-run.html">Read the full note →</a></p>
         </article>
+
 
       </div>
     </div>
@@ -136,6 +135,7 @@
         <a href="index.html#how">How It Works</a><span class="sep" aria-hidden="true">/</span>
         <a href="technical.html">Technical deep dive</a><span class="sep" aria-hidden="true">/</span>
         <a href="blog.html">Blog</a><span class="sep" aria-hidden="true">/</span>
+        <a href="download.html">Download</a><span class="sep" aria-hidden="true">/</span>
         <a href="index.html#results">Results</a><span class="sep" aria-hidden="true">/</span>
         <a href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">GitHub</a>
       </nav>

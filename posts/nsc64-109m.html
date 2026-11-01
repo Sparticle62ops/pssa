@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NSC64 trained a 109M PSSA in PyTorch · PSSA blog</title>
+<meta name="description" content="NSC64 ported PSSA to PyTorch and trained 109M parameters on 4B tokens; held-out numbers and weights are public.">
+<meta name="theme-color" content="#050505">
+<link rel="canonical" href="https://sparticle62ops.github.io/pssa/posts/nsc64-109m.html">
+<meta name="keywords" content="state space model, PSSA, Rust language model, download, release binaries">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://sparticle62ops.github.io/pssa/posts/nsc64-109m.html">
+<meta property="og:image" content="https://sparticle62ops.github.io/pssa/assets/mark.png">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="NSC64 trained a 109M PSSA in PyTorch · PSSA blog">
+<meta name="twitter:description" content="NSC64 ported PSSA to PyTorch and trained 109M parameters on 4B tokens; held-out numbers and weights are public.">
+<meta name="twitter:image" content="https://sparticle62ops.github.io/pssa/assets/mark.png">
+<meta name="robots" content="index, follow">
+<meta property="og:title" content="NSC64 trained a 109M PSSA in PyTorch · PSSA blog">
+<meta property="og:description" content="NSC64 ported PSSA to PyTorch and trained 109M parameters on 4B tokens; held-out numbers and weights are public.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect x='3' y='3' width='12' height='12' fill='%23E9FFF1'/%3E%3Crect x='18' y='3' width='12' height='12' fill='%2396EFB7'/%3E%3Crect x='33' y='3' width='12' height='12' fill='%233BCB78'/%3E%3Crect x='3' y='18' width='12' height='12' fill='%23C4F8D8'/%3E%3Crect x='18' y='18' width='12' height='12' fill='%2322A85D'/%3E%3Crect x='33' y='18' width='12' height='12' fill='%23178348'/%3E%3Crect x='3' y='33' width='12' height='12' fill='%2362E096'/%3E%3Crect x='18' y='33' width='12' height='12' fill='%23115E36'/%3E%3Crect x='33' y='33' width='12' height='12' fill='%230B3823'/%3E%3C/svg%3E">
+<script>document.documentElement.classList.add('js');</script>
+<link rel="stylesheet" href="assets/site.css?v=3">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "BlogPosting",
+ "name": "NSC64 trained a 109M PSSA in PyTorch · PSSA blog",
+ "url": "https://sparticle62ops.github.io/pssa/posts/nsc64-109m.html"
+}
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header" data-header>
+  <div class="wrap header-inner">
+    <a class="brand" href="index.html" aria-label="PSSA blog, back to the main site">
+      <svg class="mark" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+        <rect class="lg-sq" x="3" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="3" width="12" height="12"/>
+        <rect class="lg-sq" x="3" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="18" width="12" height="12"/>
+        <rect class="lg-sq" x="3" y="33" width="12" height="12"/>
+        <rect class="lg-sq" x="18" y="33" width="12" height="12"/>
+        <rect class="lg-sq" x="33" y="33" width="12" height="12"/>
+      </svg>
+      <span class="brand-text">
+        <span class="brand-name">PSSA</span>
+        <span class="brand-sep" aria-hidden="true">-</span>
+        <span class="brand-sub">Plastic State-Space Architecture</span>
+      </span>
+    </a>
+    <nav class="primary-nav" aria-label="Primary">
+      <a href="index.html#overview">Overview</a>
+      <a href="index.html#how">How It Works</a>
+      <a href="technical.html">Deep Dive</a>
+      <a href="blog.html">Blog</a>
+      <a href="index.html#results">Results</a>
+      <a href="index.html#get">Resources</a>
+      <a href="donate.html">Support</a>
+      <a href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">GitHub <span class="nav-arrow" aria-hidden="true">↗</span></a>
+    </nav>
+  </div>
+  <span class="scroll-progress" aria-hidden="true" data-scroll-progress></span>
+</header>
+
+<main id="main">
+  <section class="section" id="post" aria-labelledby="post-title">
+    <div class="wrap wrap-narrow">
+      <p class="post-date reveal"><a href="../blog.html">← All notes</a></p>
+      <article class="card post reveal">
+        <p class="post-date">Oct 30, 2026 · collab</p>
+        <h1 id="post-title" class="post-title">NSC64 trained a 109M PSSA in PyTorch</h1>
+        <div class="post-body">
+          <p>NSC64 ported the architecture to PyTorch and trained the result from scratch: 4B tokens in two phases, 50/50 TinyStories and FineWeb-Edu, then an 85/15 web/story fine-tune. The port keeps the same scan and memory-bank design as the Rust reference; the two departures it needed at this scale are backprop truncated at 256 tokens and the scan running as a fused Triton kernel with a hand-written backward that matches a plain PyTorch loop to about 1e-7.</p>
+          <p>Held-out scores, 1M unseen tokens per corpus, batch 8, sequence length 512: <strong>TinyStories 1.312 cross-entropy</strong> (3.71 perplexity, 64.8% next-token accuracy) and <strong>FineWeb-Edu web 2.866</strong> (17.6 perplexity, 44.2% next-token accuracy). Web loss was still falling at 4B, so more tokens would help.</p>
+          <p>The weights are public: bf16 <a href="https://huggingface.co/NSC64/pssa-100m/blob/main/model.safetensors">model.safetensors</a>, a 16k byte-level BPE <a href="https://huggingface.co/NSC64/pssa-100m">tokenizer and a self-contained loader</a> that runs a plain scan on CPU and the Triton kernel on CUDA. See the <a href="https://huggingface.co/NSC64/pssa-100m">model card</a> for samples and the full write-up.</p>
+        </div>
+      </article>
+    </div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="footer-top">
+      <div class="footer-brand">
+        <svg class="mark mark-static" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+          <rect class="lg-sq" x="3" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="3" width="12" height="12"/>
+          <rect class="lg-sq" x="3" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="18" width="12" height="12"/>
+          <rect class="lg-sq" x="3" y="33" width="12" height="12"/>
+          <rect class="lg-sq" x="18" y="33" width="12" height="12"/>
+          <rect class="lg-sq" x="33" y="33" width="12" height="12"/>
+        </svg>
+        <span class="footer-wordmark"><strong>PSSA</strong><span>Plastic State-Space Architecture</span></span>
+      </div>
+      <nav class="footer-nav" aria-label="Footer">
+        <a href="index.html#overview">Overview</a><span class="sep" aria-hidden="true">/</span>
+        <a href="index.html#how">How It Works</a><span class="sep" aria-hidden="true">/</span>
+        <a href="technical.html">Technical deep dive</a><span class="sep" aria-hidden="true">/</span>
+        <a href="blog.html">Blog</a><span class="sep" aria-hidden="true">/</span>
+        <a href="index.html#results">Results</a><span class="sep" aria-hidden="true">/</span>
+        <a href="https://github.com/Sparticle62ops/pssa" target="_blank" rel="noopener noreferrer">GitHub</a>
+      </nav>
+    </div>
+    <div class="footer-bottom">
+      <span>A 1,544,704-parameter research prototype. No attention map.</span>
+      <span>© 2026 PSSA · <a href="https://discord.gg/9sqfKeqWYF" target="_blank" rel="noopener noreferrer">Discord</a> · <a href="https://huggingface.co/sparticle62/pssa" target="_blank" rel="noopener noreferrer">Hugging Face</a></span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+<script src="assets/index.js"></script>
+</body>
+</html>
