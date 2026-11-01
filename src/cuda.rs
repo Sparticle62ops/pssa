@@ -243,10 +243,7 @@ impl CudaContext {
     /// and length. Cached weights from other models (a frozen teacher) stay
     /// valid, so they are not re-uploaded after every optimizer step.
     pub fn invalidate_weights_only(&self, keys: &[(usize, usize)]) {
-        let mut cache = self
-            .weight_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.weight_cache.lock().unwrap_or_else(|e| e.into_inner());
         for (key, entry) in cache.iter_mut() {
             if keys.contains(key) {
                 entry.current = false;
@@ -265,6 +262,7 @@ impl CudaContext {
     ) -> Vec<f32> {
         self.try_dispatch_gemm(x, w, m, n, k, batch)
             .unwrap_or_else(|error| {
+                panic_if_fatal_cuda_error(&error);
                 eprintln!("warning: CUDA GEMM failed; using CPU fallback: {error}");
                 crate::backend::gemm_cpu_reference(x, w, m, n, k, batch)
             })
@@ -323,6 +321,7 @@ impl CudaContext {
 
     pub fn gemm_nn(&self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         self.try_gemm_nn(a, b, m, k, n).unwrap_or_else(|error| {
+            panic_if_fatal_cuda_error(&error);
             eprintln!("warning: CUDA backward GEMM (NN) failed; using CPU fallback: {error}");
             crate::backend::gemm_nn_cpu(a, b, m, k, n)
         })
@@ -330,6 +329,7 @@ impl CudaContext {
 
     pub fn gemm_tn(&self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         self.try_gemm_tn(a, b, m, k, n).unwrap_or_else(|error| {
+            panic_if_fatal_cuda_error(&error);
             eprintln!("warning: CUDA backward GEMM (TN) failed; using CPU fallback: {error}");
             crate::backend::gemm_tn_cpu(a, b, m, k, n)
         })
@@ -402,6 +402,7 @@ impl CudaContext {
         out: &mut [f32],
     ) -> Result<(), String> {
         self.try_gemm_nn_into(a, b, m, k, n, out).or_else(|error| {
+            panic_if_fatal_cuda_error(&error);
             eprintln!("warning: CUDA backward GEMM (NN) failed; using CPU fallback: {error}");
             crate::backend::gemm_nn_cpu_into(a, b, m, k, n, out)
         })
@@ -452,6 +453,7 @@ impl CudaContext {
             return result;
         }
         result.or_else(|error| {
+            panic_if_fatal_cuda_error(&error);
             eprintln!("warning: CUDA backward GEMM (TN) failed; using CPU fallback: {error}");
             crate::backend::gemm_tn_cpu_accumulate_into(a, b, m, k, n, out)
         })
@@ -584,9 +586,40 @@ impl CudaContext {
     }
 }
 
+/// A device-side illegal access poisons the CUDA context. CPU recovery can
+/// hide the original fault and subsequent operations only generate more
+/// misleading fallback warnings, so treat these errors as terminal.
+pub(crate) fn panic_if_fatal_cuda_error(error: &str) {
+    const FATAL: [&str; 4] = [
+        "CUDA_ERROR_ILLEGAL_ADDRESS",
+        "CUDA_ERROR_CONTEXT_IS_DESTROYED",
+        "CUDA_ERROR_DEVICE_UNAVAILABLE",
+        "CUDA_ERROR_LAUNCH_TIMEOUT",
+    ];
+    if FATAL.iter().any(|kind| error.contains(kind)) {
+        panic!("fatal CUDA context error; stopping GPU operation: {error}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fatal_context_errors_are_not_fallback_candidates() {
+        assert!(
+            std::panic::catch_unwind(|| {
+                panic_if_fatal_cuda_error("CUDA_ERROR_ILLEGAL_ADDRESS: an illegal memory access");
+            })
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                panic_if_fatal_cuda_error("CUDA_ERROR_INVALID_VALUE");
+            })
+            .is_ok()
+        );
+    }
 
     #[test]
     fn shape_validation_requires_exact_lengths_signed_dimensions_and_bytes() {

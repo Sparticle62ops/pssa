@@ -1099,6 +1099,10 @@ impl GpuDispatch {
             return Err("GEMM output length mismatch".into());
         }
         if let Err(error) = self.try_dispatch_gemm_into(x, w, m, n, k, batch, out) {
+            #[cfg(feature = "cuda")]
+            if matches!(self, GpuDispatch::Cuda(_)) {
+                crate::cuda::panic_if_fatal_cuda_error(&error);
+            }
             eprintln!("warning: GPU GEMM failed; using CPU fallback: {error}");
             gemm_cpu_into(x, w, m, n, k, batch, out)?;
         }

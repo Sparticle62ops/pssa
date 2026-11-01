@@ -1,7 +1,6 @@
-// CUDA stage kernels.  The affine scan is a tiled exclusive Blelloch scan:
-// one block owns one independent channel and one lane owns one time row inside
-// a tile.  Tile totals are scanned recursively and a final map composition adds
-// the tile prefix.  The same decomposition maps directly to a WGSL workgroup.
+// CUDA stage kernels. The affine scan uses one thread per independent channel;
+// that thread walks the sequence and emits exclusive affine prefixes. Fixed
+// bounded blocks cover the full channel stride.
 .version 6.0
 .target sm_50
 .address_size 64
@@ -30,62 +29,27 @@
 SP_EXIT: ret;
 }
 
-// Tile-local exclusive scan.  summary receives the total map of each tile.
+// Channel-parallel exclusive affine scan. One thread owns one channel and
+// walks the sequence in order, so arbitrary channel counts use multiple
+// bounded blocks without shared-memory barriers or partial tiles.
 .visible .entry affine_scan(
  .param .u64 in_a, .param .u64 in_b, .param .u64 out_a, .param .u64 out_b,
- .param .u64 summary_a, .param .u64 summary_b,
- .param .u32 len, .param .u32 stride, .param .u32 capacity
+ .param .u32 len, .param .u32 stride
 ) {
- .reg .pred %p<10>; .reg .b32 %r<24>; .reg .b64 %rd<18>; .reg .f32 %f<10>;
- .shared .align 4 .b8 sa[4096]; .shared .align 4 .b8 sb[4096];
+ .reg .pred %p<3>; .reg .b32 %r<12>; .reg .b64 %rd<8>; .reg .f32 %f<5>;
  ld.param.u64 %rd0,[in_a]; ld.param.u64 %rd1,[in_b]; ld.param.u64 %rd2,[out_a]; ld.param.u64 %rd3,[out_b];
- ld.param.u64 %rd4,[summary_a]; ld.param.u64 %rd5,[summary_b]; ld.param.u32 %r0,[len]; ld.param.u32 %r1,[stride]; ld.param.u32 %r2,[capacity];
- mov.u32 %r3,%tid.x; mov.u32 %r4,%ctaid.x; mov.u32 %r5,%ctaid.y; setp.ge.u32 %p0,%r3,%r2; @%p0 bra AS_EXIT;
- mul.lo.u32 %r6,%r5,%r2; add.u32 %r6,%r6,%r3; setp.ge.u32 %p1,%r6,%r0; @%p1 bra AS_IDENTITY;
- mul.lo.u32 %r7,%r6,%r1; add.u32 %r7,%r7,%r4; mul.wide.u32 %rd6,%r7,4; add.u64 %rd13,%rd0,%rd6; ld.global.f32 %f0,[%rd13]; add.u64 %rd13,%rd1,%rd6; ld.global.f32 %f1,[%rd13]; bra AS_LOAD;
-AS_IDENTITY: mov.f32 %f0,0f3f800000; mov.f32 %f1,0f00000000;
-AS_LOAD: mul.wide.u32 %rd7,%r3,4; cvta.shared.u64 %rd8,sa; add.u64 %rd8,%rd8,%rd7; st.shared.f32 [%rd8],%f0; cvta.shared.u64 %rd8,sb; add.u64 %rd8,%rd8,%rd7; st.shared.f32 [%rd8],%f1; bar.sync 0;
- mov.u32 %r8,1;
-AS_UP: setp.ge.u32 %p2,%r8,%r2; @%p2 bra AS_ROOT;
- shl.b32 %r9,%r8,1; rem.u32 %r10,%r3,%r9; add.u32 %r11,%r8,%r8; sub.u32 %r12,%r11,1; setp.eq.u32 %p3,%r10,%r12; @!%p3 bra AS_UP_BARRIER;
- sub.u32 %r13,%r3,%r8; mul.wide.u32 %rd9,%r13,4; cvta.shared.u64 %rd10,sa; add.u64 %rd10,%rd10,%rd9; ld.shared.f32 %f2,[%rd10]; cvta.shared.u64 %rd10,sb; add.u64 %rd10,%rd10,%rd9; ld.shared.f32 %f3,[%rd10];
- mul.wide.u32 %rd11,%r3,4; cvta.shared.u64 %rd12,sa; add.u64 %rd12,%rd12,%rd11; ld.shared.f32 %f4,[%rd12]; cvta.shared.u64 %rd12,sb; add.u64 %rd12,%rd12,%rd11; ld.shared.f32 %f5,[%rd12];
- mul.f32 %f6,%f4,%f2; mul.f32 %f7,%f4,%f3; add.f32 %f7,%f7,%f5; cvta.shared.u64 %rd12,sa; add.u64 %rd12,%rd12,%rd11; st.shared.f32 [%rd12],%f6; cvta.shared.u64 %rd12,sb; add.u64 %rd12,%rd12,%rd11; st.shared.f32 [%rd12],%f7;
-AS_UP_BARRIER: bar.sync 0; shl.b32 %r8,%r8,1; bra AS_UP;
-AS_ROOT: setp.eq.u32 %p4,%r3,0; @!%p4 bra AS_DOWN_INIT;
- mov.u32 %r13,%r2; sub.u32 %r13,%r13,1; mul.wide.u32 %rd9,%r13,4; cvta.shared.u64 %rd10,sa; add.u64 %rd10,%rd10,%rd9; ld.shared.f32 %f0,[%rd10]; cvta.shared.u64 %rd10,sb; add.u64 %rd10,%rd10,%rd9; ld.shared.f32 %f1,[%rd10];
- mul.lo.u32 %r14,%r5,%r1; add.u32 %r14,%r14,%r4; mul.wide.u32 %rd11,%r14,4; add.u64 %rd12,%rd4,%rd11; st.global.f32 [%rd12],%f0; add.u64 %rd12,%rd5,%rd11; st.global.f32 [%rd12],%f1;
- // An exclusive Blelloch scan starts the downsweep with the identity map.
- cvta.shared.u64 %rd10,sa; add.u64 %rd10,%rd10,%rd9; st.shared.f32 [%rd10],0f3f800000;
- cvta.shared.u64 %rd10,sb; add.u64 %rd10,%rd10,%rd9; st.shared.f32 [%rd10],0f00000000;
-AS_DOWN_INIT: bar.sync 0; mov.u32 %r8,%r2; shr.u32 %r8,%r8,1;
-AS_DOWN: setp.eq.u32 %p5,%r8,0; @%p5 bra AS_WRITE;
- shl.b32 %r9,%r8,1; rem.u32 %r10,%r3,%r9; add.u32 %r11,%r8,%r8; sub.u32 %r12,%r11,1; setp.eq.u32 %p6,%r10,%r12; @!%p6 bra AS_DOWN_BARRIER;
- sub.u32 %r13,%r3,%r8; mul.wide.u32 %rd9,%r13,4; cvta.shared.u64 %rd10,sa; add.u64 %rd10,%rd10,%rd9; ld.shared.f32 %f2,[%rd10]; cvta.shared.u64 %rd10,sb; add.u64 %rd10,%rd10,%rd9; ld.shared.f32 %f3,[%rd10];
- mul.wide.u32 %rd11,%r3,4; cvta.shared.u64 %rd12,sa; add.u64 %rd12,%rd12,%rd11; ld.shared.f32 %f4,[%rd12]; cvta.shared.u64 %rd12,sb; add.u64 %rd12,%rd12,%rd11; ld.shared.f32 %f5,[%rd12];
- cvta.shared.u64 %rd12,sa; add.u64 %rd12,%rd12,%rd9; st.shared.f32 [%rd12],%f4; cvta.shared.u64 %rd12,sb; add.u64 %rd12,%rd12,%rd9; st.shared.f32 [%rd12],%f5;
- // Right prefix = left subtree total composed AFTER the parent prefix.
- mul.f32 %f6,%f2,%f4; mul.f32 %f7,%f2,%f5; add.f32 %f7,%f7,%f3; cvta.shared.u64 %rd12,sa; add.u64 %rd12,%rd12,%rd11; st.shared.f32 [%rd12],%f6; cvta.shared.u64 %rd12,sb; add.u64 %rd12,%rd12,%rd11; st.shared.f32 [%rd12],%f7;
-AS_DOWN_BARRIER: bar.sync 0; shr.u32 %r8,%r8,1; bra AS_DOWN;
-AS_WRITE: setp.ge.u32 %p7,%r6,%r0; @%p7 bra AS_EXIT; mul.lo.u32 %r7,%r6,%r1; add.u32 %r7,%r7,%r4; mul.wide.u32 %rd6,%r7,4; add.u64 %rd13,%rd2,%rd6; cvta.shared.u64 %rd7,sa; mul.wide.u32 %rd8,%r3,4; add.u64 %rd7,%rd7,%rd8; ld.shared.f32 %f0,[%rd7]; st.global.f32 [%rd13],%f0; add.u64 %rd13,%rd3,%rd6; cvta.shared.u64 %rd7,sb; add.u64 %rd7,%rd7,%rd8; ld.shared.f32 %f1,[%rd7]; st.global.f32 [%rd13],%f1;
-AS_EXIT: ret;
-}
-
-// Add the prefix of all preceding tiles to each local exclusive prefix.
-.visible .entry scan_apply(
- .param .u64 scan_a, .param .u64 scan_b, .param .u64 prefix_a, .param .u64 prefix_b,
- .param .u32 len, .param .u32 stride, .param .u32 capacity
-) {
- .reg .pred %p; .reg .b32 %r<13>; .reg .b64 %rd<10>; .reg .f32 %f<6>;
- ld.param.u64 %rd0,[scan_a]; ld.param.u64 %rd1,[scan_b]; ld.param.u64 %rd2,[prefix_a]; ld.param.u64 %rd3,[prefix_b]; ld.param.u32 %r0,[len]; ld.param.u32 %r1,[stride]; ld.param.u32 %r2,[capacity];
+ ld.param.u32 %r0,[len]; ld.param.u32 %r1,[stride];
  mov.u32 %r3,%tid.x; mov.u32 %r4,%ctaid.x; mov.u32 %r5,%ntid.x; mad.lo.u32 %r6,%r4,%r5,%r3;
- mul.lo.u32 %r11,%r0,%r1; setp.ge.u32 %p,%r6,%r11; @%p bra SA_EXIT;
- // One thread per flattened [time,channel] element, not per time row.
- rem.u32 %r7,%r6,%r1; div.u32 %r8,%r6,%r1; div.u32 %r8,%r8,%r2;
- mul.wide.u32 %rd4,%r6,4; add.u64 %rd6,%rd0,%rd4; ld.global.f32 %f0,[%rd6]; add.u64 %rd6,%rd1,%rd4; ld.global.f32 %f1,[%rd6];
- mul.lo.u32 %r10,%r8,%r1; add.u32 %r10,%r10,%r7; mul.wide.u32 %rd5,%r10,4; add.u64 %rd6,%rd2,%rd5; ld.global.f32 %f2,[%rd6]; add.u64 %rd6,%rd3,%rd5; ld.global.f32 %f3,[%rd6];
- mul.f32 %f4,%f0,%f2; mul.f32 %f5,%f0,%f3; add.f32 %f5,%f5,%f1; add.u64 %rd6,%rd0,%rd4; st.global.f32 [%rd6],%f4; add.u64 %rd6,%rd1,%rd4; st.global.f32 [%rd6],%f5;
-SA_EXIT: ret;
+ setp.ge.u32 %p0,%r6,%r1; @%p0 bra AS_EXIT;
+ mov.f32 %f0,0f3f800000; mov.f32 %f1,0f00000000; mov.u32 %r7,0;
+AS_LOOP: setp.ge.u32 %p1,%r7,%r0; @%p1 bra AS_DONE;
+ mul.lo.u32 %r8,%r7,%r1; add.u32 %r8,%r8,%r6; mul.wide.u32 %rd6,%r8,4;
+ add.u64 %rd7,%rd2,%rd6; st.global.f32 [%rd7],%f0; add.u64 %rd7,%rd3,%rd6; st.global.f32 [%rd7],%f1;
+ add.u64 %rd7,%rd0,%rd6; ld.global.f32 %f2,[%rd7]; add.u64 %rd7,%rd1,%rd6; ld.global.f32 %f3,[%rd7];
+ mul.f32 %f4,%f2,%f0; mul.f32 %f1,%f2,%f1; add.f32 %f1,%f1,%f3; mov.f32 %f0,%f4;
+ add.u32 %r7,%r7,1; bra AS_LOOP;
+AS_DONE: ret;
+AS_EXIT: ret;
 }
 
 .visible .entry ssm_materialize(
@@ -218,7 +182,7 @@ SBL_EXIT: ret;
 
 // Packed SSM: grid.y is a stable lane ID; offsets/lengths contain u32 rows.
 // One x thread owns a state channel and walks only that lane's ordered maps.
-// Unlike the tiled scan, this needs no summaries, scratch, or host recursion.
+// Unlike the original time-tiled scan, this needs no summaries, scratch, or host recursion.
 .visible .entry packed_scan(
  .param .u64 in_a, .param .u64 in_b, .param .u64 out_a, .param .u64 out_b,
  .param .u64 offsets, .param .u64 lengths, .param .u32 stride

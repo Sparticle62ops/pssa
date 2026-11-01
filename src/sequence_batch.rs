@@ -335,6 +335,8 @@ impl SequenceBatch {
             self.cuda_pending = match self.forward_cuda(m) {
                 Ok(resident) => resident,
                 Err(error) => {
+                    #[cfg(feature = "cuda")]
+                    crate::cuda::panic_if_fatal_cuda_error(&error);
                     eprintln!("warning: CUDA packed forward failed; replaying CPU stages: {error}");
                     cuda_failed = true;
                     false
@@ -408,6 +410,8 @@ impl SequenceBatch {
             match self.backward_cuda(m) {
                 Ok(()) => true,
                 Err(error) => {
+                    #[cfg(feature = "cuda")]
+                    crate::cuda::panic_if_fatal_cuda_error(&error);
                     eprintln!(
                         "warning: CUDA packed backward failed; replaying CPU tapes/adjoints: {error}"
                     );
