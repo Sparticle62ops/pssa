@@ -281,61 +281,20 @@ fn scan(
     b: &str,
     len: usize,
     stride: usize,
-    capacity: usize,
+    _capacity: usize,
     tag: &str,
 ) -> (String, String) {
-    let tiles = len.div_ceil(capacity);
     let oa = format!("{tag}-oa");
     let ob = format!("{tag}-ob");
-    let sa = format!("{tag}-sa");
-    let sb = format!("{tag}-sb");
     m.zeros(&oa, len * stride);
     m.zeros(&ob, len * stride);
-    m.zeros(&sa, tiles * stride);
-    m.zeros(&sb, tiles * stride);
     m.launch(
         PTX,
         "affine_scan",
-        &[
-            B(a),
-            B(b),
-            B(&oa),
-            B(&ob),
-            B(&sa),
-            B(&sb),
-            U(len as u32),
-            U(stride as u32),
-            U(capacity as u32),
-        ],
-        (stride, tiles),
-        capacity,
+        &[B(a), B(b), B(&oa), B(&ob), U(len as u32), U(stride as u32)],
+        (stride.div_ceil(256), 1),
+        256,
     );
-    if tiles > 1 {
-        let (pa, pb) = scan(
-            m,
-            &sa,
-            &sb,
-            tiles,
-            stride,
-            tiles.next_power_of_two().min(1024),
-            &format!("{tag}-prefix"),
-        );
-        m.launch(
-            PTX,
-            "scan_apply",
-            &[
-                B(&oa),
-                B(&ob),
-                B(&pa),
-                B(&pb),
-                U(len as u32),
-                U(stride as u32),
-                U(capacity as u32),
-            ],
-            ((len * stride).div_ceil(32), 1),
-            32,
-        );
-    }
     (oa, ob)
 }
 
@@ -376,7 +335,7 @@ fn cuda_ssm_ptx_reverse_maps_match_cpu_without_gpu() {
 }
 
 #[test]
-fn cuda_ssm_ptx_tiled_exclusive_scan_matches_cpu_without_gpu() {
+fn cuda_ssm_ptx_channel_exclusive_scan_matches_cpu_without_gpu() {
     // Forced small tiles cover recursive composition cheaply; 1025 also uses
     // production's maximum 1024-thread tile and a padded final tile.
     for (len, stride, capacity) in [(1, 1, 1), (3, 2, 4), (7, 3, 8), (33, 2, 8), (1025, 2, 1024)] {

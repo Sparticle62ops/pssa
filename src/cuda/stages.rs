@@ -1,9 +1,9 @@
 //! CUDA SSM scan, episodic-memory retrieval, and token-local arithmetic.
 //!
-//! The decomposition is backend-neutral: the affine scan is a tiled exclusive
-//! Blelloch scan. One workgroup/block owns one independent latent/state channel
-//! and one lane owns one sequence row within a tile. Tile totals are scanned by
-//! the same kernel recursively, then composed into each tile's local prefix.
+//! The affine scan assigns one thread to each independent latent/state channel;
+//! each thread walks sequence positions in order and writes exclusive prefixes.
+//! Fixed 256-thread blocks cover arbitrarily wide channel strides without a
+//! shared-memory scan or oversized block.
 //! Memory retrieval and its VJP use one invocation per token and keep the slot
 //! loop inside that invocation. A WGSL port can reuse these ownership rules.
 
@@ -11,13 +11,14 @@ use super::*;
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use std::{ffi::CString, ptr};
 
-use super::stage_bounds::{MemoryShape, SsmShape, elems, gemm_shape, lengths, product, scan_shape};
+use super::stage_bounds::{
+    MAX_THREADS_PER_BLOCK, MemoryShape, SsmShape, elems, gemm_shape, lengths, product, scan_shape,
+};
 
 pub(super) struct Kernels {
     pub(super) module: Arc<cudarc::driver::CudaModule>,
     prepare: CudaFunction,
     scan: CudaFunction,
-    scan_apply: CudaFunction,
     materialize: CudaFunction,
     backward_maps: CudaFunction,
     backward_local: CudaFunction,
@@ -148,7 +149,6 @@ impl CudaContext {
                     module: module.clone(),
                     prepare: module.load_function("ssm_prepare")?,
                     scan: module.load_function("affine_scan")?,
-                    scan_apply: module.load_function("scan_apply")?,
                     materialize: module.load_function("ssm_materialize")?,
                     backward_maps: module.load_function("ssm_backward_maps")?,
                     backward_local: module.load_function("ssm_backward_local")?,
@@ -207,9 +207,8 @@ impl CudaContext {
         unsafe { self.blas.gemm(cfg, b, a, out) }.map_err(error)
     }
 
-    /// Scan arbitrary sequence lengths in tiled workgroups.  The temporary
-    /// tile-total arrays are device-only; recursive calls never cross the host
-    /// boundary.  `out_a/out_b` are exclusive prefixes on return.
+    /// Scan each independent channel in sequence order. `out_a/out_b` are
+    /// exclusive prefixes on return.
     fn launch_scan(
         &self,
         kernels: &Kernels,
@@ -220,7 +219,7 @@ impl CudaContext {
         len: usize,
         stride: usize,
     ) -> Result<(), String> {
-        let (capacity, tiles) = scan_shape(len, stride)?;
+        let (block_threads, blocks) = scan_shape(len, stride)?;
         let total = product(len, stride, "scan elements")?;
         lengths(
             "affine scan",
@@ -233,16 +232,13 @@ impl CudaContext {
         )?;
         let len_arg = elems(len, "scan length")?;
         let stride_arg = elems(stride, "scan stride")?;
-        let capacity_arg = elems(capacity, "scan tile width")?;
-        let tiles_arg = elems(tiles, "scan tile count")?;
-        let mut summary_a = self
-            .stream
-            .alloc_zeros::<f32>(product(tiles, stride, "scan summaries")?)
-            .map_err(error)?;
-        let mut summary_b = self
-            .stream
-            .alloc_zeros::<f32>(product(tiles, stride, "scan summaries")?)
-            .map_err(error)?;
+        let block_arg = elems(block_threads, "scan block threads")?;
+        let blocks_arg = elems(blocks, "scan block count")?;
+        if block_threads > MAX_THREADS_PER_BLOCK || block_arg as usize != block_threads {
+            return Err(format!(
+                "CUDA affine scan block configuration ({block_threads} threads) exceeds the supported limit of {MAX_THREADS_PER_BLOCK}; refusing launch"
+            ));
+        }
         unsafe {
             self.stream
                 .launch_builder(&kernels.scan)
@@ -250,52 +246,13 @@ impl CudaContext {
                 .arg(in_b)
                 .arg(&mut *out_a)
                 .arg(&mut *out_b)
-                .arg(&mut summary_a)
-                .arg(&mut summary_b)
                 .arg(&len_arg)
                 .arg(&stride_arg)
-                .arg(&capacity_arg)
                 .launch(LaunchConfig {
-                    grid_dim: (stride_arg, tiles_arg, 1),
-                    block_dim: (capacity_arg, 1, 1),
+                    grid_dim: (blocks_arg, 1, 1),
+                    block_dim: (block_arg, 1, 1),
                     shared_mem_bytes: 0,
                 })
-                .map_err(error)?;
-        }
-        if tiles == 1 {
-            return Ok(());
-        }
-        let mut prefix_a = self
-            .stream
-            .alloc_zeros::<f32>(product(tiles, stride, "scan prefixes")?)
-            .map_err(error)?;
-        let mut prefix_b = self
-            .stream
-            .alloc_zeros::<f32>(product(tiles, stride, "scan prefixes")?)
-            .map_err(error)?;
-        self.launch_scan(
-            kernels,
-            &summary_a,
-            &summary_b,
-            &mut prefix_a,
-            &mut prefix_b,
-            tiles,
-            stride,
-        )?;
-        unsafe {
-            self.stream
-                .launch_builder(&kernels.scan_apply)
-                .arg(&mut *out_a)
-                .arg(&mut *out_b)
-                .arg(&prefix_a)
-                .arg(&prefix_b)
-                .arg(&len_arg)
-                .arg(&stride_arg)
-                .arg(&capacity_arg)
-                .launch(LaunchConfig::for_num_elems(elems(
-                    product(len, stride, "scan elements")?,
-                    "scan elements",
-                )?))
                 .map_err(error)?;
         }
         Ok(())

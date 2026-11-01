@@ -27,6 +27,8 @@ use std::sync::{Mutex, OnceLock};
 /// CUDA loader. Suppress repeated fallback chatter for that permanent error;
 /// other transient stage failures are also reported only once per message.
 pub(crate) fn warn_gpu_fallback_once(error: &str, message: String) {
+    #[cfg(feature = "cuda")]
+    crate::cuda::panic_if_fatal_cuda_error(error);
     if error.contains("stage module failed to load") {
         return;
     }
@@ -1130,7 +1132,18 @@ fn distill_logit_grad_row(
     let (max_s, inv_sum_s, has) = distill_terms(logits, off, v, temp);
     for i in 0..v {
         out[i] = distill_grad_at(
-            logits, probs, teacher_probs, off, v, i, target, temp, ce_mix, max_s, inv_sum_s, has,
+            logits,
+            probs,
+            teacher_probs,
+            off,
+            v,
+            i,
+            target,
+            temp,
+            ce_mix,
+            max_s,
+            inv_sum_s,
+            has,
         ) * scale;
     }
 }
@@ -1845,7 +1858,8 @@ pub fn bwd_stage_logits_scalar(m: &mut PSSALayerV2, seq_len: usize, scale_loss: 
         for j in 0..d_m {
             m.bwd_g_zfinal[z_off + j] = 0.0;
         }
-        let (max_s, inv_sum_s, has_distill) = distill_terms(&m.tape.logits, log_off, d_v, m.tape.distill_temp);
+        let (max_s, inv_sum_s, has_distill) =
+            distill_terms(&m.tape.logits, log_off, d_v, m.tape.distill_temp);
         for i in 0..d_v {
             let g_coeff = distill_grad_at(
                 &m.tape.logits,

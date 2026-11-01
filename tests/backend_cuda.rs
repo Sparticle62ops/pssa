@@ -258,6 +258,87 @@ fn cuda_ssm_scan_forward_and_backward_match_cpu_twin() {
 }
 
 #[test]
+#[ignore = "requires a working CUDA device and cuBLAS"]
+fn cuda_scan_len64_stride4096_covers_all_channels_and_matches_cpu() {
+    let ctx = CudaContext::init().expect("CUDA is required for the ignored parity test");
+    let gpu = pssa::backend::GpuDispatch::Cuda(ctx);
+    let (len, dm, ds) = (64usize, 256usize, 16usize);
+    let stride = dm * ds;
+    let delta: Vec<_> = (0..len * dm)
+        .map(|i| 0.01 + (i % 19) as f32 * 0.001)
+        .collect();
+    let delta_raw = delta.clone();
+    let b_proj: Vec<_> = (0..len * ds)
+        .map(|i| (i % 13) as f32 * 0.002 - 0.01)
+        .collect();
+    let x_norm: Vec<_> = (0..len * dm)
+        .map(|i| (i % 23) as f32 * 0.01 - 0.1)
+        .collect();
+    let rates: Vec<_> = (0..stride)
+        .map(|i| -0.01 - (i % 7) as f32 * 0.001)
+        .collect();
+    let rate_deriv = vec![1.0; stride];
+    let c_proj: Vec<_> = (0..len * ds)
+        .map(|i| (i % 11) as f32 * 0.003 - 0.01)
+        .collect();
+    let initial: Vec<_> = (0..stride)
+        .map(|i| (i % 17) as f32 * 0.001 - 0.008)
+        .collect();
+
+    let mut cpu_a = vec![0.0; len * stride];
+    let mut cpu_b = vec![0.0; len * stride];
+    let mut cpu_states = vec![0.0; (len + 1) * stride];
+    let mut cpu_y = vec![0.0; len * dm];
+    cpu_states[..stride].copy_from_slice(&initial);
+    for t in 0..len {
+        for i in 0..dm {
+            for j in 0..ds {
+                let channel = i * ds + j;
+                let map_a = (delta[t * dm + i] * rates[channel]).exp();
+                let map_b = delta[t * dm + i] * b_proj[t * ds + j];
+                cpu_a[t * stride + channel] = map_a;
+                cpu_b[t * stride + channel] = map_b;
+                let h = map_a * cpu_states[t * stride + channel] + map_b * x_norm[t * dm + i];
+                cpu_states[(t + 1) * stride + channel] = h;
+                cpu_y[t * dm + i] += h * c_proj[t * ds + j];
+            }
+        }
+    }
+
+    let mut a = vec![0.0; len * stride];
+    let mut b = vec![0.0; len * stride];
+    let mut states = vec![0.0; (len + 1) * stride];
+    let mut y = vec![0.0; len * dm];
+    gpu.ssm_forward(
+        &delta,
+        &delta_raw,
+        &b_proj,
+        &x_norm,
+        &rates,
+        &rate_deriv,
+        &c_proj,
+        &initial,
+        len,
+        dm,
+        ds,
+        &mut a,
+        &mut b,
+        &mut states,
+        &mut y,
+    )
+    .unwrap();
+    assert_close_stage(&a, &cpu_a);
+    assert_close_stage(&b, &cpu_b);
+    assert_close_stage(&states, &cpu_states);
+    assert_close_stage(&y, &cpu_y);
+    // Explicit terminal and final-channel checks catch off-by-one and missed-grid work.
+    assert_eq!(states[0], initial[0]);
+    assert!(
+        (states[len * stride + stride - 1] - cpu_states[len * stride + stride - 1]).abs() < 3e-3
+    );
+}
+
+#[test]
 #[ignore]
 fn cuda_memory_forward_and_backward_match_cpu_twin() {
     let ctx = CudaContext::init().expect("CUDA is required for the ignored parity test");
@@ -320,19 +401,11 @@ fn cuda_memory_forward_and_backward_match_cpu_twin() {
     let mut cgm = vec![0.0; l * dm];
     let mut cmp = vec![0.0; l * dm];
     let mut cinj = vec![0.0; l * dm];
-    let bank = pssa::memory::HyperbolicEpisodicBankV2 {
-        capacity: cap,
-        count,
-        dim_key: dk,
-        dim_val: dm,
-        write_head: 0,
-        keys: keys.clone(),
-        values: values.clone(),
-        value_cap: None,
-        norm_sq: norm_sq.clone(),
-        confidence: vec![1.0; cap],
-        last_seen_step: vec![0; cap],
-    };
+    let mut bank = pssa::memory::HyperbolicEpisodicBankV2::new(cap, dk, dm);
+    bank.count = count;
+    bank.keys.clone_from(&keys);
+    bank.values.clone_from(&values);
+    bank.norm_sq.clone_from(&norm_sq);
     for t in 0..l {
         for k in 0..dk {
             cqe[t * dk + k] = (0..dm)

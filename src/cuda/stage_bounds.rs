@@ -39,30 +39,29 @@ pub(super) fn lengths(stage: &str, buffers: &[(&str, usize, usize)]) -> Result<(
     Ok(())
 }
 
-pub(super) fn scan_capacity(len: usize) -> usize {
-    if len <= 512 {
-        len.max(1).next_power_of_two()
-    } else {
-        1024
-    }
-}
+// CUDA's architectural maximum is 1024 threads per block. Keep both the
+// device limit and our conservative fixed scan block size explicit.
+pub(super) const MAX_THREADS_PER_BLOCK: usize = 1024;
+pub(super) const SCAN_BLOCK_THREADS: usize = 256;
 
 pub(super) fn scan_shape(len: usize, stride: usize) -> Result<(usize, usize), String> {
     if len == 0 || stride == 0 {
         return Err("CUDA affine scan dimensions must be positive; refusing launch".into());
     }
     product(len, stride, "affine scan elements")?;
-    let capacity = scan_capacity(len);
-    let tiles = len.div_ceil(capacity);
-    // Supported sm_50+ devices: grid.x <= 2^31-1, grid.y <= 65535.
-    // Static shared arrays hold 1024 floats each (8192 bytes total).
-    if stride > i32::MAX as usize || tiles > 65535 {
+    if SCAN_BLOCK_THREADS > MAX_THREADS_PER_BLOCK {
         return Err(format!(
-            "CUDA affine scan grid ({stride}, {tiles}) exceeds grid limits (2147483647, 65535); refusing launch"
+            "CUDA affine scan block has {SCAN_BLOCK_THREADS} threads, maximum is {MAX_THREADS_PER_BLOCK}; refusing launch"
         ));
     }
-    product(tiles, stride, "affine scan summaries")?;
-    Ok((capacity, tiles))
+    let blocks = stride.div_ceil(SCAN_BLOCK_THREADS);
+    // Supported sm_50+ devices allow grid.x up to 2^31-1.
+    if blocks > i32::MAX as usize {
+        return Err(format!(
+            "CUDA affine scan grid ({blocks}, 1) exceeds grid limits (2147483647, 65535); refusing launch"
+        ));
+    }
+    Ok((SCAN_BLOCK_THREADS, blocks))
 }
 
 pub(super) struct SsmShape {
@@ -248,25 +247,16 @@ mod tests {
     }
 
     #[test]
-    fn scan_grid_and_shared_capacity_are_bounded() {
-        assert_eq!(scan_shape(1, 1).unwrap(), (1, 1));
-        assert_eq!(scan_shape(513, 57344).unwrap(), (1024, 1));
-        assert_eq!(scan_shape(1025, 57344).unwrap(), (1024, 2));
-        assert!(
-            scan_shape(65535 * 1024 + 1, 1)
-                .unwrap_err()
-                .contains("grid limits")
-        );
-        assert!(
-            scan_shape(1, i32::MAX as usize + 1)
-                .unwrap_err()
-                .contains("grid limits")
-        );
+    fn scan_grid_and_block_size_are_bounded() {
+        assert_eq!(scan_shape(1, 1).unwrap(), (256, 1));
+        // 4096 independent channels use 16 blocks of 256 threads each.
+        assert_eq!(scan_shape(64, 4096).unwrap(), (256, 16));
+        assert_eq!(scan_shape(64, 1).unwrap(), (256, 1));
+        assert_eq!(scan_shape(64, 16384).unwrap(), (256, 64));
+        assert_eq!(scan_shape(513, 57344).unwrap(), (256, 224));
+        assert_eq!(scan_shape(1025, 57344).unwrap(), (256, 224));
+        assert!(scan_shape(1, (i32::MAX as usize) * 256 + 1).is_err());
         assert!(scan_shape(1024, 1 << 23).is_err());
-        for len in [1, 32, 64, 511, 512, 513, 1025, 1 << 20] {
-            let width = scan_capacity(len);
-            assert!(width.is_power_of_two() && width <= 1024 && width * 4 <= 4096);
-        }
     }
 
     #[test]
