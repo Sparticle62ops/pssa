@@ -1932,6 +1932,10 @@ pub struct PSSALayerV2 {
     /// checkpoints: dream controls and their ephemeral rehearsal cache must be
     /// supplied again when resuming a run.
     dream_sequences: Vec<DreamSequence>,
+    /// Reusable (ptr, len) key buffer for GPU weight invalidation. Runtime-only:
+    /// built once at construction and refilled in place on every AdamW step so
+    /// the live optimizer path never allocates.
+    adam_keys_scratch: Vec<(usize, usize)>,
 }
 
 impl std::ops::Deref for PSSALayerV2 {
@@ -2036,6 +2040,7 @@ impl PSSALayerV2 {
             inf_features: vec![0.0; d],
             inf_block_out: vec![0.0; d],
             dream_sequences: Vec::new(),
+            adam_keys_scratch: Vec::with_capacity(2 + 16 * depth),
         }
     }
     pub fn depth(&self) -> usize {
@@ -2957,6 +2962,44 @@ impl PSSALayerV2 {
         tensors
     }
 
+    /// Pointer/length keys of every AdamW-managed tensor, in `adam_tensors()`
+    /// order. Immutable view, so the live optimizer path can refill a
+    /// model-owned buffer without allocating.
+    pub(crate) fn adam_tensor_keys(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        fn key(data: &Vec<f32>) -> (usize, usize) {
+            (data.as_ptr() as usize, data.len())
+        }
+        std::iter::once(key(&self.embed_w.data))
+            .chain(std::iter::once(key(&self.unembed_w.data)))
+            .chain(
+                std::iter::once(&self.block)
+                    .chain(self.extra_blocks.iter())
+                    .flat_map(|b| {
+                        [&b.norm_gamma.data, &b.norm_beta.data]
+                            .into_iter()
+                            .chain([
+                                &b.a_mat.data,
+                                &b.w_delta.data,
+                                &b.w_b.data,
+                                &b.w_c.data,
+                                &b.w_qx.data,
+                                &b.w_qh.data,
+                                &b.w_gate.data,
+                                &b.w_proj.data,
+                                &b.mlp_w1.data,
+                                &b.mlp_w2.data,
+                            ])
+                            .chain(b.local_conv_kernel.as_ref().map(|p| &p.data).into_iter())
+                            .chain(b.ssm_skip.as_ref().map(|p| &p.data).into_iter())
+                            .chain([
+                                &b.adapters[0].down_proj.data,
+                                &b.adapters[0].up_proj.data,
+                            ])
+                            .map(key)
+                    }),
+            )
+    }
+
     /// Global f64 L2 norm, then min(1, max_norm / norm) before AdamW.
     /// CUDA reduces and scales on-device. The CPU fallback has one norm pass;
     /// scaling is fused into AdamW's required pass over optimizer state.
@@ -3046,14 +3089,13 @@ impl PSSALayerV2 {
         }
         self.unembed_w
             .step_adamw(lr, c.beta1, c.beta2, c.weight_decay, c.eps, s);
-        let adam_keys: Vec<(usize, usize)> = self
-            .adam_tensors()
-            .iter()
-            .map(|t| (t.data.as_ptr() as usize, t.data.len()))
-            .collect();
+        let mut adam_keys = std::mem::take(&mut self.adam_keys_scratch);
+        adam_keys.clear();
+        adam_keys.extend(self.adam_tensor_keys());
         if let Some(ctx) = self.device.gpu() {
             ctx.invalidate_weights_only(&adam_keys);
         }
+        self.adam_keys_scratch = adam_keys;
     }
     pub fn backward_and_step_chunk(&mut self, seq_len: usize) {
         self.zero_gradients();
