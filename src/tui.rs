@@ -2615,14 +2615,7 @@ fn draw_section_menu(f: &mut ratatui::Frame, area: Rect, nav: &nav::Nav) {
         Line::from(""),
     ];
     let rows = usize::from(inner.height).saturating_sub(lines.len());
-    // When every section plus a blank spacer between rows fits, lay the menu
-    // out roomily; narrow or short terminals fall back to the compact list.
-    let roomy = category.sections.len() * 2 - 1 <= rows;
-    let first = if roomy {
-        0
-    } else {
-        nav.section.saturating_sub(rows.saturating_sub(1))
-    };
+    let first = nav.section.saturating_sub(rows.saturating_sub(1));
     for (index, section) in category
         .sections
         .iter()
@@ -2651,9 +2644,6 @@ fn draw_section_menu(f: &mut ratatui::Frame, area: Rect, nav: &nav::Nav) {
             Span::styled(format!("{:<11}", section.title), title),
             Span::styled(section.blurb, Style::new().fg(Color::Gray)),
         ]));
-        if roomy && index + 1 < category.sections.len() {
-            lines.push(Line::from(""));
-        }
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
