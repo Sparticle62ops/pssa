@@ -313,6 +313,17 @@ fn find_embedding(shards: &[SafetensorsFile], family: Family) -> Result<(usize, 
 
 // -------------------------------------------------------------- conversion
 
+/// Detect the architecture and discover the shards for `source` without
+/// running the conversion. Shared by the CLI and the TUI convert panel.
+pub fn plan_from_paths(
+    source: &Path,
+    config: &serde_json::Value,
+) -> Result<(ArchInfo, Vec<PathBuf>), String> {
+    let shards = shard_paths(source)?;
+    let info = detect::detect(config)?;
+    Ok((info, shards))
+}
+
 pub struct ConvertOptions {
     pub shards: Vec<PathBuf>,
     pub info: ArchInfo,
