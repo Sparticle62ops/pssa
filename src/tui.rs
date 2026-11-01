@@ -74,6 +74,41 @@ const PSSA_LOGO: [&str; 5] = [
     "█     ███   ███   █  █",
 ];
 
+// The nine-square mark's brand palette in row-major order: the same grid the
+// site logo, favicon and README badge use.
+const MARK_COLORS: [(u8, u8, u8); 9] = [
+    (0xE9, 0xFF, 0xF1),
+    (0x96, 0xEF, 0xB7),
+    (0x3B, 0xCB, 0x78),
+    (0xC4, 0xF8, 0xD8),
+    (0x22, 0xA8, 0x5D),
+    (0x17, 0x83, 0x48),
+    (0x62, 0xE0, 0x96),
+    (0x11, 0x5E, 0x36),
+    (0x0B, 0x38, 0x23),
+];
+
+/// Draw the nine-square brand mark: a 3x3 grid of colored block glyphs, each
+/// square two columns wide with a one-column gap. Skips silently on areas too
+/// small to hold the whole grid.
+fn draw_nine_square_mark(f: &mut ratatui::Frame, area: Rect) {
+    if area.width < 9 || area.height < 3 {
+        return;
+    }
+    for row in 0..3 {
+        for col in 0..3 {
+            let (r, g, b) = MARK_COLORS[row * 3 + col];
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "\u{2588}\u{2588}",
+                    Style::default().fg(Color::Rgb(r, g, b)),
+                ))),
+                Rect::new(area.x + col as u16 * 3, area.y + row as u16, 2, 1),
+            );
+        }
+    }
+}
+
 // Halloween week palette. Every October 24-31 the TUI lights itself up
 // jack-o'-lantern orange over haunted violet; PSSA_SPOOKY=1 forces it on,
 // PSSA_SPOOKY=0 keeps the regular look any day of the year.
@@ -2455,9 +2490,22 @@ fn draw_with_background(
             Paragraph::new(PSSA_LOGO.map(|row| Line::styled(row, accent())).to_vec()),
             Rect::new(header.x, header.y, 24, 5),
         );
+        // The nine-square brand mark sits between the wordmark and the run
+        // stats when the terminal is wide enough for all three; narrower
+        // terminals keep the original two-part header.
+        let mark_fits = header.width >= 100;
+        if mark_fits {
+            draw_nine_square_mark(f, Rect::new(header.x + 26, header.y + 1, 9, 3));
+        }
+        let stats_offset = if mark_fits { 38 } else { 24 };
         draw_header_stats(
             f,
-            Rect::new(header.x + 24, header.y, header.width - 24, 5),
+            Rect::new(
+                header.x + stats_offset,
+                header.y,
+                header.width - stats_offset,
+                5,
+            ),
             state,
             &health,
         );
@@ -4191,6 +4239,41 @@ mod tests {
         assert!(row(1).contains("┌"));
         assert!(row(5).contains("└"));
         assert!(row(2).contains("[ WAITING ]"));
+    }
+
+    #[test]
+    fn nine_square_mark_renders_the_brand_palette() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal
+            .draw(|f| draw_nine_square_mark(f, Rect::new(2, 2, 9, 3)))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for row in 0..3 {
+            for col in 0..3 {
+                let (r, g, b) = MARK_COLORS[row * 3 + col];
+                let cell = &buffer[(2 + col as u16 * 3, 2 + row as u16)];
+                assert_eq!(
+                    cell.fg,
+                    ratatui::style::Color::Rgb(r, g, b),
+                    "mark cell ({row}, {col}) color"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_header_shows_the_nine_square_mark() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        terminal.draw(|f| draw(f, &RunState::default(), 2)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let palette: Vec<ratatui::style::Color> = MARK_COLORS
+            .iter()
+            .map(|(r, g, b)| ratatui::style::Color::Rgb(*r, *g, *b))
+            .collect();
+        let found = buffer.content().iter().any(|cell| palette.contains(&cell.fg));
+        assert!(found, "nine-square mark colors missing from the wide header");
     }
 
     #[test]

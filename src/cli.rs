@@ -1910,6 +1910,7 @@ impl CLIHandler {
             ),
             ("status", "checkpoints and corpora in this directory"),
             ("download", "pull a Hugging Face dataset to a local file"),
+            ("convert", "convert a HuggingFace LLM checkpoint into a PSSA v6 checkpoint"),
             (
                 "clean-wikitext",
                 "stream-clean raw WikiText into a new file",
@@ -2592,6 +2593,13 @@ impl CLIHandler {
                     "Example: {bin} clean-wikitext wiki.train.raw --out data/wikitext-clean.txt"
                 );
             }
+            "convert" => {
+                println!("Usage: {bin} convert MODEL-OR-DIR CONFIG.JSON OUT.V6 [--target compact|source-width] [--seed N]");
+                println!();
+                println!("Convert a HuggingFace LLM checkpoint into a PSSA v6 checkpoint (token-table transplant).");
+                println!("MODEL-OR-DIR is a .safetensors file or a sharded model directory; CONFIG.JSON is its config.json.");
+                println!("Supported today: Qwen3 dense, Llama, Mistral, Qwen2, Mixtral, Gemma, Phi-3, GPT-2 style.");
+            }
             "download" => {
                 println!("Usage: {bin} download REPOSITORY [-o|--out PATH]");
                 println!();
@@ -2715,6 +2723,7 @@ impl CLIHandler {
                 Ok(())
             }
             "world-model" => world_model::execute(&args[2..]),
+            "convert" => crate::convert::run_cli(&args[2..]),
             "train" | "train-transformer" => {
                 let baseline = command == "train-transformer";
                 let mut allowed = vec![

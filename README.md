@@ -4,9 +4,9 @@
 
 # PSSA: a plastic state-space architecture
 
-[![Discord](https://img.shields.io/badge/discord-join%20PSlabs-5865F2?logo=discord&logoColor=white)](https://discord.gg/9sqfKeqWYF)
+[![Discord](https://img.shields.io/badge/discord-join%20PSlabs-5865F2?logo=discord&logoColor=white)](https://discord.gg/9sqfKeqWYF) [![Hugging Face](https://img.shields.io/badge/huggingface-sparticle62%2Fpssa-FFD21E?logo=huggingface&logoColor=black)](https://huggingface.co/sparticle62/pssa) [![Blog](https://img.shields.io/badge/blog-read%20the%20notes-3BCB78)](https://sparticle62ops.github.io/pssa/blog.html)
 
-[Technical deep dive](https://sparticle62ops.github.io/pssa/technical.html) · [Support PSSA](DONATE.md) · [The math, in full](MODELMATH.md) · [Qwen distillation math](docs/qwen-distill.md)
+[Technical deep dive](https://sparticle62ops.github.io/pssa/technical.html) · [Support PSSA](DONATE.md) · [The math, in full](MODELMATH.md) · [Qwen distillation math](docs/qwen-distill.md) · [Universal converter](docs/convert.md)
 
 PSSA is a small language model that is not a transformer. It reads text one
 token at a time through a recurrent state-space layer, keeps a bank of episodic
