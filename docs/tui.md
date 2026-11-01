@@ -14,9 +14,9 @@ in prompts/paths). `Ctrl+C` quits everywhere. Existing piped / `--no-tui` CLI
 behavior is unchanged. Screens retain the CRT green style and compact /
 narrow-terminal layouts.
 
-For the training wizard in detail see [training-setup.md](training-setup.md).
+For the training wizard in detail see [tui-setup.md](tui-setup.md).
 For Kaggle, the plastic memory inspector, A/B inference and the one-key
-benchmark see [TUI-EXTRAS.md](TUI-EXTRAS.md). For plain CLI commands see
+benchmark see [tui-features.md](tui-features.md). For plain CLI commands see
 [cli.md](cli.md).
 
 ## Monitor
@@ -108,7 +108,7 @@ passthrough.
 The tab order is **monitor, chain, model, feed, inference, setup, HF login,
 Kaggle, memory, runs, benchmark, sample, hardware, math, devices, limits,
 library, mixer, eval, HF backup, cloud log, phone ping, updates, support,
-GitHub, sweeps, timeline**. The [training setup wizard](training-setup.md)
+GitHub, sweeps, timeline**. The [training setup wizard](tui-setup.md)
 launches a separate trainer and returns to the monitor; **Tab** switches tabs
 even while editing a field. **Ctrl+K** opens the command palette. All tabs share
 one **F1 / ?** keyboard reference. At 80+ columns the tab strip pages between
@@ -326,8 +326,8 @@ No models are downloaded and the default build has **no audio dependencies**.
 
 ## Related documents
 
-- [training-setup.md](training-setup.md) — the training wizard.
-- [TUI-EXTRAS.md](TUI-EXTRAS.md) — Kaggle, memory inspector, A/B inference,
+- [tui-setup.md](tui-setup.md) — the training wizard.
+- [tui-features.md](tui-features.md) — Kaggle, memory inspector, A/B inference,
   runs browser, matched benchmark, alerts, GIF recording.
 - [tui-demo.tape](tui-demo.tape) — the VHS recording tape for the dashboard GIF.
 - [cli.md](cli.md) — the plain-command equivalent of every dashboard action.

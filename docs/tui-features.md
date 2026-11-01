@@ -110,7 +110,7 @@ The harness rejects training/evaluation overlap and inconsistent update clocks
 before training. It writes `manifest.json`, checkpoints, curves and `results.json`;
 the TUI renders the latter as a result card. Parameter counts may differ; it matches
 exposure, not wall time, compute or architecture. Larger/custom held-out slices
-and mixed link plans remain available through the CLI; see [COMPARISON.md](COMPARISON.md).
+and mixed link plans remain available through the CLI; see [comparison.md](comparison.md).
 This is distinct from the historical `benchmark` smoke-test CLI, which is unchanged.
 
 ## Alerts

@@ -7,11 +7,11 @@ setup see [setup.md](setup.md); for the command reference see [cli.md](cli.md).
 
 Related write-ups:
 
-- [BATCHING.md](BATCHING.md) — independent-sequence batching.
-- [STACKED-DEPTH.md](STACKED-DEPTH.md) — stacked-depth PSSA and loops.
-- [GPU-CLIP-SPEED.md](GPU-CLIP-SPEED.md) — gradient clipping and the
+- [batching.md](batching.md) — independent-sequence batching.
+- [stacked-depth.md](stacked-depth.md) — stacked-depth PSSA and loops.
+- [training-stability.md](training-stability.md) — gradient clipping and the
   memory-value cap.
-- [PAIRED-EVAL.md](PAIRED-EVAL.md) — the paired multi-seed evaluation harness.
+- [paired-eval.md](paired-eval.md) — the paired multi-seed evaluation harness.
 
 ## Training loss safety
 
@@ -34,7 +34,7 @@ exposes all three settings and the monitor shows the configured guard and halt
 reason. Existing non-finite tensor checks remain in force.
 
 For the opt-in `--grad-clip` and `--memory-value-cap` flags, and the validation
-behind them, see [GPU-CLIP-SPEED.md](GPU-CLIP-SPEED.md).
+behind them, see [training-stability.md](training-stability.md).
 
 ## Memory capacity experiments
 

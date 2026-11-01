@@ -93,47 +93,33 @@ and long-corpus training chains are covered in [docs/setup.md](docs/setup.md).
 
 ## Documentation
 
-- [docs/setup.md](docs/setup.md) — install, build, backends, dataset and cache
-  setup, WikiText cleaning, long-corpus chains, checkpoint compatibility.
-- [docs/architecture.md](docs/architecture.md) — the recurrence, hyperbolic
-  memory read, gate/adapter/MLP, plastic write path and training pipeline.
-- [docs/benchmarks.md](docs/benchmarks.md) — headline results, matched-run
-  methodology, throughput caveats, benchmark and comparison commands.
-- [docs/cli.md](docs/cli.md) — commands, options, chat, plain logs and
-  generation defaults.
-- [docs/tui.md](docs/tui.md) — the terminal dashboard: monitor, inference,
-  setup, model/chain/feed, backups, run controls, library and evaluation.
-- [docs/experiments.md](docs/experiments.md) — dreaming, the loss guard, memory
-  capacity experiments and the boxes-world world model.
-- [docs/contributors.md](docs/contributors.md) — building and testing locally,
-  commit and PR expectations, code layout, roadmap and where help is needed.
-- [MODELMATH.md](MODELMATH.md) — the equations behind the layer, the memory
-  bank and the plastic write path, with the measured results.
-- [CONTRIBUTING.md](CONTRIBUTING.md) — the short version of how to build, test
-  and open a PR.
-- [DONATE.md](DONATE.md) — where sponsorship goes and how to get in touch.
+Getting started and reference:
 
-Deeper write-ups for specific features and experiments:
+- [docs/setup.md](docs/setup.md) — install, build, backends, datasets, checkpoints.
+- [docs/architecture.md](docs/architecture.md) — how the layer works.
+- [docs/benchmarks.md](docs/benchmarks.md) — results and how they were measured.
+- [docs/cli.md](docs/cli.md) — commands and options.
+- [docs/tui.md](docs/tui.md) — the terminal dashboard.
+- [docs/tui-setup.md](docs/tui-setup.md) — the TUI training wizard.
+- [docs/experiments.md](docs/experiments.md) — dreaming, the loss guard, memory capacity, the world model.
+- [docs/convert.md](docs/convert.md) — converting any Hugging Face checkpoint to PSSA.
+- [docs/contributors.md](docs/contributors.md) — building, testing, contributing.
+- [MODELMATH.md](MODELMATH.md) — the math, in full.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — quick build/test/PR guide.
+- [DONATE.md](DONATE.md) — sponsorship.
 
-- [docs/training-setup.md](docs/training-setup.md) — the TUI training wizard.
-- [docs/TUI-EXTRAS.md](docs/TUI-EXTRAS.md) — Kaggle launch/monitor, plastic
-  memory inspector, A/B inference, runs browser, alerts and GIF recording.
-- [docs/COMPARISON.md](docs/COMPARISON.md) — replaying a chain against the
-  transformer and scoring held-out tokens.
-- [docs/TRANSFORMER-BASELINE.md](docs/TRANSFORMER-BASELINE.md) — the
-  parameter-matched decoder-only baseline.
-- [docs/GPU-CLIP-SPEED.md](docs/GPU-CLIP-SPEED.md) — gradient clipping and the
-  memory-value cap.
-- [docs/PAIRED-EVAL.md](docs/PAIRED-EVAL.md) — the paired multi-seed evaluation
-  harness.
-- [docs/BATCHING.md](docs/BATCHING.md) — independent-sequence batching.
-- [docs/STACKED-DEPTH.md](docs/STACKED-DEPTH.md) — stacked-depth PSSA and loops.
-- [docs/distill_trainer.md](docs/distill_trainer.md) — Qwen3-to-PSSA
-  distillation trainer design.
-- [docs/tui-demo.tape](docs/tui-demo.tape) — the VHS tape that records the
-  dashboard GIF.
-- [assets/math.md](assets/math.md) — equations and source references for the
-  layer, also rendered by the dashboard's `F11` math tab.
+Deeper dives:
+
+- [docs/baseline.md](docs/baseline.md) — the parameter-matched transformer baseline.
+- [docs/comparison.md](docs/comparison.md) — scoring PSSA against that baseline.
+- [docs/training-stability.md](docs/training-stability.md) — gradient clipping and the memory cap.
+- [docs/paired-eval.md](docs/paired-eval.md) — multi-seed paired evaluation.
+- [docs/batching.md](docs/batching.md) — independent-sequence batching.
+- [docs/stacked-depth.md](docs/stacked-depth.md) — stacked depth and loops.
+- [docs/distill-trainer.md](docs/distill-trainer.md) — Qwen3-to-PSSA distillation trainer.
+- [docs/tui-features.md](docs/tui-features.md) — Kaggle, memory inspector, A/B inference, runs browser, alerts, GIF recording.
+- [docs/tui-demo.tape](docs/tui-demo.tape) — the dashboard GIF recording tape.
+- [assets/math.md](assets/math.md) — layer equations, rendered in the dashboard's F11 math tab.
 
 ## What this is not
 

@@ -91,7 +91,7 @@ Being straight about the scale, because the numbers above are easy to over-read:
 - Losses here are end-of-link training cross-entropy on the stream being fit,
   not held-out evaluation, unless a table says otherwise. For a held-out
   comparison on an unseen slice, use the `compare` command described in
-  [COMPARISON.md](COMPARISON.md).
+  [comparison.md](comparison.md).
 
 ## How the comparison was run
 
@@ -185,24 +185,24 @@ and is not a quality evaluation on general language tasks.
 `pssa compare` replays an existing PSSA chain with a token/update-matched
 transformer and scores both on held-out tokens. The full workflow, including
 chain provenance limits, loss CSV logging and standalone evaluation, is in
-[COMPARISON.md](COMPARISON.md). The TUI also exposes a one-key matched
-benchmark; see [TUI-EXTRAS.md](TUI-EXTRAS.md).
+[comparison.md](comparison.md). The TUI also exposes a one-key matched
+benchmark; see [tui-features.md](tui-features.md).
 
 ## Detailed write-ups
 
-- [COMPARISON.md](COMPARISON.md) — replaying the Kaggle chain against the
+- [comparison.md](comparison.md) — replaying the Kaggle chain against the
   transformer, checkpoint provenance limits, curve logging, and held-out
   evaluation without training.
-- [TRANSFORMER-BASELINE.md](TRANSFORMER-BASELINE.md) — the parameter-matched
+- [baseline.md](baseline.md) — the parameter-matched
   decoder-only baseline: architecture, size accounting, what is held constant,
   reproducible windows, and limitations.
-- [GPU-CLIP-SPEED.md](GPU-CLIP-SPEED.md) — gradient-clipping and memory-value-cap
+- [training-stability.md](training-stability.md) — gradient-clipping and memory-value-cap
   validation, bounded CPU timing, and unverified GPU behavior.
-- [PAIRED-EVAL.md](PAIRED-EVAL.md) — the opt-in paired multi-seed evaluation
+- [paired-eval.md](paired-eval.md) — the opt-in paired multi-seed evaluation
   harness and its statistics.
-- [BATCHING.md](BATCHING.md) — independent-sequence batching and its fixed-work
+- [batching.md](batching.md) — independent-sequence batching and its fixed-work
   throughput measurement.
-- [STACKED-DEPTH.md](STACKED-DEPTH.md) — depth-four pilot and parameter
+- [stacked-depth.md](stacked-depth.md) — depth-four pilot and parameter
   accounting; a smoke test, not a language-quality claim.
 
 Architecture details behind these numbers are in

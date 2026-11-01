@@ -76,7 +76,7 @@ Numeric inputs, local-file readability, HF names and output paths are validated
 before launch. When resuming, latent/state/depth and chunk must match the
 checkpoint; vocabulary comes from that checkpoint. Errors from the child appear
 in the monitor and remain in `train.log`. See
-[training-setup.md](training-setup.md) for the full wizard reference.
+[tui-setup.md](tui-setup.md) for the full wizard reference.
 
 ## Datasets
 
@@ -233,7 +233,7 @@ choice, not a guarantee of stability or a universal model-scale setting.
 size and a link count, walks the corpus offset by offset, and resumes each link
 from the previous checkpoint. `status` then reports every checkpoint in the
 chain with its shape and optimizer step count. The validated behavior behind
-these flags is documented in [GPU-CLIP-SPEED.md](GPU-CLIP-SPEED.md).
+these flags is documented in [training-stability.md](training-stability.md).
 
 ## Checkpoint compatibility
 
@@ -261,6 +261,6 @@ restored tokenizer.
 
 - Full command and option reference: [cli.md](cli.md).
 - Dashboard tour and run controls: [tui.md](tui.md).
-- Training wizard details: [training-setup.md](training-setup.md).
+- Training wizard details: [tui-setup.md](tui-setup.md).
 - Opt-in training features and experiments: [experiments.md](experiments.md).
 - Results and methodology: [benchmarks.md](benchmarks.md).

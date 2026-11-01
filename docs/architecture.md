@@ -163,8 +163,8 @@ Defaults are latent 256, recurrent state 16, memory-key 32, memory capacity 512,
 Stacked PSSA blocks (`--depth`) and shared repeated passes (`--loops`) are
 available from the normal `train` command. The operational details, parameter
 accounting and CPU-only limits of stacked depth are in
-[STACKED-DEPTH.md](STACKED-DEPTH.md). Batching independent documents through
-shared matrix operations is described in [BATCHING.md](BATCHING.md).
+[stacked-depth.md](stacked-depth.md). Batching independent documents through
+shared matrix operations is described in [batching.md](batching.md).
 
 ## Math reference
 

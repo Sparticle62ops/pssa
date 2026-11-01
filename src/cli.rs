@@ -2534,7 +2534,7 @@ impl CLIHandler {
                 println!(
                     "For paired training/seeds/bootstrap intervals use scripts/paired_eval.py."
                 );
-                println!("This minimal port scores PSSA only. See docs/PAIRED-EVAL.md.");
+                println!("This minimal port scores PSSA only. See docs/paired-eval.md.");
             }
             "chat" | "repl" => {
                 println!("Usage: {bin} chat [DATA] [OPTIONS]");
@@ -2617,7 +2617,7 @@ impl CLIHandler {
                 println!(
                     "--eval-skip-tokens N --link-plan JSON --loss-every 10000 --seed 42 --warmup-steps 0"
                 );
-                println!("Use the ORIGINAL corpus and training settings. See docs/COMPARISON.md.");
+                println!("Use the ORIGINAL corpus and training settings. See docs/comparison.md.");
             }
             "benchmark" => {
                 println!("Usage: {bin} benchmark [-f|--feature NAME] [-o|--out PATH]");

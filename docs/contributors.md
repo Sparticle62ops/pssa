@@ -89,7 +89,7 @@ that contract.
   optional generated rehearsal sequences between updates. It is described in
   [experiments.md](experiments.md#dreaming) and remains off by default.
 - **Depth and loops.** Stacked PSSA blocks (`--depth`) and shared repeated passes
-  (`--loops`), with notes in [STACKED-DEPTH.md](STACKED-DEPTH.md).
+  (`--loops`), with notes in [stacked-depth.md](stacked-depth.md).
 - **WebGPU training.** The recurrent scan and memory stage are being ported to
   WebGPU so AMD, Intel and Apple GPUs can train too. It still needs testing on a
   real hardware adapter.
@@ -123,15 +123,15 @@ baseline to compare against, and evaluation beyond next-token loss.
 
 Deeper notes for the current research directions:
 
-- [BATCHING.md](BATCHING.md) — independent-sequence batching.
-- [STACKED-DEPTH.md](STACKED-DEPTH.md) — stacked-depth PSSA.
-- [PAIRED-EVAL.md](PAIRED-EVAL.md) — paired multi-seed evaluation harness.
-- [COMPARISON.md](COMPARISON.md) — replaying a chain against the transformer.
-- [TRANSFORMER-BASELINE.md](TRANSFORMER-BASELINE.md) — the matched baseline.
-- [GPU-CLIP-SPEED.md](GPU-CLIP-SPEED.md) — clipping and memory-cap validation.
-- [distill_trainer.md](distill_trainer.md) — Qwen3-to-PSSA distillation trainer
+- [batching.md](batching.md) — independent-sequence batching.
+- [stacked-depth.md](stacked-depth.md) — stacked-depth PSSA.
+- [paired-eval.md](paired-eval.md) — paired multi-seed evaluation harness.
+- [comparison.md](comparison.md) — replaying a chain against the transformer.
+- [baseline.md](baseline.md) — the matched baseline.
+- [training-stability.md](training-stability.md) — clipping and memory-cap validation.
+- [distill-trainer.md](distill-trainer.md) — Qwen3-to-PSSA distillation trainer
   design.
-- [TUI-EXTRAS.md](TUI-EXTRAS.md) — dashboard extras.
+- [tui-features.md](tui-features.md) — dashboard extras.
 
 ## License
 
