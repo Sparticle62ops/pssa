@@ -4,7 +4,7 @@
 //! any screen from any other in two keystrokes.
 
 use super::keybindings::{
-    BACKUP_TAB, BENCHMARK_TAB, CHAIN_TAB, DEVICE_TAB, EVAL_TAB, FEED_TAB, GITHUB_TAB,
+    BACKUP_TAB, BENCHMARK_TAB, CHAIN_TAB, CONVERT_TAB, DEVICE_TAB, EVAL_TAB, FEED_TAB, GITHUB_TAB,
     HARDWARE_TAB, HF_TAB, INFERENCE_TAB, KAGGLE_TAB, LIBRARY_TAB, LIMITS_TAB, LOG_STREAM_TAB,
     MATH_TAB, MEMORY_TAB, MIXER_TAB, MODEL_TAB, MONITOR_TAB, NOTIFY_TAB, RUNS_TAB, SAMPLE_TAB,
     SETUP_TAB, SUPPORT_TAB, SWEEP_TAB, TIMELINE_TAB, UPDATE_TAB,
@@ -88,6 +88,12 @@ pub(super) const CATEGORIES: [Category; 5] = [
                 title: "Math",
                 key: 'p',
                 blurb: "PSSA equations and live dimensions",
+            },
+            Section {
+                tab: CONVERT_TAB,
+                title: "Convert",
+                key: 'o',
+                blurb: "turn a Hugging Face checkpoint into a PSSA v6 file",
             },
         ],
     },

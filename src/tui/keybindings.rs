@@ -36,10 +36,11 @@ pub(super) const SUPPORT_TAB: usize = 23;
 pub(super) const GITHUB_TAB: usize = 24;
 pub(super) const SWEEP_TAB: usize = 25;
 pub(super) const TIMELINE_TAB: usize = 26;
+pub(super) const CONVERT_TAB: usize = 27;
 /// Every renderable screen, indexed by its stable numeric id. The visible
 /// navigation is the smaller category strip in `nav`; this list stays the
 /// internal registry so screen modules keep one id each.
-pub(super) const SCREENS: [&str; 27] = [
+pub(super) const SCREENS: [&str; 28] = [
     "monitor",
     "chain",
     "model",
@@ -67,6 +68,7 @@ pub(super) const SCREENS: [&str; 27] = [
     "GitHub",
     "sweeps",
     "timeline",
+    "convert",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +101,7 @@ pub(super) enum Context {
     Network,
     NetworkEdit,
     Timeline,
+    Convert,
     Feed,
     Menu,
 }
@@ -135,6 +138,7 @@ impl Context {
             TIMELINE_TAB => Self::Timeline,
             BACKUP_TAB..=SWEEP_TAB if editing => Self::NetworkEdit,
             BACKUP_TAB..=SWEEP_TAB => Self::Network,
+            CONVERT_TAB => Self::Convert,
             _ => Self::Dashboard,
         }
     }
@@ -175,6 +179,7 @@ const LOCAL_EDIT: u32 = LIBRARY_EDIT | EVAL_EDIT;
 const NETWORK: u32 = 1 << Context::Network as u32;
 const NETWORK_EDIT: u32 = 1 << Context::NetworkEdit as u32;
 const TIMELINE: u32 = 1 << Context::Timeline as u32;
+const CONVERT: u32 = 1 << Context::Convert as u32;
 const MENU: u32 = 1 << Context::Menu as u32;
 const BROWSE: u32 = MONITOR | PAGES | SETUP | EXTRA_BROWSE | LOCAL_BROWSE | NETWORK | TIMELINE;
 const ALL: u32 = BROWSE
@@ -187,7 +192,8 @@ const ALL: u32 = BROWSE
     | LIMIT_EDIT
     | LOCAL_EDIT
     | NETWORK_EDIT
-    | MENU;
+    | MENU
+    | CONVERT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
@@ -206,6 +212,7 @@ pub(super) enum Action {
     Extras,
     Network,
     OpenCategory(usize),
+    Convert,
     Heatmap,
     Preview,
     MathScroll(i16),
@@ -304,7 +311,7 @@ const BINDINGS: &[Binding] = &[
         routes: &[(ALL, OpenCategory(4))],
     },
     bind!(Esc, "Esc", "Back out one level: close help or the palette, cancel an edit, stop chat work, cancel a running job, or leave a screen for its section menu.",
-        MONITOR | PAGES | SETUP | LOCAL_BROWSE | NETWORK | TIMELINE => BackToSections, MENU => BackToSections, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, NETWORK_EDIT => Network, PALETTE => Palette, HELP => ToggleHelp),
+        MONITOR | PAGES | SETUP | LOCAL_BROWSE | NETWORK | TIMELINE | CONVERT => BackToSections, MENU => BackToSections, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, NETWORK_EDIT => Network, PALETTE => Palette, HELP => ToggleHelp),
     bind!(Left, "Left", "Monitor: pan to older steps. Timeline: older checkpoint. Setup: previous page.",
         MONITOR => Pan(false), SETUP => Setup, TIMELINE => Network),
     bind!(Right, "Right", "Monitor: pan to newer steps. Timeline: newer checkpoint. Setup: next page.",
@@ -314,8 +321,8 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('='), "=", "Zoom in: monitor graph; mixer share (same as +).", MONITOR => Zoom(true), MIXER => Local),
     bind!(Char('-'), "-", "Zoom out: monitor graph; setup depth/loops; mixer share.", MONITOR => Zoom(false), SETUP => Setup, MIXER => Local),
     bind!(Char('0'), "0", "Monitor: reset pan and zoom.", MONITOR => ResetGraph),
-    bind!(Up, "Up", "Move up: section menu, setup fields, run and benchmark lists, devices, limits, local and network lists. Scroll up: feed, math, help.", MENU => MenuMove(-1), FEED => FeedScroll(-1), SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(-1), HELP => ScrollHelp(-1)),
-    bind!(Down, "Down", "Move down: section menu, setup fields, run and benchmark lists, devices, limits, local and network lists. Scroll down: feed, math, help.", MENU => MenuMove(1), FEED => FeedScroll(1), SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(1), HELP => ScrollHelp(1)),
+    bind!(Up, "Up", "Move up: section menu, setup fields, run and benchmark lists, devices, limits, local and network lists. Scroll up: feed, math, help.", MENU => MenuMove(-1), FEED => FeedScroll(-1), SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(-1), HELP => ScrollHelp(-1), CONVERT => Convert),
+    bind!(Down, "Down", "Move down: section menu, setup fields, run and benchmark lists, devices, limits, local and network lists. Scroll down: feed, math, help.", MENU => MenuMove(1), FEED => FeedScroll(1), SETUP => Setup, RUNS | BENCHMARK => Extras, PALETTE => Palette, DEVICE => Device, LIMITS => Limits, LOCAL_BROWSE => Local, NETWORK | TIMELINE => Network, MATH => MathScroll(1), HELP => ScrollHelp(1), CONVERT => Convert),
     bind!(BackTab, "Shift+Tab", "Previous category.", ALL => PreviousTab),
     bind!(F(5), "F5", "Setup: next wizard page.", SETUP => Setup),
     bind!(Char('c'), "c", "Setup: show command preview. Runs/library: chat with the checkpoint. Network/timeline: open or copy.", SETUP => Setup, RUNS => Extras, LIBRARY => Local, NETWORK | TIMELINE => Network),
@@ -340,9 +347,9 @@ const BINDINGS: &[Binding] = &[
     bind!(PageDown, "PgDn", "Scroll down: chat, setup preview, memory, local, network, feed, math, help.", FEED => FeedScroll(8), CHAT => Chat, SETUP => Setup, MEMORY => Extras, EVAL => Local, NETWORK => Network, MATH => MathScroll(8), HELP => ScrollHelp(8)),
     bind!(Home, "Home", "First line (feed, math, help). First field (devices, limits, network). First checkpoint (timeline).", FEED => FeedTop, HELP => HelpTop, MATH => MathTop, DEVICE => Device, LIMITS => Limits, NETWORK | TIMELINE => Network),
     bind!(End, "End", "Chat: follow. Last line (feed, math, help). Last field (devices, limits, network).", FEED => FeedBottom, CHAT => Chat, HELP => HelpBottom, MATH => MathBottom, DEVICE => Device, LIMITS => Limits, NETWORK | TIMELINE => Network),
-    bind!(Enter, "Enter", "Section menu: open the highlighted section. Chat: send. Setup: edit/save/start. HF: log in. Kaggle: review. Runs: monitor/score. Benchmark/local/network: edit/save/open. Palette: run. Devices/limits: select/edit/apply. Timeline: prepare resume.", MENU => MenuOpen, CHAT => Chat, SETUP | EDIT => Setup, HF => Hf, KAGGLE_INPUT | RUNS | RUNS_EDIT | BENCHMARK | BENCHMARK_EDIT => Extras, PALETTE => Palette, DEVICE => Device, LIMITS | LIMIT_EDIT => Limits, LOCAL_BROWSE | LOCAL_EDIT => Local, NETWORK | NETWORK_EDIT | TIMELINE => Network),
+    bind!(Enter, "Enter", "Section menu: open the highlighted section. Chat: send. Setup: edit/save/start. HF: log in. Kaggle: review. Runs: monitor/score. Benchmark/local/network: edit/save/open. Palette: run. Devices/limits: select/edit/apply. Timeline: prepare resume.", MENU => MenuOpen, CHAT => Chat, SETUP | EDIT => Setup, HF => Hf, KAGGLE_INPUT | RUNS | RUNS_EDIT | BENCHMARK | BENCHMARK_EDIT => Extras, PALETTE => Palette, DEVICE => Device, LIMITS | LIMIT_EDIT => Limits, LOCAL_BROWSE | LOCAL_EDIT => Local, NETWORK | NETWORK_EDIT | TIMELINE => Network, CONVERT => Convert),
     bind!(Char(' '), "Space", "Activate the selected field or button (setup, devices, limits). In a text editor it types a space.", SETUP => Setup, DEVICE => Device, LIMITS => Limits),
-    bind!(Backspace, "Backspace", "Delete a character in text editors and the palette.", CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA_EDIT => Extras, PALETTE => Palette, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, NETWORK_EDIT => Network),
+    bind!(Backspace, "Backspace", "Delete a character in text editors and the palette.", CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA_EDIT => Extras, PALETTE => Palette, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, NETWORK_EDIT => Network, CONVERT => Convert),
     Binding {
         code: Char('u'),
         modifiers: KeyModifiers::CONTROL,
@@ -355,6 +362,7 @@ const BINDINGS: &[Binding] = &[
             (LIMIT_EDIT, Limits),
             (LOCAL_EDIT, Local),
             (NETWORK_EDIT, Network),
+            (CONVERT, Convert),
         ],
     },
     Binding {
@@ -400,6 +408,7 @@ impl Context {
                 | Context::LibraryEdit
                 | Context::EvalEdit
                 | Context::NetworkEdit
+                | Context::Convert
         )
     }
 }
@@ -438,6 +447,7 @@ pub(super) fn action(key: KeyEvent, context: Context) -> Option<Action> {
             Context::LimitsEdit => Some(Limits),
             Context::LibraryEdit | Context::EvalEdit => Some(Local),
             Context::NetworkEdit => Some(Network),
+            Context::Convert => Some(Convert),
             _ => None,
         };
     }
@@ -751,6 +761,7 @@ mod tests {
                 Context::Timeline,
                 Context::Timeline,
             ),
+            (CONVERT_TAB, "convert", Context::Convert, Context::Convert),
         ];
         let mut indices = HashSet::new();
         let mut contexts = vec![Context::Help, Context::Palette, Context::Menu];
@@ -770,7 +781,7 @@ mod tests {
                 .fold(0, |mask, context| mask | context.mask()),
             ALL
         );
-        assert_eq!(ALL.count_ones(), 30);
+        assert_eq!(ALL.count_ones(), 31);
         for context in contexts {
             for binding in BINDINGS {
                 let matching: Vec<_> = BINDINGS

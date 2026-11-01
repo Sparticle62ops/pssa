@@ -10,6 +10,7 @@ pub(crate) mod benchmark_replay;
 mod charts;
 mod chat;
 mod comparison;
+mod convert;
 mod depth_zoom;
 mod device;
 mod eval;
@@ -231,6 +232,7 @@ struct RunState {
     math_view: math::Math,
     device_picker: std::cell::RefCell<device::DevicePicker>,
     resource_limits: std::cell::RefCell<limits::Limits>,
+    convert: convert::Panel,
     loop_count: usize,
     feed: Option<FeedState>,
     feed_telemetry: Option<bool>,
@@ -1394,6 +1396,7 @@ fn run_app(
                 }
             }
             hf_login.poll();
+            state.convert.poll();
             extras.poll_with(&mut state, &mut tab, &mut chat, |event| {
                 network.remote_line(event)
             });
@@ -1442,6 +1445,9 @@ fn run_app(
                 if !nav.menu {
                     if tab == HF_TAB {
                         hf_login.draw(f, feature_area(f.area()));
+                    }
+                    if tab == keybindings::CONVERT_TAB {
+                        state.convert.draw(f, feature_area(f.area()));
                     }
                     local.draw(f, tab);
                     extras.draw(f, &state, tab, &chat);
@@ -1566,6 +1572,7 @@ fn run_app(
                             None => {}
                         },
                         Some(Action::Hf) => hf_login.key(key),
+                        Some(Action::Convert) => state.convert.key(key),
                         Some(Action::Extras) => {
                             if training.as_ref().is_some_and(|run| run.active())
                                 && ((tab == BENCHMARK_TAB
