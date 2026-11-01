@@ -67,6 +67,14 @@ use std::time::{Duration, Instant};
 
 use keybindings::{BENCHMARK_TAB, HF_TAB, KAGGLE_TAB, MEMORY_TAB, RUNS_TAB, SCREENS};
 // Five scanlines leave room for the P's stem, both S turns and the A's crossbar.
+const PSSA_LOGO: [&str; 5] = [
+    "███    ███   ███   ██ ",
+    "█  █  █     █     █  █",
+    "███    ██    ██   ████",
+    "█        █     █  █  █",
+    "█     ███   ███   █  █",
+];
+
 // Halloween week palette. Every October 24-31 the TUI lights itself up
 // jack-o'-lantern orange over haunted violet; PSSA_SPOOKY=1 forces it on,
 // PSSA_SPOOKY=0 keeps the regular look any day of the year.
@@ -2451,15 +2459,10 @@ fn draw_with_background(
         .split(area);
     let header = chunks[0];
     if large_title {
-        // The wordmark is gone: the app identifies itself with a compact
-        // text block in the left gutter, run stats keep the wide header.
+        // The nine-square mark stays out of the header: the PSSA wordmark
+        // identifies the app, run stats keep the wide header.
         f.render_widget(
-            Paragraph::new(vec![
-                Line::styled(format!("PSSA Engine{halloween}"), accent()),
-                Line::styled("pssa tui", accent()),
-                Line::styled("? help", Style::default().fg(normal_green())),
-                Line::styled("Ctrl+C quit", Style::default().fg(normal_green())),
-            ]),
+            Paragraph::new(PSSA_LOGO.map(|row| Line::styled(row, accent())).to_vec()),
             Rect::new(header.x, header.y, 24, 5),
         );
         draw_header_stats(
@@ -4203,7 +4206,36 @@ mod tests {
         assert!(row(2).contains("[ WAITING ]"));
     }
 
-    #[test]
+        #[test]
+    fn test_backend_logo_has_distinct_p_s_s_a_strokes() {
+        use ratatui::{Terminal, backend::TestBackend};
+        // Independent pixel masks catch the old OCCO-like glyphs, not merely
+        // whether the renderer copied the PSSA_LOGO constant into the buffer.
+        let letters = [
+            ["1110", "1001", "1110", "1000", "1000"], // P: open lower bowl + stem
+            ["0111", "1000", "0110", "0001", "1110"], // S: opposite turns
+            ["0111", "1000", "0110", "0001", "1110"],
+            ["0110", "1001", "1111", "1001", "1001"], // A: crossbar + legs
+        ];
+        for (width, height) in [(80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| draw(f, &RunState::default(), 2)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let origin = HexBackground::content_area(buffer.area);
+            for (letter, rows) in letters.iter().enumerate() {
+                for (y, mask) in rows.iter().enumerate() {
+                    for (x, pixel) in mask.chars().enumerate() {
+                        let cell =
+                            &buffer[(origin.x + (letter * 6 + x) as u16, origin.y + y as u16)];
+                        assert_eq!(cell.symbol(), if pixel == '1' { "█" } else { " " });
+                        assert_eq!(cell.fg, normal_green());
+                    }
+                }
+            }
+        }
+    }
+
+#[test]
     fn test_backend_header_shows_live_stats_on_every_tab_and_missing_values() {
         use ratatui::{Terminal, backend::TestBackend};
         let mut state = RunState::default();
