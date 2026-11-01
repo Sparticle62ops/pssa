@@ -270,11 +270,11 @@ const BINDINGS: &[Binding] = &[
     bind!(F(1), "F1", "Open or close this help. Works even while typing.", ALL => ToggleHelp),
     bind!(Char('?'), "?", "Open or close this help outside text editors. In an editor it just types '?'.", BROWSE | MENU | HELP => ToggleHelp),
     bind!(Char('q'), "q", "Quit from a normal tab or the section menu. When help is open, close help instead.", BROWSE | MENU => Quit, HELP => ToggleHelp),
-    bind!(Char('1'), "1", "Open the Overview category menu.", BROWSE | MENU => OpenCategory(0)),
-    bind!(Char('2'), "2", "Open the Model category menu.", BROWSE | MENU => OpenCategory(1)),
-    bind!(Char('3'), "3", "Open the Data & Eval category menu.", BROWSE | MENU => OpenCategory(2)),
-    bind!(Char('4'), "4", "Open the Training category menu.", BROWSE | MENU => OpenCategory(3)),
-    bind!(Char('5'), "5", "Open the Settings category menu.", BROWSE | MENU => OpenCategory(4)),
+    bind!(Char('1'), "1", "Open the Overview category menu.", BROWSE => OpenCategory(0)),
+    bind!(Char('2'), "2", "Open the Model category menu.", BROWSE => OpenCategory(1)),
+    bind!(Char('3'), "3", "Open the Data & Eval category menu.", BROWSE => OpenCategory(2)),
+    bind!(Char('4'), "4", "Open the Training category menu.", BROWSE => OpenCategory(3)),
+    bind!(Char('5'), "5", "Open the Settings category menu.", BROWSE => OpenCategory(4)),
     Binding {
         code: Char('1'),
         modifiers: KeyModifiers::ALT,
@@ -475,7 +475,7 @@ impl Help {
         let inner = block.inner(area);
         let mut lines: Vec<Line<'static>> = vec![
             Line::from("Keys on the left, what they do on the right. Press F1, ? or Esc to close; PgUp/PgDn scroll."),
-            Line::from("Navigation: Tab / Shift+Tab move between the five categories; 1-5 (or Alt+1-5 while typing) jump straight to one. On a category menu, arrows or j/k move, Enter opens the highlighted section, and its letter opens it directly."),
+            Line::from("Navigation: Tab / Shift+Tab move between the five categories; 1-5 (or Alt+1-5 while typing) jump straight to one. On a category menu, arrows or j/k move, Enter opens the highlighted section, and its number opens it directly."),
             Line::from("Esc backs out one level: close help or the palette, cancel an edit, stop chat work, cancel a running job, or leave a screen for its menu. Ctrl+K jumps to any screen."),
             Line::from(""),
         ];
@@ -485,11 +485,11 @@ impl Help {
                 .map(|binding| Line::from(format!("{:<10} {}", binding.label, binding.description))),
         );
         lines.push(Line::from(""));
-        lines.push(Line::from("Category menus and their section letters:"));
+        lines.push(Line::from("Category menus and their section numbers:"));
         lines.extend(nav::CATEGORIES.iter().enumerate().map(|(index, category)| {
             let mut text = format!("{} {}:", index + 1, category.name);
-            for section in category.sections {
-                text.push_str(&format!("  {} {}", section.key, section.title));
+            for (index, section) in category.sections.iter().enumerate() {
+                text.push_str(&format!("  {} {}", nav::section_digit(index), section.title));
             }
             Line::from(text)
         }));
@@ -1049,13 +1049,12 @@ mod tests {
         assert_eq!(action(key(Char('?')), Context::Menu), Some(ToggleHelp));
         assert_eq!(action(key(Char('q')), Context::Menu), Some(Quit));
 
-        // 1-5 pick a category on any browse screen. Alt+1-5 also work while
-        // typing, which keeps two-key reachability from chat and editors.
+        // 1-5 pick a category on any browse screen. On the section menu the
+        // same digits pick a section, handled by the nav digit path, so the
+        // action table stays silent there. Alt+1-5 also work while typing,
+        // which keeps two-key reachability from chat and editors.
         for (index, digit) in ['1', '2', '3', '4', '5'].into_iter().enumerate() {
-            assert_eq!(
-                action(key(Char(digit)), Context::Menu),
-                Some(OpenCategory(index))
-            );
+            assert_eq!(action(key(Char(digit)), Context::Menu), None);
             for context in [
                 Context::Monitor,
                 Context::Runs,

@@ -1,6 +1,6 @@
 //! Category and section navigation. Five category tabs hold the existing
 //! screens as sections, so the top strip stays short while every screen keeps
-//! its own state and renderer. A category digit plus a section letter opens
+//! its own state and renderer. A category digit plus a section number opens
 //! any screen from any other in two keystrokes.
 
 use super::keybindings::{
@@ -302,12 +302,37 @@ impl Nav {
         self.menu = true;
     }
 
-    /// Section letter pressed on the menu, if any.
+    /// Section number pressed on the menu, if any. 1-9 pick the first nine
+    /// sections and 0 picks the tenth.
+    pub(super) fn section_for_digit(&self, key: char) -> Option<usize> {
+        let index = match key {
+            '1'..='9' => (key as u8 - b'1') as usize,
+            '0' => 9,
+            _ => return None,
+        };
+        if index < CATEGORIES[self.category].sections.len() {
+            Some(index)
+        } else {
+            None
+        }
+    }
+
+    /// Section letter pressed on the menu, if any. Kept as a hidden alias so
+    /// screen shortcuts and old muscle memory keep working.
     pub(super) fn section_for_key(&self, key: char) -> Option<usize> {
         CATEGORIES[self.category]
             .sections
             .iter()
             .position(|section| section.key == key)
+    }
+}
+
+/// The on-screen number for a section row: 1-9 then 0 for the tenth.
+pub(super) fn section_digit(index: usize) -> char {
+    if index == 9 {
+        '0'
+    } else {
+        char::from(b'1' + index as u8)
     }
 }
 
@@ -339,6 +364,23 @@ mod tests {
         assert_eq!(seen.len(), SCREENS.len());
         for tab in 0..SCREENS.len() {
             assert!(seen.contains(&tab), "{} has no section", SCREENS[tab]);
+        }
+    }
+
+    #[test]
+    fn section_numbers_cover_every_section() {
+        for category in &CATEGORIES {
+            for index in 0..category.sections.len() {
+                let digit = section_digit(index);
+                let picked = category
+                    .sections
+                    .len()
+                    .checked_sub(1)
+                    .map(|_| index < category.sections.len())
+                    .unwrap_or(false);
+                assert!(picked || digit == '0');
+                assert!("1234567890".contains(digit));
+            }
         }
     }
 

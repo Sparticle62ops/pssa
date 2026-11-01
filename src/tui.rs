@@ -1465,13 +1465,15 @@ fn run_app(
                             })
                     };
                     let action = keybindings::action(key, context);
-                    // On a section menu a plain letter opens that section. Letters
-                    // are only consumed here, so screen shortcuts keep theirs.
+                    // On a section menu a plain number opens that section;
+                    // letters stay as hidden aliases. These are only consumed
+                    // here, so screen shortcuts keep theirs.
                     if action.is_none()
                         && context == Context::Menu
                         && let crossterm::event::KeyCode::Char(c) = key.code
                         && !c.is_control()
-                        && let Some(index) = nav.section_for_key(c)
+                        && let Some(index) =
+                            nav.section_for_digit(c).or_else(|| nav.section_for_key(c))
                     {
                         nav.section = index;
                         nav.open_section();
@@ -2582,7 +2584,7 @@ fn draw_with_background(
 }
 
 /// Section menu for one category: related screens grouped in place, with a
-/// letter, title and plain-language summary for each.
+/// number, title and plain-language summary for each.
 fn draw_section_menu(f: &mut ratatui::Frame, area: Rect, nav: &nav::Nav) {
     let category = &nav::CATEGORIES[nav.category];
     let title = format!(" {} / pick a section ", category.name);
@@ -2594,10 +2596,18 @@ fn draw_section_menu(f: &mut ratatui::Frame, area: Rect, nav: &nav::Nav) {
     }
     let mut lines = vec![
         Line::styled(category.blurb, Style::new().fg(second_accent())),
-        Line::from("Enter opens the highlighted section · its letter opens it directly"),
+        Line::from("Enter opens the highlighted section · its number opens it directly"),
+        Line::from(""),
     ];
     let rows = usize::from(inner.height).saturating_sub(lines.len());
-    let first = nav.section.saturating_sub(rows.saturating_sub(1));
+    // When every section plus a blank spacer between rows fits, lay the menu
+    // out roomily; narrow or short terminals fall back to the compact list.
+    let roomy = category.sections.len() * 2 - 1 <= rows;
+    let first = if roomy {
+        0
+    } else {
+        nav.section.saturating_sub(rows.saturating_sub(1))
+    };
     for (index, section) in category
         .sections
         .iter()
@@ -2612,7 +2622,11 @@ fn draw_section_menu(f: &mut ratatui::Frame, area: Rect, nav: &nav::Nav) {
         }
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{} {}  ", if selected { "▶" } else { " " }, section.key),
+                format!(
+                    " {} {}  ",
+                    if selected { "▶" } else { " " },
+                    nav::section_digit(index)
+                ),
                 if selected {
                     accent().add_modifier(Modifier::BOLD)
                 } else {
@@ -2622,6 +2636,9 @@ fn draw_section_menu(f: &mut ratatui::Frame, area: Rect, nav: &nav::Nav) {
             Span::styled(format!("{:<11}", section.title), title),
             Span::styled(section.blurb, Style::new().fg(Color::Gray)),
         ]));
+        if roomy && index + 1 < category.sections.len() {
+            lines.push(Line::from(""));
+        }
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -4130,7 +4147,7 @@ mod tests {
                 assert!(text.contains("pick a section"), "{width}x{height}");
                 assert!(text.contains(category.name), "{width}x{height}");
                 assert!(text.contains(category.blurb), "{width}x{height}");
-                for section in category.sections {
+                for (row, section) in category.sections.iter().enumerate() {
                     assert!(
                         text.contains(section.title),
                         "{width}x{height} missing {}",
@@ -4142,8 +4159,12 @@ mod tests {
                         section.blurb
                     );
                     assert!(
-                        text.contains(&format!("{}  {}", section.key, section.title)),
-                        "{width}x{height} missing letter {}",
+                        text.contains(&format!(
+                            "{}  {}",
+                            nav::section_digit(row),
+                            section.title
+                        )),
+                        "{width}x{height} missing number {}",
                         section.title
                     );
                 }
