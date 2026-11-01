@@ -324,6 +324,84 @@ pub fn plan_from_paths(
     Ok((info, shards))
 }
 
+/// Parse a `--target` size like `500m`, `1b`, `5b`, `64k`, or a bare
+/// parameter count. Returns the requested number of student parameters.
+pub fn parse_target_size(value: &str) -> Option<u64> {
+    let text = value.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return None;
+    }
+    let (digits, scale): (&str, u64) = if let Some(head) = text.strip_suffix('b') {
+        (head, 1_000_000_000)
+    } else if let Some(head) = text.strip_suffix('m') {
+        (head, 1_000_000)
+    } else if let Some(head) = text.strip_suffix('k') {
+        (head, 1_000)
+    } else {
+        (text.as_str(), 1)
+    };
+    let number: u64 = digits.parse().ok()?;
+    number.checked_mul(scale)
+}
+
+/// Trainable parameters of one `PSSAContinuousBlockV2` with the default
+/// single rank-16 adapter and local-conv/ssm-skip disabled, mirroring
+/// `PSSAContinuousBlockV2::parameter_count` without allocating.
+fn student_block_params(latent: u128, state: u128, key: u128) -> u128 {
+    7 * latent * latent + latent * (3 * state + 2 * key + 34)
+}
+
+fn student_params(vocab: u128, latent: u128, depth: u128, state: u128, key: u128) -> u128 {
+    2 * vocab * latent + depth * student_block_params(latent, state, key)
+}
+
+/// Pick the latent width whose student lands closest to `target_params`.
+/// Returns `(latent, parameters at that latent)`.
+pub fn solve_latent_for_params(
+    target_params: u64,
+    vocab: usize,
+    depth: usize,
+    state: usize,
+    key: usize,
+) -> Result<(u64, u64), String> {
+    if target_params == 0 {
+        return Err("target size must be a positive parameter count".to_owned());
+    }
+    let params = |latent: u64| -> u128 {
+        student_params(
+            vocab as u128,
+            latent as u128,
+            depth as u128,
+            state as u128,
+            key as u128,
+        )
+    };
+    let max_latent = 1u64 << 17;
+    if params(max_latent) < u128::from(target_params) {
+        return Err(format!(
+            "target of {target_params} parameters is beyond the student shape (latent caps at {max_latent})"
+        ));
+    }
+    let target = u128::from(target_params);
+    let mut lo = 4u64;
+    let mut hi = max_latent;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if params(mid) >= target {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let below = lo.max(5) - 1;
+    let (chosen, count) = if params(below).abs_diff(target) <= params(lo).abs_diff(target) {
+        (below, params(below))
+    } else {
+        (lo, params(lo))
+    };
+    Ok((chosen, count as u64))
+}
+
 pub struct ConvertOptions {
     pub shards: Vec<PathBuf>,
     pub info: ArchInfo,
@@ -362,11 +440,28 @@ pub fn convert(options: ConvertOptions) -> Result<ConversionReport, String> {
             "depth clamped {depth_requested} -> {depth_used} (student shape supports up to 32 layers)"
         ));
     }
+    let mut sizing_note: Option<String> = None;
     let latent_dim = match target_mode.as_str() {
         "compact" => 256,
         "source-width" => info.hidden_size,
-        other => return Err(format!("unknown --target '{other}'; expected compact or source-width")),
+        other => {
+            let requested = parse_target_size(other).ok_or_else(|| {
+                format!(
+                    "unknown --target '{other}'; expected compact, source-width, or a size like 500m or 5b"
+                )
+            })?;
+            let (latent, params) =
+                solve_latent_for_params(requested, info.vocab_size, depth_used, 16, 32)?;
+            sizing_note = Some(format!(
+                "target '{other}' solved to latent {latent} ({params} parameters, ~{} GiB checkpoint file)",
+                params.saturating_mul(16) / (1_u64 << 30)
+            ));
+            latent as usize
+        }
     };
+    if let Some(note) = sizing_note {
+        notes.push(note);
+    }
     let target = Qwen3PssaTarget {
         vocab_size: info.vocab_size,
         depth: depth_used,
@@ -500,7 +595,7 @@ pub fn convert(options: ConvertOptions) -> Result<ConversionReport, String> {
 
 // -------------------------------------------------------------------- CLI
 
-pub const USAGE: &str = "convert <model-or-dir> <config.json> <out.v6> [--target compact|source-width] [--seed N]";
+pub const USAGE: &str = "convert <model-or-dir> <config.json> <out.v6> [--target compact|source-width|SIZE] [--seed N]  (SIZE like 500m or 5b sizes the student to that many parameters)";
 
 /// Entry point for `pssa convert ...` and the TUI convert action. Prints a
 /// human-readable conversion report to stdout.
@@ -526,7 +621,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
                 target_mode = args
                     .get(index)
                     .cloned()
-                    .ok_or("--target needs a value (compact or source-width)")?;
+                    .ok_or("--target needs a value (compact, source-width, or a size like 5b)")?;
             }
             "--seed" => {
                 index += 1;
@@ -566,4 +661,63 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     })?;
     println!("{}", report.summary());
     Ok(())
+}
+
+#[cfg(test)]
+mod sizing_tests {
+    use super::*;
+    use crate::pssa::{PSSAConfigV2, PSSALayerV2};
+
+    #[test]
+    fn parse_target_size_accepts_suffixes_and_bare_counts() {
+        assert_eq!(parse_target_size("5b"), Some(5_000_000_000));
+        assert_eq!(parse_target_size(" 8B "), Some(8_000_000_000));
+        assert_eq!(parse_target_size("500m"), Some(500_000_000));
+        assert_eq!(parse_target_size("64k"), Some(64_000));
+        assert_eq!(parse_target_size("1500000"), Some(1_500_000));
+        assert_eq!(parse_target_size("compact"), None);
+        assert_eq!(parse_target_size(""), None);
+        assert_eq!(parse_target_size("5x"), None);
+        assert_eq!(parse_target_size("0.5b"), None);
+    }
+
+    #[test]
+    fn param_formula_matches_the_real_layer() {
+        let config = PSSAConfigV2 {
+            depth: 3,
+            d_vocab: 37,
+            d_latent: 24,
+            d_state: 4,
+            d_mem_key: 3,
+            mem_capacity: 5,
+            chunk_len: 8,
+            ..Default::default()
+        };
+        let layer = PSSALayerV2::new(config, 7);
+        assert_eq!(
+            student_params(37, 24, 3, 4, 3),
+            u128::try_from(layer.parameter_count()).expect("parameter count"),
+        );
+    }
+
+    #[test]
+    fn solve_lands_close_to_the_requested_count() {
+        let (latent, params) = solve_latent_for_params(1_000_000, 2048, 8, 16, 32).expect("solve");
+        assert!(latent >= 4, "latent {latent}");
+        assert!(
+            (i128::from(params) - 1_000_000).abs() <= 50_000,
+            "latent {latent} gave {params} params"
+        );
+    }
+
+    #[test]
+    fn solve_scales_a_qwen3_8b_shaped_student_to_five_billion() {
+        let (latent, params) =
+            solve_latent_for_params(5_000_000_000, 151_936, 32, 16, 32).expect("solve");
+        assert!((3_800..=4_600).contains(&latent), "latent {latent}");
+        assert!(
+            (i128::from(params) - 5_000_000_000).abs() <= 50_000_000,
+            "params {params}"
+        );
+    }
 }

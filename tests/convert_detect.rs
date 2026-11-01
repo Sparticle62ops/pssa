@@ -174,3 +174,35 @@ fn missing_embedding_fails_with_a_useful_message() {
     .unwrap_err();
     assert!(error.contains("no embedding tensor"), "unexpected error: {error}");
 }
+
+#[test]
+fn size_target_solves_the_latent_width() {
+    let dir = std::env::temp_dir().join("pssa_convert_test_size");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("tiny.safetensors");
+    write_tiny_safetensors(&source, "model.embed_tokens.weight");
+    let config = json!({
+        "model_type": "llama",
+        "vocab_size": 8usize,
+        "hidden_size": 16usize,
+        "num_hidden_layers": 1usize
+    });
+    let info = detect(&config).unwrap();
+    let report = convert(ConvertOptions {
+        shards: vec![source],
+        info,
+        target_mode: "2k".into(),
+        seed: 7,
+        out_path: dir.join("tiny-2k.v6"),
+    })
+    .unwrap();
+    assert_eq!(report.latent_dim, 9);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("solved to latent 9")),
+        "notes: {:?}",
+        report.notes
+    );
+}

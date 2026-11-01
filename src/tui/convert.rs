@@ -14,7 +14,7 @@ const FIELD_LABELS: [&str; 5] = [
     "source (HF checkpoint dir or .safetensors)",
     "config (config.json path)",
     "output (.pssa path to write)",
-    "target (compact or source-width)",
+    "target (compact, source-width, or size like 5b)",
     "seed (integer, default 1234)",
 ];
 
@@ -137,7 +137,15 @@ impl Panel {
         match self.fields[3].trim() {
             "" => Ok("compact".to_owned()),
             "compact" | "source-width" => Ok(self.fields[3].trim().to_owned()),
-            other => Err(format!("target must be compact or source-width, got '{other}'")),
+            other => {
+                if crate::convert::parse_target_size(other).is_some() {
+                    Ok(self.fields[3].trim().to_owned())
+                } else {
+                    Err(format!(
+                        "target must be compact, source-width, or a size like 5b, got '{other}'"
+                    ))
+                }
+            }
         }
     }
 
@@ -438,7 +446,7 @@ mod tests {
         assert!(text.contains("convert"));
         assert!(text.contains("source (HF checkpoint dir"));
         assert!(text.contains("config (config.json path)"));
-        assert!(text.contains("target (compact or source-width)"));
+        assert!(text.contains("target (compact, source-width, or size like 5b)"));
         assert!(text.contains("Enter: detect the checkpoint family"));
     }
 }
