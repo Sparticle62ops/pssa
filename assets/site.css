@@ -1106,3 +1106,19 @@ code{font-family:var(--mono)}
 .resource-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
 @media (max-width:760px){.resource-grid{grid-template-columns:1fr}}
 .h-like{margin-bottom:10px}
+
+/* Download page: smart-download CTA + terminal quick start */
+.dl-cta{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-top:clamp(26px,3vw,40px)}
+.dl-btn{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:14px;font-weight:600;letter-spacing:.2px;color:#06130b;background:#3BCB78;border:1px solid #3BCB78;border-radius:10px;padding:14px 22px;text-decoration:none;transition:background .15s ease,box-shadow .15s ease,transform .15s ease}
+.dl-btn:hover{background:#62E096;box-shadow:0 0 22px rgba(59,203,120,.35);transform:translateY(-1px)}
+.dl-sub{font-family:var(--mono);font-size:12px;color:#7fae92;margin:0;max-width:46ch;line-height:1.6}
+.dl-sub a{color:#96EFB7;text-decoration:none;border-bottom:1px solid #1c3a29}
+.dl-sub a:hover{color:#C4F8D8}
+.term-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:18px}
+@media (max-width:760px){.term-grid{grid-template-columns:1fr}}
+.term{background:#0b120e;border:1px solid #1c3a29;border-radius:10px;overflow:hidden}
+.term-bar{display:flex;align-items:center;gap:6px;padding:9px 13px;background:#0e1712;border-bottom:1px solid #1c3a29}
+.term-dot{width:8px;height:8px;border-radius:50%;background:#22A85D;opacity:.8}
+.term-title{margin-left:8px;font-family:var(--mono);font-size:11px;color:#96EFB7;letter-spacing:.5px}
+.term pre{background:transparent;border:0;border-radius:0;margin:0;padding:14px 16px;font-size:12.5px;color:#d7f5e3}
+.qs-note{margin-top:16px;color:#8fb39e}
