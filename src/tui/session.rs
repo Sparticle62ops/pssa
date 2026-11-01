@@ -3,7 +3,9 @@ use crossterm::{
     cursor::Show,
     event::{DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
+    },
 };
 use std::{
     io,
@@ -36,7 +38,7 @@ impl Session {
     pub(super) fn start() -> io::Result<(Self, ratatui::DefaultTerminal)> {
         let session = Self::arm();
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, SetTitle("PSSA Engine"))?;
         let terminal =
             ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))?;
         // Unsupported terminals ignore these requests: no mouse events means

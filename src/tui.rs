@@ -2511,10 +2511,10 @@ fn draw_with_background(
         );
     } else {
         let halloween = if spooky() { "  \u{1F383} happy halloween" } else { "" };
-        let title = if area.width >= 45 {
-            format!("PSSA / pssa tui{halloween}  Tab categories  ? help  Ctrl+C quit")
+        let title = if area.width >= 60 {
+            format!("PSSA Engine / pssa tui{halloween}  Tab categories  ? help  Ctrl+C quit")
         } else {
-            format!("PSSA / pssa tui{halloween}  ? help")
+            format!("PSSA Engine / pssa tui{halloween}  ? help")
         };
         f.render_widget(
             Paragraph::new(vec![Line::styled(title, accent()), status_badge(&health)]),
