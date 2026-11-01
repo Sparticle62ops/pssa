@@ -46,6 +46,7 @@ mod shadow;
 mod speech;
 mod support;
 mod sweep;
+pub(crate) mod telemetry;
 mod timeline;
 mod update;
 mod world_model;
@@ -114,13 +115,13 @@ fn spooky() -> bool {
     })
 }
 
-fn normal_green() -> Color {
+pub(super) fn normal_green() -> Color {
     if spooky() { SPOOKY_ORANGE } else { Color::Rgb(0x39, 0xe0, 0x7a) }
 }
-fn second_accent() -> Color {
+pub(super) fn second_accent() -> Color {
     if spooky() { SPOOKY_VIOLET } else { Color::Rgb(0x57, 0x82, 0x91) }
 }
-fn panel_bg() -> Color {
+pub(super) fn panel_bg() -> Color {
     if spooky() { SPOOKY_PANEL_BG } else { Color::Rgb(0x07, 0x12, 0x10) }
 }
 fn inset_bg() -> Color {
@@ -1289,6 +1290,15 @@ fn run_app(
     let mut local = local::Local::new(chain_dir.clone());
     let mut help = keybindings::Help::default();
     let mut palette = overlay::Overlay::default();
+    let mut telemetry = telemetry::Telemetry::load();
+    telemetry::Telemetry::record(
+        "start",
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        }),
+    );
     let mut training: Option<setup::TrainingRun> = None;
     let mut hf_login = hf::Login::new();
     let mut extras = extras::Extras::new(chain_dir.clone());
@@ -1419,6 +1429,7 @@ fn run_app(
                     network.draw(f, tab);
                 }
                 palette.draw(f);
+                telemetry.draw(f);
                 if help.open {
                     help.draw(f);
                 }
@@ -1445,7 +1456,9 @@ fn run_app(
                 if key.kind == crossterm::event::KeyEventKind::Press {
                     use keybindings::{Action, Context};
                     let old_tab = tab;
-                    let context = if help.open {
+                    let context = if telemetry.prompt_open {
+                        Context::Telemetry
+                    } else if help.open {
                         Context::Help
                     } else if palette.open {
                         Context::Palette
@@ -1480,6 +1493,8 @@ fn run_app(
                         tab = nav.tab();
                     }
                     match action {
+                        Some(Action::TelemetryAllow) => telemetry.answer(true),
+                        Some(Action::TelemetryDecline) => telemetry.answer(false),
                         Some(Action::Quit) => break,
                         Some(Action::NextTab) => {
                             palette.open = false;
@@ -1680,7 +1695,7 @@ fn poll_training_queue(
     started
 }
 
-fn accent() -> Style {
+pub(super) fn accent() -> Style {
     Style::new().fg(normal_green())
 }
 

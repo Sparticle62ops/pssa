@@ -104,6 +104,7 @@ pub(super) enum Context {
     Convert,
     Feed,
     Menu,
+    Telemetry,
 }
 impl Context {
     fn mask(self) -> u32 {
@@ -181,6 +182,7 @@ const NETWORK_EDIT: u32 = 1 << Context::NetworkEdit as u32;
 const TIMELINE: u32 = 1 << Context::Timeline as u32;
 const CONVERT: u32 = 1 << Context::Convert as u32;
 const MENU: u32 = 1 << Context::Menu as u32;
+const TELEMETRY: u32 = 1 << Context::Telemetry as u32;
 const BROWSE: u32 = MONITOR | PAGES | SETUP | EXTRA_BROWSE | LOCAL_BROWSE | NETWORK | TIMELINE;
 const ALL: u32 = BROWSE
     | CHAT
@@ -231,6 +233,8 @@ pub(super) enum Action {
     ScrollHelp(i16),
     HelpTop,
     HelpBottom,
+    TelemetryAllow,
+    TelemetryDecline,
 }
 
 struct Binding {
@@ -311,7 +315,7 @@ const BINDINGS: &[Binding] = &[
         routes: &[(ALL, OpenCategory(4))],
     },
     bind!(Esc, "Esc", "Back out one level: close help or the palette, cancel an edit, stop chat work, cancel a running job, or leave a screen for its section menu.",
-        MONITOR | PAGES | SETUP | LOCAL_BROWSE | NETWORK | TIMELINE | CONVERT => BackToSections, MENU => BackToSections, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, NETWORK_EDIT => Network, PALETTE => Palette, HELP => ToggleHelp),
+        MONITOR | PAGES | SETUP | LOCAL_BROWSE | NETWORK | TIMELINE | CONVERT => BackToSections, MENU => BackToSections, CHAT => Chat, EDIT => Setup, HF => Hf, EXTRA => Extras, LIMIT_EDIT => Limits, LOCAL_EDIT => Local, NETWORK_EDIT => Network, PALETTE => Palette, HELP => ToggleHelp, TELEMETRY => TelemetryDecline),
     bind!(Left, "Left", "Monitor: pan to older steps. Timeline: older checkpoint. Setup: previous page.",
         MONITOR => Pan(false), SETUP => Setup, TIMELINE => Network),
     bind!(Right, "Right", "Monitor: pan to newer steps. Timeline: newer checkpoint. Setup: next page.",
@@ -339,8 +343,8 @@ const BINDINGS: &[Binding] = &[
     bind!(Char('n'), "n", "Kaggle preview: cancel the launch.", KAGGLE_BUSY => Extras),
     bind!(Char('N'), "N", "Kaggle preview: cancel the launch (uppercase N).", KAGGLE_BUSY => Extras),
     bind!(Char('m'), "m", "Library: edit the models folder.", LIBRARY => Local),
-    bind!(Char('d'), "d", "Limits: reset the draft. Library: edit the datasets folder. Network: toggle, stop or cancel.", LIMITS => Limits, LIBRARY => Local, NETWORK => Network),
-    bind!(Char('a'), "a", "Eval: pause or resume background checkpoint evaluation.", EVAL => Local),
+    bind!(Char('d'), "d", "Limits: reset the draft. Library: edit the datasets folder. Network: toggle, stop or cancel. Telemetry prompt: decline anonymous data.", LIMITS => Limits, LIBRARY => Local, NETWORK => Network, TELEMETRY => TelemetryDecline),
+    bind!(Char('a'), "a", "Eval: pause or resume background checkpoint evaluation. Telemetry prompt: allow anonymous data.", EVAL => Local, TELEMETRY => TelemetryAllow),
     bind!(Char('u'), "u", "Library: fill Setup's Resume-from with the selected checkpoint.", LIBRARY => Local),
     bind!(Char('t'), "t", "Library: fill Setup's Dataset (converts JSONL/Parquet in the background).", LIBRARY => Local),
     bind!(PageUp, "PgUp", "Scroll up: chat, setup preview, memory, local, network, feed, math, help.", FEED => FeedScroll(-8), CHAT => Chat, SETUP => Setup, MEMORY => Extras, EVAL => Local, NETWORK => Network, MATH => MathScroll(-8), HELP => ScrollHelp(-8)),
@@ -764,7 +768,7 @@ mod tests {
             (CONVERT_TAB, "convert", Context::Convert, Context::Convert),
         ];
         let mut indices = HashSet::new();
-        let mut contexts = vec![Context::Help, Context::Palette, Context::Menu];
+        let mut contexts = vec![Context::Help, Context::Palette, Context::Menu, Context::Telemetry];
         for (index, label, browse, edit) in tabs {
             assert!(indices.insert(index), "duplicate tab index: {label}");
             assert_eq!(SCREENS[index], label);
@@ -779,7 +783,7 @@ mod tests {
             contexts
                 .iter()
                 .fold(0, |mask, context| mask | context.mask()),
-            ALL
+            ALL | TELEMETRY
         );
         assert_eq!(ALL.count_ones(), 31);
         for context in contexts {
@@ -803,6 +807,11 @@ mod tests {
                         Some(*expected)
                     );
                 }
+            }
+            if context == Context::Telemetry {
+                // The first-run telemetry prompt is a modal: navigation is
+                // swallowed and only allow/decline/esc answer.
+                continue;
             }
             for (code, modifiers, expected) in [
                 (Tab, KeyModifiers::NONE, NextTab),

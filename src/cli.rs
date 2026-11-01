@@ -2682,6 +2682,7 @@ impl CLIHandler {
     }
 
     pub fn parse_and_execute(args: Vec<String>) -> Result<(), String> {
+        crate::tui::telemetry::Telemetry::install_panic_hook();
         if args.len() < 2 {
             use std::io::IsTerminal;
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
