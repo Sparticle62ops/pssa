@@ -1175,7 +1175,7 @@ fn allocation_guard_rejects_omitted_backward_buffer_case_and_overflows() {
         d_state: 1,
         d_mem_key: 1,
         mem_capacity: 1,
-        chunk_len: 50_000,
+        chunk_len: 60_000,
         ..Default::default()
     };
     // The old guard accepted about 946 MiB despite >1 GiB of actual storage.
