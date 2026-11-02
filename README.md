@@ -57,6 +57,7 @@ On the held-out slice and on matched CPU hardware:
 
 - [NSC64/pssa-100m](https://huggingface.co/NSC64/pssa-100m) — a 109M-parameter PyTorch port of this architecture, trained from scratch by NSC64 on 4B tokens of TinyStories and FineWeb-Edu. Ships bf16 safetensors weights, a 16k byte-level BPE tokenizer and a self-contained loader (plain scan on CPU, fused Triton kernel on CUDA).
 - [sparticle62/pssa-checkpoints-105m](https://huggingface.co/sparticle62/pssa-checkpoints-105m) — training checkpoints from the 105M run in progress (raw .pssa resume files, not a packaged model).
+- [NSC64/pssa-distill-105m](https://huggingface.co/NSC64/pssa-distill-105m) — a 107M PSSA student distilled from Qwen3-8B by NSC64, continuing the ck256.pssa base for 5,000 updates on about 2 GB of FineWeb-Edu, OpenWebMath and CodeParrot (0.5 CE + 0.5 KL at temperature 2.0, one RTX PRO 6000). Ships V7 .pssa checkpoints, GPL-3.0.
 
 ## What makes it different
 
