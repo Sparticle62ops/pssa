@@ -317,14 +317,6 @@ impl Nav {
         }
     }
 
-    /// Section letter pressed on the menu, if any. Kept as a hidden alias so
-    /// screen shortcuts and old muscle memory keep working.
-    pub(super) fn section_for_key(&self, key: char) -> Option<usize> {
-        CATEGORIES[self.category]
-            .sections
-            .iter()
-            .position(|section| section.key == key)
-    }
 }
 
 /// The on-screen number for a section row: 1-9 then 0 for the tenth.
@@ -399,7 +391,7 @@ mod tests {
 
     #[test]
     fn any_screen_reaches_any_screen_in_two_keys() {
-        // A category digit then a section letter, from every possible screen.
+        // A category digit then a section number, from every possible screen.
         for from in 0..SCREENS.len() {
             let mut nav = Nav::default();
             assert!(nav.follow(from), "{}", SCREENS[from]);
@@ -410,7 +402,7 @@ mod tests {
                     nav.select_category(index); // first key: category digit
                     assert!(nav.menu);
                     assert_eq!(
-                        nav.section_for_key(target.key), // second key: section letter
+                        nav.section_for_digit(section_digit(section)), // second key: section number
                         Some(section),
                         "{} -> {}",
                         SCREENS[from],

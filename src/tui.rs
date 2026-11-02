@@ -1445,15 +1445,57 @@ fn run_app(
         // reader still feeds the unbounded channel independently of rendering.
         if crossterm::event::poll(next_frame.saturating_duration_since(Instant::now()))? {
             let event = crossterm::event::read()?;
+            // The scroll wheel rides the same arrow-key path as the keyboard,
+            // so every screen scrolls without extra wiring.
+            let mut keys: Vec<crossterm::event::KeyEvent> = Vec::new();
             match event {
-                crossterm::event::Event::Mouse(mouse) => background.mouse(mouse.column, mouse.row),
+                crossterm::event::Event::Mouse(mouse) => {
+                    background.mouse(mouse.column, mouse.row);
+                    match mouse.kind {
+                        crossterm::event::MouseEventKind::ScrollUp => {
+                            keys.push(crossterm::event::KeyEvent::new(
+                                crossterm::event::KeyCode::Up,
+                                crossterm::event::KeyModifiers::NONE,
+                            ));
+                        }
+                        crossterm::event::MouseEventKind::ScrollDown => {
+                            keys.push(crossterm::event::KeyEvent::new(
+                                crossterm::event::KeyCode::Down,
+                                crossterm::event::KeyModifiers::NONE,
+                            ));
+                        }
+                        crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        ) => {
+                            if let Ok(size) = terminal.size()
+                                && let Some(index) = section_menu_click(
+                                    Rect::new(0, 0, size.width, size.height),
+                                    &nav,
+                                    mouse.row,
+                                )
+                            {
+                                if index == nav.section {
+                                    nav.open_section();
+                                    tab = nav.tab();
+                                } else {
+                                    nav.section = index;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 crossterm::event::Event::FocusLost | crossterm::event::Event::Resize(_, _) => {
                     background.leave();
                 }
+                crossterm::event::Event::Key(key)
+                    if key.kind == crossterm::event::KeyEventKind::Press =>
+                {
+                    keys.push(key);
+                }
                 _ => {}
             }
-            if let crossterm::event::Event::Key(key) = event {
-                if key.kind == crossterm::event::KeyEventKind::Press {
+            for key in keys {
                     use keybindings::{Action, Context};
                     let old_tab = tab;
                     let context = if telemetry.prompt_open {
@@ -1478,15 +1520,14 @@ fn run_app(
                             })
                     };
                     let action = keybindings::action(key, context);
-                    // On a section menu a plain number opens that section;
-                    // letters stay as hidden aliases. These are only consumed
-                    // here, so screen shortcuts keep theirs.
+                    // On a section menu a plain number opens that section.
+                    // These are only consumed here, so screen shortcuts keep
+                    // theirs.
                     if action.is_none()
                         && context == Context::Menu
                         && let crossterm::event::KeyCode::Char(c) = key.code
                         && !c.is_control()
-                        && let Some(index) =
-                            nav.section_for_digit(c).or_else(|| nav.section_for_key(c))
+                        && let Some(index) = nav.section_for_digit(c)
                     {
                         nav.section = index;
                         nav.open_section();
@@ -1658,7 +1699,6 @@ fn run_app(
                             }
                         }
                     }
-                }
             }
         }
     }
@@ -2403,7 +2443,7 @@ fn draw_with_background(
         let detail = if let Some(nav) = nav.filter(|nav| nav.menu) {
             let category = &nav::CATEGORIES[nav.category];
             format!(
-                "{} sections. Press a section letter.",
+                "{} sections. Press a section number.",
                 category.sections.len()
             )
         } else {
@@ -2602,6 +2642,39 @@ fn draw_with_background(
 
 /// Section menu for one category: related screens grouped in place, with a
 /// number, title and plain-language summary for each.
+/// Hit-test a left click against the section menu rows. Returns the index of
+/// the clicked section, or None when the click landed outside the menu body.
+/// Mirrors the geometry draw_section_menu renders from the same terminal size.
+fn section_menu_click(area: Rect, nav: &nav::Nav, row: u16) -> Option<usize> {
+    if !nav.menu {
+        return None;
+    }
+    let content = HexBackground::content_area(area);
+    if content.width < 30 || content.height < 10 {
+        return None;
+    }
+    let large_title = area.width >= 80 && area.height >= 22;
+    let title_h: u16 = if large_title { 5 } else { 3 };
+    let menu = Rect::new(
+        content.x,
+        content.y + title_h + 2,
+        content.width,
+        content.height.saturating_sub(title_h + 2),
+    );
+    let inner = panel(" ").inner(menu);
+    if inner.height == 0 || row < inner.y + 3 || row >= inner.y + inner.height {
+        return None;
+    }
+    let rows = usize::from(inner.height).saturating_sub(3);
+    let first = nav.section.saturating_sub(rows.saturating_sub(1));
+    let index = first + usize::from(row - (inner.y + 3));
+    if index < nav::CATEGORIES[nav.category].sections.len() {
+        Some(index)
+    } else {
+        None
+    }
+}
+
 fn draw_section_menu(f: &mut ratatui::Frame, area: Rect, nav: &nav::Nav) {
     let category = &nav::CATEGORIES[nav.category];
     let title = format!(" {} / pick a section ", category.name);
@@ -4132,7 +4205,7 @@ mod tests {
             assert!(strip.contains("F1 help"), "help must be discoverable: {strip}");
         }
 
-        // Each category menu lists its sections, letters and plain summaries.
+        // Each category menu lists its sections, numbers and plain summaries.
         for (index, category) in nav::CATEGORIES.iter().enumerate() {
             let mut nav = nav::Nav::default();
             nav.select_category(index);
