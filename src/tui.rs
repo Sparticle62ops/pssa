@@ -2611,9 +2611,16 @@ fn draw_section_menu(f: &mut ratatui::Frame, area: Rect, nav: &nav::Nav) {
     }
     let mut lines = vec![
         Line::styled(category.blurb, Style::new().fg(second_accent())),
-        Line::from("Enter opens the highlighted section · its number opens it directly"),
+        Line::from("Enter opens · its number opens directly"),
         Line::from(""),
     ];
+    let title_w = category
+        .sections
+        .iter()
+        .map(|section| section.title.len())
+        .max()
+        .unwrap_or(11)
+        + 1;
     let rows = usize::from(inner.height).saturating_sub(lines.len());
     let first = nav.section.saturating_sub(rows.saturating_sub(1));
     for (index, section) in category
@@ -2641,7 +2648,7 @@ fn draw_section_menu(f: &mut ratatui::Frame, area: Rect, nav: &nav::Nav) {
                     Style::new().fg(second_accent())
                 },
             ),
-            Span::styled(format!("{:<11}", section.title), title),
+            Span::styled(format!("{:<1$}", section.title, title_w), title),
             Span::styled(section.blurb, Style::new().fg(Color::Gray)),
         ]));
     }
