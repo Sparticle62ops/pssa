@@ -243,16 +243,15 @@ impl LogStream {
             network::clean(value)
         };
         let lines = vec![
-            Line::styled("CLOUD LOG / separate live view", accent()),
+            Line::styled("Cloud log", accent()),
             Line::from(format!(
                 "▶ Source: {shown}{}",
                 if self.editing() { "▏" } else { "" }
             )),
             Line::from(self.status.as_str()),
             Line::from(
-                "Enter edit/apply • Esc cancel • Ctrl+U clear • p follow • r refresh • d pause",
+                "Enter edit/apply · Esc cancel · p follow · r refresh · d pause · PgUp/PgDn history · End live",
             ),
-            Line::from("PgUp/PgDn history • End live • green checkpoint / cyan throughput"),
         ];
         let header = Paragraph::new(lines).wrap(Wrap { trim: false });
         let header_height = header.line_count(inner.width).min(inner.height as usize) as u16;
@@ -280,9 +279,9 @@ impl LogStream {
         lines.reverse();
         if self.history.is_empty() {
             lines.push(Line::from(if self.source.is_empty() {
-                "No cloud log source configured. Local training data is in Monitor and Feed."
+                "No source yet. Press Enter and paste a log URL or file path."
             } else {
-                "Waiting for complete lines. Partial lines survive append/reconnect."
+                "Waiting for output."
             }));
         }
         let scroll = wrapped_height
@@ -826,7 +825,7 @@ mod tests {
             };
             let live = render(&view);
             assert!(live.contains("NEWEST_ENTRY"), "live at {width}x{height}");
-            assert!(live.contains("CLOUD LOG / separate live view"));
+            assert!(live.contains("Cloud log"));
             assert!(live.contains("▶ Source:"));
             view.key(key(KeyCode::PageUp));
             assert!(!render(&view).contains("NEWEST_ENTRY"));

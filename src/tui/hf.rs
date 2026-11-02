@@ -361,21 +361,25 @@ impl Login {
         );
         f.render_widget(
             Paragraph::new(vec![
-                Line::styled("HUGGING FACE / secure dataset access", accent()),
+                Line::styled("Hugging Face", accent()),
                 Line::from(format!(
                     "Account: {}",
                     self.user.as_deref().unwrap_or("signed out")
                 )),
-                Line::from(""),
-                Line::from(format!("Token: {mask}")),
+                Line::from(if self.input.is_empty() {
+                    "Token: none typed".to_string()
+                } else {
+                    format!("Token: {mask}")
+                }),
                 Line::from(self.status.as_str()),
-                Line::from(""),
+                Line::from(if self.user.is_some() {
+                    "Ready. Tab moves between tabs; Ctrl+L signs out."
+                } else {
+                    "Next: paste a token, then Enter verifies and saves it."
+                }),
                 Line::from("Enter verify/save · Esc clear · Ctrl+L logout · Tab next tab"),
-                Line::from("Reads HF_TOKEN, then ~/.cache/huggingface/token; saves mode 0600."),
                 Line::from("Create a read token: https://huggingface.co/settings/tokens"),
-                Line::from(
-                    "Logout removes the file; it cannot edit the parent shell's environment.",
-                ),
+                Line::from("Saved locally with owner-only permissions; logout removes it."),
             ])
             .wrap(Wrap { trim: false })
             .block(panel(" HF login ")),

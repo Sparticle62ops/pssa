@@ -325,49 +325,45 @@ impl Notify {
             "•".repeat(target.chars().count().min(24))
         };
         let mut lines = vec![
-            Line::styled("NOTIFICATIONS / explicit opt-in", accent()),
+            Line::styled("Phone alerts", accent()),
             Line::from(format!(
-                "Delivery: {}",
+                "Alerts: {}",
                 if self.enabled { "ON" } else { "OFF" }
             )),
             Line::from(format!(
-                "{} Mode: {}",
+                "{} mode: {}{}",
                 if self.selected == 0 { "▶" } else { " " },
-                network::clean(mode)
+                network::clean(mode),
+                if self.selected == 0 && self.editing() { " ▏" } else { "" }
             )),
             Line::from(format!(
-                "{} {}: {mask}{}",
+                "{} target: {mask}{}",
                 if self.selected == 1 { "▶" } else { " " },
-                if self.webhook {
-                    "Webhook URL"
-                } else {
-                    "ntfy.sh topic"
-                },
-                if self.selected == 1 && self.editing() {
-                    "▏"
-                } else {
-                    ""
-                }
+                if self.selected == 1 && self.editing() { " ▏" } else { "" }
             )),
             Line::from(self.status.as_str()),
-            Line::from(format!(
-                "Failed attempts this session: {} (no automatic retry)",
-                self.failures
-            )),
-            Line::from("↑/↓ field • Enter edit/apply • Esc cancel • Ctrl+U clear"),
-            Line::from("d enable/disable • p send test checkpoint • r retry last"),
-            Line::from(
-                "Only checkpoint / finished / died summaries; no logs, paths, prompts or credentials.",
-            ),
-            Line::from(
-                "ntfy topics are public unless protected; use an unguessable topic. Generic webhook: JSON POST.",
-            ),
-            Line::from(
-                "Targets are saved in local TUI config; use a dedicated/revocable webhook URL.",
-            ),
         ];
+        if self.failures > 0 {
+            lines.push(Line::from(format!(
+                "{} failed sends (no automatic retry)",
+                self.failures
+            )));
+        }
+        lines.push(Line::from(if target.is_empty() {
+            "Next: Enter on target, paste your ntfy topic or webhook URL, Enter."
+        } else if !self.enabled {
+            "Next: d turns alerts on, p sends a test."
+        } else {
+            "Ready. p sends a test checkpoint."
+        }));
+        lines.push(Line::from(
+            "↑/↓ field · Enter edit/apply · Esc cancel · Ctrl+U clear · d on/off · p test · r retry",
+        ));
+        lines.push(Line::from(
+            "Summary alerts only, never logs or tokens. ntfy topics are public: pick an unguessable one.",
+        ));
         if !self.history.is_empty() {
-            lines.push(Line::styled("DELIVERY LOG / latest attempts", accent()));
+            lines.push(Line::styled("Latest deliveries", accent()));
             lines.extend(
                 self.history
                     .iter()
