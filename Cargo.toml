@@ -11,6 +11,9 @@ readme = "README.md"
 keywords = ["language-model", "state-space", "machine-learning", "cuda", "webgpu"]
 categories = ["science", "command-line-utilities"]
 
+[build-dependencies]
+winresource = "0.1"
+
 [dependencies]
 # HTTP/HTTPS streaming for corpus downloads. Held at ureq 2.x for now.
 ureq = { version = "2.9", features = ["tls"] }
