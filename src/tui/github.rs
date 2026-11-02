@@ -402,8 +402,7 @@ impl Github {
                     )
                 )),
                 Line::from("Enter verify/save / Esc cancel / Ctrl+U clear / Ctrl+L logout"),
-                Line::from("Fine-grained token: only read access needed. No write actions exist."),
-                Line::from("Reads GH_TOKEN, GITHUB_TOKEN, then ~/.cache/pssa/github/token (0600)."),
+                Line::from("A read-only token is enough; saved locally, never shown."),
             ]);
         } else {
             lines.extend([
@@ -419,7 +418,7 @@ impl Github {
         }
         let count = area
             .height
-            .saturating_sub(if self.editing { 13 } else { 10 })
+            .saturating_sub(if self.editing { 12 } else { 10 })
             .max(1) as usize;
         let start = self.selected.saturating_sub(count.saturating_sub(1));
         for (i, item) in self.rows.iter().enumerate().skip(start).take(count) {

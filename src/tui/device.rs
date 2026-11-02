@@ -340,9 +340,7 @@ impl DevicePicker {
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(detail.clone(), Style::new().fg(second_accent())),
-                Line::from(
-                    "Backend family only; CUDA visible device 0 / WebGPU preferred adapter.",
-                ),
+                Line::from("Picks the backend family; the exact GPU is chosen automatically."),
                 Line::styled(self.message.clone(), Style::new().fg(amber())),
             ])
             .wrap(Wrap { trim: false }),

@@ -303,13 +303,10 @@ impl Backup {
             Line::from(self.status.as_str()),
             Line::from("↑/↓ field • Enter edit/apply • Esc cancel • Ctrl+U clear"),
             Line::from("p push • r retry • d toggle automatic backup"),
+            Line::from("Needs an HF login with write access; no repo is created."),
             Line::from(
-                "Phase-10 login needs write access. No repo is created. Offline/logged out: skip.",
+                "Push replaces the model files and README on main, max 5 GiB. Only new saves count.",
             ),
-            Line::from(
-                "Replaces model.pssa/model.trfm + README.md on main. Maximum 5 GiB (basic LFS).",
-            ),
-            Line::from("Only new save events count; newest due job wins while busy."),
         ]);
         f.render_widget(
             Paragraph::new(lines)

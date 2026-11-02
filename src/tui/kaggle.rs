@@ -1068,10 +1068,9 @@ impl Kaggle {
             Line::styled("KAGGLE / remote notebook run", accent()),
             Line::from(format!("Folder: {}", clean(&self.folder))),
             Line::from(self.status.as_str()),
-            Line::from("Credentials: KAGGLE_USERNAME + KAGGLE_KEY, else ~/.kaggle/kaggle.json"),
-            Line::from("No key is displayed or saved. Keep kaggle.json private (chmod 600)."),
+            Line::from("Credentials: KAGGLE_USERNAME + KAGGLE_KEY or ~/.kaggle/kaggle.json (kept private)"),
             Line::from("Enter review · Y confirm · N/Esc cancel · Ctrl+U clear · Tab next tab"),
-            Line::from("Run pssa with --no-tui in the notebook for parseable monitor metrics."),
+            Line::from("The notebook should run pssa --no-tui so metrics parse."),
         ];
         if let Some(prepared) = &self.prepared {
             text.extend(prepared.summary.lines().map(|s| Line::from(s.to_owned())));

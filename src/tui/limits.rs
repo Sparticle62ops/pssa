@@ -173,10 +173,10 @@ impl Limits {
         self.applied.append_args(&mut args);
         let semantics_area = panel_area(f, parts[2]);
         f.render_widget(Paragraph::new(vec![
-            Line::styled("Threads: local Rayon pool. Changing reduction order may change the last digits.", Style::new().fg(amber())),
-            Line::from("RAM: Linux prlimit hard address-space (RLIMIT_AS) budget; NOT RSS or VRAM. Too low may abort the child; GPU mappings also count. Other OSes reject it."),
-            Line::from("Batch lanes use --batch-size (default 1); not a VRAM cap. Tokens cap the corpus, not each epoch or inference reply."),
-            Line::from("No CPU throttling, affinity, or GPU VRAM quota. In-process chat is not RAM-limited."),
+            Line::styled("Threads: extra CPU workers. Results may differ in the last digits.", Style::new().fg(amber())),
+            Line::from("RAM: hard memory budget for the training run. Too low can abort it."),
+            Line::from("Batch: examples per step (default 1). Tokens: cap the training text."),
+            Line::from("No CPU or GPU caps here; chat is not RAM-limited."),
             Line::styled(format!("Applied CLI: {}", if args.is_empty() { "(no extra flags)".into() } else { args.join(" ") }), Style::new().fg(second_accent())),
         ]).wrap(Wrap { trim: false }).block(panel(" how limits are applied ")), semantics_area);
         f.render_widget(
@@ -262,8 +262,8 @@ mod tests {
                     "RAM budget",
                     "Max batch",
                     "Max corpus",
-                    "RLIMIT_AS",
-                    "not a VRAM cap",
+                    "hard memory budget",
+                    "examples per step",
                 ] {
                     assert!(text.contains(expected), "missing {expected} at {width}");
                 }
