@@ -35,6 +35,7 @@ mod nav;
 mod network;
 mod notify;
 mod overlay;
+mod widgets;
 mod preview;
 mod process;
 mod ring;

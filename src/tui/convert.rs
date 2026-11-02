@@ -267,6 +267,9 @@ impl Panel {
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
         let mut lines: Vec<Line> = Vec::new();
         for (index, label) in FIELD_LABELS.iter().enumerate() {
+            if index > 0 {
+                lines.push(Line::from(String::new()));
+            }
             let focused = index == self.focus;
             let value = &self.fields[index];
             let cursor = if focused && self.phase != Phase::Running {
@@ -296,20 +299,21 @@ impl Panel {
             ]));
         }
         lines.push(Line::from(String::new()));
-        match self.phase {
+        let buttons: Vec<super::widgets::Button<'_>> = match self.phase {
             Phase::Idle => {
                 lines.push(Line::from(
-                    "Enter: detect the checkpoint family. Up/Down switch fields, Ctrl+U clears the focused one.",
+                    "Up/Down switch fields, Ctrl+U clears the focused one.",
                 ));
                 lines.push(Line::from(
                     "Hybrid linear-attention models (Qwen3.5/3.6/3.8) are rejected here with the reason.",
                 ));
+                vec![("detect", true)]
             }
             Phase::Detected => {
                 for line in &self.summary {
                     lines.push(Line::from(line.clone()));
                 }
-                lines.push(Line::from("Enter: run the conversion now."));
+                vec![("convert", true)]
             }
             Phase::Running => {
                 let elapsed = self.started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
@@ -320,17 +324,16 @@ impl Panel {
                 lines.push(Line::from(
                     "working in the background; the report appears here when it finishes.",
                 ));
+                Vec::new()
             }
             Phase::Done => {
                 for line in &self.summary {
                     lines.push(Line::from(line.clone()));
                 }
-                lines.push(Line::from("Enter: detect another checkpoint."));
+                vec![("detect another", true)]
             }
-            Phase::Failed => {
-                lines.push(Line::from("Enter: fix the fields and detect again."));
-            }
-        }
+            Phase::Failed => vec![("detect again", true)],
+        };
         if let Some((text, is_error)) = &self.note {
             lines.push(Line::from(Span::styled(
                 text.clone(),
@@ -347,10 +350,20 @@ impl Panel {
                 " convert ",
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             ));
-        f.render_widget(
-            Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
-            area,
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let strip_height = if inner.height >= 6 { 3 } else { 0 };
+        let body = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(strip_height),
         );
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+        if strip_height > 0 {
+            let strip = Rect::new(inner.x, inner.y + body.height, inner.width, strip_height);
+            super::widgets::draw_button_row(f, strip, &buttons);
+        }
     }
 }
 
@@ -447,6 +460,7 @@ mod tests {
         assert!(text.contains("source (HF checkpoint dir"));
         assert!(text.contains("config (config.json path)"));
         assert!(text.contains("target (compact, source-width, or size like 5b)"));
-        assert!(text.contains("Enter: detect the checkpoint family"));
+        assert!(text.contains('\u{256d}'), "convert panel shows a real button box");
+        assert!(text.contains("detect"));
     }
 }

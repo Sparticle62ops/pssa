@@ -182,6 +182,10 @@ impl Math {
         }
         for line in EQUATIONS.lines() {
             if let Some(title) = line.strip_prefix("# ") {
+                if !lines.is_empty() {
+                    lines.push(Line::from(String::new()));
+                    lines.push(Line::from(String::new()));
+                }
                 lines.push(Line::styled(format!("▌ {title}"), accent()));
             } else if line.starts_with("Source:") {
                 lines.push(Line::styled(line, Style::new().fg(second_accent())));
