@@ -167,8 +167,8 @@ impl Telemetry {
         use ratatui::{
             layout::{Constraint, Layout},
             style::{Modifier, Style},
-            text::Line,
-            widgets::{Block, Borders, Paragraph},
+            text::{Line, Span},
+            widgets::{Clear, Paragraph},
         };
         if !self.prompt_open {
             return;
@@ -187,34 +187,49 @@ impl Telemetry {
         ])
         .split(vertical[1]);
         let box_area = horizontal[1];
-        f.render_widget(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" help improve pssa "),
-            box_area,
-        );
-        let accent = super::accent();
+        // An opaque card: erase what sits behind so the prompt stays readable
+        // over any screen, and give it the same panel treatment as the rest.
+        f.render_widget(Clear, box_area);
+        f.render_widget(super::panel(" help improve pssa "), box_area);
+        let base = Style::new().bg(super::panel_bg());
+        let heading = super::accent().add_modifier(Modifier::BOLD);
+        let key = |label: &str| {
+            Span::styled(
+                format!(" {label} "),
+                Style::new()
+                    .fg(super::panel_bg())
+                    .bg(super::normal_green())
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
         let lines = vec![
-            Line::from("share anonymous data with the pssa project?"),
+            Line::styled("share anonymous data with the pssa project?", heading),
             Line::from(""),
-            Line::from("would be shared:"),
-            Line::from("  · training stats: loss, speed, token counts"),
-            Line::from("  · errors: panic and crash summaries"),
-            Line::from("  · model performance and hardware specs"),
+            Line::styled("would be shared:", heading),
+            Line::from("  - training stats: loss, speed, token counts"),
+            Line::from("  - errors: panic and crash summaries"),
+            Line::from("  - model performance and hardware specs"),
             Line::from(""),
             Line::from("never shared: personal data, model weights, files."),
             Line::from(""),
             Line::from(""),
-            Line::styled("A allow      D no thanks", accent.add_modifier(Modifier::BOLD)),
+            Line::from(vec![
+                Span::raw("  "),
+                key("A"),
+                Span::raw("  allow        "),
+                key("D"),
+                Span::raw("  no thanks"),
+            ]),
         ];
         let inner_x = box_area.x + 2;
         let inner_y = box_area.y + 1;
         let inner_w = box_area.width.saturating_sub(4);
         let inner_h = box_area.height.saturating_sub(2);
         let inner = ratatui::layout::Rect::new(inner_x, inner_y, inner_w, inner_h);
-        f.render_widget(Paragraph::new(lines), inner);
+        f.render_widget(Paragraph::new(lines).style(base), inner);
     }
 }
+
 
 #[cfg(test)]
 mod tests {

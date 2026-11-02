@@ -352,41 +352,138 @@ impl Login {
         }
     }
     pub fn draw(&self, f: &mut ratatui::Frame, area: Rect) {
+        use ratatui::{
+            layout::{Constraint, Layout},
+            style::{Color, Modifier, Style},
+            text::{Line, Span},
+            widgets::{Block, Borders, Paragraph, Wrap},
+        };
         let area = panel_area(f, area);
-        let mask = "•".repeat(
-            self.input
-                .chars()
-                .count()
-                .min(area.width.saturating_sub(12) as usize),
-        );
+        let block = panel(" HF login ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let rows = Layout::vertical([
+            Constraint::Length(2), // heading + account
+            Constraint::Length(3), // token entry box
+            Constraint::Length(1), // status
+            Constraint::Length(1), // gap
+            Constraint::Length(1), // key buttons
+            Constraint::Length(2), // hints
+            Constraint::Min(0),
+        ])
+        .split(inner);
+        let base = Style::new().bg(super::panel_bg());
+        let heading = super::accent().add_modifier(Modifier::BOLD);
         f.render_widget(
             Paragraph::new(vec![
-                Line::styled("Hugging Face", accent()),
+                Line::styled("Hugging Face", heading),
                 Line::from(format!(
                     "Account: {}",
                     self.user.as_deref().unwrap_or("signed out")
                 )),
-                Line::from(if self.input.is_empty() {
-                    "Token: none typed".to_string()
-                } else {
-                    format!("Token: {mask}")
-                }),
-                Line::from(self.status.as_str()),
-                Line::from(if self.user.is_some() {
-                    "Ready. Tab moves between tabs; Ctrl+L signs out."
-                } else {
-                    "Next: paste a token, then Enter verifies and saves it."
-                }),
-                Line::from("Enter verify/save · Esc clear · Ctrl+L logout · Tab next tab"),
-                Line::from("Create a read token: https://huggingface.co/settings/tokens"),
-                Line::from("Saved locally with owner-only permissions; logout removes it."),
             ])
-            .wrap(Wrap { trim: false })
-            .block(panel(" HF login ")),
-            area,
+            .style(base),
+            rows[0],
+        );
+
+        // The token entry is a real, bordered box so it reads as a field:
+        // masked value inside, or a dim placeholder when empty.
+        let box_area = rows[1];
+        if box_area.height >= 3 && box_area.width >= 6 {
+            let field_w = box_area.width.saturating_sub(4) as usize;
+            let mask = "\u{2022}".repeat(self.input.chars().count().min(field_w.saturating_sub(1)));
+            let field = if self.input.is_empty() {
+                Line::styled(
+                    " paste a read token here, then Enter",
+                    Style::new().bg(super::panel_bg()).add_modifier(Modifier::DIM),
+                )
+            } else {
+                Line::from(vec![
+                    Span::raw(mask),
+                    Span::styled(
+                        "\u{258c}",
+                        Style::new().fg(super::normal_green()).bg(super::panel_bg()),
+                    ),
+                ])
+            };
+            f.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(super::accent().add_modifier(Modifier::DIM))
+                    .title(Line::styled(
+                        " token ",
+                        super::accent().add_modifier(Modifier::BOLD),
+                    ))
+                    .style(base),
+                box_area,
+            );
+            let field_area = Rect::new(
+                box_area.x + 1,
+                box_area.y + 1,
+                box_area.width.saturating_sub(2),
+                box_area.height.saturating_sub(2),
+            );
+            f.render_widget(Paragraph::new(vec![field]).style(base), field_area);
+        }
+
+        let failing = self.status.starts_with("HTTP")
+            || self.status.contains("denied")
+            || self.status.contains("Invalid")
+            || self.status.contains("Cannot");
+        let status_color = if failing {
+            Color::Rgb(0xe0, 0x6c, 0x5a)
+        } else {
+            super::normal_green()
+        };
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" {}", self.status),
+                Style::new().fg(status_color).bg(super::panel_bg()),
+            )),
+            rows[2],
+        );
+
+        let key = |label: &str| {
+            Span::styled(
+                format!(" {label} "),
+                Style::new()
+                    .fg(super::panel_bg())
+                    .bg(super::normal_green())
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("  "),
+                key("Enter"),
+                Span::raw(" verify/save   "),
+                key("Esc"),
+                Span::raw(" clear   "),
+                key("Ctrl+L"),
+                Span::raw(" logout"),
+            ]))
+            .style(base),
+            rows[4],
+        );
+
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    "Create a read token: https://huggingface.co/settings/tokens",
+                    Style::new().bg(super::panel_bg()).add_modifier(Modifier::DIM),
+                ),
+                Line::styled(
+                    "Saved locally with owner-only permissions; logout removes it.",
+                    Style::new().bg(super::panel_bg()).add_modifier(Modifier::DIM),
+                ),
+            ])
+            .style(base)
+            .wrap(Wrap { trim: false }),
+            rows[5],
         );
     }
 }
+
 
 #[cfg(test)]
 mod tests {
