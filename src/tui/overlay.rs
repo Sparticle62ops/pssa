@@ -1,5 +1,5 @@
 //! Command palette. Global shortcuts and the single help overlay live in keybindings.
-use super::{panel_bg, SCREENS, accent, panel};
+use super::{nav, panel_bg, SCREENS, accent, panel};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::Rect,
@@ -26,10 +26,24 @@ impl Overlay {
         self.selected = 0;
     }
     fn choices(&self) -> Vec<(String, Action)> {
+        // Each entry carries its category and blurb, so the palette doubles
+        // as a browsable table of what every screen does.
         let mut all: Vec<_> = SCREENS
             .iter()
             .enumerate()
-            .map(|(i, name)| (format!("Open {name}"), Action::Tab(i)))
+            .map(|(i, name)| {
+                let detail = nav::CATEGORIES
+                    .iter()
+                    .find_map(|category| {
+                        category
+                            .sections
+                            .iter()
+                            .find(|section| section.tab == i)
+                            .map(|section| format!(" \u{2014} {} \u{b7} {}", category.name, section.blurb))
+                    })
+                    .unwrap_or_default();
+                (format!("Open {name}{detail}"), Action::Tab(i))
+            })
             .collect();
         all.push((
             "Run matched benchmark (configured corpus/chain)".into(),

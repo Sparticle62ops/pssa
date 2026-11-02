@@ -2554,6 +2554,8 @@ fn draw_with_background(
         let screen = SCREENS[tab.min(SCREENS.len() - 1)];
         let hint = if menu {
             " pick a section · Enter open ".to_string()
+        } else if strip[1].width >= 46 {
+            format!(" {screen} · Ctrl+K jump · F1 help ")
         } else if strip[1].width >= 32 {
             format!(" {screen} · F1 help ")
         } else if strip[1].width >= screen.len() as u16 + 5 {
