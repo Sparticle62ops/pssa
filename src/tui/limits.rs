@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
 
@@ -121,6 +121,15 @@ impl Limits {
         if area.is_empty() {
             return;
         }
+        let key = |label: &str| {
+            Span::styled(
+                format!(" {label} "),
+                Style::new()
+                    .fg(super::panel_bg())
+                    .bg(super::normal_green())
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
         let parts = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(7),
@@ -129,7 +138,8 @@ impl Limits {
         ])
         .split(area);
         f.render_widget(
-            Paragraph::new("resource limits / optional").style(accent()),
+            Paragraph::new("resource limits / optional")
+                .style(accent().add_modifier(Modifier::BOLD)),
             parts[0],
         );
         let available = parts[1].height.saturating_sub(2) as usize;
@@ -179,19 +189,37 @@ impl Limits {
             Line::from("No CPU or GPU caps here; chat is not RAM-limited."),
             Line::styled(format!("Applied CLI: {}", if args.is_empty() { "(no extra flags)".into() } else { args.join(" ") }), Style::new().fg(second_accent())),
         ]).wrap(Wrap { trim: false }).block(panel(" how limits are applied ")), semantics_area);
+        let keys_line = if self.editing() {
+            Line::from(vec![
+                key("0-9"),
+                Span::raw(" digits   "),
+                key("Enter"),
+                Span::raw(" save   "),
+                key("Esc"),
+                Span::raw(" cancel   "),
+                key("Ctrl+U"),
+                Span::raw(" clear"),
+            ])
+        } else {
+            Line::from(vec![
+                key("↑/↓"),
+                Span::raw(" select   "),
+                key("Enter"),
+                Span::raw(" edit/apply   "),
+                key("d"),
+                Span::raw(" defaults"),
+            ])
+        };
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(
                     self.message.clone(),
                     Style::new().fg(if self.error { bright_red() } else { amber() }),
                 ),
-                Line::from(if self.editing() {
-                    "Digits / Enter save / Esc cancel / Ctrl+U clear"
-                } else {
-                    "Up/Down select / Enter edit or apply / d defaults"
-                }),
+                keys_line,
             ])
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .style(Style::new().bg(super::panel_bg())),
             parts[3],
         );
     }

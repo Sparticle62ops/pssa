@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
 use std::{
@@ -230,6 +230,27 @@ impl LogStream {
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
         let area = panel_area(f, area);
+        let base = Style::new().bg(super::panel_bg());
+        let key = |label: &str| {
+            Span::styled(
+                format!(" {label} "),
+                Style::new()
+                    .fg(super::panel_bg())
+                    .bg(super::normal_green())
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        let failing = self.status.starts_with("HTTP")
+            || self.status.contains("denied")
+            || self.status.contains("Invalid")
+            || self.status.contains("invalid")
+            || self.status.contains("Failed")
+            || self.status.contains("failed");
+        let status_color = if failing {
+            Color::Rgb(0xe0, 0x6c, 0x5a)
+        } else {
+            super::normal_green()
+        };
         let block = panel(" Cloud log stream ");
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -243,17 +264,30 @@ impl LogStream {
             network::clean(value)
         };
         let lines = vec![
-            Line::styled("Cloud log", accent()),
+            Line::styled("Cloud log", accent().add_modifier(Modifier::BOLD)),
             Line::from(format!(
                 "▶ Source: {shown}{}",
                 if self.editing() { "▏" } else { "" }
             )),
-            Line::from(self.status.as_str()),
-            Line::from(
-                "Enter edit/apply · Esc cancel · p follow · r refresh · d pause · PgUp/PgDn history · End live",
-            ),
+            Line::styled(self.status.as_str(), Style::new().fg(status_color)),
+            Line::from(vec![
+                key("Enter"),
+                Span::raw(" edit/apply   "),
+                key("Esc"),
+                Span::raw(" cancel   "),
+                key("p"),
+                Span::raw(" follow   "),
+                key("r"),
+                Span::raw(" refresh   "),
+                key("d"),
+                Span::raw(" pause   "),
+                key("PgUp/PgDn"),
+                Span::raw(" history   "),
+                key("End"),
+                Span::raw(" live"),
+            ]),
         ];
-        let header = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let header = Paragraph::new(lines).wrap(Wrap { trim: false }).style(base);
         let header_height = header.line_count(inner.width).min(inner.height as usize) as u16;
         let rows =
             Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)]).split(inner);
@@ -278,11 +312,14 @@ impl LogStream {
         }
         lines.reverse();
         if self.history.is_empty() {
-            lines.push(Line::from(if self.source.is_empty() {
-                "No source yet. Press Enter and paste a log URL or file path."
-            } else {
-                "Waiting for output."
-            }));
+            lines.push(Line::styled(
+                if self.source.is_empty() {
+                    "No source yet. Press Enter and paste a log URL or file path."
+                } else {
+                    "Waiting for output."
+                },
+                Style::new().add_modifier(Modifier::DIM),
+            ));
         }
         let scroll = wrapped_height
             .saturating_sub(available)

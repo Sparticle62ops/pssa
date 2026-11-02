@@ -1,7 +1,7 @@
 //! Hugging Face credentials shared by the TUI and plain CLI dataset loader.
 //! Secrets deliberately have no Debug implementation. Never report HTTP bodies
 //! or transport diagnostics from authenticated requests (either can echo headers).
-use super::{accent, panel, panel_area};
+use super::{panel, panel_area};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::Rect,

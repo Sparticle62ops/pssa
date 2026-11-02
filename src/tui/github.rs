@@ -8,7 +8,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::Rect,
-    text::Line,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
 use serde_json::Value;
@@ -383,8 +384,33 @@ impl Github {
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
         let area = panel_area(f, area);
+        let base = Style::new().bg(super::panel_bg());
+        let dim = Style::new().add_modifier(Modifier::DIM);
+        let key = |label: &str| {
+            Span::styled(
+                format!(" {label} "),
+                Style::new()
+                    .fg(super::panel_bg())
+                    .bg(super::normal_green())
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        let failing = self.status.starts_with("HTTP")
+            || self.status.contains("denied")
+            || self.status.contains("Invalid")
+            || self.status.contains("invalid")
+            || self.status.contains("Failed")
+            || self.status.contains("failed");
+        let status_color = if failing {
+            Color::Rgb(0xe0, 0x6c, 0x5a)
+        } else {
+            super::normal_green()
+        };
         let mut lines = vec![
-            Line::styled("GITHUB / COMMUNITY / READ ONLY", accent()),
+            Line::styled(
+                "GITHUB / COMMUNITY / READ ONLY",
+                accent().add_modifier(Modifier::BOLD),
+            ),
             Line::from(format!(
                 "Account: {}",
                 self.user.as_deref().unwrap_or("public / signed out")
@@ -401,19 +427,51 @@ impl Github {
                             .min(area.width.saturating_sub(10) as usize)
                     )
                 )),
-                Line::from("Enter verify/save / Esc cancel / Ctrl+U clear / Ctrl+L logout"),
-                Line::from("A read-only token is enough; saved locally, never shown."),
+                Line::from(vec![
+                    key("Enter"),
+                    Span::raw(" verify/save   "),
+                    key("Esc"),
+                    Span::raw(" cancel   "),
+                    key("Ctrl+U"),
+                    Span::raw(" clear   "),
+                    key("Ctrl+L"),
+                    Span::raw(" logout"),
+                ]),
+                Line::styled(
+                    "A read-only token is enough; saved locally, never shown.",
+                    dim,
+                ),
             ]);
         } else {
             lines.extend([
-                Line::from("p PRs / i issues / r refresh / l login / Ctrl+L logout"),
-                Line::from("Up/Down PgUp/PgDn Home/End select / Enter or o browser"),
+                Line::from(vec![
+                    key("p"),
+                    Span::raw(" PRs   "),
+                    key("i"),
+                    Span::raw(" issues   "),
+                    key("r"),
+                    Span::raw(" refresh   "),
+                    key("l"),
+                    Span::raw(" login   "),
+                    key("Ctrl+L"),
+                    Span::raw(" logout"),
+                ]),
+                Line::from(vec![
+                    key("↑/↓"),
+                    Span::raw(" PgUp/PgDn Home/End select   "),
+                    key("Enter"),
+                    Span::raw(" or o browser"),
+                ]),
             ]);
         }
-        lines.push(Line::from(self.status.as_str()));
+        lines.push(Line::styled(
+            self.status.as_str(),
+            Style::new().fg(status_color),
+        ));
         if self.rows.is_empty() {
-            lines.push(Line::from(
+            lines.push(Line::styled(
                 "No items loaded. Public browsing does not require login.",
+                dim,
             ));
         }
         let count = area
@@ -439,7 +497,8 @@ impl Github {
         f.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .block(panel(" GitHub ")),
+                .block(panel(" GitHub "))
+                .style(base),
             area,
         );
     }

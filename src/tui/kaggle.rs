@@ -13,7 +13,7 @@
 //! and src/kaggle/api/kaggle_api_extended.py in that repository. Live SSE may
 //! be unavailable on older deployments; an explicit error is shown, not fake
 //! progress. No remote service access is needed by the tests below.
-use super::{accent, panel, panel_area, process::clean};
+use super::{panel, panel_area, process::clean};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -1059,18 +1059,63 @@ impl Kaggle {
         }
     }
     pub fn draw(&self, f: &mut ratatui::Frame, area: Rect) {
+        let base = ratatui::style::Style::new().bg(super::panel_bg());
+        let dim = ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::DIM);
+        let key = |label: &str| {
+            ratatui::text::Span::styled(
+                format!(" {label} "),
+                ratatui::style::Style::new()
+                    .fg(super::panel_bg())
+                    .bg(super::normal_green())
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            )
+        };
+        let failing = self.status.starts_with("HTTP")
+            || self.status.contains("denied")
+            || self.status.contains("Invalid")
+            || self.status.contains("invalid")
+            || self.status.contains("Failed")
+            || self.status.contains("failed");
+        let status_color = if failing {
+            ratatui::style::Color::Rgb(0xe0, 0x6c, 0x5a)
+        } else {
+            super::normal_green()
+        };
         let sections = Layout::vertical([
             Constraint::Length(if self.prepared.is_some() { 18 } else { 10 }),
             Constraint::Min(0),
         ])
         .split(area);
         let mut text = vec![
-            Line::styled("KAGGLE / remote notebook run", accent()),
+            Line::styled(
+                "KAGGLE / remote notebook run",
+                super::accent().add_modifier(ratatui::style::Modifier::BOLD),
+            ),
             Line::from(format!("Folder: {}", clean(&self.folder))),
-            Line::from(self.status.as_str()),
-            Line::from("Credentials: KAGGLE_USERNAME + KAGGLE_KEY or ~/.kaggle/kaggle.json (kept private)"),
-            Line::from("Enter review · Y confirm · N/Esc cancel · Ctrl+U clear · Tab next tab"),
-            Line::from("The notebook should run pssa --no-tui so metrics parse."),
+            Line::styled(
+                self.status.as_str(),
+                ratatui::style::Style::new().fg(status_color),
+            ),
+            Line::styled(
+                "Credentials: KAGGLE_USERNAME + KAGGLE_KEY or ~/.kaggle/kaggle.json (kept private)",
+                dim,
+            ),
+            Line::from(vec![
+                key("Enter"),
+                ratatui::text::Span::raw(" review   "),
+                key("Y"),
+                ratatui::text::Span::raw(" confirm   "),
+                key("N/Esc"),
+                ratatui::text::Span::raw(" cancel   "),
+                key("Ctrl+U"),
+                ratatui::text::Span::raw(" clear   "),
+                key("Tab"),
+                ratatui::text::Span::raw(" next tab"),
+            ]),
+            Line::styled(
+                "The notebook should run pssa --no-tui so metrics parse.",
+                dim,
+            ),
         ];
         if let Some(prepared) = &self.prepared {
             text.extend(prepared.summary.lines().map(|s| Line::from(s.to_owned())));
@@ -1079,7 +1124,8 @@ impl Kaggle {
         f.render_widget(
             Paragraph::new(text)
                 .wrap(Wrap { trim: false })
-                .block(panel(" Kaggle launch ")),
+                .block(panel(" Kaggle launch "))
+                .style(base),
             launch_area,
         );
         let visible = sections[1].height.saturating_sub(2) as usize;
@@ -1091,7 +1137,9 @@ impl Kaggle {
             .collect();
         let log_area = panel_area(f, sections[1]);
         f.render_widget(
-            Paragraph::new(logs).block(panel(" Kaggle live log (latest lines) ")),
+            Paragraph::new(logs)
+                .block(panel(" Kaggle live log (latest lines) "))
+                .style(base),
             log_area,
         );
     }

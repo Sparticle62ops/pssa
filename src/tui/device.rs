@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
 use std::sync::mpsc::{self, Receiver};
@@ -295,6 +295,15 @@ impl DevicePicker {
         if area.is_empty() {
             return;
         }
+        let key = |label: &str| {
+            Span::styled(
+                format!(" {label} "),
+                Style::new()
+                    .fg(super::panel_bg())
+                    .bg(super::normal_green())
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
         let parts = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(0),
@@ -303,7 +312,7 @@ impl DevicePicker {
         .split(area);
         f.render_widget(
             Paragraph::new(format!("device / selected: {}", self.backend().as_str()))
-                .style(accent()),
+                .style(accent().add_modifier(Modifier::BOLD)),
             parts[0],
         );
         let rows = parts[1].height.saturating_sub(2) as usize;
@@ -340,7 +349,16 @@ impl DevicePicker {
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(detail.clone(), Style::new().fg(second_accent())),
-                Line::from("Picks the backend family; the exact GPU is chosen automatically."),
+                Line::from(vec![
+                    key("↑/↓"),
+                    Span::raw(" select   "),
+                    key("Enter"),
+                    Span::raw(" choose"),
+                ]),
+                Line::styled(
+                    "Picks the backend family; the exact GPU is chosen automatically.",
+                    Style::new().add_modifier(Modifier::DIM),
+                ),
                 Line::styled(self.message.clone(), Style::new().fg(amber())),
             ])
             .wrap(Wrap { trim: false }),

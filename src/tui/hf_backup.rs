@@ -7,7 +7,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::Rect,
-    text::Line,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
 use serde_json::{Value, json};
@@ -274,7 +275,32 @@ impl Backup {
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
         let area = panel_area(f, area);
-        let mut lines = vec![Line::styled("HF HUB / checkpoint backup", accent())];
+        let base = Style::new().bg(super::panel_bg());
+        let dim = Style::new().add_modifier(Modifier::DIM);
+        let key = |label: &str| {
+            Span::styled(
+                format!(" {label} "),
+                Style::new()
+                    .fg(super::panel_bg())
+                    .bg(super::normal_green())
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        let failing = self.status.starts_with("HTTP")
+            || self.status.contains("denied")
+            || self.status.contains("Invalid")
+            || self.status.contains("invalid")
+            || self.status.contains("Failed")
+            || self.status.contains("failed");
+        let status_color = if failing {
+            Color::Rgb(0xe0, 0x6c, 0x5a)
+        } else {
+            super::normal_green()
+        };
+        let mut lines = vec![Line::styled(
+            "HF HUB / checkpoint backup",
+            accent().add_modifier(Modifier::BOLD),
+        )];
         for (i, (name, value)) in [
             ("Checkpoint", self.path.clone()),
             ("Existing repo", self.repo.clone()),
@@ -299,19 +325,39 @@ impl Backup {
                 }
             )));
         }
-        lines.extend([
-            Line::from(self.status.as_str()),
-            Line::from("↑/↓ field • Enter edit/apply • Esc cancel • Ctrl+U clear"),
-            Line::from("p push • r retry • d toggle automatic backup"),
-            Line::from("Needs an HF login with write access; no repo is created."),
-            Line::from(
-                "Push replaces the model files and README on main, max 5 GiB. Only new saves count.",
-            ),
-        ]);
+        lines.push(Line::styled(
+            self.status.as_str(),
+            Style::new().fg(status_color),
+        ));
+        lines.push(Line::from(vec![
+            key("↑/↓"),
+            Span::raw(" field   "),
+            key("Enter"),
+            Span::raw(" edit/apply   "),
+            key("Esc"),
+            Span::raw(" cancel   "),
+            key("Ctrl+U"),
+            Span::raw(" clear   "),
+            key("p"),
+            Span::raw(" push   "),
+            key("r"),
+            Span::raw(" retry   "),
+            key("d"),
+            Span::raw(" auto backup"),
+        ]));
+        lines.push(Line::styled(
+            "Needs an HF login with write access; no repo is created.",
+            dim,
+        ));
+        lines.push(Line::styled(
+            "Push replaces the model files and README on main, max 5 GiB. Only new saves count.",
+            dim,
+        ));
         f.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .block(panel(" HF backup ")),
+                .block(panel(" HF backup "))
+                .style(base),
             area,
         );
     }

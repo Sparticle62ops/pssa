@@ -6,7 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::Rect,
-    text::Line,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
 use serde_json::{Value, json};
@@ -303,6 +304,17 @@ impl Notify {
     }
     pub(super) fn draw(&self, f: &mut Frame, area: Rect) {
         let area = panel_area(f, area);
+        let base = Style::new().bg(super::panel_bg());
+        let dim = Style::new().add_modifier(Modifier::DIM);
+        let key = |label: &str| {
+            Span::styled(
+                format!(" {label} "),
+                Style::new()
+                    .fg(super::panel_bg())
+                    .bg(super::normal_green())
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
         let mode = if self.selected == 0 {
             self.input
                 .as_deref()
@@ -324,8 +336,19 @@ impl Notify {
         } else {
             "•".repeat(target.chars().count().min(24))
         };
+        let failing = self.status.starts_with("HTTP")
+            || self.status.contains("denied")
+            || self.status.contains("Invalid")
+            || self.status.contains("invalid")
+            || self.status.contains("Failed")
+            || self.status.contains("failed");
+        let status_color = if failing {
+            Color::Rgb(0xe0, 0x6c, 0x5a)
+        } else {
+            super::normal_green()
+        };
         let mut lines = vec![
-            Line::styled("Phone alerts", accent()),
+            Line::styled("Phone alerts", accent().add_modifier(Modifier::BOLD)),
             Line::from(format!(
                 "Alerts: {}",
                 if self.enabled { "ON" } else { "OFF" }
@@ -341,29 +364,49 @@ impl Notify {
                 if self.selected == 1 { "▶" } else { " " },
                 if self.selected == 1 && self.editing() { " ▏" } else { "" }
             )),
-            Line::from(self.status.as_str()),
+            Line::styled(self.status.as_str(), Style::new().fg(status_color)),
         ];
         if self.failures > 0 {
-            lines.push(Line::from(format!(
-                "{} failed sends (no automatic retry)",
-                self.failures
-            )));
+            lines.push(Line::styled(
+                format!("{} failed sends (no automatic retry)", self.failures),
+                Style::new().fg(super::bright_red()),
+            ));
         }
-        lines.push(Line::from(if target.is_empty() {
-            "Next: Enter on target, paste your ntfy topic or webhook URL, Enter."
-        } else if !self.enabled {
-            "Next: d turns alerts on, p sends a test."
-        } else {
-            "Ready. p sends a test checkpoint."
-        }));
-        lines.push(Line::from(
-            "↑/↓ field · Enter edit/apply · Esc cancel · Ctrl+U clear · d on/off · p test · r retry",
+        lines.push(Line::styled(
+            if target.is_empty() {
+                "Next: Enter on target, paste your ntfy topic or webhook URL, Enter."
+            } else if !self.enabled {
+                "Next: d turns alerts on, p sends a test."
+            } else {
+                "Ready. p sends a test checkpoint."
+            },
+            dim,
         ));
-        lines.push(Line::from(
+        lines.push(Line::from(vec![
+            key("↑/↓"),
+            Span::raw(" field   "),
+            key("Enter"),
+            Span::raw(" edit/apply   "),
+            key("Esc"),
+            Span::raw(" cancel   "),
+            key("Ctrl+U"),
+            Span::raw(" clear   "),
+            key("d"),
+            Span::raw(" on/off   "),
+            key("p"),
+            Span::raw(" test   "),
+            key("r"),
+            Span::raw(" retry"),
+        ]));
+        lines.push(Line::styled(
             "Summary alerts only, never logs or tokens. ntfy topics are public: pick an unguessable one.",
+            dim,
         ));
         if !self.history.is_empty() {
-            lines.push(Line::styled("Latest deliveries", accent()));
+            lines.push(Line::styled(
+                "Latest deliveries",
+                accent().add_modifier(Modifier::BOLD),
+            ));
             lines.extend(
                 self.history
                     .iter()
@@ -375,7 +418,8 @@ impl Notify {
         f.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .block(panel(" Notifications ")),
+                .block(panel(" Notifications "))
+                .style(base),
             area,
         );
     }
