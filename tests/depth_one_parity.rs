@@ -10,6 +10,9 @@ use pssa::checkpoint::{CheckpointFormat, load_checkpoint, save_model};
 const INITIAL: &[u8] = include_bytes!("fixtures/depth_one_main85d9d33_initial.pssa");
 const TRAINED: &[u8] = include_bytes!("fixtures/depth_one_main85d9d33_trained.pssa");
 const OBSERVED: &[u8] = include_bytes!("fixtures/depth_one_main85d9d33_observed.bin");
+// Bit-exactness holds only under the golden recipe: run with `cargo test
+// --release` (fat LTO, one codegen unit). The fast profile reorders float
+// operations and will not bit-match.
 // Generated with the unchanged recipe against exported main 014f617, release
 // opt-level 3 / fat LTO / one codegen unit, on x86_64 with AVX2/FMA.
 // SHA-256 trained: 69549428d1285cac528c5870559282ea93030cdfed7956721d16109cac16cf91

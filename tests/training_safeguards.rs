@@ -68,6 +68,9 @@ fn flags_off_three_link_resume_matches_unmodified_baseline_bytes() {
     // main intentionally changed reduction rounding; keep strict bit checks
     // against the matching kernel, not a tolerance or a regenerated test value.
     // Includes serialized gradients, Adam moments, memory, RNG and schedule.
+    // Bit-exactness holds only under the capture recipe: run with `cargo test
+    // --release` (fat LTO, one codegen unit). The fast profile reorders float
+    // operations and will not reproduce these hashes.
     let baseline_hash = full_bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| {
         (h ^ b as u64).wrapping_mul(0x100000001b3)
     });

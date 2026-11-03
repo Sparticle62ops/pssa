@@ -151,7 +151,14 @@ fn emit_round_trips_projected_tied_embeddings() {
     assert_eq!(loaded.cfg.d_latent, 4);
     assert_eq!(loaded.embed_w.rows, 17);
     assert_eq!(loaded.embed_w.cols, 4);
-    assert_eq!(loaded.embed_w.data, loaded.unembed_w.data);
+    // The logit-scale calibration rescales the unembedding uniformly after
+    // emission, so the projected tied geometry survives as a uniform factor:
+    // unembed must stay exactly embed * logit_scale.
+    let scale = report.logit_scale;
+    assert!(scale.is_finite() && scale > 0.0, "logit_scale {scale}");
+    for (embed, unembed) in loaded.embed_w.data.iter().zip(loaded.unembed_w.data.iter()) {
+        assert_eq!(embed * scale, *unembed);
+    }
     for token in 0..17 {
         let row = &loaded.embed_w.data[token * 4..(token + 1) * 4];
         let rms = row.iter().map(|v| v * v).sum::<f32>() / 4.0;
