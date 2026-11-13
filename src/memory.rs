@@ -17,6 +17,12 @@ pub struct HyperbolicEpisodicBankV2 {
     pub norm_sq: Vec<f32>,
     pub confidence: Vec<f32>,
     pub last_seen_step: Vec<usize>,
+    /// Runtime-only hybrid-read write strength per slot (1.0 = ungated).
+    /// Not part of the checkpoint format: a loaded bank resets to neutral gates.
+    pub hybrid_gate: Vec<f32>,
+    /// Runtime-only per-slot age (bump count) since the slot's last write, used
+    /// by `retrieve_hybrid_into` for lam^age recency decay. Not checkpointed.
+    pub hybrid_age: Vec<u64>,
 }
 
 impl HyperbolicEpisodicBankV2 {
@@ -38,6 +44,8 @@ impl HyperbolicEpisodicBankV2 {
             norm_sq: vec![0.0; capacity],
             confidence: vec![1.0; capacity],
             last_seen_step: vec![0; capacity],
+            hybrid_gate: vec![1.0; capacity],
+            hybrid_age: vec![0; capacity],
         }
     }
 
@@ -74,6 +82,8 @@ impl HyperbolicEpisodicBankV2 {
             grown.norm_sq[dst] = self.norm_sq[src];
             grown.confidence[dst] = self.confidence[src];
             grown.last_seen_step[dst] = self.last_seen_step[src];
+            grown.hybrid_gate[dst] = self.hybrid_gate[src];
+            grown.hybrid_age[dst] = self.hybrid_age[src];
         }
         *self = grown;
         Ok(())
@@ -277,6 +287,8 @@ impl HyperbolicEpisodicBankV2 {
         }
         self.confidence[idx] = 1.0;
         self.last_seen_step[idx] = 0;
+        self.hybrid_gate[idx] = 1.0;
+        self.hybrid_age[idx] = 0;
         idx
     }
 
@@ -461,6 +473,138 @@ impl HyperbolicEpisodicBankV2 {
             }
         }
         -max_distance
+    }
+
+    /// Opt-in gated write for the hybrid read: like `insert`, but records a
+    /// write strength the hybrid read multiplies into its softmax weights.
+    /// gate must be finite and nonnegative (1.0 is the ungated default).
+    pub fn insert_gated(&mut self, key_pnc: &[f32], val: &[f32], gate: f32) -> usize {
+        assert!(
+            gate.is_finite() && gate >= 0.0,
+            "hybrid write gate must be finite and nonnegative"
+        );
+        let idx = self.insert(key_pnc, val);
+        self.hybrid_gate[idx] = gate;
+        idx
+    }
+
+    /// Age every live slot by one step for hybrid-read recency decay. Ages
+    /// saturate at u64::MAX; a write (plain or gated) resets the slot to 0.
+    pub fn bump_hybrid_ages(&mut self) {
+        for age in &mut self.hybrid_age[..self.count] {
+            *age = age.saturating_add(1);
+        }
+    }
+
+    /// Hybrid read, port of the pinned chunk-bank design (nightly research,
+    /// 2026-11-10/11): w = softmax(g_i * lam^age_i * exp((min_dist - dist_i)/tau)).
+    /// The base softmax matches `retrieve_soft_into` exactly; the learned write
+    /// gate and recency decay multiply each slot's numerator before the final
+    /// normalization, so the read keeps attention's capacity behavior while
+    /// letting the newest binding win on repeated keys.
+    ///
+    /// Neutral settings (gate 1.0, lam 1.0) reproduce `retrieve_soft_into`
+    /// bit for bit. If every weighted slot is fully gated to zero, the read
+    /// falls back to the unweighted softmax so it never returns all zeros.
+    /// lam must be in (0.0, 1.0]; decay is computed in f64 as
+    /// exp(age * ln(lam)) so large ages underflow to zero instead of NaN.
+    pub fn retrieve_hybrid_into(
+        &self,
+        q_pnc: &[f32],
+        tau: f32,
+        lam: f32,
+        out_val: &mut [f32],
+        out_weights: &mut [f32],
+    ) -> f32 {
+        assert_eq!(q_pnc.len(), self.dim_key);
+        assert_eq!(out_val.len(), self.dim_val);
+        assert!(out_weights.len() >= self.count);
+        assert!(
+            tau.is_finite() && tau > 0.0,
+            "tau must be positive and finite"
+        );
+        assert!(
+            lam.is_finite() && lam > 0.0 && lam <= 1.0,
+            "hybrid decay lam must be in (0.0, 1.0]"
+        );
+        if self.count == 0 {
+            out_val.fill(0.0);
+            out_weights.fill(0.0);
+            return 0.0;
+        }
+        let log_lam = (lam as f64).ln();
+        let q_sq = Self::squared_norm(q_pnc);
+        assert!(
+            q_sq.is_finite() && q_sq < 1.0,
+            "query must be in open Poincare ball"
+        );
+        let mut min_dist = f32::MAX;
+        for idx in 0..self.count {
+            let off = idx * self.dim_key;
+            let dist = Self::poincare_distance(
+                q_pnc,
+                q_sq,
+                &self.keys[off..off + self.dim_key],
+                self.norm_sq[idx],
+            );
+            min_dist = min_dist.min(dist);
+            out_weights[idx] = dist;
+        }
+        // Optional top-k selection on distance, mirroring the soft read, then
+        // gating and decay apply to the survivors before renormalization.
+        let mut live = vec![false; self.count];
+        if let Some(k) = self.top_k.filter(|&k| k < self.count) {
+            let mut nearest = std::collections::BinaryHeap::with_capacity(k + 1);
+            for (idx, &distance) in out_weights[..self.count].iter().enumerate() {
+                nearest.push((distance.to_bits(), idx));
+                if nearest.len() > k {
+                    nearest.pop();
+                }
+            }
+            for (_, idx) in nearest.into_iter() {
+                live[idx] = true;
+            }
+        } else {
+            live.iter_mut().for_each(|l| *l = true);
+        }
+        // Distances must survive the weight pass: the fully-gated fallback
+        // below recomputes the unweighted softmax from them.
+        let dists: Vec<f32> = out_weights[..self.count].to_vec();
+        let mut sum = 0.0f32;
+        for idx in 0..self.count {
+            if live[idx] {
+                let decay = ((self.hybrid_age[idx] as f64) * log_lam).exp() as f32;
+                let w =
+                    ((min_dist - dists[idx]) / tau).exp() * self.hybrid_gate[idx] * decay;
+                out_weights[idx] = w;
+                sum += w;
+            } else {
+                out_weights[idx] = 0.0;
+            }
+        }
+        if sum == 0.0 {
+            // Fully gated out: fall back to the unweighted softmax over live slots.
+            sum = 0.0;
+            for idx in 0..self.count {
+                if live[idx] {
+                    let w = ((min_dist - dists[idx]) / tau).exp();
+                    out_weights[idx] = w;
+                    sum += w;
+                }
+            }
+        }
+        out_val.fill(0.0);
+        for idx in 0..self.count {
+            if live[idx] {
+                let w = out_weights[idx] / sum;
+                out_weights[idx] = w;
+                let off = idx * self.dim_val;
+                for j in 0..self.dim_val {
+                    out_val[j] += w * self.values[off + j];
+                }
+            }
+        }
+        min_dist
     }
 }
 
@@ -687,5 +831,142 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(bank, before);
         }
+    }
+    #[test]
+    fn hybrid_read_at_neutral_settings_matches_soft_read_bitwise() {
+        let mut bank = Bank::new(8, 4, 3);
+        let mut seed = 7u64;
+        for i in 0..5 {
+            let mut v = Vec::with_capacity(4);
+            for _ in 0..4 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let x = ((seed >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0;
+                v.push(x as f32);
+            }
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let k: Vec<f32> = v.iter().map(|x| 0.5 * x / norm).collect();
+            bank.insert(&k, &[i as f32, (2 * i) as f32, (3 * i) as f32]);
+            bank.bump_hybrid_ages();
+        }
+        let mut q = Vec::with_capacity(4);
+        for _ in 0..4 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let x = ((seed >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0;
+            q.push(x as f32);
+        }
+        let q_norm: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let q: Vec<f32> = q.iter().map(|x| 0.5 * x / q_norm).collect();
+        let mut soft_val = vec![0.0; 3];
+        let mut soft_w = vec![0.0; 8];
+        let soft = bank.retrieve_soft_into(&q, 0.7, &mut soft_val, &mut soft_w);
+        let mut hy_val = vec![0.0; 3];
+        let mut hy_w = vec![0.0; 8];
+        let hy = bank.retrieve_hybrid_into(&q, 0.7, 1.0, &mut hy_val, &mut hy_w);
+        assert_eq!(bits(&soft_val), bits(&hy_val));
+        assert_eq!(bits(&soft_w[..bank.count]), bits(&hy_w[..bank.count]));
+        assert_eq!(soft.to_bits(), hy.to_bits());
+    }
+
+    #[test]
+    fn hybrid_read_resolves_rebinding_by_recency() {
+        let mut bank = Bank::new(4, 2, 2);
+        let k = [0.5f32, 0.0];
+        bank.insert(&k, &[1.0, 0.0]);
+        for _ in 0..5000 {
+            bank.bump_hybrid_ages();
+        }
+        bank.insert(&k, &[0.0, 1.0]);
+        for _ in 0..5000 {
+            bank.bump_hybrid_ages();
+        }
+        let mut val = vec![0.0; 2];
+        let mut w = vec![0.0; 4];
+        bank.retrieve_hybrid_into(&k, 0.5, 0.999, &mut val, &mut w);
+        assert!(
+            val[1] > 0.99 && val[0] < 0.01,
+            "newest binding must win under decay, got {val:?}"
+        );
+        bank.retrieve_hybrid_into(&k, 0.5, 1.0, &mut val, &mut w);
+        assert!(
+            val[0] > 0.45 && val[0] < 0.55,
+            "without decay both bindings mix, got {val:?}"
+        );
+    }
+
+    #[test]
+    fn hybrid_gate_zero_slots_drop_out_of_the_read() {
+        let mut bank = Bank::new(4, 2, 2);
+        bank.insert_gated(&[0.5f32, 0.0], &[1.0, 0.0], 0.0);
+        bank.insert_gated(&[0.0f32, 0.5], &[0.0, 1.0], 1.0);
+        let mut val = vec![0.0; 2];
+        let mut w = vec![0.0; 4];
+        bank.retrieve_hybrid_into(&[0.5f32, 0.0], 0.5, 0.999, &mut val, &mut w);
+        assert!(val[1] > 0.999, "gated-out slot must not contribute: {val:?}");
+        assert_eq!(w[0], 0.0);
+    }
+
+    #[test]
+    fn fully_gated_read_falls_back_to_unweighted_softmax() {
+        let mut bank = Bank::new(4, 2, 2);
+        bank.insert_gated(&[0.5f32, 0.0], &[1.0, 0.0], 0.0);
+        bank.insert_gated(&[0.0f32, 0.5], &[0.0, 1.0], 0.0);
+        let mut val = vec![0.0; 2];
+        let mut w = vec![0.0; 4];
+        bank.retrieve_hybrid_into(&[0.5f32, 0.0], 0.5, 1.0, &mut val, &mut w);
+        let mut soft_val = vec![0.0; 2];
+        let mut soft_w = vec![0.0; 4];
+        bank.retrieve_soft_into(&[0.5f32, 0.0], 0.5, &mut soft_val, &mut soft_w);
+        assert!(
+            val[0] > 0.9 && (val[0] - soft_val[0]).abs() < 1e-6,
+            "fallback must equal the unweighted soft read: {val:?} vs {soft_val:?}"
+        );
+    }
+
+    #[test]
+    fn grow_copies_hybrid_gate_and_age() {
+        let mut bank = Bank::new(4, 2, 2);
+        bank.insert_gated(&[0.5f32, 0.0], &[1.0, 0.0], 0.5);
+        bank.bump_hybrid_ages();
+        bank.bump_hybrid_ages();
+        bank.grow(16).unwrap();
+        assert_eq!(bank.hybrid_gate[0], 0.5);
+        assert_eq!(bank.hybrid_age[0], 2);
+        let mut val = vec![0.0; 2];
+        let mut w = vec![0.0; 16];
+        bank.retrieve_hybrid_into(&[0.5f32, 0.0], 0.5, 1.0, &mut val, &mut w);
+        assert!(val[0] > 0.999, "hybrid metadata must survive grow: {val:?}");
+    }
+
+    #[test]
+    fn hybrid_metadata_resets_on_ring_overwrite() {
+        let mut bank = Bank::new(2, 2, 2);
+        bank.insert_gated(&[0.5f32, 0.0], &[1.0, 0.0], 0.25);
+        bank.insert(&[0.0f32, 0.5], &[0.0, 1.0]);
+        for _ in 0..3 {
+            bank.bump_hybrid_ages();
+        }
+        bank.insert_gated(&[0.5f32, 0.0], &[1.0, 1.0], 0.75);
+        assert_eq!(bank.hybrid_gate[0], 0.75);
+        assert_eq!(bank.hybrid_age[0], 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "hybrid decay lam")]
+    fn hybrid_read_rejects_lam_out_of_range() {
+        let bank = Bank::new(2, 2, 2);
+        let mut val = vec![0.0; 2];
+        let mut w = vec![0.0; 2];
+        bank.retrieve_hybrid_into(&[0.5f32, 0.0], 0.5, 1.2, &mut val, &mut w);
+    }
+
+    #[test]
+    #[should_panic(expected = "hybrid write gate")]
+    fn insert_gated_rejects_negative_gate() {
+        let mut bank = Bank::new(2, 2, 2);
+        bank.insert_gated(&[0.5f32, 0.0], &[1.0, 0.0], -0.1);
     }
 }
