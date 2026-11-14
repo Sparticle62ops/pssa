@@ -690,6 +690,10 @@ fn retrieve_memory_row(
     tau: f32,
 ) {
     *q_norm = HyperbolicEpisodicBankV2::diffeomorphic_project(q_euc, q_poincare);
+    assert!(
+        !memory.hybrid_enabled,
+        "hybrid read currently requires the CPU backend"
+    );
     memory.retrieve_soft_into(q_poincare, tau, value, weights);
 }
 
@@ -1414,6 +1418,10 @@ fn stacked_memory(
         block.tape.q_norm[t] = crate::memory::HyperbolicEpisodicBankV2::diffeomorphic_project(
             &block.tape.q_euc[q..q + k],
             &mut block.tape.q_poincare[q..q + k],
+        );
+        assert!(
+            !block.memory.hybrid_enabled,
+            "hybrid read currently requires the CPU backend"
         );
         block.memory.retrieve_soft_into(
             &block.tape.q_poincare[q..q + k],

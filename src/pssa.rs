@@ -1151,12 +1151,24 @@ impl PSSAContinuousBlockV2 {
                 dot_slice(row_x, &self.inf_x_norm) + dot_slice(row_h, &self.inf_y_ssm);
         }
         HyperbolicEpisodicBankV2::diffeomorphic_project(&self.inf_q_euc, &mut self.inf_q_pnc);
-        self.memory.retrieve_soft_into(
-            &self.inf_q_pnc,
-            self.cfg.tau_mem,
-            &mut self.inf_m_val,
-            &mut self.inf_mem_weights,
-        );
+        if self.memory.hybrid_enabled {
+            self.memory.bump_hybrid_ages();
+            let lam = self.memory.hybrid_lam;
+            self.memory.retrieve_hybrid_into(
+                &self.inf_q_pnc,
+                self.cfg.tau_mem,
+                lam,
+                &mut self.inf_m_val,
+                &mut self.inf_mem_weights,
+            );
+        } else {
+            self.memory.retrieve_soft_into(
+                &self.inf_q_pnc,
+                self.cfg.tau_mem,
+                &mut self.inf_m_val,
+                &mut self.inf_mem_weights,
+            );
+        }
         self.w_gate.matvec(&self.inf_x_norm, &mut self.inf_g_mem);
         for i in 0..d_m {
             self.inf_g_mem[i] = sigmoid(self.inf_g_mem[i]);
@@ -1319,12 +1331,26 @@ impl PSSAContinuousBlockV2 {
 
             let m_off = (loop_l + t) * d_m;
             let mw_off = (loop_l + t) * mem_cap;
-            self.memory.retrieve_soft_into(
-                &self.tape.q_poincare[q_off..q_off + d_k],
-                self.cfg.tau_mem,
-                &mut self.tape.m_val[m_off..m_off + d_m],
-                &mut self.tape.mem_weights[mw_off..mw_off + mem_cap],
-            );
+            if self.memory.hybrid_enabled {
+                // Each retrieval step ages the live slots for recency decay;
+                // a write resets its slot's age to zero.
+                self.memory.bump_hybrid_ages();
+                let lam = self.memory.hybrid_lam;
+                self.memory.retrieve_hybrid_into(
+                    &self.tape.q_poincare[q_off..q_off + d_k],
+                    self.cfg.tau_mem,
+                    lam,
+                    &mut self.tape.m_val[m_off..m_off + d_m],
+                    &mut self.tape.mem_weights[mw_off..mw_off + mem_cap],
+                );
+            } else {
+                self.memory.retrieve_soft_into(
+                    &self.tape.q_poincare[q_off..q_off + d_k],
+                    self.cfg.tau_mem,
+                    &mut self.tape.m_val[m_off..m_off + d_m],
+                    &mut self.tape.mem_weights[mw_off..mw_off + mem_cap],
+                );
+            }
 
             self.w_gate
                 .matvec(x_n, &mut self.tape.g_mem[m_off..m_off + d_m]);
@@ -1569,7 +1595,8 @@ impl PSSAContinuousBlockV2 {
                 }
             }
 
-            // Retrieval is a full-bank softmax over -hyperbolic_distance/tau.
+            // Retrieval is a full-bank softmax over -hyperbolic_distance/tau
+            // (the opt-in hybrid read changes only the recorded weights).
             // Bank keys/values are detached stored state; only the query path learns.
             self.g_query_pnc.fill(0.0);
             let q_off = (loop_l + t) * d_k;
@@ -2194,6 +2221,23 @@ impl PSSALayerV2 {
         }
         for block in std::iter::once(&mut self.block).chain(&mut self.extra_blocks) {
             block.memory.set_top_k(top_k)?;
+        }
+        Ok(())
+    }
+
+    /// Opt-in hybrid read on every block's memory bank: gated writes and
+    /// lam^age recency decay feeding the softmax keyed read (nightly research,
+    /// pinned chunk-bank design). CPU-only like top-k selection. The toggle,
+    /// the per-slot gates and the ages are runtime-only and never checkpointed.
+    pub fn set_hybrid_read(&mut self, enabled: bool, lam: f32) -> Result<(), String> {
+        if !lam.is_finite() || lam <= 0.0 || lam > 1.0 {
+            return Err("hybrid decay lam must be in (0.0, 1.0]".into());
+        }
+        if self.device.is_gpu() {
+            return Err("hybrid read currently requires the CPU backend".into());
+        }
+        for block in std::iter::once(&mut self.block).chain(&mut self.extra_blocks) {
+            block.memory.set_hybrid_read(enabled, lam)?;
         }
         Ok(())
     }
@@ -3670,13 +3714,25 @@ impl PSSALayerV2 {
             } else {
                 (loops - 1) * b.tape.max_l
             };
-            b.memory.insert_protected_with_device(
-                &b.tape.q_poincare[(loop_l + last) * k..(loop_l + last + 1) * k],
-                &b.tape.z_final[(loop_l + last) * d..(loop_l + last + 1) * d],
-                loss,
-                self.step_counter,
-                &self.device,
-            );
+            let key = &b.tape.q_poincare[(loop_l + last) * k..(loop_l + last + 1) * k];
+            let value = &b.tape.z_final[(loop_l + last) * d..(loop_l + last + 1) * d];
+            if b.memory.hybrid_enabled {
+                // Learned-feature write gate: the mean of the block's memory
+                // injection gate activations at the write token. Stored memory
+                // is detached, so the gate receives no gradient of its own; it
+                // only scores the write for the hybrid read.
+                let g_off = (loop_l + last) * d;
+                let gate = b.tape.g_mem[g_off..g_off + d].iter().sum::<f32>() / d as f32;
+                b.memory.insert_gated_protected(key, value, gate, loss, self.step_counter);
+            } else {
+                b.memory.insert_protected_with_device(
+                    key,
+                    value,
+                    loss,
+                    self.step_counter,
+                    &self.device,
+                );
+            }
         }
     }
     pub fn insert_training_memory(&mut self, loss: f32, seq_len: usize) {
@@ -4084,5 +4140,85 @@ mod training_safeguards_tests {
         assert_eq!(norm, 1e21f32 as f64);
         assert_eq!(m.block.norm_gamma.grad[0], 1.0);
         assert!(optimizer_state(&m).iter().all(|x| x.is_finite()));
+    }
+}
+
+#[cfg(test)]
+mod hybrid_read_tests {
+    use super::*;
+
+    fn model() -> PSSALayerV2 {
+        PSSALayerV2::new_with_device(
+            PSSAConfigV2 {
+                depth: 2,
+                d_vocab: 5,
+                d_latent: 4,
+                d_state: 2,
+                d_mem_key: 2,
+                mem_capacity: 2,
+                chunk_len: 2,
+                ..Default::default()
+            },
+            42,
+            Device::Cpu,
+        )
+    }
+
+    #[test]
+    fn hybrid_toggle_sets_every_block_bank_and_validates_lam() {
+        let mut m = model();
+        assert!(m.set_hybrid_read(true, 0.0).is_err());
+        assert!(m.set_hybrid_read(true, 1.2).is_err());
+        assert!(m.set_hybrid_read(true, f32::NAN).is_err());
+        assert!(m.set_hybrid_read(true, 0.999).is_ok());
+        for b in std::iter::once(&m.block).chain(&m.extra_blocks) {
+            assert!(b.memory.hybrid_enabled);
+            assert_eq!(b.memory.hybrid_lam, 0.999);
+        }
+        assert!(m.set_hybrid_read(false, 1.0).is_ok());
+        assert!(!m.block.memory.hybrid_enabled);
+    }
+
+    #[test]
+    fn hybrid_forward_matches_standard_at_neutral_settings() {
+        let mut hybrid = model();
+        let mut standard = model();
+        for m in [&mut hybrid, &mut standard] {
+            for b in std::iter::once(&mut m.block).chain(&mut m.extra_blocks) {
+                b.memory.insert(&[0.5f32, 0.0], &[1.0, 0.0, 0.5, 0.0]);
+                b.memory.insert(&[0.0f32, 0.5], &[0.0, 1.0, 0.0, 0.5]);
+            }
+        }
+        hybrid.set_hybrid_read(true, 1.0).expect("hybrid on");
+        let loss_hybrid = hybrid.forward_train_chunk(&[1, 2], &[2, 3]);
+        let loss_standard = standard.forward_train_chunk(&[1, 2], &[2, 3]);
+        assert_eq!(loss_hybrid.to_bits(), loss_standard.to_bits());
+    }
+
+    #[test]
+    fn hybrid_training_chunk_backward_stays_finite() {
+        let mut m = model();
+        m.set_hybrid_read(true, 0.999).expect("hybrid on");
+        let loss = m.forward_train_chunk(&[1, 2], &[2, 3]);
+        assert!(loss.is_finite());
+        m.zero_gradients();
+        m.backward_chunk(2, 1.0);
+        m.for_each_adam_gradient(|g| {
+            assert!(g.iter().all(|x| x.is_finite()), "non-finite gradient");
+        });
+    }
+
+    #[test]
+    fn gated_training_insert_records_injection_gate_mean() {
+        let mut m = model();
+        m.set_hybrid_read(true, 0.999).expect("hybrid on");
+        m.forward_train_chunk(&[1, 2], &[2, 3]);
+        m.insert_training_memory_at(5.0, 1);
+        let b = &m.block;
+        let d = b.cfg.d_latent;
+        let expected: f32 = b.tape.g_mem[d..2 * d].iter().sum::<f32>() / d as f32;
+        assert!(expected > 0.0 && expected <= 1.0);
+        assert_eq!(b.memory.hybrid_gate[0].to_bits(), expected.to_bits());
+        assert_eq!(b.memory.count, 1);
     }
 }

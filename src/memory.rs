@@ -23,6 +23,12 @@ pub struct HyperbolicEpisodicBankV2 {
     /// Runtime-only per-slot age (bump count) since the slot's last write, used
     /// by `retrieve_hybrid_into` for lam^age recency decay. Not checkpointed.
     pub hybrid_age: Vec<u64>,
+    /// Runtime-only opt-in flag that switches the model's retrieval to the
+    /// hybrid read. Not part of the checkpoint format: a loaded bank starts
+    /// disabled with neutral decay.
+    pub hybrid_enabled: bool,
+    /// Runtime-only per-step recency decay for the hybrid read, in (0.0, 1.0].
+    pub hybrid_lam: f32,
 }
 
 impl HyperbolicEpisodicBankV2 {
@@ -46,6 +52,8 @@ impl HyperbolicEpisodicBankV2 {
             last_seen_step: vec![0; capacity],
             hybrid_gate: vec![1.0; capacity],
             hybrid_age: vec![0; capacity],
+            hybrid_enabled: false,
+            hybrid_lam: 1.0,
         }
     }
 
@@ -69,6 +77,8 @@ impl HyperbolicEpisodicBankV2 {
         grown.count = self.count;
         grown.value_cap = self.value_cap;
         grown.top_k = self.top_k;
+        grown.hybrid_enabled = self.hybrid_enabled;
+        grown.hybrid_lam = self.hybrid_lam;
         for dst in 0..self.count {
             let src = if self.count == self.capacity {
                 (self.write_head + dst) % self.capacity
@@ -493,6 +503,53 @@ impl HyperbolicEpisodicBankV2 {
     pub fn bump_hybrid_ages(&mut self) {
         for age in &mut self.hybrid_age[..self.count] {
             *age = age.saturating_add(1);
+        }
+    }
+
+    /// Switch this bank between the standard soft read and the hybrid read.
+    /// `lam` must be finite and in (0.0, 1.0]; 1.0 disables recency decay.
+    pub fn set_hybrid_read(&mut self, enabled: bool, lam: f32) -> Result<(), String> {
+        if !lam.is_finite() || lam <= 0.0 || lam > 1.0 {
+            return Err("hybrid decay lam must be in (0.0, 1.0]".into());
+        }
+        self.hybrid_enabled = enabled;
+        self.hybrid_lam = lam;
+        Ok(())
+    }
+
+    /// Gated variant of `insert_protected`: the same refractory-overwrite
+    /// defense, but the recorded slot also carries a hybrid write strength.
+    /// CPU-only: the hybrid read is not staged on GPU backends.
+    pub fn insert_gated_protected(
+        &mut self,
+        key_pnc: &[f32],
+        val: &[f32],
+        gate: f32,
+        surprise: f32,
+        current_step: usize,
+    ) -> Option<usize> {
+        assert!(
+            gate.is_finite() && gate >= 0.0,
+            "hybrid write gate must be finite and nonnegative"
+        );
+        if self.count < self.capacity {
+            let idx = self.insert_gated(key_pnc, val, gate);
+            self.last_seen_step[idx] = current_step;
+            return Some(idx);
+        }
+        let idx = self.write_head;
+        match RateLimiterGate::apply_refractory_overwrite(
+            &mut self.confidence[idx],
+            &mut self.last_seen_step[idx],
+            current_step,
+            surprise,
+        ) {
+            UpdateOutcome::Defended { .. } | UpdateOutcome::Stable { .. } => None,
+            UpdateOutcome::Overwritten => {
+                let inserted = self.insert_gated(key_pnc, val, gate);
+                self.last_seen_step[inserted] = current_step;
+                Some(inserted)
+            }
         }
     }
 
@@ -968,5 +1025,57 @@ mod tests {
     fn insert_gated_rejects_negative_gate() {
         let mut bank = Bank::new(2, 2, 2);
         bank.insert_gated(&[0.5f32, 0.0], &[1.0, 0.0], -0.1);
+    }
+    #[test]
+    fn hybrid_read_toggle_validates_lam() {
+        let mut bank = Bank::new(2, 2, 2);
+        assert!(bank.set_hybrid_read(true, 0.0).is_err());
+        assert!(bank.set_hybrid_read(true, 1.5).is_err());
+        assert!(bank.set_hybrid_read(true, f32::NAN).is_err());
+        assert!(bank.set_hybrid_read(true, 0.999).is_ok());
+        assert!(bank.hybrid_enabled);
+        assert_eq!(bank.hybrid_lam, 0.999);
+        assert!(bank.set_hybrid_read(false, 1.0).is_ok());
+        assert!(!bank.hybrid_enabled);
+    }
+
+    #[test]
+    fn hybrid_enabled_neutral_matches_soft_read() {
+        let mut bank = Bank::new(4, 2, 2);
+        bank.insert(&[0.5f32, 0.0], &[1.0, 0.0]);
+        bank.insert(&[0.0f32, 0.5], &[0.0, 1.0]);
+        bank.insert(&[0.3f32, 0.3], &[0.5, 0.5]);
+        assert!(bank.set_hybrid_read(true, 1.0).is_ok());
+        let mut hybrid_val = vec![0.0f32; 2];
+        let mut hybrid_w = vec![0.0f32; 4];
+        bank.retrieve_hybrid_into(&[0.4f32, 0.1], 0.5, 1.0, &mut hybrid_val, &mut hybrid_w);
+        let mut soft_val = vec![0.0f32; 2];
+        let mut soft_w = vec![0.0f32; 4];
+        bank.retrieve_soft_into(&[0.4f32, 0.1], 0.5, &mut soft_val, &mut soft_w);
+        assert_eq!(bits(&hybrid_val), bits(&soft_val));
+        assert_eq!(bits(&hybrid_w[..bank.count]), bits(&soft_w[..bank.count]));
+    }
+
+    #[test]
+    fn gated_protected_write_records_gate_and_step() {
+        let mut bank = Bank::new(2, 2, 2);
+        let idx = bank
+            .insert_gated_protected(&[0.5f32, 0.0], &[1.0, 0.0], 0.4, 3.0, 7)
+            .expect("fresh-bank insert should land");
+        assert_eq!(idx, 0);
+        assert_eq!(bank.hybrid_gate[0], 0.4);
+        assert_eq!(bank.last_seen_step[0], 7);
+        assert_eq!(bank.count, 1);
+    }
+
+    #[test]
+    fn grow_preserves_hybrid_read_settings() {
+        let mut bank = Bank::new(2, 2, 2);
+        assert!(bank.set_hybrid_read(true, 0.99).is_ok());
+        bank.insert_gated(&[0.5f32, 0.0], &[1.0, 0.0], 0.3);
+        bank.grow(4).expect("grow must succeed");
+        assert!(bank.hybrid_enabled);
+        assert_eq!(bank.hybrid_lam, 0.99);
+        assert_eq!(bank.hybrid_gate[0], 0.3);
     }
 }
