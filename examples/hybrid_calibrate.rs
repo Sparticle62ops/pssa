@@ -1,7 +1,9 @@
-//! Hybrid-read calibration: four same-seed PSSA models train on a synthetic
+//! Hybrid-read calibration: same-seed PSSA models train on a synthetic
 //! associative-recall corpus that repeats keys with re-bound values, so the
 //! newest binding is the only correct answer. Arms differ only in the hybrid
-//! read toggle (off, lam 1.0, 0.9, 0.75). Reports final train loss and
+//! read toggle (off / lam) and whether lam is length-scaled: scaled arms pass
+//! lam^(1/chunk_len) to the read, so a slot decays to lam after one full
+//! 32-token chunk instead of per retrieval step. Reports final train loss and
 //! held-out loss. Memory-research tool; run locally only.
 use pssa::backend::Device;
 use pssa::pssa::{PSSAConfigV2, PSSALayerV2};
@@ -64,7 +66,13 @@ fn make_chunk(rng: &mut Rng, query_bias_recent: bool) -> (Vec<usize>, Vec<usize>
     (inputs, targets)
 }
 
-fn train_arm(seed: u64, lam: Option<f32>, train_chunks: usize, eval_chunks: usize) -> (f32, f32) {
+fn train_arm(
+    seed: u64,
+    lam: Option<f32>,
+    scaled: bool,
+    train_chunks: usize,
+    eval_chunks: usize,
+) -> (f32, f32) {
     let mut model = PSSALayerV2::new_with_device(
         PSSAConfigV2 {
             depth: 2,
@@ -80,9 +88,12 @@ fn train_arm(seed: u64, lam: Option<f32>, train_chunks: usize, eval_chunks: usiz
         42,
         Device::Cpu,
     );
-    if let Some(lam) = lam {
+    // Length-scaled arms translate "decay to lam over one full chunk" into a
+    // per-step decay rate, since ages still bump once per retrieval step.
+    let lam_eff = lam.map(|l| if scaled { l.powf(1.0 / 32.0) } else { l });
+    if let Some(lam_eff) = lam_eff {
         model
-            .set_hybrid_read(true, lam)
+            .set_hybrid_read(true, lam_eff)
             .expect("cpu model accepts the hybrid read");
     }
     let mut rng = Rng(seed);
@@ -112,18 +123,20 @@ fn train_arm(seed: u64, lam: Option<f32>, train_chunks: usize, eval_chunks: usiz
 
 fn main() {
     const SEEDS: [u64; 4] = [42, 43, 44, 45];
-    let arms: [(&str, Option<f32>); 4] = [
-        ("hybrid off (baseline)", None),
-        ("hybrid lam=1.0", Some(1.0)),
-        ("hybrid lam=0.9", Some(0.9)),
-        ("hybrid lam=0.75", Some(0.75)),
+    let arms: [(&str, Option<f32>, bool); 6] = [
+        ("hybrid off (baseline)", None, false),
+        ("hybrid lam=1.0", Some(1.0), false),
+        ("lam=0.99 raw (per step)", Some(0.99), false),
+        ("lam=0.99 chunk-scaled", Some(0.99), true),
+        ("lam=0.95 chunk-scaled", Some(0.95), true),
+        ("lam=0.9 chunk-scaled", Some(0.9), true),
     ];
     let mut rows = Vec::new();
-    for (name, lam) in arms {
+    for (name, lam, scaled) in arms {
         let mut train_losses = Vec::new();
         let mut eval_losses = Vec::new();
         for &seed in &SEEDS {
-            let (train_loss, eval_loss) = train_arm(seed, lam, 300, 200);
+            let (train_loss, eval_loss) = train_arm(seed, lam, scaled, 300, 200);
             train_losses.push(train_loss);
             eval_losses.push(eval_loss);
             println!("{name:<24} seed {seed}: train(last50) {train_loss:.4}  heldout {eval_loss:.4}");
@@ -143,23 +156,27 @@ fn main() {
         rows.push((
             name.to_string(),
             lam,
+            scaled,
             mean(&train_losses),
             spread(&train_losses),
             mean(&eval_losses),
             spread(&eval_losses),
         ));
     }
-    let baseline = rows[0].4;
+    let baseline = rows[0].5;
     let mut json = String::from(
-        "{\"schema\":2,\"kind\":\"hybrid_read_calibration\",\"seeds\":[42,43,44,45],\"arms\":[",
+        "{\"schema\":3,\"kind\":\"hybrid_read_calibration\",\"seeds\":[42,43,44,45],\"arms\":[",
     );
-    for (i, (name, lam, train_mean, train_sd, eval_mean, eval_sd)) in rows.iter().enumerate() {
+    for (i, (name, lam, scaled, train_mean, train_sd, eval_mean, eval_sd)) in
+        rows.iter().enumerate()
+    {
         if i > 0 {
             json.push(',');
         }
         json.push_str(&format!(
-            "{{\"arm\":\"{name}\",\"lam\":{},\"train_loss_last50_mean\":{train_mean:.6},\"train_loss_last50_sd\":{train_sd:.6},\"heldout_loss_mean\":{eval_mean:.6},\"heldout_loss_sd\":{eval_sd:.6},\"heldout_delta_vs_baseline\":{:.6}}}",
+            "{{\"arm\":\"{name}\",\"lam\":{},\"scaled\":{},\"train_loss_last50_mean\":{train_mean:.6},\"train_loss_last50_sd\":{train_sd:.6},\"heldout_loss_mean\":{eval_mean:.6},\"heldout_loss_sd\":{eval_sd:.6},\"heldout_delta_vs_baseline\":{:.6}}}",
             lam.map(|l| format!("{l}")).unwrap_or_else(|| "null".into()),
+            scaled,
             eval_mean - baseline
         ));
     }
